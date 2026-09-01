@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.research/
+.coverage
+htmlcov/
+.env
+*.egg-info/
+dist/
+build/
+knowledge/
+*.log
+.DS_Store
+Thumbs.db
+
+# InkFlow project runtime data
+**/.inkflow/inkflow.db*
+**/.inkflow/cache/
+**/.inkflow/index/
+**/.inkflow/runs/
+**/.inkflow/trash/

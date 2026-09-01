@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "inkflow": {
+      "type": "stdio",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "scripts/inkflow-mcp.ps1"
+      ]
+    }
+  }
+}
