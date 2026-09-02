@@ -41,7 +41,7 @@ class ReferenceService:
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ProjectError("只支持 http/https 公开网页。")
-        async with httpx.AsyncClient(follow_redirects=True, timeout=45, headers={"User-Agent": "InkFlow/0.1"}) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=45, headers={"User-Agent": "InkFlow/0.2"}) as client:
             response = await client.get(url)
         response.raise_for_status()
         content_type = response.headers.get("content-type", "")
@@ -132,6 +132,30 @@ class ReferenceService:
         path = self.feature_dir / f"{reference_id}.json"
         atomic_write_json(path, feature)
         return feature
+
+    def list_references(self) -> list[dict]:
+        manifest_path = self.project.internal / "references" / "manifest.json"
+        if not manifest_path.is_file():
+            return []
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        result: list[dict] = []
+        for item in list(manifest.get("items") or []):
+            if not isinstance(item, dict) or not item.get("reference_id"):
+                continue
+            feature_path = self.feature_dir / f"{item['reference_id']}.json"
+            result.append(
+                {
+                    **item,
+                    "analyzed": feature_path.is_file(),
+                    "feature_path": (
+                        str(feature_path.relative_to(self.project.root)) if feature_path.is_file() else None
+                    ),
+                }
+            )
+        return sorted(result, key=lambda value: str(value.get("imported_at") or ""), reverse=True)
 
     def _update_manifest(
         self,

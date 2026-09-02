@@ -42,12 +42,14 @@ class JsonModelProvider(Protocol):
 
 
 class DeepSeekProvider:
-    """DeepSeek 官方 Chat Completions JSON 输出适配器。"""
+    """OpenAI 兼容 Chat Completions 适配器，并为 DeepSeek 启用官方扩展字段。"""
 
     def __init__(self, settings: Settings):
         self.settings = settings
 
     async def get_balance(self) -> dict[str, Any]:
+        if not self.settings.is_deepseek:
+            raise ProviderError("当前是自定义 OpenAI 兼容接口，未声明 DeepSeek 余额能力。")
         api_key = self.settings.require_api_key()
         headers = {"Authorization": f"Bearer {api_key}"}
         url = f"{self.settings.base_url}/user/balance"
@@ -95,18 +97,20 @@ class DeepSeekProvider:
             + "输出必须满足以下 JSON Schema：\n"
             + schema_prompt
         )
+        requested_max_tokens = min(max(1, int(max_tokens)), self.settings.max_output_tokens)
         payload: dict[str, Any] = {
             "model": self.settings.model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_prompt},
             ],
-            "thinking": {"type": "enabled" if thinking else "disabled"},
             "response_format": {"type": "json_object"},
-            "max_tokens": max_tokens,
+            "max_tokens": requested_max_tokens,
             "stream": False,
         }
-        if thinking:
+        if self.settings.is_deepseek:
+            payload["thinking"] = {"type": "enabled" if thinking else "disabled"}
+        if thinking and self.settings.is_deepseek:
             payload["reasoning_effort"] = effort or self.settings.reasoning_effort
         url = f"{self.settings.base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -122,7 +126,16 @@ class DeepSeekProvider:
                     )
                 if response.status_code >= 400:
                     message = _safe_error_message(response)
-                    raise ProviderError(f"DeepSeek API 返回 HTTP {response.status_code}：{message}")
+                    if (
+                        attempt == 0
+                        and not self.settings.is_deepseek
+                        and response.status_code in {400, 404, 422}
+                        and "response_format" in payload
+                    ):
+                        payload.pop("response_format", None)
+                        continue
+                    provider_name = "DeepSeek" if self.settings.is_deepseek else "模型服务"
+                    raise ProviderError(f"{provider_name} API 返回 HTTP {response.status_code}：{message}")
                 body = response.json()
                 choice = body["choices"][0]
                 message = choice["message"]
@@ -131,7 +144,7 @@ class DeepSeekProvider:
                     usage = dict(body.get("usage") or {})
                     detail = usage.get("completion_tokens_details") or {}
                     raise ProviderError(
-                        "DeepSeek 返回了空 JSON 内容"
+                        "模型服务返回了空 JSON 内容"
                         f"（finish_reason={choice.get('finish_reason') or 'unknown'}, "
                         f"completion_tokens={usage.get('completion_tokens', 'unknown')}, "
                         f"reasoning_tokens={detail.get('reasoning_tokens', 'unknown')}）。"
@@ -156,16 +169,19 @@ class DeepSeekProvider:
                 last_error = exc
                 if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
                     raise ProviderError(
-                        f"DeepSeek 在 {request_timeout:.0f} 秒内未返回有效 JSON；为避免不确定的重复计费，"
+                        f"模型服务在 {request_timeout:.0f} 秒内未返回有效 JSON；为避免不确定的重复计费，"
                         "本次请求不会自动重试。保留草稿与 Trace 后可由用户或长跑协调器恢复。"
                     ) from exc
                 if attempt == 0:
                     # 第二次重试仍受任务原始预算量级约束，不能让小型分类/校对任务
                     # 因首次输出为空而突然膨胀到 24K。
-                    if thinking:
+                    if thinking and self.settings.is_deepseek:
                         payload["reasoning_effort"] = "low"
                     retry_floor = 6_000 if thinking else 2_000
-                    payload["max_tokens"] = min(max(max_tokens * 2, retry_floor), 64_000)
+                    payload["max_tokens"] = min(
+                        max(requested_max_tokens * 2, retry_floor),
+                        self.settings.max_output_tokens,
+                    )
                     payload["messages"][1]["content"] = (
                         user_prompt
                         + "\n\n上一次输出为空、截断或不符合 Schema。请压缩内部推理，"
@@ -173,7 +189,7 @@ class DeepSeekProvider:
                     )
                     continue
                 break
-        raise ProviderError(f"DeepSeek JSON 调用两次均未通过验证：{last_error}") from last_error
+        raise ProviderError(f"模型 JSON 调用两次均未通过验证：{last_error}") from last_error
 
 
 def _safe_error_message(response: httpx.Response) -> str:

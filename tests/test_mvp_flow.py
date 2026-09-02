@@ -12,6 +12,7 @@ from inkflow.project import InkFlowProject
 from inkflow.provider import ScriptedProvider
 from inkflow.references import ReferenceService
 from inkflow.terminal_session import TerminalSession
+from inkflow.studio import StudioService
 from inkflow.schemas import (
     ArcAuditReport,
     ArcPlan,
@@ -360,11 +361,25 @@ def test_complete_mvp_flow(tmp_path: Path) -> None:
     assert plan_result["chapter_range"] == [1, 2]
     assert "第 1 章" in (root / "PLAN.md").read_text(encoding="utf-8")
 
+    studio = StudioService(InkFlowProject(root))
+    studio.db.upsert_bible_entry(
+        entry_id=None,
+        kind="character",
+        name="林照",
+        aliases=[],
+        data={"voice": "回答短，遇到档案问题才会连续追问"},
+    )
+    studio.db.upsert_scene_note(1, 1, {"goal": "先确认来信来源", "knowledge_boundary": "尚不知道寄信机制"})
+
     context = engine.build_context(root, 1)
     assert [item["key"] for item in context["sections"]] == list("ABCDEFGHIJ")
+    context_d = next(item for item in context["sections"] if item["key"] == "D")
+    assert "回答短" in context_d["content"]
+    assert "尚不知道寄信机制" in context_d["content"]
 
     draft_result = asyncio.run(engine.write_chapter(root, 1))
     assert Path(draft_result["draft_path"]).exists()
+    assert "创意镜头软建议" in provider.calls[1]["user_prompt"]
 
     review_result = asyncio.run(engine.review_chapter(root, 1))
     assert review_result["verdict"] == "pass"

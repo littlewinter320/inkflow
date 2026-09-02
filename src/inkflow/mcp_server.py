@@ -1,21 +1,37 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
+import anyio
 from mcp.server.fastmcp import FastMCP
+from mcp.server.stdio import stdio_server
+from mcp.types import ToolAnnotations
 
+from . import __version__
 from .config import Settings
 from .engine import InkFlowEngine
 from .project import InkFlowProject
 from .provider import DeepSeekProvider
 from .references import ReferenceService
 from .schemas import BookBrief
+from .studio import StudioService
 
 
-mcp = FastMCP("墨流 InkFlow")
+mcp = FastMCP("墨流 InkFlow", log_level="WARNING")
+# FastMCP defaults this field to the Python MCP package version, which makes
+# clients show (for example) 1.29.1 instead of the installed InkFlow version.
+mcp._mcp_server.version = __version__
+
+READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+LOCAL_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
+MODEL_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True)
+CANON_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True)
+RECOVERY_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False)
+EXTERNAL_READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True)
 
 
 def _workspace() -> Path:
@@ -31,7 +47,7 @@ def _engine(root: Path) -> InkFlowEngine:
     return InkFlowEngine(DeepSeekProvider(settings), settings)
 
 
-@mcp.tool()
+@mcp.tool(annotations=LOCAL_WRITE)
 def novel_project_create(
     project_root: str,
     title: str,
@@ -63,7 +79,7 @@ def novel_project_create(
     return _engine(root).create_project(root, brief)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def novel_project_status(project_root: str | None = None) -> dict[str, Any]:
     """读取当前项目的规划、章节、事实和未结线索统计。"""
 
@@ -71,7 +87,7 @@ def novel_project_status(project_root: str | None = None) -> dict[str, Any]:
     return _engine(root).status(root)
 
 
-@mcp.tool()
+@mcp.tool(annotations=EXTERNAL_READ)
 async def novel_provider_balance(project_root: str | None = None) -> dict[str, Any]:
     """读取模型账户的 CNY 余额；不会把 API Key 写入项目或 Trace。"""
 
@@ -79,7 +95,7 @@ async def novel_provider_balance(project_root: str | None = None) -> dict[str, A
     return await _engine(root).balance()
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def novel_checkpoint_list(limit: int = 50, project_root: str | None = None) -> dict[str, Any]:
     """列出不可变检查点及其父节点、分支和已接受章节边界。"""
 
@@ -87,7 +103,7 @@ def novel_checkpoint_list(limit: int = 50, project_root: str | None = None) -> d
     return _engine(root).checkpoint_list(root, limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=LOCAL_WRITE)
 def novel_checkpoint_create(
     label: str = "用户手动检查点",
     project_root: str | None = None,
@@ -98,7 +114,15 @@ def novel_checkpoint_create(
     return _engine(root).checkpoint_create(root, label)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
+def novel_task_history(limit: int = 30, project_root: str | None = None) -> dict[str, Any]:
+    """读取桌面/编辑器长任务的完成、失败、中断与取消记录；不包含模型思维链。"""
+
+    project = InkFlowProject(_root(project_root))
+    return {"tasks": StudioService(project).db.list_tasks(limit)}
+
+
+@mcp.tool(annotations=READ_ONLY)
 def novel_rollback_preview(
     checkpoint_id: str | None = None,
     boundary_chapter: int | None = None,
@@ -114,7 +138,7 @@ def novel_rollback_preview(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=RECOVERY_WRITE)
 def novel_rollback_restore(
     confirmation_token: str,
     checkpoint_id: str | None = None,
@@ -132,7 +156,7 @@ def novel_rollback_restore(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=MODEL_WRITE)
 async def novel_plan_generate(project_root: str | None = None) -> dict[str, Any]:
     """调用写作 Agent 的 PLAN 模式，生成全书、卷、篇章和章节卡四级规划。"""
 
@@ -140,7 +164,7 @@ async def novel_plan_generate(project_root: str | None = None) -> dict[str, Any]
     return await _engine(root).generate_plan(root)
 
 
-@mcp.tool()
+@mcp.tool(annotations=MODEL_WRITE)
 async def novel_plan_advance(
     instruction: str = "",
     project_root: str | None = None,
@@ -151,7 +175,7 @@ async def novel_plan_advance(
     return await _engine(root).advance_plan(root, instruction=instruction)
 
 
-@mcp.tool()
+@mcp.tool(annotations=MODEL_WRITE)
 async def novel_plan_brief(
     instruction: str = "",
     project_root: str | None = None,
@@ -162,7 +186,7 @@ async def novel_plan_brief(
     return await _engine(root).preview_next_arc(root, instruction=instruction)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def novel_plan_preview(
     start_chapter: int,
     end_chapter: int,
@@ -174,7 +198,7 @@ def novel_plan_preview(
     return _engine(root).preview_plan_range(root, start_chapter, end_chapter)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CANON_WRITE)
 async def novel_continue_until(
     target_characters: int | None = None,
     instruction: str = "",
@@ -194,7 +218,7 @@ async def novel_continue_until(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=MODEL_WRITE)
 async def novel_batch_draft(
     start_chapter_no: int,
     end_chapter_no: int,
@@ -214,7 +238,7 @@ async def novel_batch_draft(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=MODEL_WRITE)
 async def novel_batch_repair(
     batch_id: str,
     start_chapter_no: int | None = None,
@@ -236,15 +260,15 @@ async def novel_batch_repair(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=CANON_WRITE)
 async def novel_batch_accept(batch_id: str, project_root: str | None = None) -> dict[str, Any]:
-    """接收一个已通过即时审查的批次，并按连续前缀依次提交正史。"""
+    """经用户明确确认后，接收已通过即时审查的批次并依次提交正史。"""
 
     root = _root(project_root)
     return await _engine(root).accept_batch(root, batch_id)
 
 
-@mcp.tool()
+@mcp.tool(annotations=MODEL_WRITE)
 async def novel_arc_audit(
     start_chapter_no: int,
     end_chapter_no: int,
@@ -262,7 +286,7 @@ async def novel_arc_audit(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def novel_context_build(
     chapter_no: int,
     task: str = "",
@@ -274,7 +298,7 @@ def novel_context_build(
     return _engine(root).build_context(root, chapter_no, task or None)
 
 
-@mcp.tool()
+@mcp.tool(annotations=MODEL_WRITE)
 async def novel_chapter_write(
     chapter_no: int,
     instruction: str = "",
@@ -286,7 +310,7 @@ async def novel_chapter_write(
     return await _engine(root).write_chapter(root, chapter_no, instruction)
 
 
-@mcp.tool()
+@mcp.tool(annotations=MODEL_WRITE)
 async def novel_chapter_review(chapter_no: int, project_root: str | None = None) -> dict[str, Any]:
     """对完整章节执行代码层和独立审查 Agent 检查。"""
 
@@ -294,7 +318,7 @@ async def novel_chapter_review(chapter_no: int, project_root: str | None = None)
     return await _engine(root).review_chapter(root, chapter_no)
 
 
-@mcp.tool()
+@mcp.tool(annotations=MODEL_WRITE)
 async def novel_chapter_revise(
     chapter_no: int,
     instruction: str = "",
@@ -306,19 +330,18 @@ async def novel_chapter_revise(
     return await _engine(root).revise_chapter(root, chapter_no, instruction)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CANON_WRITE)
 async def novel_chapter_accept(
     chapter_no: int,
-    force: bool = False,
     project_root: str | None = None,
 ) -> dict[str, Any]:
-    """接受草稿，调用记忆 Agent 并把章节与事实事务提交为正史。"""
+    """经用户明确确认后接受草稿，调用记忆 Agent 并把章节与事实事务提交为正史；不会绕过门禁。"""
 
     root = _root(project_root)
-    return await _engine(root).accept_chapter(root, chapter_no, force=force)
+    return await _engine(root).accept_chapter(root, chapter_no, force=False)
 
 
-@mcp.tool()
+@mcp.tool(annotations=LOCAL_WRITE)
 def novel_reference_import(source_path: str, project_root: str | None = None) -> dict[str, Any]:
     """导入本地 TXT/MD 等文本参考资料。"""
 
@@ -326,7 +349,7 @@ def novel_reference_import(source_path: str, project_root: str | None = None) ->
     return ReferenceService(project).import_text(source_path)
 
 
-@mcp.tool()
+@mcp.tool(annotations=EXTERNAL_READ)
 async def novel_reference_fetch(url: str, project_root: str | None = None) -> dict[str, Any]:
     """读取无需登录即可访问的公开网页并保存清洗文本。"""
 
@@ -334,7 +357,7 @@ async def novel_reference_fetch(url: str, project_root: str | None = None) -> di
     return await ReferenceService(project).fetch_url(url)
 
 
-@mcp.tool()
+@mcp.tool(annotations=EXTERNAL_READ)
 async def novel_reference_fetch_fanqie(url: str, project_root: str | None = None) -> dict[str, Any]:
     """抓取无需登录的番茄公开页并标记适配器版本；不会绕过访问控制或登录。"""
 
@@ -342,7 +365,7 @@ async def novel_reference_fetch_fanqie(url: str, project_root: str | None = None
     return await ReferenceService(project).fetch_fanqie_public(url)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def novel_reference_analyze(reference_id: str, project_root: str | None = None) -> dict[str, Any]:
     """为已导入参考文本生成确定性节奏与文本特征卡。"""
 
@@ -350,14 +373,22 @@ def novel_reference_analyze(reference_id: str, project_root: str | None = None) 
     return ReferenceService(project).analyze(reference_id)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
+def novel_reference_list(project_root: str | None = None) -> list[dict[str, Any]]:
+    """列出已导入参考资料及其分析状态，不读取或返回全文。"""
+
+    project = InkFlowProject(_root(project_root))
+    return ReferenceService(project).list_references()
+
+
+@mcp.tool(annotations=READ_ONLY)
 def novel_file_read(relative_path: str, project_root: str | None = None) -> str:
     """读取小说工作区内的用户文件。"""
 
     return InkFlowProject(_root(project_root)).read_file(relative_path)
 
 
-@mcp.tool()
+@mcp.tool(annotations=LOCAL_WRITE)
 def novel_file_write(
     relative_path: str,
     content: str,
@@ -371,7 +402,7 @@ def novel_file_write(
     return {"path": str(path), "characters": len(content)}
 
 
-@mcp.tool()
+@mcp.tool(annotations=RECOVERY_WRITE)
 def novel_file_delete(
     relative_path: str,
     permanent: bool = False,
@@ -382,7 +413,7 @@ def novel_file_delete(
     return InkFlowProject(_root(project_root)).delete_file(relative_path, permanent=permanent)
 
 
-@mcp.tool()
+@mcp.tool(annotations=RECOVERY_WRITE)
 def novel_process_powershell(
     command: str,
     timeout_seconds: int = 60,
@@ -393,7 +424,7 @@ def novel_process_powershell(
     return InkFlowProject(_root(project_root)).run_powershell(command, timeout_seconds)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def novel_trace_read(trace_id: str, project_root: str | None = None) -> str:
     """读取一次运行的可折叠过程记录。"""
 
@@ -406,12 +437,162 @@ def novel_trace_read(trace_id: str, project_root: str | None = None) -> str:
     return path.read_text(encoding="utf-8")
 
 
+@mcp.tool(annotations=READ_ONLY)
+def novel_document_open(relative_path: str, project_root: str | None = None) -> dict[str, Any]:
+    """读取用户文档、统计、行级批注、版本与正史保护状态。"""
+
+    project = InkFlowProject(_root(project_root))
+    return StudioService(project).read_document(relative_path)
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def novel_document_save(
+    relative_path: str,
+    content: str,
+    expected_hash: str | None = None,
+    project_root: str | None = None,
+) -> dict[str, Any]:
+    """安全保存草稿或普通文档并留版本；已验收正文只建立未应用修改提案。"""
+
+    project = InkFlowProject(_root(project_root))
+    return StudioService(project).save_document(
+        relative_path,
+        content,
+        expected_hash=expected_hash,
+        source="mcp_editor",
+    )
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def novel_document_annotate(
+    relative_path: str,
+    start_offset: int,
+    end_offset: int,
+    comment: str,
+    project_root: str | None = None,
+) -> dict[str, Any]:
+    """给文档精确字符区间添加可重定位批注，不直接修改正文。"""
+
+    project = InkFlowProject(_root(project_root))
+    return StudioService(project).create_annotation(relative_path, start_offset, end_offset, comment)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def novel_document_search(
+    query: str,
+    limit: int = 100,
+    project_root: str | None = None,
+) -> dict[str, Any]:
+    """在书籍设定、规划、章节与审查 Markdown 中进行本地全文搜索。"""
+
+    project = InkFlowProject(_root(project_root))
+    return StudioService(project).search(query, limit)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def novel_story_bible(project_root: str | None = None) -> dict[str, Any]:
+    """读取人工故事圣经以及 Memory Keeper 已提交的事实与开放线索。"""
+
+    project = InkFlowProject(_root(project_root))
+    studio = StudioService(project)
+    return {
+        "manual": studio.db.list_bible_entries(),
+        "canon_facts": project.db.current_facts(),
+        "open_threads": project.db.open_threads(),
+    }
+
+
+@mcp.resource(
+    "inkflow://project/book",
+    title="墨流书籍契约",
+    description="当前小说的 BOOK.md；它是书籍契约的人类可读投影。",
+    mime_type="text/markdown",
+)
+def resource_book() -> str:
+    return InkFlowProject(_workspace()).read_file("BOOK.md")
+
+
+@mcp.resource(
+    "inkflow://project/plan",
+    title="墨流当前规划",
+    description="当前全书、卷、篇章与章节卡规划。",
+    mime_type="text/markdown",
+)
+def resource_plan() -> str:
+    return InkFlowProject(_workspace()).read_file("PLAN.md")
+
+
+@mcp.resource(
+    "inkflow://project/state",
+    title="墨流正史状态",
+    description="Memory Keeper 从已验收正文提交的正史状态投影。",
+    mime_type="text/markdown",
+)
+def resource_state() -> str:
+    return InkFlowProject(_workspace()).read_file("STATE.md")
+
+
+@mcp.resource(
+    "inkflow://chapter/{chapter_no}",
+    title="墨流章节",
+    description="按章节号读取正史正文，尚未验收时读取当前草稿。",
+    mime_type="text/markdown",
+)
+def resource_chapter(chapter_no: int) -> str:
+    project = InkFlowProject(_workspace())
+    accepted = f"chapters/chapter_{chapter_no:05d}.md"
+    draft = f"chapters/chapter_{chapter_no:05d}.draft.md"
+    return project.read_file(accepted if (project.root / accepted).is_file() else draft)
+
+
+@mcp.prompt(title="创建并规划一本墨流小说")
+def prompt_start_novel(idea: str, chapter_words: int = 3000) -> str:
+    return (
+        "请先用自然语言和用户确认书名、题材、故事前提、主角与硬规则；信息够用后调用 "
+        "novel_project_create，再调用 novel_plan_generate。不要替用户自动验收正文。\n\n"
+        f"用户灵感：{idea}\n单章目标：约 {chapter_words} 字。"
+    )
+
+
+@mcp.prompt(title="批量写作并逐章审查")
+def prompt_batch_draft(start_chapter: int, end_chapter: int, instruction: str = "") -> str:
+    return (
+        f"请调用 novel_batch_draft 生成第 {start_chapter}～{end_chapter} 章。"
+        "逐章 Writer→Reviewer→必要时最多两轮 Writer 修订与重审；批次完成前不提交正史。"
+        f"用户补充：{instruction or '无'}"
+    )
+
+
+@mcp.prompt(title="篇章复审与后续规划讨论")
+def prompt_arc_audit(start_chapter: int, end_chapter: int) -> str:
+    return (
+        f"调用 novel_arc_audit 复审第 {start_chapter}～{end_chapter} 章，并把实际正文与篇章规划逐项对照。"
+        "先把偏差、依据、扣分和未来影响展示给用户；需要改未来规划或已验收正文时先取得确认。"
+    )
+
+
+async def _run_stdio_server() -> None:
+    # The MCP SDK normally creates a second TextIOWrapper around stdout. In a
+    # PyInstaller one-file executable that wrapper can close the original
+    # stream during shutdown and print a misleading "I/O operation on closed
+    # file" traceback. InkFlow has already configured UTF-8 streams below, so
+    # pass non-owning AnyIO wrappers and keep the process handles open.
+    stdin = anyio.wrap_file(sys.stdin)
+    stdout = anyio.wrap_file(sys.stdout)
+    async with stdio_server(stdin=stdin, stdout=stdout) as (read_stream, write_stream):
+        await mcp._mcp_server.run(
+            read_stream,
+            write_stream,
+            mcp._mcp_server.create_initialization_options(),
+        )
+
+
 def main() -> None:
     # MCP JSON-RPC is UTF-8. Windows may otherwise inherit a legacy console code page.
     for stream in (sys.stdin, sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
-    mcp.run(transport="stdio")
+    anyio.run(_run_stdio_server)
 
 
 if __name__ == "__main__":

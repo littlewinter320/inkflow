@@ -118,7 +118,7 @@ class InkFlowEngine:
                 user_prompt=packet.to_markdown(),
                 output_model=PlanBundle,
                 effort="max",
-                max_tokens=32_000,
+                max_tokens=16_000,
             )
             bundle = result.data
             trace.record_model(
@@ -540,7 +540,7 @@ class InkFlowEngine:
                     user_prompt=packet.to_markdown(),
                     output_model=VolumeArcPlan,
                     effort="max",
-                    max_tokens=32_000,
+                    max_tokens=16_000,
                     timeout_seconds=self.settings.planning_timeout_seconds,
                 )
                 proposal = result.data
@@ -656,7 +656,12 @@ class InkFlowEngine:
             card = project.db.get_chapter_card(chapter_no)
             if not card:
                 raise ValidationGateError(f"缺少第 {chapter_no} 章章节卡。")
-            task = f"创作第 {chapter_no} 章。用户补充：{instruction or '无'}"
+            creative_lens = _creative_lens(chapter_no)
+            task = (
+                f"创作第 {chapter_no} 章。用户补充：{instruction or '无'}\n"
+                f"本章创意镜头软建议：{creative_lens}。只有在不违背正史、章节卡和人物动机时采用；"
+                "它用于改变信息呈现方式，不得凭空增加事件。"
+            )
             packet = ContextBuilder(project, self.settings.context_soft_tokens).build(
                 chapter_no, task, mode="draft", provisional_chapters=provisional_chapters
             )
@@ -666,14 +671,18 @@ class InkFlowEngine:
                 "context.build",
                 "completed",
                 f"构建唯一 Context Packet，估算 {packet.estimated_tokens} tokens",
-                metadata={"sections": [section.key for section in packet.sections], "warnings": packet.warnings},
+                metadata={
+                    "sections": [section.key for section in packet.sections],
+                    "warnings": packet.warnings,
+                    "creative_lens": creative_lens,
+                },
             )
             result = await self.provider.generate_json(
                 system_prompt=WRITER_SYSTEM,
                 user_prompt=packet.to_markdown(),
                 output_model=DraftOutput,
                 effort="high",
-                max_tokens=min(24_000, max(8_000, int(card["target_words"] * 2.2))),
+                max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
             )
             draft = result.data
             trace.record_model("writer.model", result, "完成章节草稿并给出可审计决策摘要")
@@ -885,7 +894,7 @@ class InkFlowEngine:
                 user_prompt=user_prompt,
                 output_model=DraftOutput,
                 effort="high",
-                max_tokens=min(24_000, max(8_000, int(card["target_words"] * 2.2))),
+                max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
             )
             draft = result.data
             trace.record_model("writer.revise", result, "Writer 读取旧稿与审查证据后完成定点修订")
@@ -2129,6 +2138,20 @@ class InkFlowEngine:
         service = CheckpointService(project)
         resolved = service.resolve(checkpoint_id, boundary_chapter)
         return service.restore(resolved, confirmation_token)
+
+
+def _creative_lens(chapter_no: int) -> str:
+    lenses = (
+        "让误解先成立一小段，再用人物行动暴露代价",
+        "用一个可触碰的物件承载信息变化，避免旁白解释",
+        "让旁观者的现实压力迫使人物更早作出选择",
+        "把关键消息延迟到人物已经付出小代价之后",
+        "给予人物一次局部成功，但让成功改变下一步风险",
+        "利用空间限制改变对话权力，而非单纯增加冲突",
+        "让关系中的旧承诺与当前目标发生短暂拉扯",
+        "从异常日常细节进入冲突，结尾保留可追踪余韵",
+    )
+    return lenses[(chapter_no - 1) % len(lenses)]
 
 
 def _render_long_run_progress(project_id: str, state: dict[str, Any]) -> str:

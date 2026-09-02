@@ -1,4 +1,5 @@
 .venv/
+node_modules/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -9,6 +10,9 @@ htmlcov/
 *.egg-info/
 dist/
 build/
+release/
+desktop/dist-electron/
+vscode-extension/bin/
 knowledge/
 *.log
 .DS_Store
@@ -16,7 +20,9 @@ Thumbs.db
 
 # InkFlow project runtime data
 **/.inkflow/inkflow.db*
+**/.inkflow/studio.db*
 **/.inkflow/cache/
+**/.inkflow/checkpoints/
 **/.inkflow/index/
 **/.inkflow/runs/
 **/.inkflow/trash/

@@ -114,7 +114,7 @@ def test_empty_content_retries_with_smaller_reasoning_budget(monkeypatch) -> Non
     assert result.data.verdict == "pass"
     assert FakeAsyncClient.payloads[0]["reasoning_effort"] == "high"
     assert FakeAsyncClient.payloads[1]["reasoning_effort"] == "low"
-    assert FakeAsyncClient.payloads[1]["max_tokens"] == 24_000
+    assert FakeAsyncClient.payloads[1]["max_tokens"] == 16_000
 
 
 def test_total_request_timeout_stops_stalled_provider_without_retry(monkeypatch) -> None:
@@ -149,3 +149,51 @@ def test_total_request_timeout_stops_stalled_provider_without_retry(monkeypatch)
         )
 
     assert StalledAsyncClient.calls == 1
+
+
+def test_custom_openai_compatible_endpoint_omits_deepseek_only_fields(monkeypatch) -> None:
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def json(self) -> dict[str, Any]:
+            return {
+                "id": "custom-response",
+                "model": "custom-model",
+                "choices": [{"finish_reason": "stop", "message": {"content": json.dumps(_review_payload(), ensure_ascii=False)}}],
+                "usage": {"completion_tokens": 120},
+            }
+
+    class FakeAsyncClient:
+        payload: dict[str, Any] = {}
+
+        def __init__(self, **_: Any):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_: Any) -> None:
+            return None
+
+        async def post(self, _url: str, *, headers: dict[str, str], json: dict[str, Any]):
+            self.__class__.payload = copy.deepcopy(json)
+            return FakeResponse()
+
+    monkeypatch.setenv("INKFLOW_API_KEY", "test-key")
+    monkeypatch.setattr(provider_module.httpx, "AsyncClient", FakeAsyncClient)
+    provider = DeepSeekProvider(Settings(base_url="https://gateway.example.test/v1", model="custom-model"))
+
+    result = asyncio.run(
+        provider.generate_json(
+            system_prompt="审查",
+            user_prompt="待审正文",
+            output_model=ReviewReport,
+            max_tokens=32_000,
+        )
+    )
+
+    assert result.data.verdict == "pass"
+    assert "thinking" not in FakeAsyncClient.payload
+    assert "reasoning_effort" not in FakeAsyncClient.payload
+    assert FakeAsyncClient.payload["max_tokens"] == 16_000

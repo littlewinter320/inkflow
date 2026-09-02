@@ -7,6 +7,7 @@ from typing import Any, Literal
 from .errors import ValidationGateError
 from .project import InkFlowProject
 from .schemas import ContextPacket, ContextSection
+from .studio import StudioDatabase
 from .utils import estimate_tokens
 
 
@@ -37,6 +38,7 @@ class ContextBuilder:
 
         facts = database.current_facts()
         threads = database.open_threads()
+        studio_context = self._studio_context(chapter_no, task, card)
         effective_recent_limit = recent_limit if recent_limit is not None else {
             "draft": 2,
             "review": 1,
@@ -82,10 +84,19 @@ class ContextBuilder:
                 key="D",
                 title="当前人物状态与知识边界",
                 content=json.dumps(
-                    [_state_for_model(item) for item in facts if item["predicate"].startswith(("state.", "knows.", "believes."))],
+                    {
+                        "正史状态与认知": [
+                            _state_for_model(item)
+                            for item in facts
+                            if item["predicate"].startswith(("state.", "knows.", "believes."))
+                        ],
+                        "本章人工场景笔记": studio_context["scene_notes"],
+                        "与本章相关的人工故事圣经": studio_context["bible"],
+                    },
                     ensure_ascii=False,
                     indent=2,
                 ),
+                source_ids=studio_context["source_ids"],
                 hard=True,
             ),
             ContextSection(
@@ -161,6 +172,46 @@ class ContextBuilder:
             except (OSError, json.JSONDecodeError):
                 continue
         return result
+
+    def _studio_context(
+        self,
+        chapter_no: int,
+        task: str,
+        card: dict[str, Any],
+    ) -> dict[str, Any]:
+        """挑选相关人工条目；模型始终只看到编译后的单一 Packet。"""
+
+        studio = StudioDatabase(self.project.internal / "studio.db")
+        entries = studio.list_bible_entries()
+        scene_notes = studio.scene_notes(chapter_no)
+        query = (task + "\n" + json.dumps(card, ensure_ascii=False)).casefold()
+        ranked: list[tuple[int, dict[str, Any]]] = []
+        for item in entries:
+            names = [str(item.get("name") or ""), *[str(value) for value in item.get("aliases") or []]]
+            direct = any(name and name.casefold() in query for name in names)
+            always = item.get("kind") in {"style", "lore"}
+            score = 2 if direct else 1 if always else 0
+            ranked.append((score, item))
+        ranked.sort(key=lambda value: (-value[0], str(value[1].get("kind")), str(value[1].get("name"))))
+        chosen = [
+            {
+                "条目编号": item["entry_id"],
+                "类型": item["kind"],
+                "名称": item["name"],
+                "别名": item["aliases"],
+                "内容": item["data"],
+            }
+            for score, item in ranked
+            if score > 0
+        ][:24]
+        return {
+            "scene_notes": scene_notes,
+            "bible": chosen,
+            "source_ids": [
+                *[f"scene-note:{chapter_no}:{item['scene_no']}" for item in scene_notes],
+                *[str(item["条目编号"]) for item in chosen],
+            ],
+        }
 
     def build_arc_audit(
         self,

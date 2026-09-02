@@ -2,7 +2,7 @@
 
 面向中文长篇网文的本地三 Agent 创作引擎。你可以在 Claude Code、VS Code、TRAE、GitHub Copilot、Codex 等编程 Agent 中用自然语言完成规划、写章、审查、修订、验收、记忆同步和回退。
 
-> 当前状态：`0.1.0` MVP。Windows 10/11 + Python 3.11/3.12 是主要验证环境；仓库当前私密发布，尚未发布到 PyPI。
+> 当前状态：`0.2.0` 私密预览版。Windows 10/11 桌面端、VS Code 扩展与通用 MCP 是主要交付形态；仓库尚未发布到 PyPI。
 
 ## 为什么是三个 Agent
 
@@ -13,6 +13,19 @@
 会话主控只理解自然语言并路由，不是第四个小说 Agent；Python 编排器负责保证步骤顺序和文件一致性。
 
 ## 安装
+
+### 普通用户：安装 Windows 版
+
+拿到发布目录后，先双击 `InkFlow-Setup-0.2.0.exe` 完成安装，再打开“墨流 InkFlow”。第一次使用时：
+
+1. 点击“模型设置”，填写兼容 DeepSeek/OpenAI 请求格式的地址、模型名和 API Key；Key 进入 Windows 凭据库，不写进小说文件。
+2. 点击“新建小说”，用普通中文填写题材、主角、核心设想和预计篇幅。
+3. 在中间对话框直接说需求，例如“先和我讨论开篇方向，不写正文”或“批量写第 1～5 章草稿，逐章审查，先不要验收”。
+4. 在右侧“项目”页查看任务状态、失败恢复、检查点和回退预览；在“过程”页查看阶段摘要和工具状态。
+
+安装包自带本地引擎，不要求普通用户安装 Python、Node 或使用终端。`inkflow-vscode-0.2.0.vsix` 是可选的 VS Code 适配器：在 VS Code 的“扩展”页面选择“从 VSIX 安装”，即可获得小说树、选区批注/修订、Reviewer 审查、检查点和 MCP 配置入口。
+
+### 开发者：从源码运行
 
 准备 Python 3.11 或 3.12，然后在 PowerShell 中执行：
 
@@ -119,14 +132,14 @@ python -m venv .venv
 
 ## 升级已有小说项目
 
-当前轻量会话与番茄公开页适配器**不迁移数据库**。更新代码后，在工作区执行一次：
+升级到 0.2 **不迁移正史数据库 `.inkflow/inkflow.db`**。桌面版会自动创建或增量补齐独立的 `.inkflow/studio.db`，只保存文档版本、批注、手工故事圣经、场景笔记和任务记录；删掉它不会删除正史，但会失去这些桌面辅助记录。更新源码后，在工作区执行一次：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-然后直接用原项目继续会话即可；`DIALOGUE.md` 会在第一次会话时按需创建，已有 `BOOK.md`、`PLAN.md`、`STATE.md`、章节及 `.inkflow/inkflow.db` 均不会被改写。将来若确实需要数据库迁移，墨流会先自动创建不可变检查点、显示受影响文件与数据库版本、要求确认，再执行可回退迁移；不会静默改造已有小说。
+然后直接用原项目继续会话即可；`DIALOGUE.md` 会在第一次会话时按需创建，已有 `BOOK.md`、`PLAN.md`、`STATE.md`、章节及 `.inkflow/inkflow.db` 不会仅因升级而被改写。将来若确实需要正史数据库迁移，墨流会先自动创建不可变检查点、显示受影响文件与数据库版本、要求确认，再执行可回退迁移；不会静默改造已有小说。
 
 ## 番茄公开页参考适配器
 
@@ -147,6 +160,14 @@ python -m venv .venv
 ```powershell
 .\.venv\Scripts\python.exe .\scripts\online_mvp_smoke.py --live
 ```
+
+生成 Windows 安装包、VSIX 和各自携带的本地引擎：
+
+```powershell
+.\scripts\build-release.ps1
+```
+
+构建结果位于 `desktop/release/` 与 `vscode-extension/release/`。完整的 0.2 能力、升级影响和已知边界见 [0.2 发布说明](./docs/V0.2_RELEASE_NOTES.md)。
 
 总体设计见 [墨流-InkFlow_长篇网文Agent总体设计方案.md](./墨流-InkFlow_长篇网文Agent总体设计方案.md)。开发者自己的 Obsidian 知识库和本地研究缓存不会上传到 GitHub，也不是运行依赖。
 
