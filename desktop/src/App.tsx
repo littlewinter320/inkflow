@@ -505,7 +505,7 @@ function App() {
                 </div>
               </article>
             ))}
-            {busy && <article className="message assistant pending"><span className="avatar">墨</span><div><p>正在梳理约束并执行工作流……</p><small>过程面板会显示阶段与工具状态，不展示模型原始思维链。</small></div></article>}
+            {busy && <article className="message assistant pending" aria-live="polite"><span className="avatar">墨</span><div><p>{[...events].reverse().find(item => item.run_id === activeRunId && item.summary)?.summary || "已收到，先理解你的目标，再把回答或需要确认的问题发在这里。"}</p><small>完成后直接显示答复；也可随时停止。</small></div></article>}
           </div>
           <form className="composer" onSubmit={sendChat}>
             <textarea
@@ -544,7 +544,7 @@ function App() {
               onPrompt={(value) => { setChatInput(value); setMascotMood("waiting"); }}
               onRefresh={() => refresh()}
               onNotice={setNotice}
-              onError={(message) => { setError(message); setMascotMood("rest"); }}
+              onError={setError}
             />
           )}
           {activeTab === "editor" && (
@@ -741,7 +741,12 @@ function MemoryPanel({ dashboard, request, onRefresh }: { dashboard: Dashboard |
 
 function ProcessPanel({ events }: { events: EngineEvent[] }) {
   const runs = processRuns(events);
-  return <div className="scroll-panel process-panel"><div className="section-heading"><p className="eyebrow">可复核过程</p><h2>任务过程</h2><p>一个任务只显示一张卡片。你能看到目标、执行阶段和结论；模型的私密逐步思维不会保存或展示。</p></div><div className="run-list">{runs.length === 0 && <p className="empty-mini">开始一次对话、规划、写作或审查后，这里会出现清晰的任务记录。</p>}{runs.map((run) => <article className={`run-card ${run.status}`} key={run.id}><header><div><span className="run-state">{run.status === "failed" ? "失败" : run.status === "cancelled" ? "已停止" : run.status === "done" ? "完成" : "进行中"}</span><strong>{methodLabel(run.method)}</strong></div><small>{run.finishedAt ? formatTime(run.finishedAt) : "正在执行"}</small></header><p>{run.summary}</p>{run.steps.length > 0 && <ol>{run.steps.map((step, index) => <li key={`${step.type}-${index}`} className={step.type?.includes("failed") ? "failed" : step.type?.includes("completed") ? "done" : ""}><span>{eventLabel(step.type)}</span><small>{step.summary || "状态已更新"}</small></li>)}</ol>}<details><summary>技术信息</summary><code>{run.id}</code></details></article>)}</div></div>;
+  return <div className="scroll-panel process-panel"><div className="section-heading"><p className="eyebrow">本次安排</p><h2>任务计划</h2><p>先看要做什么，再看当前进度。普通聊天只需理解和回答；写作任务按你提出的范围执行。</p></div><div className="run-list">{runs.length === 0 && <p className="empty-mini">发送需求后，这里显示本次任务的安排。</p>}{runs.slice(0, 8).map(run => {
+    const plan = run.method === "conversation.send" ? ["理解需求与已有设定", "回答问题，或执行确认后的写作任务", "在对话中交付结果"] : run.method === "project.ideate" ? ["读取开书偏好", "构思故事方向与开篇", "展示方案，等待你选择"] : run.method === "provider.test" ? ["发送连接检查", "等待模型回答", "显示连接结果"] : ["读取任务范围与相关章节", "执行本次任务", "交付结果供你查看"];
+    const started = run.steps.some(step => ["workflow.started", "writer.started", "provider.testing"].includes(step.type || ""));
+    const current = run.status === "done" ? 3 : started ? 1 : 0;
+    return <article className={`run-card ${run.status}`} key={run.id}><header><strong>{methodLabel(run.method)}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : "进行中"}</span></header><ol>{plan.map((step, index) => <li key={step}><span>{index < current ? "✓" : index === current && run.status === "running" ? "进行中 ·" : "待完成 ·"} {step}</span></li>)}</ol><p>{run.summary}</p><small>{run.method === "project.ideate" ? "结果位置：新建小说窗口" : run.method === "provider.test" ? "结果位置：模型设置窗口" : "结果位置：中间对话区；生成文件可从左侧小说结构打开"}</small></article>;
+  })}</div></div>;
 }
 
 function ReferencesPanel({ request }: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> }) {
@@ -831,27 +836,25 @@ function SettingsDialog({ provider, onClose, onSaved }: { provider: Record<strin
   const [stage, setStage] = useState("");
   const [result, setResult] = useState("");
   const persist = async (testConnection: boolean) => {
-    setWorking(true); setError(""); setResult(""); setStage("正在保存安全设置…");
+    setWorking(true); setError(""); setResult(""); setStage("正在保存模型设置…");
     let testRunId = "";
     try {
-      await window.inkflow.request<Record<string, unknown>>("provider.configure", form);
+      const saved = await withDeadline(window.inkflow.request<Record<string, unknown>>("provider.configure", form), 15000, "本机保存没有及时返回。请重新打开设置核对保存结果后再试。");
       setForm((value) => ({ ...value, api_key: "" }));
-      const status = await window.inkflow.request<Record<string, unknown>>("provider.status");
-      onSaved(status);
-      if (!testConnection) { setResult("设置已安全保存。"); return; }
-      setResult("设置已安全保存到 Windows 凭据库；现在开始检查模型连接。");
+      onSaved({ ...provider, ...saved });
+      if (!testConnection) { setResult("设置已保存，可以开始对话。"); return; }
+      setResult("设置已保存；现在开始检查模型连接。");
       setStage("保存完成，正在直接询问模型；通常约 5～15 秒…");
       testRunId = `provider-test-${crypto.randomUUID()}`;
       const request = window.inkflow.request<{ message: string; reply: string; public_reasoning_summary: string }>("provider.test", { run_id: testRunId });
-      const timeout = new Promise<never>((_resolve, reject) => window.setTimeout(() => reject(new Error("模型在 75 秒内没有回应，已结束本次检查；设置仍已保存。")), 75_000));
-      const checked = await Promise.race([request, timeout]);
+      const checked = await withDeadline(request, 75000, "连接检查没有及时返回，设置已保存。可以关闭窗口，稍后重试连接。");
       setResult(`${checked.message}\n${checked.reply}\n公开判断：${checked.public_reasoning_summary}`);
     } catch (cause) {
       if (testRunId) void window.inkflow.request("run.cancel", { run_id: testRunId }).catch(() => undefined);
       setError(errorMessage(cause));
     } finally { setWorking(false); setStage(""); }
   };
-  return <Modal title="模型与上下文" subtitle="密钥只进入 Windows 凭据库，不会回显，也不会写进小说或日志。" onClose={onClose}><form className="dialog-form" onSubmit={(event) => { event.preventDefault(); void persist(false); }}>
+  return <Modal title="模型与上下文" subtitle="填写接口与模型后即可保存使用；连接检查可选。" onClose={onClose}><form className="dialog-form" onSubmit={(event) => { event.preventDefault(); void persist(false); }}>
     <div className={`provider-status ${provider?.api_key_configured ? "ready" : "missing"}`}><strong>{provider?.api_key_configured ? "API Key 已安全保存" : "尚未保存 API Key"}</strong><span>{provider?.api_key_configured ? `凭据来源：${credentialLabel(String(provider?.api_key_storage || ""))}` : "请输入一次，保存后界面不会再显示原文。"}</span></div>
     <label>更换 API Key <small>{provider?.api_key_configured ? "留空表示继续使用已有密钥" : "首次使用必须填写"}</small><input type="password" autoComplete="new-password" value={form.api_key} onChange={(e) => setForm({ ...form, api_key: e.target.value })} placeholder="sk-…（仅发送给本机引擎）" /></label>
     <label>接口地址<input value={form.base_url} onChange={(e) => setForm({ ...form, base_url: e.target.value })} /></label>
@@ -892,8 +895,13 @@ function visibleResult(result: unknown): { summary: string; details?: string } {
   return { summary: "工作流已返回结果，请查看右侧文件与过程面板。", details: JSON.stringify(value, null, 2) };
 }
 function errorMessage(cause: unknown): string { return cause instanceof Error ? cause.message : String(cause); }
+async function withDeadline<T>(request: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try { return await Promise.race([request, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })]); }
+  finally { if (timer) clearTimeout(timer); }
+}
 function currentChapter(path?: string): number | null { const match = path?.match(/chapter_(\d+)/); return match ? Number(match[1]) : null; }
-function tabLabel(tab: Tab): string { return ({ project: "项目", editor: "正文", chapter: "章工位", review: "审查", memory: "记忆", references: "参考", process: "过程" })[tab]; }
+function tabLabel(tab: Tab): string { return ({ project: "项目", editor: "正文", chapter: "章工位", review: "审查", memory: "记忆", references: "参考", process: "计划" })[tab]; }
 function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "run.cancelled": "任务已停止", "workflow.started": "工作流启动", "workflow.completed": "工作流完成", "controller.routing": "理解与路由", "writer.started": "Writer 构思", "writer.completed": "Writer 完成", "provider.testing": "模型连接" } as Record<string, string>)[value || ""] || value || "过程"; }
 function credentialLabel(value: string): string { return ({ windows_credential_manager: "Windows 凭据库", "environment:INKFLOW_API_KEY": "系统环境变量", "environment:DEEPSEEK_API_KEY": "DeepSeek 环境变量" } as Record<string, string>)[value] || "本机安全存储"; }
 function methodLabel(value?: string): string { return ({ "conversation.send": "自然对话", "workflow.run": "小说工作流", "project.ideate": "从零构思", "provider.test": "模型连接测试", "reference.fetch": "抓取参考资料", "reference.analyze": "分析参考资料" } as Record<string, string>)[value || ""] || "墨流任务"; }
@@ -913,8 +921,9 @@ function processRuns(events: EngineEvent[]) {
     const cancelled = steps.some((item) => item.type === "run.cancelled");
     const summary = [...steps].reverse().find((item) => item.summary && !["任务已完成", "任务已进入墨流"].includes(item.summary))?.summary || (done ? "任务已经完成。" : "任务正在执行。");
     const visibleSteps = steps.filter((item) => !["run.started", "run.completed"].includes(item.type || ""));
-    return { id, steps: visibleSteps, method, status: failed ? "failed" : cancelled ? "cancelled" : done ? "done" : "running", summary, finishedAt: failed || cancelled || done ? [...steps].reverse().find((item) => item.timestamp)?.timestamp : undefined };
-  }).filter((run) => visibleMethods.has(run.method || "") || run.steps.some((item) => ["controller.routing", "workflow.started", "writer.started"].includes(item.type || ""))).reverse();
+    const action = steps.find((item) => item.action)?.action;
+    return { id, steps: visibleSteps, method, action, status: failed ? "failed" : cancelled ? "cancelled" : done ? "done" : "running", summary, finishedAt: failed || cancelled || done ? [...steps].reverse().find((item) => item.timestamp)?.timestamp : undefined };
+  }).filter((run) => !["checkpoint_list", "rollback_preview"].includes(run.action || "") && (visibleMethods.has(run.method || "") || run.steps.some((item) => ["controller.routing", "workflow.started", "writer.started"].includes(item.type || "")))).reverse();
 }
 function statusLabel(value: string): string { return ({ open: "待处理", resolved: "已处理", dismissed: "已忽略", orphaned: "原文已变化" } as Record<string, string>)[value] || value; }
 function kindLabel(value: string): string { return ({ character: "人物", location: "地点", organization: "组织", item: "物品", lore: "世界观", style: "文风" } as Record<string, string>)[value] || value; }
