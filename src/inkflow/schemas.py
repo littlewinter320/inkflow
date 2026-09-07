@@ -22,6 +22,28 @@ class BookBrief(StrictModel):
     user_rules: list[str] = Field(default_factory=list)
 
 
+class NovelIdeaCandidate(BookBrief):
+    """Writer 在建项前提供的可选开书方案。"""
+
+    concept_id: str = Field(min_length=1, max_length=40)
+    opening_hook: str = Field(min_length=1)
+    long_term_engine: str = Field(min_length=1)
+    choice_note: str = Field(min_length=1)
+
+
+class NovelIdeaBundle(StrictModel):
+    """一次零想法构思固定返回三个差异明确的方向。"""
+
+    candidates: list[NovelIdeaCandidate] = Field(min_length=3, max_length=3)
+    public_reasoning_summary: list[str] = Field(default_factory=list, max_length=6)
+
+
+class ProviderProbe(StrictModel):
+    """低成本连通性探针，只验证模型是否能返回受约束 JSON。"""
+
+    status: Literal["ok"]
+
+
 class VolumeCompass(StrictModel):
     volume_no: int = Field(ge=1)
     title: str

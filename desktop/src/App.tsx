@@ -75,6 +75,22 @@ type EngineEvent = {
 type Message = { id: string; role: "user" | "assistant" | "system"; text: string; details?: string };
 type Tab = "project" | "editor" | "chapter" | "review" | "memory" | "references" | "process";
 type RecentProject = { root: string; title: string; openedAt: string };
+type NovelIdea = {
+  concept_id: string;
+  title: string;
+  genre: string;
+  premise: string;
+  protagonist: string;
+  target_audience: string;
+  core_selling_point: string;
+  target_chapter_words: number;
+  estimated_chapters: number;
+  estimated_volumes: number;
+  user_rules: string[];
+  opening_hook: string;
+  long_term_engine: string;
+  choice_note: string;
+};
 
 const emptyStatistics: Statistics = {
   characters: 0,
@@ -437,6 +453,8 @@ function App() {
           {busy && <span className="working-dot">正在工作</span>}
         </div>
         <nav className="top-actions">
+          <button onClick={() => setShowCreate(true)}>＋ 新建</button>
+          <button onClick={openFolder}>切换项目</button>
           <button onClick={() => setShowSearch(true)}>⌕ 搜索</button>
           <button onClick={() => void refresh()}>↻ 刷新</button>
           <button onClick={() => void window.inkflow.openPath(projectRoot)}>打开文件夹</button>
@@ -446,7 +464,7 @@ function App() {
 
       <main className="workspace-grid">
         <aside className="left-rail">
-          <div className="rail-heading"><span>小说结构</span><button title="换一本小说" onClick={openFolder}>＋</button></div>
+          <div className="rail-heading"><span>小说结构</span><button title="新建小说" onClick={() => setShowCreate(true)}>＋</button></div>
           <TreeSection label="核心文档" items={tree?.items || []} onOpen={openDocument} active={document?.relative_path} />
           {(tree?.groups || []).map((group) => (
             <TreeSection key={group.id} label={group.label} items={group.items} onOpen={openDocument} active={document?.relative_path} />
@@ -721,7 +739,8 @@ function MemoryPanel({ dashboard, request, onRefresh }: { dashboard: Dashboard |
 }
 
 function ProcessPanel({ events }: { events: EngineEvent[] }) {
-  return <div className="scroll-panel process-panel"><div className="section-heading"><p className="eyebrow">可复核过程</p><h2>工作流时间线</h2><p>这里只显示约束、路由、工具状态和结果摘要，不保存供应商原始思维链。</p></div><div className="timeline">{events.length === 0 && <p className="empty-mini">执行一次规划、写作或审查后，这里会出现过程。</p>}{[...events].reverse().map((event, index) => <article key={`${event.run_id}-${index}`}><span className={`timeline-dot ${event.type?.includes("failed") ? "failed" : event.type?.includes("completed") ? "done" : ""}`} /><div><strong>{eventLabel(event.type)}</strong><p>{event.summary || event.method || event.action || "任务状态变化"}</p><small>{event.run_id} · {event.timestamp ? formatTime(event.timestamp) : ""}</small></div></article>)}</div></div>;
+  const runs = processRuns(events);
+  return <div className="scroll-panel process-panel"><div className="section-heading"><p className="eyebrow">可复核过程</p><h2>任务过程</h2><p>一个任务只显示一张卡片。你能看到目标、执行阶段和结论；模型的私密逐步思维不会保存或展示。</p></div><div className="run-list">{runs.length === 0 && <p className="empty-mini">开始一次对话、规划、写作或审查后，这里会出现清晰的任务记录。</p>}{runs.map((run) => <article className={`run-card ${run.status}`} key={run.id}><header><div><span className="run-state">{run.status === "failed" ? "失败" : run.status === "done" ? "完成" : "进行中"}</span><strong>{methodLabel(run.method)}</strong></div><small>{run.finishedAt ? formatTime(run.finishedAt) : "正在执行"}</small></header><p>{run.summary}</p><ol>{run.steps.map((step, index) => <li key={`${step.type}-${index}`} className={step.type?.includes("failed") ? "failed" : step.type?.includes("completed") ? "done" : ""}><span>{eventLabel(step.type)}</span><small>{step.summary || "状态已更新"}</small></li>)}</ol><details><summary>技术信息</summary><code>{run.id}</code></details></article>)}</div></div>;
 }
 
 function ReferencesPanel({ request }: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> }) {
@@ -759,36 +778,59 @@ function ReferencesPanel({ request }: { request: <T>(method: string, params?: Re
 function CreateProject({ onClose, onCreated }: { onClose: () => void; onCreated: (root: string) => Promise<void> }) {
   const [root, setRoot] = useState("");
   const [form, setForm] = useState({ title: "", genre: "都市悬疑", premise: "", protagonist: "", target_chapter_words: 3000, estimated_chapters: 200, estimated_volumes: 6 });
+  const [mode, setMode] = useState<"ai" | "manual">("ai");
+  const [preferences, setPreferences] = useState("");
+  const [ideas, setIdeas] = useState<NovelIdea[]>([]);
+  const [selectedIdea, setSelectedIdea] = useState("");
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
+  const ideate = async () => {
+    setWorking(true); setError(""); setIdeas([]); setSelectedIdea("");
+    try {
+      const result = await window.inkflow.request<{ candidates: NovelIdea[] }>("project.ideate", { preferences });
+      setIdeas(result.candidates);
+    } catch (cause) { setError(errorMessage(cause)); } finally { setWorking(false); }
+  };
+  const chooseIdea = (idea: NovelIdea) => {
+    setSelectedIdea(idea.concept_id);
+    setForm({ title: idea.title, genre: idea.genre, premise: idea.premise, protagonist: idea.protagonist, target_chapter_words: idea.target_chapter_words, estimated_chapters: idea.estimated_chapters, estimated_volumes: idea.estimated_volumes });
+  };
   const create = async (event: FormEvent) => {
     event.preventDefault(); setWorking(true); setError("");
     try {
-      await window.inkflow.request("project.create", { project_root: root, brief: { ...form, target_audience: "中文网文读者", core_selling_point: "", user_rules: [] } });
+      const idea = ideas.find((item) => item.concept_id === selectedIdea);
+      await window.inkflow.request("project.create", { project_root: root, brief: { ...form, target_audience: idea?.target_audience || "中文网文读者", core_selling_point: idea?.core_selling_point || "", user_rules: idea?.user_rules || [] } });
       onClose(); await onCreated(root);
     } catch (cause) { setError(errorMessage(cause)); } finally { setWorking(false); }
   };
-  return <Modal title="新建小说" subtitle="先定最少的书籍契约，细节可以在对话中继续商量。" onClose={onClose}><form className="dialog-form" onSubmit={create}>
-    <label>项目文件夹<div className="path-picker"><input value={root} readOnly placeholder="选择一个空文件夹" /><button type="button" onClick={async () => { const value = await window.inkflow.chooseFolder("选择小说项目文件夹"); if (value) setRoot(value); }}>选择</button></div></label>
+  return <Modal title="新建小说" subtitle="没有题材、书名或主角也能开始；Writer 会先给你三个可选择的方向。" onClose={onClose}><form className="dialog-form" onSubmit={create}>
+    <label>项目文件夹<div className="path-picker"><input value={root} readOnly placeholder="选择保存小说的文件夹" /><button type="button" onClick={async () => { const value = await window.inkflow.chooseFolder("选择小说项目文件夹"); if (value) setRoot(value); }}>选择</button></div></label>
+    <div className="mode-switch"><button className={mode === "ai" ? "active" : ""} type="button" onClick={() => setMode("ai")}>我没有想法，AI 来构思</button><button className={mode === "manual" ? "active" : ""} type="button" onClick={() => setMode("manual")}>我自己填写</button></div>
+    {mode === "ai" && <section className="idea-studio"><label>可选偏好 <small>完全没想法就留空</small><textarea value={preferences} onChange={(event) => setPreferences(event.target.value)} placeholder="例如：女频、轻松一点；或直接留空，让 Writer 主动选择。" /></label><button className="wide-action" type="button" disabled={working} onClick={() => void ideate()}>{working ? "Writer 正在构思…" : ideas.length ? "换三个方向" : "让 Writer 从零构思"}</button>{ideas.length > 0 && <div className="idea-grid">{ideas.map((idea) => <button type="button" key={idea.concept_id} className={selectedIdea === idea.concept_id ? "selected" : ""} onClick={() => chooseIdea(idea)}><span>{idea.genre}</span><strong>{idea.title}</strong><p>{idea.premise}</p><small>开篇抓手：{idea.opening_hook}</small><em>{idea.choice_note}</em></button>)}</div>}<p className="form-hint">选择方案只会填入下方书籍契约；你确认创建后才会在本地写文件，仍不会自动生成正文或写入正史。</p></section>}
+    {(mode === "manual" || selectedIdea) && <>
     <div className="form-grid"><label>书名<input required value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></label><label>题材<input required value={form.genre} onChange={(e) => setForm({ ...form, genre: e.target.value })} /></label></div>
     <label>一句话故事前提<textarea required minLength={10} value={form.premise} onChange={(e) => setForm({ ...form, premise: e.target.value })} placeholder="谁，因为哪件事，必须做什么；最大的阻力是什么。" /></label>
     <label>主角<input required value={form.protagonist} onChange={(e) => setForm({ ...form, protagonist: e.target.value })} /></label>
     <div className="form-grid three"><label>单章字数<input type="number" min={500} max={20000} value={form.target_chapter_words} onChange={(e) => setForm({ ...form, target_chapter_words: Number(e.target.value) })} /></label><label>预计章节<input type="number" min={10} value={form.estimated_chapters} onChange={(e) => setForm({ ...form, estimated_chapters: Number(e.target.value) })} /></label><label>预计卷数<input type="number" min={1} value={form.estimated_volumes} onChange={(e) => setForm({ ...form, estimated_volumes: Number(e.target.value) })} /></label></div>
-    {error && <p className="form-error">{error}</p>}<div className="dialog-actions"><button type="button" onClick={onClose}>取消</button><button className="primary" disabled={working || !root} type="submit">{working ? "正在创建…" : "创建小说"}</button></div>
+    </>}
+    {error && <p className="form-error">{error}</p>}<div className="dialog-actions"><button type="button" onClick={onClose}>取消</button><button className="primary" disabled={working || !root || !form.title || !form.premise || !form.protagonist} type="submit">{working ? "正在处理…" : "确认创建小说"}</button></div>
   </form></Modal>;
 }
 
 function SettingsDialog({ provider, onClose, onSaved }: { provider: Record<string, unknown> | null; onClose: () => void; onSaved: (value: Record<string, unknown>) => void }) {
-  const [form, setForm] = useState({ api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), max_output_tokens: 16000 });
+  const [form, setForm] = useState({ api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), max_output_tokens: Number(provider?.max_output_tokens || 16000) });
   const [error, setError] = useState("");
-  const save = async (event: FormEvent) => { event.preventDefault(); try { const value = await window.inkflow.request<Record<string, unknown>>("provider.configure", form); const status = await window.inkflow.request<Record<string, unknown>>("provider.status"); onSaved({ ...value, ...status }); onClose(); } catch (cause) { setError(errorMessage(cause)); } };
-  return <Modal title="模型与上下文" subtitle="Key 只保存到 Windows 凭据库；下面其他设置不会写进小说项目。" onClose={onClose}><form className="dialog-form" onSubmit={save}>
-    <label>API Key <small>{provider?.api_key_configured ? "已配置；留空表示不更换" : "尚未配置"}</small><input type="password" autoComplete="off" value={form.api_key} onChange={(e) => setForm({ ...form, api_key: e.target.value })} placeholder="不会写入文件或日志" /></label>
+  const [working, setWorking] = useState(false);
+  const [result, setResult] = useState("");
+  const persist = async (testConnection: boolean) => { setWorking(true); setError(""); setResult(""); try { await window.inkflow.request<Record<string, unknown>>("provider.configure", form); const status = await window.inkflow.request<Record<string, unknown>>("provider.status"); onSaved(status); setForm((value) => ({ ...value, api_key: "" })); if (testConnection) { const checked = await window.inkflow.request<{ message: string }>("provider.test"); setResult(checked.message); } else setResult("设置已安全保存。"); } catch (cause) { setError(errorMessage(cause)); } finally { setWorking(false); } };
+  return <Modal title="模型与上下文" subtitle="密钥只进入 Windows 凭据库，不会回显，也不会写进小说或日志。" onClose={onClose}><form className="dialog-form" onSubmit={(event) => { event.preventDefault(); void persist(false); }}>
+    <div className={`provider-status ${provider?.api_key_configured ? "ready" : "missing"}`}><strong>{provider?.api_key_configured ? "API Key 已安全保存" : "尚未保存 API Key"}</strong><span>{provider?.api_key_configured ? `凭据来源：${credentialLabel(String(provider?.api_key_storage || ""))}` : "请输入一次，保存后界面不会再显示原文。"}</span></div>
+    <label>更换 API Key <small>{provider?.api_key_configured ? "留空表示继续使用已有密钥" : "首次使用必须填写"}</small><input type="password" autoComplete="new-password" value={form.api_key} onChange={(e) => setForm({ ...form, api_key: e.target.value })} placeholder="sk-…（仅发送给本机引擎）" /></label>
     <label>接口地址<input value={form.base_url} onChange={(e) => setForm({ ...form, base_url: e.target.value })} /></label>
     <label>模型名称<input value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} /></label>
     <div className="form-grid"><label>思考强度<select value={form.reasoning_effort} onChange={(e) => setForm({ ...form, reasoning_effort: e.target.value })}><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最高</option></select></label><label>单次输出上限<input type="number" readOnly value={form.max_output_tokens} /></label></div>
     <div className="form-grid"><label>常用上下文<input type="number" min={16000} max={512000} value={form.context_soft_tokens} onChange={(e) => setForm({ ...form, context_soft_tokens: Number(e.target.value) })} /></label><label>最大上下文<input type="number" min={16000} max={1000000} value={form.context_hard_tokens} onChange={(e) => setForm({ ...form, context_hard_tokens: Number(e.target.value) })} /></label></div>
-    <p className="form-hint">墨流会从多个来源构建一个去重后的 Context Packet；设置 256K/512K 是上限，不代表每次都塞满。</p>{error && <p className="form-error">{error}</p>}<div className="dialog-actions"><button type="button" onClick={onClose}>取消</button><button className="primary" type="submit">保存设置</button></div>
+    <p className="form-hint">墨流会从多个来源构建一个去重后的 Context Packet；256K/512K 是预算上限，不代表每次都塞满。单次输出上限为 16K。</p>{result && <p className="form-success">✓ {result}</p>}{error && <p className="form-error">{error}</p>}<div className="dialog-actions"><button type="button" onClick={onClose}>关闭</button><button type="submit" disabled={working}>仅保存</button><button className="primary" type="button" disabled={working || (!provider?.api_key_configured && !form.api_key)} onClick={() => void persist(true)}>{working ? "正在检查…" : "保存并测试连接"}</button></div>
   </form></Modal>;
 }
 
@@ -807,6 +849,8 @@ function visibleResult(result: unknown): { summary: string; details?: string } {
   if (typeof result === "string") return { summary: result };
   if (!result || typeof result !== "object") return { summary: "任务完成，可以从右侧工作台查看结果。" };
   const value = result as Record<string, unknown>;
+  if (value.reply) return { summary: String(value.reply) };
+  if (value.help) return { summary: String(value.help) };
   for (const key of ["message", "summary", "gate", "next_action"]) if (value[key]) return { summary: String(value[key]), details: JSON.stringify(value, null, 2) };
   if (value.result && typeof value.result === "object") {
     const nested = visibleResult(value.result);
@@ -817,7 +861,26 @@ function visibleResult(result: unknown): { summary: string; details?: string } {
 function errorMessage(cause: unknown): string { return cause instanceof Error ? cause.message : String(cause); }
 function currentChapter(path?: string): number | null { const match = path?.match(/chapter_(\d+)/); return match ? Number(match[1]) : null; }
 function tabLabel(tab: Tab): string { return ({ project: "项目", editor: "正文", chapter: "章工位", review: "审查", memory: "记忆", references: "参考", process: "过程" })[tab]; }
-function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "workflow.started": "工作流启动", "workflow.completed": "工作流完成", "controller.routing": "理解与路由" } as Record<string, string>)[value || ""] || value || "过程"; }
+function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "run.cancelled": "任务已停止", "workflow.started": "工作流启动", "workflow.completed": "工作流完成", "controller.routing": "理解与路由", "writer.started": "Writer 构思", "writer.completed": "Writer 完成", "provider.testing": "模型连接" } as Record<string, string>)[value || ""] || value || "过程"; }
+function credentialLabel(value: string): string { return ({ windows_credential_manager: "Windows 凭据库", "environment:INKFLOW_API_KEY": "系统环境变量", "environment:DEEPSEEK_API_KEY": "DeepSeek 环境变量" } as Record<string, string>)[value] || "本机安全存储"; }
+function methodLabel(value?: string): string { return ({ "conversation.send": "自然对话", "workflow.run": "小说工作流", "project.ideate": "从零构思", "provider.test": "模型连接测试", "reference.fetch": "抓取参考资料", "reference.analyze": "分析参考资料" } as Record<string, string>)[value || ""] || "墨流任务"; }
+function processRuns(events: EngineEvent[]) {
+  const visibleMethods = new Set(["conversation.send", "workflow.run", "project.ideate", "provider.test", "reference.fetch", "reference.analyze"]);
+  const groups = new Map<string, EngineEvent[]>();
+  for (const event of events) {
+    const id = event.run_id || "unknown";
+    const current = groups.get(id) || [];
+    current.push(event);
+    groups.set(id, current);
+  }
+  return [...groups.entries()].map(([id, steps]) => {
+    const method = steps.find((item) => item.method)?.method;
+    const failed = steps.some((item) => item.type?.includes("failed"));
+    const done = steps.some((item) => item.type === "run.completed");
+    const summary = [...steps].reverse().find((item) => item.summary && !["任务已完成", "任务已进入墨流"].includes(item.summary))?.summary || (done ? "任务已经完成。" : "任务正在执行。");
+    return { id, steps, method, status: failed ? "failed" : done ? "done" : "running", summary, finishedAt: [...steps].reverse().find((item) => item.timestamp)?.timestamp };
+  }).filter((run) => visibleMethods.has(run.method || "") || run.steps.some((item) => ["controller.routing", "workflow.started", "writer.started"].includes(item.type || ""))).reverse();
+}
 function statusLabel(value: string): string { return ({ open: "待处理", resolved: "已处理", dismissed: "已忽略", orphaned: "原文已变化" } as Record<string, string>)[value] || value; }
 function kindLabel(value: string): string { return ({ character: "人物", location: "地点", organization: "组织", item: "物品", lore: "世界观", style: "文风" } as Record<string, string>)[value] || value; }
 function stringifyShort(value: unknown): string { return typeof value === "string" ? value : JSON.stringify(value, null, 0); }

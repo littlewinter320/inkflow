@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from "electron";
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -127,6 +127,7 @@ function createWindow(): void {
     backgroundColor: "#11110f",
     title: "墨流 InkFlow",
     show: false,
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -134,6 +135,7 @@ function createWindow(): void {
       sandbox: true,
     },
   });
+  Menu.setApplicationMenu(null);
   bridge = new EngineBridge(mainWindow);
   ipcMain.handle("engine:request", (_event, method: string, params: Record<string, unknown>) =>
     bridge?.request(method, params),

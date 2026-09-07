@@ -19,7 +19,7 @@ from .errors import InkFlowError
 from .project import InkFlowProject
 from .provider import DeepSeekProvider
 from .references import ReferenceService
-from .schemas import BookBrief
+from .schemas import BookBrief, NovelIdeaBundle, ProviderProbe
 from .studio import StudioService
 from .terminal_session import TerminalSession
 
@@ -60,7 +60,7 @@ class InkFlowAppService:
                 "max_output_tokens": settings.max_output_tokens,
             }
         if method == "provider.configure":
-            key = str(params.pop("api_key", "")).strip()
+            key = str(params.get("api_key", "")).strip()
             if key:
                 save_api_key_to_keyring(key)
             allowed = {
@@ -78,6 +78,51 @@ class InkFlowAppService:
             if allowed:
                 save_user_settings(allowed)
             return {"configured": True, **api_key_status(), **allowed}
+        if method == "provider.test":
+            settings = Settings.from_env(params.get("workspace_root"))
+            await emit({"type": "provider.testing", "summary": "正在验证密钥、接口与模型名称"})
+            result = await DeepSeekProvider(settings).generate_json(
+                system_prompt="你只负责返回 API 连通性检查结果。",
+                user_prompt='请返回 {"status":"ok"}。',
+                output_model=ProviderProbe,
+                effort="low",
+                max_tokens=64,
+                thinking=False,
+                timeout_seconds=min(settings.request_timeout_seconds, 60.0),
+            )
+            return {
+                "connected": result.data.status == "ok",
+                "message": f"连接成功，当前模型：{result.model}",
+                "model": result.model,
+            }
+        if method == "project.ideate":
+            settings = Settings.from_env(params.get("workspace_root"))
+            preferences = str(params.get("preferences") or "").strip()
+            await emit({"type": "writer.started", "summary": "Writer 正在构思三个不同的开书方向"})
+            result = await DeepSeekProvider(settings).generate_json(
+                system_prompt=(
+                    "你是墨流的 Writer，当前只负责建项前构思，不写正文。面向中文网文读者，"
+                    "给出三个差异明确、可长线连载、不是换皮复读的原创方案。每个方案都必须有"
+                    "清晰主角欲望、持续矛盾、前三章抓手与可升级的长期叙事引擎。不要依赖用户已有小说。"
+                    "书名简洁可辨识；premise 至少写清人物、触发事件、目标与主要阻力。"
+                ),
+                user_prompt=(
+                    "用户可以完全没有想法。请生成三个可直接建立项目的开书方案。"
+                    f"\n用户可选偏好：{preferences or '无，请主动做多样化选择。'}"
+                    "\n默认单章 3000 字、约 200 章、6 卷；可按题材合理微调。"
+                ),
+                output_model=NovelIdeaBundle,
+                effort="high",
+                max_tokens=3000,
+                thinking=True,
+                timeout_seconds=settings.planning_timeout_seconds,
+            )
+            await emit({"type": "writer.completed", "summary": "三个开书方案已经准备好，等待用户选择"})
+            return {
+                **result.data.model_dump(),
+                "message": "Writer 已生成三个开书方向；选择一个后再建立项目，不会自动写入正史。",
+                "model": result.model,
+            }
         if method == "project.create":
             root = Path(str(params["project_root"])).resolve()
             brief = BookBrief.model_validate(params["brief"])
@@ -350,10 +395,9 @@ class JsonLineServer:
 
 def _visible_result_summary(result: Any) -> str:
     if isinstance(result, dict):
-        if result.get("gate"):
-            return str(result["gate"])[:300]
-        if result.get("message"):
-            return str(result["message"])[:300]
+        for key in ("reply", "help", "gate", "message", "summary"):
+            if result.get(key):
+                return str(result[key])[:300]
         if result.get("result") and isinstance(result["result"], dict):
             nested = result["result"]
             for key in ("summary", "message", "status"):
