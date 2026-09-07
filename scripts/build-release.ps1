@@ -72,7 +72,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Desktop dependency installation failed with exit code $LASTEXITCODE." }
     if ($Publish) {
         $releaseToken = (& gh auth token).Trim()
-        if (-not $releaseToken) { throw '无法读取 GitHub 登录令牌，不能创建公开 Release。' }
+        if (-not $releaseToken) { throw 'GitHub login token is unavailable; cannot create a public Release.' }
         $env:GH_TOKEN = $releaseToken
         npm run build
         if ($LASTEXITCODE -ne 0) { throw "Desktop build failed with exit code $LASTEXITCODE." }
