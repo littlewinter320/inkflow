@@ -1,6 +1,12 @@
 src/**
-node_modules/**
-release/**
 tsconfig.json
-package-lock.json
+release/**
+node_modules/**
 *.map
+!dist/**
+!bin/**
+!media/**
+!README.md
+!CHANGELOG.md
+!SUPPORT.md
+!LICENSE

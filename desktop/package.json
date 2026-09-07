@@ -1,6 +1,6 @@
 {
   "name": "inkflow-desktop",
-  "version": "0.2.0",
+  "version": "0.3.1",
   "private": true,
   "author": "InkFlow contributors",
   "description": "墨流（InkFlow）中文长篇小说桌面工作台",
@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
+    "electron-updater": "^6.7.3",
     "monaco-editor": "^0.52.2",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
@@ -72,6 +73,14 @@
       "installerLanguages": [
         "zh_CN"
       ]
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "littlewinter320",
+        "repo": "inkflow",
+        "releaseType": "release"
+      }
+    ]
   }
 }

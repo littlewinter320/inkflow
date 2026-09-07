@@ -7,21 +7,26 @@ import { applyEdits, modify, parse } from "jsonc-parser";
 
 type RpcResult = Record<string, unknown> | unknown[] | string | number | boolean | null;
 type EngineCommand = { executable: string; args: string[]; env: NodeJS.ProcessEnv; kind: "exe" | "python" };
+type QuestionOption = { id: string; label: string; description?: string; recommended?: boolean; kind?: string };
+type QuestionCard = { id: string; header?: string; question: string; why_it_matters?: string; selection?: "single" | "multiple"; options: QuestionOption[] };
 
 let output: vscode.OutputChannel;
 let treeProvider: InkFlowTreeProvider;
+let controlProvider: InkFlowControlProvider;
 let statusDocument = "# 墨流项目状态\n\n尚未读取。\n";
 
 export function activate(context: vscode.ExtensionContext): void {
   output = vscode.window.createOutputChannel("墨流 InkFlow", { log: true });
   treeProvider = new InkFlowTreeProvider();
+  controlProvider = new InkFlowControlProvider(context);
   context.subscriptions.push(
     output,
     vscode.window.registerTreeDataProvider("inkflow.explorer", treeProvider),
+    vscode.window.registerWebviewViewProvider(InkFlowControlProvider.viewType, controlProvider),
     vscode.workspace.registerTextDocumentContentProvider("inkflow-status", {
       provideTextDocumentContent: () => statusDocument,
     }),
-    vscode.commands.registerCommand("inkflow.refresh", () => treeProvider.refresh()),
+    vscode.commands.registerCommand("inkflow.refresh", () => { treeProvider.refresh(); void controlProvider.refresh(); }),
     vscode.commands.registerCommand("inkflow.configureMcp", () => configureMcp(context)),
     vscode.commands.registerCommand("inkflow.commentSelection", () => commentSelection(context, false)),
     vscode.commands.registerCommand("inkflow.reviseSelection", () => commentSelection(context, true)),
@@ -30,6 +35,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("inkflow.createCheckpoint", () => createCheckpoint(context)),
     vscode.commands.registerCommand("inkflow.openTaskHistory", () => openTaskHistory(context)),
     vscode.commands.registerCommand("inkflow.openDesktop", () => openDesktop(context)),
+    vscode.commands.registerCommand("inkflow.ask", () => askInkFlow(context)),
+    vscode.commands.registerCommand("inkflow.generatePlan", () => runQuickWorkflow(context, "plan")),
+    vscode.commands.registerCommand("inkflow.writeChapter", () => runQuickWorkflow(context, "write")),
+    vscode.commands.registerCommand("inkflow.acceptChapter", () => runQuickWorkflow(context, "accept")),
   );
   registerMcpProviderWhenAvailable(context);
   void vscode.commands.executeCommand("setContext", "inkflow.project", Boolean(projectRoot()));
@@ -83,6 +92,98 @@ class InkFlowTreeProvider implements vscode.TreeDataProvider<InkFlowItem> {
   }
 }
 
+class InkFlowControlProvider implements vscode.WebviewViewProvider {
+  static readonly viewType = "inkflow.control";
+  private view: vscode.WebviewView | undefined;
+
+  constructor(private readonly context: vscode.ExtensionContext) {}
+
+  resolveWebviewView(view: vscode.WebviewView): void {
+    this.view = view;
+    view.webview.options = { enableScripts: true };
+    view.webview.html = controlHtml(view.webview);
+    this.context.subscriptions.push(view.webview.onDidReceiveMessage((message: Record<string, unknown>) => void this.handleMessage(message)));
+    void this.refresh();
+  }
+
+  async refresh(note = ""): Promise<void> {
+    const root = projectRoot();
+    if (!this.view) return;
+    if (!root) {
+      await this.view.webview.postMessage({ type: "state", ready: false, note: note || "请先用 VS Code 打开一本墨流小说项目。" });
+      return;
+    }
+    try {
+      const data = await requestEngine(this.context, "project.status", { project_root: root });
+      const value = data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : {};
+      const status = (value.status || {}) as Record<string, unknown>;
+      const chapters = (status.chapters || {}) as Record<string, unknown>;
+      const brief = (value.brief || {}) as Record<string, unknown>;
+      await this.view.webview.postMessage({
+        type: "state",
+        ready: true,
+        title: String(brief.title || path.basename(root)),
+        root,
+        acceptedCharacters: Number(value.accepted_characters || 0),
+        draftChapters: Number(chapters.draft || 0),
+        acceptedChapters: Number(chapters.accepted || 0),
+        openThreads: Number(status.open_threads || 0),
+        planned: Boolean(value.current_plan),
+        note,
+      });
+    } catch (cause) {
+      await this.view.webview.postMessage({ type: "state", ready: true, title: path.basename(root), root, error: errorMessage(cause), note });
+    }
+  }
+
+  private async handleMessage(message: Record<string, unknown>): Promise<void> {
+    const command = String(message.command || "");
+    if (command === "openFolder") {
+      await vscode.commands.executeCommand("workbench.action.files.openFolder");
+      return;
+    }
+    if (command === "openDesktop") { await openDesktop(this.context); return; }
+    if (command === "configureMcp") { await configureMcp(this.context); return; }
+    if (command === "openStatus") { await openStatus(this.context); return; }
+    if (command === "refresh") { treeProvider.refresh(); await this.refresh("状态已刷新。"); return; }
+    if (command === "send") {
+      const text = String(message.text || "").trim();
+      if (text) await this.run("conversation.send", { message: text }, "正在理解你的自然语言需求");
+      return;
+    }
+    if (command === "workflow") {
+      const action = String(message.action || "");
+      if (!new Set(["plan", "write", "review", "accept"]).has(action)) return;
+      const chapter = Number(message.chapter || 0);
+      if (action !== "plan" && chapter < 1) {
+        await this.view?.webview.postMessage({ type: "result", error: "请先填写要处理的章节号。" });
+        return;
+      }
+      if (action === "accept") {
+        const confirmed = await vscode.window.showWarningMessage(`确认验收第 ${chapter} 章并交给记忆角色提交正史吗？`, { modal: true }, "确认验收");
+        if (confirmed !== "确认验收") return;
+      }
+      await this.run("workflow.run", { action, ...(chapter > 0 ? { chapter_no: chapter } : {}) }, workflowProgress(action, chapter));
+    }
+  }
+
+  private async run(method: string, params: Record<string, unknown>, label: string): Promise<void> {
+    const root = requireProject();
+    if (!root) return;
+    await this.view?.webview.postMessage({ type: "busy", label });
+    try {
+      const result = await requestEngine(this.context, method, { project_root: root, ...params });
+      treeProvider.refresh();
+      await this.view?.webview.postMessage({ type: "result", text: visibleEngineResult(result) });
+      await this.refresh("任务完成；文件树与项目状态已同步。");
+      const answer = await askQuestionCards(result);
+      if (answer) await this.run("conversation.send", { message: answer }, "正在结合你的选择继续理解原任务");
+    } catch (cause) {
+      await this.view?.webview.postMessage({ type: "result", error: errorMessage(cause) });
+    }
+  }
+}
+
 function folderItem(root: string, folder: string, label: string, icon: string): InkFlowItem {
   const directory = path.join(root, folder);
   const files = fs.existsSync(directory)
@@ -92,6 +193,151 @@ function folderItem(root: string, folder: string, label: string, icon: string): 
         .map((entry) => new InkFlowItem(path.join(directory, entry.name), displayFile(entry.name), vscode.TreeItemCollapsibleState.None, [], folder === "chapters" ? "book" : "markdown"))
     : [];
   return new InkFlowItem(null, label, vscode.TreeItemCollapsibleState.Collapsed, files, icon);
+}
+
+async function askInkFlow(context: vscode.ExtensionContext): Promise<void> {
+  const root = requireProject();
+  if (!root) return;
+  const message = await vscode.window.showInputBox({
+    title: "和墨流讨论或安排任务",
+    prompt: "可以用自然语言讨论、规划、写作、审查或查询记忆，不需要背命令。",
+    placeHolder: "例如：先把第 8～12 章的章节卡一次给我看，不要修改规划。",
+    ignoreFocusOut: true,
+  });
+  if (!message?.trim()) return;
+  let result = await withProgress("墨流正在理解你的需求", (token) => requestEngine(context, "conversation.send", {
+    project_root: root,
+    message: message.trim(),
+  }, token));
+  for (let round = 0; round < 3; round += 1) {
+    const answer = await askQuestionCards(result);
+    if (!answer) break;
+    result = await withProgress("墨流正在结合你的选择继续理解", (token) => requestEngine(context, "conversation.send", {
+      project_root: root,
+      message: answer,
+    }, token));
+  }
+  statusDocument = `# 墨流答复\n\n${visibleEngineResult(result)}\n`;
+  const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(`inkflow-status:墨流答复.md?${Date.now()}`));
+  await vscode.window.showTextDocument(document, { preview: true });
+  treeProvider.refresh();
+  await controlProvider.refresh("自然语言任务已完成。");
+}
+
+async function runQuickWorkflow(context: vscode.ExtensionContext, action: "plan" | "write" | "accept"): Promise<void> {
+  const root = requireProject();
+  if (!root) return;
+  let chapter = vscode.window.activeTextEditor ? chapterNumber(vscode.window.activeTextEditor.document.uri.fsPath) : null;
+  if (action !== "plan" && !chapter) {
+    const value = await vscode.window.showInputBox({ title: "选择章节", prompt: "填写要处理的章节号。", validateInput: (text) => Number(text) >= 1 ? undefined : "请输入大于 0 的章节号。" });
+    if (!value) return;
+    chapter = Number(value);
+  }
+  if (action === "accept") {
+    const confirmed = await vscode.window.showWarningMessage(`确认验收第 ${chapter} 章并提交正史吗？`, { modal: true }, "确认验收");
+    if (confirmed !== "确认验收") return;
+  }
+  const result = await withProgress(workflowProgress(action, chapter || 0), (token) => requestEngine(context, "workflow.run", {
+    project_root: root,
+    action,
+    ...(chapter ? { chapter_no: chapter } : {}),
+  }, token));
+  treeProvider.refresh();
+  await controlProvider.refresh("快捷任务已完成。");
+  void vscode.window.showInformationMessage(visibleEngineResult(result).slice(0, 240));
+}
+
+function workflowProgress(action: string, chapter: number): string {
+  if (action === "plan") return "写作角色正在生成四级规划";
+  if (action === "write") return `写作角色正在创作第 ${chapter} 章草稿`;
+  if (action === "review") return `审查角色正在检查第 ${chapter} 章`;
+  if (action === "accept") return `记忆角色正在提交第 ${chapter} 章正史`;
+  return "墨流正在处理任务";
+}
+
+function visibleEngineResult(result: RpcResult): string {
+  if (typeof result === "string") return result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return "任务已完成，请从小说结构中查看新文件。";
+  const value = result as Record<string, unknown>;
+  const session = value.session && typeof value.session === "object" ? value.session as Record<string, unknown> : null;
+  const primary = value.reply || value.help || value.message || value.summary || value.next_action || value.gate;
+  const reason = session?.visible_reason ? `\n\n公开判断：${String(session.visible_reason)}` : "";
+  return primary ? `${String(primary)}${reason}` : "任务已完成，文件树和项目状态已经更新。";
+}
+
+async function askQuestionCards(result: RpcResult): Promise<string | null> {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return null;
+  const raw = (result as Record<string, unknown>).questions;
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const questions = raw as QuestionCard[];
+  const answers: string[] = [];
+  for (let index = 0; index < questions.length; index += 1) {
+    const question = questions[index];
+    const items = question.options.map((option) => ({
+      label: option.recommended ? `$(star-full) ${option.label}（建议）` : option.label,
+      description: option.description,
+      detail: question.why_it_matters ? `为什么问：${question.why_it_matters}` : undefined,
+      option,
+    }));
+    const picked = await vscode.window.showQuickPick(items, {
+      title: `${question.header || "需要确认"} · ${index + 1}/${questions.length}`,
+      placeHolder: question.question,
+      canPickMany: question.selection === "multiple",
+      ignoreFocusOut: true,
+    });
+    if (!picked || (Array.isArray(picked) && picked.length === 0)) return null;
+    const selected = Array.isArray(picked) ? picked : [picked];
+    const labels: string[] = [];
+    for (const item of selected) {
+      if (item.option.kind === "other") {
+        const custom = await vscode.window.showInputBox({
+          title: question.question,
+          prompt: "其他：请用自己的话回答。",
+          ignoreFocusOut: true,
+          validateInput: (value) => value.trim() ? undefined : "请填写你的答案。",
+        });
+        if (!custom) return null;
+        labels.push(`其他：${custom.trim()}`);
+      } else {
+        labels.push(item.option.label);
+      }
+    }
+    answers.push(`${index + 1}. ${question.question}\n我的回答：${labels.join("；")}`);
+  }
+  return `我来回答刚才的问题：\n${answers.join("\n")}\n请结合这些答案继续理解原来的目标；如果此前已经明确要求执行且信息足够，就继续原任务，否则先总结你理解到的方案。`;
+}
+
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause || "墨流遇到未知错误。");
+}
+
+function controlHtml(webview: vscode.Webview): string {
+  const nonce = randomUUID().replaceAll("-", "");
+  return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+<style>
+  *{box-sizing:border-box}body{padding:0 10px 16px;color:var(--vscode-foreground);font-family:var(--vscode-font-family);font-size:12px}button,textarea,input{font:inherit}button{border:1px solid var(--vscode-button-border,transparent);padding:7px 9px;color:var(--vscode-button-foreground);background:var(--vscode-button-background);cursor:pointer}button:hover{background:var(--vscode-button-hoverBackground)}button.secondary{color:var(--vscode-foreground);background:var(--vscode-button-secondaryBackground)}button:disabled{opacity:.55;cursor:default}.hero{padding:10px 0 8px}.hero h2{margin:0;font-size:17px}.hero p{margin:5px 0;color:var(--vscode-descriptionForeground);line-height:1.5}.status{padding:10px;border:1px solid var(--vscode-widget-border);background:var(--vscode-sideBarSectionHeader-background)}.status strong{display:block;font-size:13px}.status small{display:block;margin-top:4px;overflow:hidden;color:var(--vscode-descriptionForeground);text-overflow:ellipsis;white-space:nowrap}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-top:8px}.metrics div{padding:7px;border:1px solid var(--vscode-widget-border)}.metrics span{display:block;color:var(--vscode-descriptionForeground);font-size:10px}.metrics b{display:block;margin-top:3px}.section{margin-top:14px}.section h3{margin:0 0 7px;font-size:12px}.flow{display:grid;grid-template-columns:1fr 1fr;gap:5px}.chapter{display:grid;grid-template-columns:1fr 72px;gap:5px;margin-bottom:5px}.chapter input,textarea{width:100%;border:1px solid var(--vscode-input-border);padding:7px;color:var(--vscode-input-foreground);background:var(--vscode-input-background)}textarea{min-height:92px;resize:vertical}.send{display:flex;justify-content:flex-end;margin-top:5px}.result{margin-top:9px;padding:9px;border-left:3px solid var(--vscode-focusBorder);background:var(--vscode-textBlockQuote-background);line-height:1.55;white-space:pre-wrap}.result.error{border-color:var(--vscode-errorForeground);color:var(--vscode-errorForeground)}.note{margin-top:8px;color:var(--vscode-descriptionForeground);font-size:10px;line-height:1.5}.empty{padding:14px 0}.empty button{width:100%;margin-top:7px}
+</style></head><body>
+<header class="hero"><h2>墨流小说工作台</h2><p>自然语言主控，写作、审查、记忆三个角色各守边界。</p></header>
+<section id="empty" class="empty" hidden><p id="emptyNote">请先打开墨流小说项目。</p><button id="openFolder">打开项目文件夹</button><button id="openDesktopEmpty" class="secondary">打开桌面版新建小说</button></section>
+<main id="workspace" hidden>
+  <section class="status"><strong id="title">正在读取项目…</strong><small id="root"></small><div class="metrics"><div><span>已接受正文</span><b id="characters">0 字</b></div><div><span>开放线索</span><b id="threads">0</b></div><div><span>草稿章节</span><b id="drafts">0</b></div><div><span>正史章节</span><b id="accepted">0</b></div></div></section>
+  <section class="section"><h3>常用工作流</h3><div class="chapter"><input id="chapter" type="number" min="1" value="1" aria-label="章节号"><button id="status" class="secondary">项目状态</button></div><div class="flow"><button data-action="plan">生成四级规划</button><button data-action="write">写本章草稿</button><button data-action="review" class="secondary">审查本章</button><button data-action="accept" class="secondary">验收进正史</button></div></section>
+  <section class="section"><h3>自然语言</h3><textarea id="message" placeholder="例如：先比较第 8～12 章的章节卡和当前正史，只指出风险，不要修改。"></textarea><div class="send"><button id="askFirst" class="secondary">让墨流先问我</button><button id="send">发送给墨流</button></div></section>
+  <section class="section"><h3>工具</h3><div class="flow"><button id="refresh" class="secondary">刷新状态</button><button id="desktop" class="secondary">桌面版打开</button><button id="mcp" class="secondary">配置模型工具连接</button></div></section>
+  <div id="result" class="result" hidden aria-live="polite"></div><p id="note" class="note"></p>
+</main>
+<script nonce="${nonce}">
+  const vscode=acquireVsCodeApi();const previous=vscode.getState()||{};const q=id=>document.getElementById(id);const buttons=()=>[...document.querySelectorAll('button')];
+  q('chapter').value=previous.chapter||1;q('message').value=previous.message||'';
+  function post(command,extra={}){vscode.postMessage({command,...extra})}function busy(label){buttons().forEach(b=>b.disabled=true);q('result').hidden=false;q('result').className='result';q('result').textContent=label+'…'}
+  q('openFolder').onclick=()=>post('openFolder');q('openDesktopEmpty').onclick=()=>post('openDesktop');q('status').onclick=()=>post('openStatus');q('refresh').onclick=()=>post('refresh');q('desktop').onclick=()=>post('openDesktop');q('mcp').onclick=()=>post('configureMcp');
+  document.querySelectorAll('[data-action]').forEach(button=>button.onclick=()=>{const chapter=Number(q('chapter').value||0);vscode.setState({chapter,message:q('message').value});busy('任务已提交');post('workflow',{action:button.dataset.action,chapter})});
+  q('askFirst').onclick=()=>{const text='先不要执行任务。请根据当前项目状态和最近讨论，用选项主动问我一到三个最值得确认的问题；说明答案会影响什么，最后保留其他选项。';busy('墨流正在准备关键问题');post('send',{text})};
+  q('send').onclick=()=>{const text=q('message').value.trim();if(!text)return;vscode.setState({chapter:q('chapter').value,message:text});busy('墨流正在理解你的需求');post('send',{text})};
+  window.addEventListener('message',event=>{const data=event.data;if(data.type==='busy'){busy(data.label);return}if(data.type==='result'){buttons().forEach(b=>b.disabled=false);q('result').hidden=false;q('result').className=data.error?'result error':'result';q('result').textContent=data.error||data.text;return}if(data.type==='state'){buttons().forEach(b=>b.disabled=false);q('empty').hidden=Boolean(data.ready);q('workspace').hidden=!data.ready;if(!data.ready){q('emptyNote').textContent=data.note||'请先打开墨流小说项目。';return}q('title').textContent=data.title||'墨流小说';q('root').textContent=data.root||'';q('characters').textContent=Number(data.acceptedCharacters||0).toLocaleString()+' 字';q('threads').textContent=String(data.openThreads||0);q('drafts').textContent=String(data.draftChapters||0);q('accepted').textContent=String(data.acceptedChapters||0);q('note').textContent=data.error||data.note||(data.planned?'四级规划已就绪。':'尚未生成四级规划。')}});
+</script></body></html>`;
 }
 
 async function commentSelection(context: vscode.ExtensionContext, revise: boolean): Promise<void> {
@@ -108,7 +354,7 @@ async function commentSelection(context: vscode.ExtensionContext, revise: boolea
     return;
   }
   const instruction = await vscode.window.showInputBox({
-    title: revise ? "让 Writer 如何修订这段文字？" : "给这段文字添加批注",
+    title: revise ? "让写作角色如何修订这段文字？" : "给这段文字添加批注",
     prompt: revise ? "会先保存批注，再通过墨流自然语言主控请求修订。" : "批注本身不会修改正文。",
     ignoreFocusOut: true,
   });
@@ -116,7 +362,7 @@ async function commentSelection(context: vscode.ExtensionContext, revise: boolea
   const start = editor.document.offsetAt(editor.selection.start);
   const end = editor.document.offsetAt(editor.selection.end);
   const quote = editor.document.getText(editor.selection);
-  await withProgress(revise ? "Writer 正在处理选区" : "正在保存墨流批注", async (token) => {
+  await withProgress(revise ? "写作角色正在处理选区" : "正在保存墨流批注", async (token) => {
     const annotation = await requestEngine(context, "document.annotate", {
       project_root: root,
       relative_path: relative,
@@ -126,10 +372,10 @@ async function commentSelection(context: vscode.ExtensionContext, revise: boolea
     }, token);
     if (revise) {
       const chapter = chapterNumber(relative);
-      if (!chapter) throw new Error("Writer 定点修订目前只适用于章节文件；普通文档已保留批注。");
+      if (!chapter) throw new Error("写作角色定点修订目前只适用于章节文件；普通文档已保留批注。");
       await requestEngine(context, "conversation.send", {
         project_root: root,
-        message: `请让 Writer 定点修订第 ${chapter} 章。用户选中的原文是“${quote.slice(0, 800)}”，要求：${instruction}。保留旧版本，修订后不要自动验收。批注记录：${stringField(annotation, "annotation_id")}`,
+        message: `请让写作角色定点修订第 ${chapter} 章。用户选中的原文是“${quote.slice(0, 800)}”，要求：${instruction}。保留旧版本，修订后不要自动验收。批注记录：${stringField(annotation, "annotation_id")}`,
       }, token);
     }
   });
@@ -143,7 +389,7 @@ async function reviewChapter(context: vscode.ExtensionContext): Promise<void> {
   if (!root || !editor) return;
   const chapter = chapterNumber(editor.document.uri.fsPath);
   if (!chapter) { void vscode.window.showInformationMessage("当前文件不是墨流章节。"); return; }
-  await withProgress(`Reviewer 正在审查第 ${chapter} 章`, (token) => requestEngine(context, "workflow.run", { project_root: root, action: "review", chapter_no: chapter }, token));
+  await withProgress(`审查角色正在检查第 ${chapter} 章`, (token) => requestEngine(context, "workflow.run", { project_root: root, action: "review", chapter_no: chapter }, token));
   treeProvider.refresh();
   void vscode.window.showInformationMessage("审查完成。扣分项和证据已写入 reviews。", "查看审查目录").then(() => treeProvider.refresh());
 }
@@ -215,7 +461,7 @@ async function openDesktop(context: vscode.ExtensionContext): Promise<void> {
   const candidates = desktopCandidates(context);
   const executable = candidates.find(fs.existsSync);
   if (!executable) {
-    void vscode.window.showWarningMessage("没有找到已安装的墨流桌面版。请先安装墨流 0.2，或在设置中填写引擎路径。", "打开设置").then((choice) => { if (choice) void vscode.commands.executeCommand("workbench.action.openSettings", "inkflow.enginePath"); });
+    void vscode.window.showWarningMessage("没有找到已安装的墨流桌面版。请先安装墨流 0.3，或在设置中填写引擎路径。", "打开设置").then((choice) => { if (choice) void vscode.commands.executeCommand("workbench.action.openSettings", "inkflow.enginePath"); });
     return;
   }
   const child = spawn(executable, ["--project", root], { detached: true, stdio: "ignore", windowsHide: true });

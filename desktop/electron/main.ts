@@ -1,4 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from "electron";
+import electronUpdater, { AppUpdater, NsisUpdater } from "electron-updater";
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -10,6 +11,75 @@ type Pending = {
   reject: (reason?: unknown) => void;
   child: ChildProcessWithoutNullStreams;
 };
+
+type UpdateState = {
+  status: "not_configured" | "ready" | "checking" | "available" | "current" | "downloading" | "downloaded" | "error";
+  currentVersion: string;
+  availableVersion?: string;
+  progress?: number;
+  message: string;
+  source: "none" | "embedded" | "environment";
+};
+
+class UpdateManager {
+  private updater: AppUpdater | null = null;
+  private state: UpdateState;
+
+  constructor(private readonly window: BrowserWindow) {
+    const configuredUrl = String(process.env.INKFLOW_UPDATE_URL || "").trim();
+    const embeddedConfig = path.join(process.resourcesPath, "app-update.yml");
+    const source: UpdateState["source"] = configuredUrl ? "environment" : app.isPackaged && existsSync(embeddedConfig) ? "embedded" : "none";
+    this.state = {
+      status: source === "none" ? "not_configured" : "ready",
+      currentVersion: app.getVersion(),
+      message: source === "none" ? "当前私密预览版尚未配置公开更新源。" : "可以检查是否有新版本。",
+      source,
+    };
+    if (source === "environment") {
+      this.updater = new NsisUpdater({ provider: "generic", url: configuredUrl });
+    } else if (source === "embedded") {
+      this.updater = electronUpdater.autoUpdater;
+    }
+    if (!this.updater) return;
+    this.updater.autoDownload = false;
+    this.updater.autoInstallOnAppQuit = false;
+    this.updater.on("checking-for-update", () => this.setState({ status: "checking", message: "正在检查新版本…" }));
+    this.updater.on("update-available", (info: { version: string }) => this.setState({ status: "available", availableVersion: info.version, message: `发现新版本 ${info.version}，可在软件内下载。` }));
+    this.updater.on("update-not-available", () => this.setState({ status: "current", availableVersion: undefined, message: "当前已经是最新版本。" }));
+    this.updater.on("download-progress", (progress: { percent: number }) => this.setState({ status: "downloading", progress: Math.round(progress.percent), message: `正在下载更新：${Math.round(progress.percent)}%` }));
+    this.updater.on("update-downloaded", (info: { version: string }) => this.setState({ status: "downloaded", availableVersion: info.version, progress: 100, message: "更新已经下载完成；重启墨流即可安装。" }));
+    this.updater.on("error", (cause: Error) => this.setState({ status: "error", message: `更新失败：${cause.message}` }));
+  }
+
+  status(): UpdateState { return { ...this.state }; }
+
+  async check(): Promise<UpdateState> {
+    if (!app.isPackaged) return this.setState({ status: "not_configured", message: "开发模式不执行在线更新；请构建安装版后检查。" });
+    if (!this.updater) return this.state;
+    await this.updater.checkForUpdates();
+    return this.state;
+  }
+
+  async download(): Promise<UpdateState> {
+    if (!this.updater || this.state.status !== "available") return this.state;
+    await this.updater.downloadUpdate();
+    return this.state;
+  }
+
+  install(): UpdateState {
+    if (!this.updater || this.state.status !== "downloaded") return this.state;
+    this.updater.quitAndInstall(false, true);
+    return this.state;
+  }
+
+  private setState(update: Partial<UpdateState>): UpdateState {
+    this.state = { ...this.state, ...update };
+    if (!this.window.isDestroyed() && !this.window.webContents.isDestroyed()) {
+      this.window.webContents.send("app:update-status", this.state);
+    }
+    return this.state;
+  }
+}
 
 class EngineBridge {
   private process: ChildProcessWithoutNullStreams | null = null;
@@ -125,6 +195,7 @@ class EngineBridge {
 
 let mainWindow: BrowserWindow | null = null;
 let bridge: EngineBridge | null = null;
+let updates: UpdateManager | null = null;
 
 function projectArgument(argv = process.argv): string | null {
   const index = argv.indexOf("--project");
@@ -150,6 +221,7 @@ function createWindow(): void {
   });
   Menu.setApplicationMenu(null);
   bridge = new EngineBridge(mainWindow);
+  updates = new UpdateManager(mainWindow);
   ipcMain.handle("engine:request", (_event, method: string, params: Record<string, unknown>) =>
     bridge?.request(method, params),
   );
@@ -171,6 +243,10 @@ function createWindow(): void {
   ipcMain.handle("shell:open-path", (_event, target: string) => shell.openPath(target));
   ipcMain.handle("shell:show-item", (_event, target: string) => shell.showItemInFolder(target));
   ipcMain.handle("app:launch-context", () => ({ projectRoot: projectArgument() }));
+  ipcMain.handle("app:update-status", () => updates?.status());
+  ipcMain.handle("app:update-check", () => updates?.check());
+  ipcMain.handle("app:update-download", () => updates?.download());
+  ipcMain.handle("app:update-install", () => updates?.install());
   mainWindow.once("ready-to-show", () => mainWindow?.show());
   const developmentUrl = process.env.VITE_DEV_SERVER_URL;
   if (developmentUrl) void mainWindow.loadURL(developmentUrl);
@@ -178,6 +254,7 @@ function createWindow(): void {
   mainWindow.on("closed", () => {
     bridge?.stop();
     bridge = null;
+    updates = null;
     mainWindow = null;
   });
 }

@@ -677,6 +677,13 @@ class InkFlowEngine:
                     "creative_lens": creative_lens,
                 },
             )
+            active_skills = ["章节卡履约", "场景动作落地", "自然中文正文"]
+            trace.record(
+                "writer.skills",
+                "completed",
+                "写作角色已装载三项轻量技能；创意镜头和用户文风优先",
+                metadata={"skills": active_skills, "extra_model_calls": 0},
+            )
             result = await self.provider.generate_json(
                 system_prompt=WRITER_SYSTEM,
                 user_prompt=packet.to_markdown(),
@@ -705,6 +712,7 @@ class InkFlowEngine:
                 "title": chapter_title,
                 "draft_path": str(project.root / relative),
                 "decision_summary": draft.decision_summary,
+                "skills_used": active_skills,
                 "trace_id": trace.run_id,
                 "next_action": "审查章节",
             }
@@ -880,6 +888,13 @@ class InkFlowEngine:
                 f"构建唯一 Context Packet，估算 {packet.estimated_tokens} tokens",
                 metadata={"sections": [section.key for section in packet.sections], "warnings": packet.warnings},
             )
+            active_skills = ["证据定点修订", "回归连续性扫描", "自然中文正文"]
+            trace.record(
+                "writer.skills",
+                "completed",
+                "写作角色已装载修订技能；只修有依据的问题并保留有效声线",
+                metadata={"skills": active_skills, "extra_model_calls": 0},
+            )
             user_prompt = (
                 packet.to_markdown()
                 + "\n\n# 当前草稿\n\n"
@@ -923,6 +938,7 @@ class InkFlowEngine:
                 "title": chapter_title,
                 "draft_path": str(draft_path),
                 "decision_summary": draft.decision_summary,
+                "skills_used": active_skills,
                 "trace_id": trace.run_id,
                 "next_action": "重新审查当前版本",
             }

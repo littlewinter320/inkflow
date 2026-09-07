@@ -1,3 +1,7 @@
+param(
+    [switch]$Publish
+)
+
 $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
@@ -66,11 +70,22 @@ Push-Location (Join-Path $repositoryRoot 'desktop')
 try {
     npm install
     if ($LASTEXITCODE -ne 0) { throw "Desktop dependency installation failed with exit code $LASTEXITCODE." }
-    npm run dist:win
+    if ($Publish) {
+        $releaseToken = (& gh auth token).Trim()
+        if (-not $releaseToken) { throw '无法读取 GitHub 登录令牌，不能创建公开 Release。' }
+        $env:GH_TOKEN = $releaseToken
+        npm run build
+        if ($LASTEXITCODE -ne 0) { throw "Desktop build failed with exit code $LASTEXITCODE." }
+        npx electron-builder --win nsis --publish always
+    }
+    else {
+        npm run dist:win
+    }
     if ($LASTEXITCODE -ne 0) { throw "Desktop packaging failed with exit code $LASTEXITCODE." }
 }
 finally {
+    Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
     Pop-Location
 }
 
-Write-Host 'InkFlow 0.2 build completed: desktop\release and vscode-extension\release.'
+Write-Host 'InkFlow 0.3.1 build completed: desktop\release and vscode-extension\release.'

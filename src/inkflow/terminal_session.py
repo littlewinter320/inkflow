@@ -60,8 +60,9 @@ requested_outcome 用一句中文保留用户最终想看到的完整结果，�
 alternative_action 只在两种理解确实都合理时填写；不要为了凑字段虚构候选。
 confidence 表示语义识别把握：high=目标与动作清楚，medium=大意清楚但有轻微省略，low=两种以上理解都合理或关键指代不明。它不能作为绕过门禁的许可。
 authorization 表示当前话语行为：none=询问/讨论，proposed=提出可能方案或条件句，approved=明确要求现在执行或明确接受最近待确认方案。
-missing_fields 列出无法从本条消息、最近对话和项目状态可靠确定的必要字段；clarification_question 只写一句最小澄清问题，无需让用户重述全部需求。
-若用户明确要求“先问我”“向我提问”或“帮我补全想法”，action=discuss，conversation_reply 应主动提出 1～3 个最有价值、容易回答的问题，并说明这些答案会影响什么；不要执行小说工作流。
+missing_fields 列出无法从本条消息、最近对话和项目状态可靠确定的必要字段；clarification_question 兼容只写一句最小澄清问题，无需让用户重述全部需求。
+更适合用选项回答时填写 clarification_questions：每问都要有简短 header、question、why_it_matters、single/multiple 选择方式和 2～4 个差异明确的 options；每个选项说明会怎样影响成品，最多标一个 recommended。不要自行添加“其他”，宿主会固定把自由填写放在最后。
+若用户明确要求“先问我”“向我提问”或“帮我补全想法”，action=discuss，clarification_questions 应主动提出 1～3 个最有价值、容易回答的问题，conversation_reply 只说明为什么此时值得问；不要执行小说工作流。
 当存在可选但会明显改变成品的未知项时，可以填写 clarification_question。若当前消息是在回答上一轮问题，或用户明确说“直接开始/不用再问”，不要重复追问。
 checkpoint_id 与 confirmation_token 必须逐字复制用户输入；用户未提供时设为 null。
 batch_id 必须逐字复制用户输入；用户未提供时设为 null。
@@ -192,10 +193,17 @@ class TerminalSession:
             if routing_response is not None:
                 response = routing_response
             elif intent.action == "discuss":
-                response = {
+                response: dict[str, Any] = {
                     "reply": intent.conversation_reply.strip()
                     or "我已理解你的想法。请确认要继续讨论，还是让我按这个方向执行下一步。"
                 }
+                if intent.clarification_questions or intent.clarification_question.strip():
+                    response.update(
+                        {
+                            "needs_clarification": True,
+                            "questions": self._question_cards(intent),
+                        }
+                    )
             else:
                 response = await self._dispatch(project.root, intent)
             self._append_dialogue(project, text, intent, response)
@@ -497,6 +505,7 @@ class TerminalSession:
         return {
             "reply": f"{fallback} {question}".strip(),
             "needs_clarification": True,
+            "questions": TerminalSession._question_cards(intent, fallback_question=question),
             "routing": {
                 "candidate_action": intent.action,
                 "alternative_action": intent.alternative_action,
@@ -505,6 +514,108 @@ class TerminalSession:
                 "authorization": intent.authorization,
             },
         }
+
+    @staticmethod
+    def _question_cards(intent: TerminalIntent, *, fallback_question: str = "") -> list[dict[str, Any]]:
+        """Normalize model questions and guarantee a final free-text choice."""
+
+        cards: list[dict[str, Any]] = []
+        for index, question in enumerate(intent.clarification_questions[:3], start=1):
+            options = [
+                {
+                    "id": f"q{index}-o{option_index}",
+                    "label": option.label.strip(),
+                    "description": option.description.strip(),
+                    "recommended": option.recommended,
+                    "kind": "choice",
+                }
+                for option_index, option in enumerate(question.options[:4], start=1)
+                if option.label.strip() and "其他" not in option.label
+            ]
+            options.append(
+                {
+                    "id": f"q{index}-other",
+                    "label": "其他",
+                    "description": "用自己的话填写；不必套用上面的选项。",
+                    "recommended": False,
+                    "kind": "other",
+                }
+            )
+            cards.append(
+                {
+                    "id": f"question-{index}",
+                    "header": question.header.strip() or "需要确认",
+                    "question": question.question.strip(),
+                    "why_it_matters": question.why_it_matters.strip(),
+                    "selection": question.selection,
+                    "options": options,
+                }
+            )
+        if cards:
+            return cards
+
+        question = fallback_question or intent.clarification_question.strip()
+        if not question:
+            outcome = intent.requested_outcome.strip() or intent.visible_reason
+            question = f"我理解你想要“{outcome}”。你是要我现在执行，还是先继续讨论？"
+        options: list[dict[str, Any]] = []
+        if intent.alternative_action:
+            options.extend(
+                [
+                    {
+                        "id": "q1-primary",
+                        "label": "按主要理解处理",
+                        "description": f"采用当前识别到的 {intent.action} 路径。",
+                        "recommended": intent.confidence != "low",
+                        "kind": "choice",
+                    },
+                    {
+                        "id": "q1-alternative",
+                        "label": "采用另一种理解",
+                        "description": f"改用 {intent.alternative_action} 路径。",
+                        "recommended": False,
+                        "kind": "choice",
+                    },
+                ]
+            )
+        elif not intent.missing_fields:
+            options.extend(
+                [
+                    {
+                        "id": "q1-run",
+                        "label": "现在执行",
+                        "description": "按刚才已经说明的目标开始，不再追加可选偏好。",
+                        "recommended": intent.confidence == "high",
+                        "kind": "choice",
+                    },
+                    {
+                        "id": "q1-discuss",
+                        "label": "先继续讨论",
+                        "description": "先澄清方向，本轮不修改正文、规划或正史。",
+                        "recommended": intent.confidence != "high",
+                        "kind": "choice",
+                    },
+                ]
+            )
+        options.append(
+            {
+                "id": "q1-other",
+                "label": "其他",
+                "description": "补充章节号、范围、偏好，或用自己的话回答。",
+                "recommended": False,
+                "kind": "other",
+            }
+        )
+        return [
+            {
+                "id": "question-1",
+                "header": "需要确认",
+                "question": question,
+                "why_it_matters": "你的回答会决定下一步工作范围；未回答前不会执行这次任务。",
+                "selection": "single",
+                "options": options,
+            }
+        ]
 
     def _build_packet(self, project: InkFlowProject, message: str) -> ContextPacket:
         brief = project.db.get_brief()

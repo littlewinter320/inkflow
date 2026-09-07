@@ -166,11 +166,15 @@ export function ProjectCenter({
 
   const chapterStatus = dashboard?.status.chapters || {};
   const suggestions = projectSuggestions(dashboard);
+  const currentPlan = dashboard?.current_plan || null;
+  const volume = (currentPlan?.volume || {}) as Record<string, unknown>;
+  const arc = (currentPlan?.arc || {}) as Record<string, unknown>;
+  const chapterCards = (arc.chapter_cards || []) as Array<Record<string, unknown>>;
 
   return (
     <div className="scroll-panel project-center">
       <header className="section-heading project-heading-block">
-        <p className="eyebrow">PROJECT HUB</p>
+        <p className="eyebrow">项目中枢</p>
         <h2>项目总览与恢复</h2>
         <p>这里显示可复核状态、下一步建议、任务记录和分支式回退；不展示模型原始思维链。</p>
         <button disabled={working} onClick={() => void load()}>刷新</button>
@@ -181,6 +185,18 @@ export function ProjectCenter({
         <Metric label="草稿章节" value={String(chapterStatus.draft || 0)} />
         <Metric label="正史章节" value={String(chapterStatus.accepted || 0)} />
         <Metric label="开放线索" value={String(dashboard?.status.open_threads || 0)} />
+      </section>
+
+      <section className="project-section plan-overview">
+        <div className="project-section-title"><div><h3>四级规划与章节卡</h3><p>这里直接展示当前卷、篇章、章节功能和钩子；完整版本仍保存在“当前规划”文档。</p></div>{chapterCards.length > 0 && <button onClick={() => onPrompt(`请把第 ${String(arc.chapter_start)} 到第 ${String(arc.chapter_end)} 章的章节卡一次性整理给我看，只预览，不改规划。`)}>集中预览本篇</button>}</div>
+        {!currentPlan && <div className="plan-empty"><strong>还没有四级规划</strong><p>先生成全书罗盘、当前卷、当前篇章和篇章内章节卡，写作角色才会开始正文。</p><button onClick={() => onPrompt("请先和我确认方向，再生成全书罗盘、当前卷、当前篇章及篇章内全部章节卡。")}>把规划请求放入对话框</button></div>}
+        {currentPlan && <>
+          <div className="plan-levels">
+            <article><small>当前卷</small><strong>第 {String(volume.volume_no || "—")} 卷 · {String(volume.title || "未命名")}</strong><p>{String(volume.promise || "尚未填写本卷承诺")}</p><span>第 {String(volume.chapter_start || "—")}～{String(volume.chapter_end || "—")} 章</span></article>
+            <article><small>当前篇章</small><strong>{String(arc.title || arc.arc_id || "未命名")}</strong><p>{String(arc.promise || arc.central_conflict || "尚未填写篇章承诺")}</p><span>第 {String(arc.chapter_start || "—")}～{String(arc.chapter_end || "—")} 章</span></article>
+          </div>
+          <div className="chapter-card-strip">{chapterCards.map((card) => <button key={String(card.chapter_no)} onClick={() => onPrompt(`请打开第 ${String(card.chapter_no)} 章的章节卡，检查目标、阻力、不可逆变化和章末钩子，先讨论，不写正文。`)}><span>第 {String(card.chapter_no)} 章 · {String(card.status || "已规划")}</span><strong>{String(card.title_working || "未命名章节")}</strong><p>{String(card.function || "尚未填写章节功能")}</p><em>钩子：{String(card.hook_question || card.hook_type || "待确认")}</em></button>)}</div>
+        </>}
       </section>
 
       <section className="project-section">
@@ -268,11 +284,11 @@ function projectSuggestions(dashboard: DashboardLike | null) {
     ];
   }
   const items = [
-    { title: "写下一章草稿", reason: "按现有章节卡写作，先不给 Memory Keeper。", prompt: "根据当前章节卡写下一章草稿，只写草稿，不自动验收。" },
+    { title: "写下一章草稿", reason: "按现有章节卡写作，暂不交给记忆角色。", prompt: "根据当前章节卡写下一章草稿，只写草稿，不自动验收。" },
     { title: "检查规划衔接", reason: "对照正史、当前篇章和未兑现线索。", prompt: "检查当前篇章规划与已接受正文是否仍然衔接，列出证据和建议，但不要直接修改规划。" },
   ];
   if ((status.draft || 0) > 0) {
-    items.unshift({ title: "审查现有草稿", reason: "Reviewer 会给出正文引用、扣分项与门禁结论。", prompt: "请审查当前未审查的草稿，逐项显示证据和扣分原因，不要自动验收。" });
+    items.unshift({ title: "审查现有草稿", reason: "审查角色会给出正文引用、扣分项与门禁结论。", prompt: "请审查当前未审查的草稿，逐项显示证据和扣分原因，不要自动验收。" });
   }
   if ((status.accepted || 0) > 0) {
     items.push({ title: "创建安全检查点", reason: "在较大改动前保存正史与受管理文件。", prompt: "请为当前状态创建一个名为“重大修改前”的检查点，然后把检查点信息给我看。" });

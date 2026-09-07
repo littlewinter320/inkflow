@@ -511,6 +511,7 @@ class TerminalIntent(StrictModel):
     authorization: Literal["none", "proposed", "approved"] = "none"
     missing_fields: list[str] = Field(default_factory=list, max_length=8)
     clarification_question: str = Field(default="", max_length=500)
+    clarification_questions: list["ClarificationQuestion"] = Field(default_factory=list, max_length=3)
     chapter_no: int | None = Field(default=None, ge=1)
     end_chapter_no: int | None = Field(default=None, ge=1)
     checkpoint_id: str | None = Field(default=None, max_length=120)
@@ -522,3 +523,21 @@ class TerminalIntent(StrictModel):
     operation_instruction: str = Field(default="", max_length=4_000)
     visible_reason: str = Field(min_length=1, max_length=240)
     conversation_reply: str = Field(default="", max_length=1_500)
+
+
+class ClarificationOption(StrictModel):
+    """One user-visible answer choice; the host appends a free-text option."""
+
+    label: str = Field(min_length=1, max_length=60)
+    description: str = Field(default="", max_length=240)
+    recommended: bool = False
+
+
+class ClarificationQuestion(StrictModel):
+    """A compact, inspectable human-in-the-loop question."""
+
+    header: str = Field(default="需要确认", max_length=24)
+    question: str = Field(min_length=1, max_length=500)
+    why_it_matters: str = Field(default="", max_length=300)
+    selection: Literal["single", "multiple"] = "single"
+    options: list[ClarificationOption] = Field(default_factory=list, max_length=5)

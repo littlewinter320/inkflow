@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
+import re
+from collections import Counter
 from pathlib import Path
 from typing import Any, Literal
 
+from .craft import select_craft_guides
 from .errors import ValidationGateError
 from .project import InkFlowProject
 from .schemas import ContextPacket, ContextSection
@@ -61,7 +65,29 @@ class ContextBuilder:
             )
             recent_ids.append(f"batch:{item.get('batch_id', 'current')}:chapter:{provisional_no:05d}")
 
+        recent_numbers = {int(item["chapter_no"]) for item in recent}
+        history_query = "\n".join(
+            [
+                task,
+                str(card.get("title_working") or ""),
+                str(card.get("function") or ""),
+                str(card.get("goal") or ""),
+                str(card.get("obstacle") or ""),
+                str(card.get("information_release") or ""),
+                " ".join(str(value) for value in card.get("foreshadow_advance") or []),
+                " ".join(str(value) for value in card.get("payoff") or []),
+            ]
+        )
+        relevant_history = _rank_chapter_summaries(
+            database.accepted_chapters(),
+            history_query,
+            before_chapter=chapter_no,
+            excluded_chapters=recent_numbers,
+            limit=8,
+        )
+
         reference_cards = self._load_reference_cards(limit=6)
+        craft_guides = select_craft_guides(task=task, genre=brief.genre, card=card, limit=2)
         sections = [
             ContextSection(key="A", title="当前任务与用户要求", content=task, hard=True),
             ContextSection(
@@ -107,9 +133,19 @@ class ContextBuilder:
             ),
             ContextSection(
                 key="F",
-                title="相关历史索引",
-                content=json.dumps(_fact_index_for_model(facts), ensure_ascii=False, indent=2) if facts else "无。",
-                source_ids=[str(item["fact_id"]) for item in facts],
+                title="相关旧章摘要与正史索引",
+                content=json.dumps(
+                    {
+                        "按本章任务召回的旧章摘要": relevant_history,
+                        "当前正史事实索引": _fact_index_for_model(facts),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                source_ids=[
+                    *[f"chapter-summary:{item['章节']:05d}" for item in relevant_history],
+                    *[str(item["fact_id"]) for item in facts],
+                ],
             ),
             ContextSection(
                 key="G",
@@ -127,6 +163,12 @@ class ContextBuilder:
             ),
             ContextSection(
                 key="I",
+                title="按本章任务选择的写作引导",
+                content=json.dumps(craft_guides, ensure_ascii=False, indent=2),
+                source_ids=[f"craft:{item['技能编号']}" for item in craft_guides],
+            ),
+            ContextSection(
+                key="J",
                 title="用户偏好与文风契约",
                 content=json.dumps(
                     {
@@ -142,7 +184,7 @@ class ContextBuilder:
                 hard=True,
             ),
             ContextSection(
-                key="J",
+                key="K",
                 title="输出契约",
                 content=_output_contract(mode, card),
                 hard=True,
@@ -363,10 +405,76 @@ class ContextBuilder:
         return packet
 
     def _shrink_soft_sections(self, packet: ContextPacket) -> None:
-        for key, limit in (("H", 6_000), ("E", 28_000)):
+        for key, limit in (("H", 6_000), ("F", 12_000), ("E", 28_000)):
             for section in packet.sections:
                 if section.key == key and len(section.content) > limit:
                     section.content = section.content[-limit:] + "\n（软预算截取）"
+
+
+def _rank_chapter_summaries(
+    chapters: list[dict[str, Any]],
+    query: str,
+    *,
+    before_chapter: int,
+    excluded_chapters: set[int] | None = None,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    """用本地轻量 BM25 召回相关旧章摘要，不增加模型调用或数据库结构。"""
+
+    excluded = excluded_chapters or set()
+    candidates = [
+        item
+        for item in chapters
+        if int(item.get("chapter_no") or 0) < before_chapter
+        and int(item.get("chapter_no") or 0) not in excluded
+        and (str(item.get("summary") or "").strip() or str(item.get("title") or "").strip())
+    ]
+    if not candidates or limit < 1:
+        return []
+    query_terms = _search_terms(query)
+    if not query_terms:
+        return []
+    documents = [
+        _search_terms(f"{item.get('title') or ''}\n{item.get('summary') or ''}")
+        for item in candidates
+    ]
+    average_length = max(1.0, sum(len(document) for document in documents) / len(documents))
+    document_frequency = Counter(term for document in documents for term in set(document))
+    ranked: list[tuple[float, int, dict[str, Any]]] = []
+    for item, document in zip(candidates, documents, strict=True):
+        counts = Counter(document)
+        length = max(1, len(document))
+        score = 0.0
+        for term in query_terms:
+            frequency = counts.get(term, 0)
+            if not frequency:
+                continue
+            inverse_frequency = math.log(1 + (len(documents) - document_frequency[term] + 0.5) / (document_frequency[term] + 0.5))
+            denominator = frequency + 1.2 * (0.25 + 0.75 * length / average_length)
+            score += inverse_frequency * frequency * 2.2 / denominator
+        chapter_no = int(item["chapter_no"])
+        if score > 0:
+            ranked.append((score, chapter_no, item))
+    ranked.sort(key=lambda value: (-value[0], -value[1]))
+    return [
+        {
+            "章节": chapter_no,
+            "标题": str(item.get("title") or ""),
+            "摘要": str(item.get("summary") or ""),
+        }
+        for _, chapter_no, item in ranked[:limit]
+    ]
+
+
+def _search_terms(text: str) -> list[str]:
+    normalized = text.casefold()
+    latin = re.findall(r"[a-z0-9_]{2,}", normalized)
+    chinese_runs = re.findall(r"[\u3400-\u9fff]+", normalized)
+    chinese: list[str] = []
+    for run in chinese_runs:
+        chinese.extend(run)
+        chinese.extend(run[index : index + 2] for index in range(len(run) - 1))
+    return latin + chinese
 
 
 def _fact_for_model(item: dict[str, Any]) -> dict[str, Any]:

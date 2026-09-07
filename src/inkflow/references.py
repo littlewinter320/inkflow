@@ -4,7 +4,7 @@ import json
 import re
 import shutil
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -41,7 +41,7 @@ class ReferenceService:
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ProjectError("只支持 http/https 公开网页。")
-        async with httpx.AsyncClient(follow_redirects=True, timeout=45, headers={"User-Agent": "InkFlow/0.2"}) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=45, headers={"User-Agent": "InkFlow/0.3"}) as client:
             response = await client.get(url)
         response.raise_for_status()
         content_type = response.headers.get("content-type", "")
@@ -71,6 +71,85 @@ class ReferenceService:
             "path": str(destination),
             "characters": len(text),
         }
+
+    async def search_public(self, query: str, *, limit: int = 6) -> dict:
+        """Search public web pages without importing or persisting any result.
+
+        Search is deliberately separated from ``fetch_url``.  A user can read
+        the title, snippet and source first, then explicitly choose which page
+        belongs in the project reference library.
+        """
+
+        normalized_query = re.sub(r"\s+", " ", query).strip()
+        if not normalized_query:
+            raise ProjectError("请输入要查找的写作问题或资料主题。")
+        if len(normalized_query) > 200:
+            raise ProjectError("搜索问题请控制在 200 个字符以内；可以拆成两次更具体的搜索。")
+        result_limit = max(1, min(int(limit), 10))
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+            )
+        }
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30, headers=headers) as client:
+                response = await client.get(
+                    "https://html.duckduckgo.com/html/",
+                    params={"q": normalized_query, "kl": "cn-zh"},
+                )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise ProjectError(
+                "公开搜索暂时不可用。你仍可粘贴已知网页链接或导入本地资料；稍后也可以更换搜索适配器。"
+            ) from exc
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        results: list[dict[str, str]] = []
+        for node in soup.select(".result"):
+            anchor = node.select_one("a.result__a")
+            if anchor is None:
+                continue
+            title = anchor.get_text(" ", strip=True)
+            url = self._search_result_url(str(anchor.get("href") or ""))
+            snippet_node = node.select_one(".result__snippet")
+            snippet = snippet_node.get_text(" ", strip=True) if snippet_node else ""
+            parsed = urlparse(url)
+            if not title or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                continue
+            results.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "source": parsed.netloc,
+                    "snippet": snippet,
+                }
+            )
+            if len(results) >= result_limit:
+                break
+        if not results:
+            raise ProjectError(
+                "公开搜索页没有返回可识别结果，可能是暂时限制或页面结构发生变化。"
+                "请换一个更具体的问题，或直接粘贴已知网页链接。"
+            )
+        return {
+            "query": normalized_query,
+            "adapter": "duckduckgo_html_v1",
+            "results": results,
+            "notice": "搜索结果尚未进入资料库；只有点击“导入这页”的来源才会保存到当前小说项目。",
+        }
+
+    @staticmethod
+    def _search_result_url(raw_url: str) -> str:
+        if not raw_url:
+            return ""
+        if raw_url.startswith("//"):
+            raw_url = "https:" + raw_url
+        parsed = urlparse(raw_url)
+        redirect_target = parse_qs(parsed.query).get("uddg")
+        if redirect_target:
+            return unquote(redirect_target[0])
+        return raw_url
 
     async def fetch_fanqie_public(self, url: str) -> dict:
         """Capture a public Fanqie page without bypassing logins or access controls.

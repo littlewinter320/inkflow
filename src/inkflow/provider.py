@@ -173,19 +173,17 @@ class DeepSeekProvider:
                         "本次请求不会自动重试。保留草稿与 Trace 后可由用户或长跑协调器恢复。"
                     ) from exc
                 if attempt == 0:
-                    # 第二次重试仍受任务原始预算量级约束，不能让小型分类/校对任务
-                    # 因首次输出为空而突然膨胀到 24K。
-                    if thinking and self.settings.is_deepseek:
-                        payload["reasoning_effort"] = "low"
-                    retry_floor = 6_000 if thinking else 2_000
-                    payload["max_tokens"] = min(
-                        max(requested_max_tokens * 2, retry_floor),
-                        self.settings.max_output_tokens,
-                    )
+                    # 对 DeepSeek 而言，空内容且 finish_reason=length 通常表示推理
+                    # 已经耗尽预算，却没有留下最终 JSON。第二次机会应优先交付
+                    # 可解析的答案：关闭推理，且绝不因为重试而突破本次任务预算。
+                    if self.settings.is_deepseek:
+                        payload["thinking"] = {"type": "disabled"}
+                        payload.pop("reasoning_effort", None)
+                    payload["max_tokens"] = requested_max_tokens
                     payload["messages"][1]["content"] = (
                         user_prompt
-                        + "\n\n上一次输出为空、截断或不符合 Schema。请压缩内部推理，"
-                        + "优先保留最终答案；重新检查所有必填字段，只返回一个完整 JSON 对象。"
+                        + "\n\n上一次输出为空、截断或不符合 Schema。此轮不展开推理，"
+                        + "优先交付最短的完整 JSON；所有必填字段都必须存在，只返回一个 JSON 对象。"
                     )
                     continue
                 break

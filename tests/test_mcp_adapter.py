@@ -62,3 +62,12 @@ def test_jsonl_app_server_once_reports_capabilities(tmp_path: Path) -> None:
     response = next(item for item in messages if item.get("id") == "test")
     assert response["result"]["product"] == "墨流（InkFlow）"
     assert response["result"]["capabilities"]["mcp"] is True
+
+
+def test_mcp_exposes_user_controlled_public_research_search() -> None:
+    tools = asyncio.run(mcp.list_tools())
+    by_name = {item.name: item for item in tools}
+
+    assert "novel_reference_search" in by_name
+    assert by_name["novel_reference_search"].annotations.readOnlyHint is True
+    assert by_name["novel_reference_search"].annotations.openWorldHint is True

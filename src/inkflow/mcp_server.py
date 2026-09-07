@@ -122,6 +122,18 @@ def novel_task_history(limit: int = 30, project_root: str | None = None) -> dict
     return {"tasks": StudioService(project).db.list_tasks(limit)}
 
 
+@mcp.tool(annotations=EXTERNAL_READ)
+async def novel_reference_search(
+    query: str,
+    limit: int = 6,
+    project_root: str | None = None,
+) -> dict[str, Any]:
+    """搜索公开写作资料并返回标题、摘要和来源；不会自动导入，也不会上传小说正文、正史或模型密钥。"""
+
+    project = InkFlowProject(_root(project_root))
+    return await ReferenceService(project).search_public(query, limit=limit)
+
+
 @mcp.tool(annotations=READ_ONLY)
 def novel_rollback_preview(
     checkpoint_id: str | None = None,

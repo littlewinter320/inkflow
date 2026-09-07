@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from . import __version__
 from .config import Settings, api_key_status, save_api_key_to_keyring, save_user_settings
 from .engine import InkFlowEngine
-from .errors import InkFlowError
+from .errors import InkFlowError, ProviderError
 from .project import InkFlowProject
 from .provider import DeepSeekProvider
 from .references import ReferenceService
@@ -113,8 +113,9 @@ class InkFlowAppService:
                     "summary": "Writer 正在快速生成一个开书方向" if fast else "Writer 正在构思三个不同的开书方向",
                 }
             )
-            result = await DeepSeekProvider(settings).generate_json(
-                system_prompt=(
+            try:
+                result = await DeepSeekProvider(settings).generate_json(
+                    system_prompt=(
                     "你是墨流的 Writer，当前只负责建项前构思，不写正文。面向中文网文读者，"
                     f"严格给出 {requested_count} 个可长线连载的原创方案。每个方案都必须有"
                     "清晰主角欲望、持续矛盾、前三章抓手与可升级的长期叙事引擎。不要依赖用户已有小说。"
@@ -126,27 +127,50 @@ class InkFlowAppService:
                     "user_rules 只能复述用户明确说过的内容，不能把本次方案细节升级为用户硬约束。"
                     "public_reasoning_summary 用 2～4 条简短中文公开说明你核对了哪些偏好、为何选择这个方向、"
                     "还有什么可调整；这是给用户看的判断摘要，不是隐藏思维链。"
-                ),
-                user_prompt=(
+                    ),
+                    user_prompt=(
                     f"用户可以完全没有想法。请生成 {requested_count} 个可直接建立项目的开书方案。"
                     f"\n用户可选偏好：{preferences or '无，请主动做多样化选择。'}"
                     "\n默认单章 3000 字、约 200 章、6 卷；可按题材合理微调。"
-                ),
-                output_model=NovelIdeaBundle,
-                effort="low" if fast else "high",
-                max_tokens=1200 if fast else 3000,
-                thinking=not fast,
-                timeout_seconds=min(settings.request_timeout_seconds, 90.0) if fast else settings.planning_timeout_seconds,
-            )
+                    ),
+                    output_model=NovelIdeaBundle,
+                    # 建项构思不是正文推演。关闭推理可以避免部分模型先耗尽
+                    # reasoning token、却来不及返回小型 JSON 的兼容性故障。
+                    effort="low",
+                    max_tokens=1200 if fast else 2800,
+                    thinking=False,
+                    timeout_seconds=min(settings.request_timeout_seconds, 90.0)
+                    if fast
+                    else min(settings.planning_timeout_seconds, 180.0),
+                )
+                fallback_used = False
+                model_name = result.model
+                idea_payload = result.data.model_dump()
+            except ProviderError as exc:
+                # 建项窗口不能因模型一次结构化输出截断而让用户无法创建项目。
+                # 保底方案只是可编辑的起点，明确标注来源，不伪装成模型成功产物。
+                fallback_used = True
+                model_name = "本地保底构思"
+                idea_payload = _fallback_idea_bundle(preferences, requested_count).model_dump()
+                await emit(
+                    {
+                        "type": "writer.fallback",
+                        "summary": "模型构思未能按时返回完整方案，已提供可编辑的保底开书方向",
+                        "details": _short_provider_error(exc),
+                    }
+                )
             await emit(
                 {
                     "type": "writer.completed",
                     "summary": "快速方案已经准备好" if fast else "三个开书方案已经准备好，等待用户选择",
                 }
             )
-            idea_payload = result.data.model_dump()
             original_rule = f"用户原始偏好（不可擅自改写）：{preferences}" if preferences else ""
-            for candidate in idea_payload["candidates"]:
+            for index, candidate in enumerate(idea_payload["candidates"], start=1):
+                # 模型给出的 concept_id 可能重复、带空格，甚至在同一次响应里复用。
+                # 项目创建界面不能把模型生成字段当作 UI 主键，因此在本地按展示顺序
+                # 重建稳定且唯一的标识；这不会改变方案正文，也不会增加模型调用。
+                candidate["concept_id"] = f"idea-{index}"
                 candidate["user_rules"] = [original_rule] if original_rule else []
                 if not candidate["core_selling_point"].strip():
                     candidate["core_selling_point"] = (
@@ -174,8 +198,15 @@ class InkFlowAppService:
             return {
                 **idea_payload,
                 "message": "Writer 已生成开书方向；选中后再建立项目，不会自动写入正史。",
-                "model": result.model,
+                "model": model_name,
                 "mode": "quick" if fast else "compare",
+                "fallback_used": fallback_used,
+                "notice": (
+                    "模型本次没有在预算内返回完整结构化方案，下面是可直接修改的保底方向；"
+                    "可先采用并编辑，也可以稍后重新生成。"
+                    if fallback_used
+                    else ""
+                ),
             }
         if method == "project.create":
             root = Path(str(params["project_root"])).resolve()
@@ -251,6 +282,12 @@ class InkFlowAppService:
             return ReferenceService(project).import_text(str(params["source_path"]))
         if method == "reference.list":
             return ReferenceService(project).list_references()
+        if method == "reference.search":
+            await emit({"type": "reference.searching", "summary": "正在搜索公开写作资料；结果不会自动导入。"})
+            return await ReferenceService(project).search_public(
+                str(params.get("query") or ""),
+                limit=int(params.get("limit", 6)),
+            )
         if method == "reference.fetch":
             url = str(params["url"])
             if "fanqienovel.com" in url:
@@ -447,6 +484,83 @@ class JsonLineServer:
             sys.stdout.flush()
 
 
+def _fallback_idea_bundle(preferences: str, requested_count: int) -> NovelIdeaBundle:
+    """Return a clearly labelled, editable starting point when ideation is truncated.
+
+    This is deliberately small and deterministic. It prevents a transient model
+    formatting failure from blocking project creation, while keeping every
+    creative detail editable before anything is written to disk.
+    """
+
+    source = preferences.strip()
+    female_lead = "女频" in source or "女主" in source or "女性" in source
+    if "末日" in source or "求生" in source:
+        genre = "末日求生"
+        setting = "灾变后的封锁城区"
+        trigger = "最后一条撤离通道突然关闭"
+        obstacle = "资源规则每天变化，幸存者之间也必须争夺有限的安全区"
+        titles = ["灰烬里的气象站", "第七天的安全屋", "末日倒计时手册"]
+    elif "古" in source or "朝" in source or "宫" in source:
+        genre = "古代成长"
+        setting = "权力即将易主的都城"
+        trigger = "主角无意拿到一封不能公开的密信"
+        obstacle = "每个盟友都可能因家族利益改变立场"
+        titles = ["长安密信", "灯下见山河", "春风不渡旧王庭"]
+    else:
+        genre = "成长冒险"
+        setting = "规则正在失效的熟人社会"
+        trigger = "主角被迫接下一件无人愿意承担的事"
+        obstacle = "每次解决眼前危机，都会暴露更高层的代价与对手"
+        titles = ["把明天借给我", "逆风的人间", "未寄出的第七封信"]
+
+    lead = "林雾" if female_lead else "沈砚"
+    audience = "女频中文网文读者" if female_lead else "中文网文读者"
+    candidates: list[dict[str, Any]] = []
+    for index in range(requested_count):
+        variation = (
+            "先活下来，再找到失散的家人"
+            if index == 0
+            else "先守住一个承诺，再判断它是否值得"
+            if index == 1
+            else "先查清规则从何而来，再决定是否推翻它"
+        )
+        candidates.append(
+            {
+                "concept_id": f"fallback-{index + 1}",
+                "title": titles[index],
+                "genre": genre,
+                "premise": (
+                    f"{lead}身处{setting}，因{trigger}不得不{variation}；"
+                    f"最大的阻力是{obstacle}。"
+                ),
+                "protagonist": lead,
+                "target_audience": audience,
+                "core_selling_point": "低起点选择不断产生可见代价，短期求生目标与长期真相互相牵引。",
+                "target_chapter_words": 3000,
+                "estimated_chapters": 200,
+                "estimated_volumes": 6,
+                "user_rules": [],
+                "opening_hook": f"开篇当夜，{lead}发现{trigger}，必须在天亮前做出第一次不可逆选择。",
+                "long_term_engine": "每次获得安全、线索或同伴，都要付出新代价，并推动主线规则逐层揭开。",
+                "choice_note": "这是模型未返回完整结构时提供的可编辑保底提案，适合先修改再建项。",
+            }
+        )
+    return NovelIdeaBundle(
+        candidates=candidates,
+        public_reasoning_summary=[
+            "模型本次未完成结构化输出，因此没有把任何模型细节当作结论。",
+            f"保底方案只保留了你写下的方向：{source or '未设置偏好'}；其余内容都可修改。",
+        ],
+    )
+
+
+def _short_provider_error(error: ProviderError) -> str:
+    text = str(error)
+    if "finish_reason=length" in text or "空 JSON" in text:
+        return "模型推理耗尽了本次预算，未留下完整方案。"
+    return "模型未能返回可解析方案，已切换为可编辑保底提案。"
+
+
 def _visible_result_summary(result: Any) -> str:
     if isinstance(result, dict):
         for key in ("reply", "help", "gate", "message", "summary"):
@@ -478,6 +592,7 @@ def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
             "boundary_chapter",
         },
         "reference.fetch": {"url"},
+        "reference.search": {"query", "limit"},
         "reference.analyze": {"reference_id"},
         "task.retry": {"task_id"},
     }
@@ -488,7 +603,7 @@ def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
 def _should_track_task(method: str, params: dict[str, Any]) -> bool:
     if method == "workflow.run":
         return str(params.get("action") or "") not in {"checkpoint_list", "rollback_preview"}
-    return method in {"conversation.send", "reference.fetch", "reference.analyze", "task.retry"}
+    return method in {"conversation.send", "reference.search", "reference.fetch", "reference.analyze", "task.retry"}
 
 
 def _error_payload(exc: Exception) -> dict[str, Any]:

@@ -130,7 +130,7 @@ class Settings:
         if soft > hard:
             raise ConfigurationError("软上下文预算不能大于硬上下文上限。")
         if output > 16_000:
-            raise ConfigurationError("墨流 0.2 的单次模型输出上限固定为 16K tokens。")
+            raise ConfigurationError("墨流的单次模型输出上限固定为 16K tokens。")
         timeout = _positive_float(
             value.get("request_timeout_seconds", defaults.request_timeout_seconds), "普通请求超时"
         )
