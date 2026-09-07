@@ -306,9 +306,9 @@ function App() {
     }
   };
 
-  const sendChat = async (event?: FormEvent) => {
+  const sendChat = async (event?: FormEvent, overrideMessage?: string) => {
     event?.preventDefault();
-    const message = chatInput.trim();
+    const message = (overrideMessage ?? chatInput).trim();
     if (!message || !projectRoot || busy) return;
     setChatInput("");
     setError("");
@@ -489,6 +489,7 @@ function App() {
             </div>
           </div>
           <div className="quick-row">
+            <button onClick={() => void sendChat(undefined, "先不要执行任务。请根据当前项目状态和最近讨论，主动问我一到三个最值得确认、容易回答的问题，并说明这些答案会影响什么。")}>先问我</button>
             <button onClick={() => void runWorkflow("plan")}>规划当前篇章</button>
             <button onClick={() => void runWorkflow("write")}>写当前章</button>
             <button onClick={() => void runWorkflow("review")}>审查当前章</button>
@@ -740,7 +741,7 @@ function MemoryPanel({ dashboard, request, onRefresh }: { dashboard: Dashboard |
 
 function ProcessPanel({ events }: { events: EngineEvent[] }) {
   const runs = processRuns(events);
-  return <div className="scroll-panel process-panel"><div className="section-heading"><p className="eyebrow">可复核过程</p><h2>任务过程</h2><p>一个任务只显示一张卡片。你能看到目标、执行阶段和结论；模型的私密逐步思维不会保存或展示。</p></div><div className="run-list">{runs.length === 0 && <p className="empty-mini">开始一次对话、规划、写作或审查后，这里会出现清晰的任务记录。</p>}{runs.map((run) => <article className={`run-card ${run.status}`} key={run.id}><header><div><span className="run-state">{run.status === "failed" ? "失败" : run.status === "done" ? "完成" : "进行中"}</span><strong>{methodLabel(run.method)}</strong></div><small>{run.finishedAt ? formatTime(run.finishedAt) : "正在执行"}</small></header><p>{run.summary}</p><ol>{run.steps.map((step, index) => <li key={`${step.type}-${index}`} className={step.type?.includes("failed") ? "failed" : step.type?.includes("completed") ? "done" : ""}><span>{eventLabel(step.type)}</span><small>{step.summary || "状态已更新"}</small></li>)}</ol><details><summary>技术信息</summary><code>{run.id}</code></details></article>)}</div></div>;
+  return <div className="scroll-panel process-panel"><div className="section-heading"><p className="eyebrow">可复核过程</p><h2>任务过程</h2><p>一个任务只显示一张卡片。你能看到目标、执行阶段和结论；模型的私密逐步思维不会保存或展示。</p></div><div className="run-list">{runs.length === 0 && <p className="empty-mini">开始一次对话、规划、写作或审查后，这里会出现清晰的任务记录。</p>}{runs.map((run) => <article className={`run-card ${run.status}`} key={run.id}><header><div><span className="run-state">{run.status === "failed" ? "失败" : run.status === "cancelled" ? "已停止" : run.status === "done" ? "完成" : "进行中"}</span><strong>{methodLabel(run.method)}</strong></div><small>{run.finishedAt ? formatTime(run.finishedAt) : "正在执行"}</small></header><p>{run.summary}</p>{run.steps.length > 0 && <ol>{run.steps.map((step, index) => <li key={`${step.type}-${index}`} className={step.type?.includes("failed") ? "failed" : step.type?.includes("completed") ? "done" : ""}><span>{eventLabel(step.type)}</span><small>{step.summary || "状态已更新"}</small></li>)}</ol>}<details><summary>技术信息</summary><code>{run.id}</code></details></article>)}</div></div>;
 }
 
 function ReferencesPanel({ request }: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> }) {
@@ -781,15 +782,21 @@ function CreateProject({ onClose, onCreated }: { onClose: () => void; onCreated:
   const [mode, setMode] = useState<"ai" | "manual">("ai");
   const [preferences, setPreferences] = useState("");
   const [ideas, setIdeas] = useState<NovelIdea[]>([]);
+  const [ideaReasoning, setIdeaReasoning] = useState<string[]>([]);
   const [selectedIdea, setSelectedIdea] = useState("");
   const [working, setWorking] = useState(false);
+  const [ideaStage, setIdeaStage] = useState("");
   const [error, setError] = useState("");
-  const ideate = async () => {
-    setWorking(true); setError(""); setIdeas([]); setSelectedIdea("");
+  const ideate = async (fast: boolean) => {
+    setWorking(true); setError(""); setIdeas([]); setSelectedIdea(""); setIdeaReasoning([]);
+    setIdeaStage(fast ? "正在快速生成一个可直接使用的方向…" : "正在生成三个不同方向供你比较…");
     try {
-      const result = await window.inkflow.request<{ candidates: NovelIdea[] }>("project.ideate", { preferences });
+      const result = await window.inkflow.request<{ candidates: NovelIdea[]; public_reasoning_summary: string[] }>("project.ideate", { preferences, fast });
       setIdeas(result.candidates);
-    } catch (cause) { setError(errorMessage(cause)); } finally { setWorking(false); }
+      setIdeaReasoning(result.public_reasoning_summary || []);
+      if (result.candidates.length === 1) chooseIdea(result.candidates[0]);
+      setIdeaStage("方案已生成，可以直接修改或确认创建。");
+    } catch (cause) { setError(errorMessage(cause)); setIdeaStage(""); } finally { setWorking(false); }
   };
   const chooseIdea = (idea: NovelIdea) => {
     setSelectedIdea(idea.concept_id);
@@ -806,7 +813,7 @@ function CreateProject({ onClose, onCreated }: { onClose: () => void; onCreated:
   return <Modal title="新建小说" subtitle="没有题材、书名或主角也能开始；Writer 会先给你三个可选择的方向。" onClose={onClose}><form className="dialog-form" onSubmit={create}>
     <label>项目文件夹<div className="path-picker"><input value={root} readOnly placeholder="选择保存小说的文件夹" /><button type="button" onClick={async () => { const value = await window.inkflow.chooseFolder("选择小说项目文件夹"); if (value) setRoot(value); }}>选择</button></div></label>
     <div className="mode-switch"><button className={mode === "ai" ? "active" : ""} type="button" onClick={() => setMode("ai")}>我没有想法，AI 来构思</button><button className={mode === "manual" ? "active" : ""} type="button" onClick={() => setMode("manual")}>我自己填写</button></div>
-    {mode === "ai" && <section className="idea-studio"><label>可选偏好 <small>完全没想法就留空</small><textarea value={preferences} onChange={(event) => setPreferences(event.target.value)} placeholder="例如：女频、轻松一点；或直接留空，让 Writer 主动选择。" /></label><button className="wide-action" type="button" disabled={working} onClick={() => void ideate()}>{working ? "Writer 正在构思…" : ideas.length ? "换三个方向" : "让 Writer 从零构思"}</button>{ideas.length > 0 && <div className="idea-grid">{ideas.map((idea) => <button type="button" key={idea.concept_id} className={selectedIdea === idea.concept_id ? "selected" : ""} onClick={() => chooseIdea(idea)}><span>{idea.genre}</span><strong>{idea.title}</strong><p>{idea.premise}</p><small>开篇抓手：{idea.opening_hook}</small><em>{idea.choice_note}</em></button>)}</div>}<p className="form-hint">选择方案只会填入下方书籍契约；你确认创建后才会在本地写文件，仍不会自动生成正文或写入正史。</p></section>}
+    {mode === "ai" && <section className="idea-studio"><label>可选偏好 <small>完全没想法就留空</small><textarea value={preferences} onChange={(event) => setPreferences(event.target.value)} placeholder="例如：女频、爽文、无脑，从×××开始；也可以留空。" /></label><div className="idea-actions"><button className="primary" type="button" disabled={working} onClick={() => void ideate(true)}>快速生成一个</button><button type="button" disabled={working} onClick={() => void ideate(false)}>生成三个供比较</button></div>{ideaStage && <p className={`stage-note ${working ? "working" : ""}`}>{working && <span />} {ideaStage}</p>}{ideas.length > 0 && <div className={`idea-grid ${ideas.length === 1 ? "single" : ""}`}>{ideas.map((idea) => <button type="button" key={idea.concept_id} className={selectedIdea === idea.concept_id ? "selected" : ""} onClick={() => chooseIdea(idea)}><span>{idea.genre}</span><strong>{idea.title}</strong><p>{idea.premise}</p><small>开篇抓手：{idea.opening_hook}</small><em>{idea.choice_note}</em></button>)}</div>}{ideaReasoning.length > 0 && <details className="public-reasoning" open><summary>Writer 的公开思考说明</summary><ul>{ideaReasoning.map((item, index) => <li key={index}>{item}</li>)}</ul></details>}<p className="form-hint">快速模式通常更适合直接开始；需要比较时再生成三个。选择方案只填入可见契约，确认创建后才写本地文件。</p></section>}
     {(mode === "manual" || selectedIdea) && <>
     <div className="form-grid"><label>书名<input required value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></label><label>题材<input required value={form.genre} onChange={(e) => setForm({ ...form, genre: e.target.value })} /></label></div>
     <label>一句话故事前提<textarea required minLength={10} value={form.premise} onChange={(e) => setForm({ ...form, premise: e.target.value })} placeholder="谁，因为哪件事，必须做什么；最大的阻力是什么。" /></label>
@@ -818,19 +825,41 @@ function CreateProject({ onClose, onCreated }: { onClose: () => void; onCreated:
 }
 
 function SettingsDialog({ provider, onClose, onSaved }: { provider: Record<string, unknown> | null; onClose: () => void; onSaved: (value: Record<string, unknown>) => void }) {
-  const [form, setForm] = useState({ api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), max_output_tokens: Number(provider?.max_output_tokens || 16000) });
+  const [form, setForm] = useState({ api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), max_output_tokens: Number(provider?.max_output_tokens || 16000) });
   const [error, setError] = useState("");
   const [working, setWorking] = useState(false);
+  const [stage, setStage] = useState("");
   const [result, setResult] = useState("");
-  const persist = async (testConnection: boolean) => { setWorking(true); setError(""); setResult(""); try { await window.inkflow.request<Record<string, unknown>>("provider.configure", form); const status = await window.inkflow.request<Record<string, unknown>>("provider.status"); onSaved(status); setForm((value) => ({ ...value, api_key: "" })); if (testConnection) { const checked = await window.inkflow.request<{ message: string }>("provider.test"); setResult(checked.message); } else setResult("设置已安全保存。"); } catch (cause) { setError(errorMessage(cause)); } finally { setWorking(false); } };
+  const persist = async (testConnection: boolean) => {
+    setWorking(true); setError(""); setResult(""); setStage("正在保存安全设置…");
+    let testRunId = "";
+    try {
+      await window.inkflow.request<Record<string, unknown>>("provider.configure", form);
+      setForm((value) => ({ ...value, api_key: "" }));
+      const status = await window.inkflow.request<Record<string, unknown>>("provider.status");
+      onSaved(status);
+      if (!testConnection) { setResult("设置已安全保存。"); return; }
+      setResult("设置已安全保存到 Windows 凭据库；现在开始检查模型连接。");
+      setStage("保存完成，正在直接询问模型；通常约 5～15 秒…");
+      testRunId = `provider-test-${crypto.randomUUID()}`;
+      const request = window.inkflow.request<{ message: string; reply: string; public_reasoning_summary: string }>("provider.test", { run_id: testRunId });
+      const timeout = new Promise<never>((_resolve, reject) => window.setTimeout(() => reject(new Error("模型在 75 秒内没有回应，已结束本次检查；设置仍已保存。")), 75_000));
+      const checked = await Promise.race([request, timeout]);
+      setResult(`${checked.message}\n${checked.reply}\n公开判断：${checked.public_reasoning_summary}`);
+    } catch (cause) {
+      if (testRunId) void window.inkflow.request("run.cancel", { run_id: testRunId }).catch(() => undefined);
+      setError(errorMessage(cause));
+    } finally { setWorking(false); setStage(""); }
+  };
   return <Modal title="模型与上下文" subtitle="密钥只进入 Windows 凭据库，不会回显，也不会写进小说或日志。" onClose={onClose}><form className="dialog-form" onSubmit={(event) => { event.preventDefault(); void persist(false); }}>
     <div className={`provider-status ${provider?.api_key_configured ? "ready" : "missing"}`}><strong>{provider?.api_key_configured ? "API Key 已安全保存" : "尚未保存 API Key"}</strong><span>{provider?.api_key_configured ? `凭据来源：${credentialLabel(String(provider?.api_key_storage || ""))}` : "请输入一次，保存后界面不会再显示原文。"}</span></div>
     <label>更换 API Key <small>{provider?.api_key_configured ? "留空表示继续使用已有密钥" : "首次使用必须填写"}</small><input type="password" autoComplete="new-password" value={form.api_key} onChange={(e) => setForm({ ...form, api_key: e.target.value })} placeholder="sk-…（仅发送给本机引擎）" /></label>
     <label>接口地址<input value={form.base_url} onChange={(e) => setForm({ ...form, base_url: e.target.value })} /></label>
     <label>模型名称<input value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} /></label>
     <div className="form-grid"><label>思考强度<select value={form.reasoning_effort} onChange={(e) => setForm({ ...form, reasoning_effort: e.target.value })}><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最高</option></select></label><label>单次输出上限<input type="number" readOnly value={form.max_output_tokens} /></label></div>
+    <label>主动询问频率<select value={form.inquiry_frequency} onChange={(e) => setForm({ ...form, inquiry_frequency: e.target.value })}><option value="low">低：只问执行必需信息</option><option value="medium">中：理解把握较低时询问</option><option value="high">高：重要创作分岔也询问</option><option value="ultra">超高：有明显未知项就先询问</option></select></label>
     <div className="form-grid"><label>常用上下文<input type="number" min={16000} max={512000} value={form.context_soft_tokens} onChange={(e) => setForm({ ...form, context_soft_tokens: Number(e.target.value) })} /></label><label>最大上下文<input type="number" min={16000} max={1000000} value={form.context_hard_tokens} onChange={(e) => setForm({ ...form, context_hard_tokens: Number(e.target.value) })} /></label></div>
-    <p className="form-hint">墨流会从多个来源构建一个去重后的 Context Packet；256K/512K 是预算上限，不代表每次都塞满。单次输出上限为 16K。</p>{result && <p className="form-success">✓ {result}</p>}{error && <p className="form-error">{error}</p>}<div className="dialog-actions"><button type="button" onClick={onClose}>关闭</button><button type="submit" disabled={working}>仅保存</button><button className="primary" type="button" disabled={working || (!provider?.api_key_configured && !form.api_key)} onClick={() => void persist(true)}>{working ? "正在检查…" : "保存并测试连接"}</button></div>
+    <p className="form-hint">墨流会从多个来源构建一个去重后的 Context Packet；256K/512K 是预算上限，不代表每次都塞满。单次输出上限为 16K。</p>{stage && <p className="stage-note working"><span /> {stage}</p>}{result && <p className="form-success">✓ {result}</p>}{error && <p className="form-error">{error}</p>}<div className="dialog-actions"><button type="button" onClick={onClose}>关闭</button><button type="submit" disabled={working}>仅保存</button><button className="primary" type="button" disabled={working || (!provider?.api_key_configured && !form.api_key)} onClick={() => void persist(true)}>{working ? (stage.includes("询问模型") ? "已保存，正在测试…" : "正在保存…") : "保存并测试连接"}</button></div>
   </form></Modal>;
 }
 
@@ -849,7 +878,11 @@ function visibleResult(result: unknown): { summary: string; details?: string } {
   if (typeof result === "string") return { summary: result };
   if (!result || typeof result !== "object") return { summary: "任务完成，可以从右侧工作台查看结果。" };
   const value = result as Record<string, unknown>;
-  if (value.reply) return { summary: String(value.reply) };
+  if (value.reply) {
+    const session = value.session && typeof value.session === "object" ? value.session as Record<string, unknown> : null;
+    const reason = session?.visible_reason ? `\n\n公开判断：${String(session.visible_reason)}` : "";
+    return { summary: `${String(value.reply)}${reason}` };
+  }
   if (value.help) return { summary: String(value.help) };
   for (const key of ["message", "summary", "gate", "next_action"]) if (value[key]) return { summary: String(value[key]), details: JSON.stringify(value, null, 2) };
   if (value.result && typeof value.result === "object") {
@@ -877,8 +910,10 @@ function processRuns(events: EngineEvent[]) {
     const method = steps.find((item) => item.method)?.method;
     const failed = steps.some((item) => item.type?.includes("failed"));
     const done = steps.some((item) => item.type === "run.completed");
+    const cancelled = steps.some((item) => item.type === "run.cancelled");
     const summary = [...steps].reverse().find((item) => item.summary && !["任务已完成", "任务已进入墨流"].includes(item.summary))?.summary || (done ? "任务已经完成。" : "任务正在执行。");
-    return { id, steps, method, status: failed ? "failed" : done ? "done" : "running", summary, finishedAt: [...steps].reverse().find((item) => item.timestamp)?.timestamp };
+    const visibleSteps = steps.filter((item) => !["run.started", "run.completed"].includes(item.type || ""));
+    return { id, steps: visibleSteps, method, status: failed ? "failed" : cancelled ? "cancelled" : done ? "done" : "running", summary, finishedAt: failed || cancelled || done ? [...steps].reverse().find((item) => item.timestamp)?.timestamp : undefined };
   }).filter((run) => visibleMethods.has(run.method || "") || run.steps.some((item) => ["controller.routing", "workflow.started", "writer.started"].includes(item.type || ""))).reverse();
 }
 function statusLabel(value: string): string { return ({ open: "待处理", resolved: "已处理", dismissed: "已忽略", orphaned: "原文已变化" } as Record<string, string>)[value] || value; }

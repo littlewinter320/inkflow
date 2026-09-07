@@ -58,6 +58,7 @@ class InkFlowAppService:
                 "context_soft_tokens": settings.context_soft_tokens,
                 "context_hard_tokens": settings.context_hard_tokens,
                 "max_output_tokens": settings.max_output_tokens,
+                "inquiry_frequency": settings.inquiry_frequency,
             }
         if method == "provider.configure":
             key = str(params.get("api_key", "")).strip()
@@ -72,6 +73,7 @@ class InkFlowAppService:
                     "context_soft_tokens",
                     "context_hard_tokens",
                     "max_output_tokens",
+                    "inquiry_frequency",
                 )
                 if name in params and params[name] not in (None, "")
             }
@@ -83,10 +85,13 @@ class InkFlowAppService:
             await emit({"type": "provider.testing", "summary": "正在验证密钥、接口与模型名称"})
             result = await DeepSeekProvider(settings).generate_json(
                 system_prompt="你只负责返回 API 连通性检查结果。",
-                user_prompt='请返回 {"status":"ok"}。',
+                user_prompt=(
+                    "请用一句简短中文向用户打招呼，明确表示你收到了这次请求；"
+                    "status 返回 ok，并用一句公开说明解释本次只验证了模型能够接收请求和按格式回复。"
+                ),
                 output_model=ProviderProbe,
                 effort="low",
-                max_tokens=64,
+                max_tokens=160,
                 thinking=False,
                 timeout_seconds=min(settings.request_timeout_seconds, 60.0),
             )
@@ -94,34 +99,83 @@ class InkFlowAppService:
                 "connected": result.data.status == "ok",
                 "message": f"连接成功，当前模型：{result.model}",
                 "model": result.model,
+                "reply": result.data.reply,
+                "public_reasoning_summary": result.data.public_reasoning_summary,
             }
         if method == "project.ideate":
             settings = Settings.from_env(params.get("workspace_root"))
             preferences = str(params.get("preferences") or "").strip()
-            await emit({"type": "writer.started", "summary": "Writer 正在构思三个不同的开书方向"})
+            fast = bool(params.get("fast", True))
+            requested_count = 1 if fast else 3
+            await emit(
+                {
+                    "type": "writer.started",
+                    "summary": "Writer 正在快速生成一个开书方向" if fast else "Writer 正在构思三个不同的开书方向",
+                }
+            )
             result = await DeepSeekProvider(settings).generate_json(
                 system_prompt=(
                     "你是墨流的 Writer，当前只负责建项前构思，不写正文。面向中文网文读者，"
-                    "给出三个差异明确、可长线连载、不是换皮复读的原创方案。每个方案都必须有"
+                    f"严格给出 {requested_count} 个可长线连载的原创方案。每个方案都必须有"
                     "清晰主角欲望、持续矛盾、前三章抓手与可升级的长期叙事引擎。不要依赖用户已有小说。"
                     "书名简洁可辨识；premise 至少写清人物、触发事件、目标与主要阻力。"
+                    "用户偏好中已经明确说出的受众、主角性别、题材、时代、基调、禁区和开篇方式均是硬约束，"
+                    "不得为了追求新奇而换掉。出现‘女频’且用户没有另行指定时，默认使用女性主角和女频叙事重点；"
+                    "出现‘从……开始’时，opening_hook 必须从该事件或场面起笔。把这些明确约束逐条写入 user_rules。"
+                    "绝不能把 Writer 自己选择的时代、题材或情节说成用户偏好；原文没有的内容只能称为创意提案。"
+                    "user_rules 只能复述用户明确说过的内容，不能把本次方案细节升级为用户硬约束。"
+                    "public_reasoning_summary 用 2～4 条简短中文公开说明你核对了哪些偏好、为何选择这个方向、"
+                    "还有什么可调整；这是给用户看的判断摘要，不是隐藏思维链。"
                 ),
                 user_prompt=(
-                    "用户可以完全没有想法。请生成三个可直接建立项目的开书方案。"
+                    f"用户可以完全没有想法。请生成 {requested_count} 个可直接建立项目的开书方案。"
                     f"\n用户可选偏好：{preferences or '无，请主动做多样化选择。'}"
                     "\n默认单章 3000 字、约 200 章、6 卷；可按题材合理微调。"
                 ),
                 output_model=NovelIdeaBundle,
-                effort="high",
-                max_tokens=3000,
-                thinking=True,
-                timeout_seconds=settings.planning_timeout_seconds,
+                effort="low" if fast else "high",
+                max_tokens=1200 if fast else 3000,
+                thinking=not fast,
+                timeout_seconds=min(settings.request_timeout_seconds, 90.0) if fast else settings.planning_timeout_seconds,
             )
-            await emit({"type": "writer.completed", "summary": "三个开书方案已经准备好，等待用户选择"})
+            await emit(
+                {
+                    "type": "writer.completed",
+                    "summary": "快速方案已经准备好" if fast else "三个开书方案已经准备好，等待用户选择",
+                }
+            )
+            idea_payload = result.data.model_dump()
+            original_rule = f"用户原始偏好（不可擅自改写）：{preferences}" if preferences else ""
+            for candidate in idea_payload["candidates"]:
+                candidate["user_rules"] = [original_rule] if original_rule else []
+                if not candidate["core_selling_point"].strip():
+                    candidate["core_selling_point"] = (
+                        f"{candidate['genre']}题材下的低起点成长、持续升级矛盾与长线悬念"
+                    )
+                candidate["choice_note"] = (
+                    f"Writer 选择这个方向，是因为：{candidate['core_selling_point']}。"
+                    "这是本次创意提案，不代表用户已经确认。"
+                )
+            safe_reasoning = [
+                item
+                for item in idea_payload["public_reasoning_summary"]
+                if not any(marker in item for marker in ("用户", "偏好", "要求", "核对"))
+            ]
+            preference_note = (
+                f"已按原文记录用户偏好：{preferences}"
+                if preferences
+                else "用户没有填写硬性偏好，本次细节均为 Writer 的创意提案。"
+            )
+            idea_payload["public_reasoning_summary"] = [preference_note, *safe_reasoning[:2]]
+            if len(idea_payload["public_reasoning_summary"]) < 2:
+                idea_payload["public_reasoning_summary"].append(
+                    "除用户原始偏好外，其余题材与情节细节都可以继续修改。"
+                )
             return {
-                **result.data.model_dump(),
-                "message": "Writer 已生成三个开书方向；选择一个后再建立项目，不会自动写入正史。",
+                **idea_payload,
+                "message": "Writer 已生成开书方向；选中后再建立项目，不会自动写入正史。",
                 "model": result.model,
+                "mode": "quick" if fast else "compare",
             }
         if method == "project.create":
             root = Path(str(params["project_root"])).resolve()

@@ -61,6 +61,8 @@ alternative_action 只在两种理解确实都合理时填写；不要为了凑�
 confidence 表示语义识别把握：high=目标与动作清楚，medium=大意清楚但有轻微省略，low=两种以上理解都合理或关键指代不明。它不能作为绕过门禁的许可。
 authorization 表示当前话语行为：none=询问/讨论，proposed=提出可能方案或条件句，approved=明确要求现在执行或明确接受最近待确认方案。
 missing_fields 列出无法从本条消息、最近对话和项目状态可靠确定的必要字段；clarification_question 只写一句最小澄清问题，无需让用户重述全部需求。
+若用户明确要求“先问我”“向我提问”或“帮我补全想法”，action=discuss，conversation_reply 应主动提出 1～3 个最有价值、容易回答的问题，并说明这些答案会影响什么；不要执行小说工作流。
+当存在可选但会明显改变成品的未知项时，可以填写 clarification_question。若当前消息是在回答上一轮问题，或用户明确说“直接开始/不用再问”，不要重复追问。
 checkpoint_id 与 confirmation_token 必须逐字复制用户输入；用户未提供时设为 null。
 batch_id 必须逐字复制用户输入；用户未提供时设为 null。
 target_characters 只表示“已接受正文”的有效字符目标，不把草稿、审查或日志计入。end_chapter_no 对 plan_preview、arc_audit 表示结束章，对 continue_run 表示长跑结束章。plan_change_confirmed 根据整句与最近待确认事项的明确执行语义判断，不做关键词匹配。
@@ -77,6 +79,7 @@ target_characters 只表示“已接受正文”的有效字符目标，不把�
 
 
 _SENSITIVE_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+_NO_OPTIONAL_QUESTION_PATTERN = re.compile(r"(?:直接|马上|立刻)(?:开始|执行|写|做)|(?:不用|不要|别|不必)再?问")
 _CHAPTER_RANGE_PATTERN = re.compile(
     r"第?\s*(\d+)\s*(?:到|至|~|～|—|-)\s*第?\s*(\d+)\s*章"
 )
@@ -336,7 +339,8 @@ class TerminalSession:
                 fallback="我已经理解大致目标，但还缺少执行所需的信息。",
             )
 
-        if resolved.confidence == "low":
+        inquiry_frequency = self.engine.settings.inquiry_frequency
+        if resolved.confidence == "low" and inquiry_frequency != "low":
             return resolved, self._clarification_response(
                 resolved,
                 fallback="这句话有两种以上合理理解，我不想替你猜错。",
@@ -346,6 +350,21 @@ class TerminalSession:
             return resolved, self._clarification_response(
                 resolved,
                 fallback="我能想到两种都合理的处理方式，需要你确认其中一种。",
+            )
+
+        should_optional_ask = (
+            resolved.action not in _READ_ONLY_ACTIONS
+            and bool(resolved.clarification_question.strip())
+            and not _NO_OPTIONAL_QUESTION_PATTERN.search(message)
+            and (
+                inquiry_frequency == "ultra"
+                or (inquiry_frequency == "high" and resolved.confidence == "medium")
+            )
+        )
+        if should_optional_ask:
+            return resolved, self._clarification_response(
+                resolved,
+                fallback="为了让这次创作更贴近你的想法，我先确认一个会明显影响结果的选择。",
             )
 
         if resolved.action not in _READ_ONLY_ACTIONS and resolved.authorization != "approved":
@@ -512,6 +531,13 @@ class TerminalSession:
                 "只有 Reviewer pass 才可进入接受",
                 "accept 永远使用 force=false",
             ],
+            "inquiry_frequency": self.engine.settings.inquiry_frequency,
+            "inquiry_policy": {
+                "low": "只追问缺少的执行条件和真实歧义",
+                "medium": "低把握时追问",
+                "high": "中等把握且存在重要创作分岔时追问",
+                "ultra": "存在会明显改变成品的未知项就先追问；用户要求直接开始时不重复问",
+            },
         }
         sections = [
             ContextSection(key="A", title="当前用户自然语言请求", content=message, hard=True),

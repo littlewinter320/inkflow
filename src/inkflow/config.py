@@ -26,6 +26,7 @@ PERSISTED_SETTING_NAMES = {
     "planning_timeout_seconds",
     "trace_level",
     "show_provider_reasoning",
+    "inquiry_frequency",
 }
 
 
@@ -100,6 +101,7 @@ class Settings:
     planning_timeout_seconds: float = 600.0
     trace_level: str = "full"
     show_provider_reasoning: bool = True
+    inquiry_frequency: str = "medium"
     workspace_root: Path | None = None
 
     @classmethod
@@ -135,6 +137,9 @@ class Settings:
         planning_timeout = _positive_float(
             value.get("planning_timeout_seconds", defaults.planning_timeout_seconds), "规划请求超时"
         )
+        inquiry_frequency = str(value.get("inquiry_frequency", defaults.inquiry_frequency)).lower()
+        if inquiry_frequency not in {"low", "medium", "high", "ultra"}:
+            raise ConfigurationError("主动询问频率只能是 low、medium、high 或 ultra。")
         return cls(
             base_url=base_url,
             model=model,
@@ -148,6 +153,7 @@ class Settings:
             show_provider_reasoning=_as_bool(
                 value.get("show_provider_reasoning", defaults.show_provider_reasoning)
             ),
+            inquiry_frequency=inquiry_frequency,
             workspace_root=Path(workspace_root).resolve() if workspace_root else None,
         )
 
@@ -165,6 +171,7 @@ class Settings:
             "planning_timeout_seconds": "INKFLOW_PLANNING_TIMEOUT_SECONDS",
             "trace_level": "INKFLOW_TRACE_LEVEL",
             "show_provider_reasoning": "INKFLOW_SHOW_REASONING",
+            "inquiry_frequency": "INKFLOW_INQUIRY_FREQUENCY",
         }
         for field, environment_name in environment_mapping.items():
             if environment_name in os.environ:

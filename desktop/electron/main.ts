@@ -8,6 +8,7 @@ import readline from "node:readline";
 type Pending = {
   resolve: (value: unknown) => void;
   reject: (reason?: unknown) => void;
+  child: ChildProcessWithoutNullStreams;
 };
 
 class EngineBridge {
@@ -20,38 +21,38 @@ class EngineBridge {
   }
 
   start(): void {
-    if (this.process && !this.process.killed) return;
+    if (this.process && !this.process.killed && this.process.exitCode === null) return;
     const command = this.command();
-    this.process = spawn(command.executable, command.args, {
+    const child = spawn(command.executable, command.args, {
       cwd: command.cwd,
       env: { ...process.env, PYTHONUTF8: "1", ...command.env },
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const lines = readline.createInterface({ input: this.process.stdout });
+    this.process = child;
+    const lines = readline.createInterface({ input: child.stdout });
     lines.on("line", (line) => this.receive(line));
-    this.process.stderr.on("data", () => {
+    child.stderr.on("data", () => {
       this.send("engine:status", {
         level: "warning",
         message: "本地写作引擎报告了诊断信息；如任务失败，可查看过程面板。",
       });
     });
-    this.process.once("exit", (code) => {
-      const error = new Error(`墨流本地引擎已退出（代码 ${code ?? "unknown"}）。`);
-      for (const item of this.pending.values()) item.reject(error);
-      this.pending.clear();
-      this.process = null;
-      this.send("engine:status", { level: "error", message: error.message });
-    });
+    child.once("error", (cause) => this.failChild(child, new Error(`无法启动墨流本地引擎：${cause.message}`)));
+    child.once("exit", (code) => this.failChild(child, new Error(`墨流本地引擎已退出（代码 ${code ?? "unknown"}）。请重试刚才的操作。`)));
   }
 
   async request(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
     this.start();
+    const child = this.process;
+    if (!child || child.killed || child.exitCode !== null) {
+      throw new Error("墨流本地引擎暂时不可用，请重试。");
+    }
     const id = randomUUID();
     const payload = JSON.stringify({ jsonrpc: "2.0", id, method, params });
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.process?.stdin.write(`${payload}\n`, "utf8", (error) => {
+      this.pending.set(id, { resolve, reject, child });
+      child.stdin.write(`${payload}\n`, "utf8", (error) => {
         if (error) {
           this.pending.delete(id);
           reject(error);
@@ -61,8 +62,20 @@ class EngineBridge {
   }
 
   stop(): void {
-    this.process?.kill();
+    const child = this.process;
     this.process = null;
+    child?.kill();
+  }
+
+  private failChild(child: ChildProcessWithoutNullStreams, error: Error): void {
+    for (const [id, item] of this.pending.entries()) {
+      if (item.child !== child) continue;
+      item.reject(error);
+      this.pending.delete(id);
+    }
+    if (this.process !== child) return;
+    this.process = null;
+    this.send("engine:status", { level: "error", message: error.message });
   }
 
   private receive(line: string): void {

@@ -256,6 +256,7 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .run-card { padding: 15px; border: 1px solid var(--line); border-left: 3px solid var(--amber); background: #171714; }
 .run-card.done { border-left-color: var(--accent-dim); }
 .run-card.failed { border-left-color: var(--red); }
+.run-card.cancelled { border-left-color: var(--faint); }
 .run-card header { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
 .run-card header > div { display: flex; align-items: center; gap: 9px; }
 .run-card header strong { font-size: 14px; }
@@ -263,6 +264,7 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .run-state { border: 1px solid #5d4b27; border-radius: 99px; padding: 3px 7px; color: #d7ad58; font-size: 9px; }
 .run-card.done .run-state { border-color: #40502f; color: #a9cb70; }
 .run-card.failed .run-state { border-color: #6b403a; color: #e1857b; }
+.run-card.cancelled .run-state { border-color: #56534b; color: #aaa59a; }
 .run-card > p { margin: 12px 0; color: #d4d0c6; font-size: 12px; line-height: 1.6; }
 .run-card ol { display: flex; flex-direction: column; gap: 5px; margin: 0; padding: 0; list-style: none; }
 .run-card li { display: grid; grid-template-columns: 100px minmax(0, 1fr); gap: 8px; padding: 7px 9px; background: #12120f; color: var(--muted); font-size: 10px; }
@@ -307,7 +309,7 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .path-picker { display: grid; grid-template-columns: 1fr auto; gap: 7px; margin-top: 6px; }
 .form-hint { margin: 0; color: var(--faint); font-size: 10px; line-height: 1.6; }
 .form-error { margin: 0; color: #ee8d84; font-size: 11px; }
-.form-success { margin: 0; color: #afd178; font-size: 11px; }
+.form-success { margin: 0; color: #afd178; font-size: 11px; line-height: 1.65; white-space: pre-wrap; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
 .mode-switch { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; border: 1px solid var(--line); background: var(--line); }
 .mode-switch button { border: 0; border-radius: 0; background: #151512; color: var(--muted); }
@@ -315,7 +317,13 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .idea-studio { display: flex; flex-direction: column; gap: 11px; padding: 15px; border: 1px solid #3d4630; background: #151912; }
 .idea-studio textarea { min-height: 64px; }
 .idea-studio .wide-action { margin-top: 0; }
+.idea-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.stage-note { margin: 0; padding: 9px 11px; border: 1px solid #3d4630; background: #171b13; color: #afc984; font-size: 11px; }
+.stage-note span { display: inline-block; width: 7px; height: 7px; margin-right: 5px; border-radius: 50%; background: var(--accent); }
+.stage-note.working span { animation: pulse 1.2s infinite; }
 .idea-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.idea-grid.single { grid-template-columns: minmax(260px, 1fr); }
+.idea-grid.single > button { min-height: 180px; }
 .idea-grid > button { display: flex; min-height: 245px; flex-direction: column; align-items: flex-start; padding: 13px; border-color: #3b3a32; background: #171714; text-align: left; }
 .idea-grid > button.selected { border-color: var(--accent-dim); background: #202717; box-shadow: inset 0 0 0 1px var(--accent-dim); }
 .idea-grid span { color: var(--accent-dim); font-size: 9px; }
@@ -323,6 +331,10 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .idea-grid p { display: -webkit-box; overflow: hidden; margin: 9px 0; color: var(--muted); font-size: 10px; line-height: 1.55; -webkit-box-orient: vertical; -webkit-line-clamp: 5; }
 .idea-grid small { color: #b9b3a7; font-size: 9px; line-height: 1.5; }
 .idea-grid em { margin-top: auto; padding-top: 10px; color: #d5a958; font-size: 9px; font-style: normal; }
+.public-reasoning { padding: 11px 13px; border: 1px solid #3d4630; background: #12150f; color: #b8c99a; font-size: 11px; }
+.public-reasoning summary { cursor: pointer; color: var(--accent-dim); font-weight: 700; }
+.public-reasoning ul { margin: 9px 0 0; padding-left: 18px; }
+.public-reasoning li { margin-top: 5px; line-height: 1.55; }
 .provider-status { display: flex; flex-direction: column; gap: 4px; padding: 12px; border: 1px solid #5b3b36; background: #251715; }
 .provider-status.ready { border-color: #40512f; background: #182014; }
 .provider-status strong { color: #e6e1d7; font-size: 12px; }
