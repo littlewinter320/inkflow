@@ -90,7 +90,23 @@ try {
         $env:GH_TOKEN = $releaseToken
         npm run build
         if ($LASTEXITCODE -ne 0) { throw "Desktop build failed with exit code $LASTEXITCODE." }
-        npx electron-builder --win nsis --publish always
+        npx electron-builder --win nsis --publish never
+        if ($LASTEXITCODE -ne 0) { throw "Desktop package generation failed with exit code $LASTEXITCODE." }
+        $desktopAssets = @(Get-ChildItem -LiteralPath (Join-Path $desktopRelease $desktopVersion) -File | Where-Object {
+            $_.Name -eq "InkFlow-Setup-$desktopVersion.exe" -or
+            $_.Name -eq "InkFlow-Setup-$desktopVersion.exe.blockmap" -or
+            $_.Name -eq "latest.yml"
+        } | ForEach-Object { $_.FullName })
+        if (-not ($desktopAssets | Where-Object { $_ -like '*latest.yml' }) -or -not ($desktopAssets | Where-Object { $_ -like '*.exe' })) {
+            throw 'The desktop build did not produce the installer and latest.yml required by electron-updater.'
+        }
+        & gh release view $tag *> $null
+        if ($LASTEXITCODE -ne 0) {
+            & gh release create $tag --title "墨流（InkFlow）桌面版 $desktopVersion" --notes "墨流（InkFlow）$desktopVersion 桌面版。"
+            if ($LASTEXITCODE -ne 0) { throw "GitHub Release creation failed with exit code $LASTEXITCODE." }
+        }
+        & gh release upload $tag @desktopAssets --clobber
+        if ($LASTEXITCODE -ne 0) { throw "GitHub Release asset upload failed with exit code $LASTEXITCODE." }
     }
     else {
         npm run dist:win

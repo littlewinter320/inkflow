@@ -71,4 +71,22 @@ jobs:
         run: |
           npm run build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npx electron-builder --win nsis --publish always
+          npx electron-builder --win nsis --publish never
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tag = $env:GITHUB_REF_NAME
+          $version = (Get-Content -Raw -LiteralPath ./package.json | ConvertFrom-Json).version
+          $output = [System.IO.Path]::GetFullPath((Join-Path "..\artifacts\desktop" $version))
+          $assets = @(Get-ChildItem -LiteralPath $output -File | Where-Object {
+            $_.Name -eq "InkFlow-Setup-$version.exe" -or
+            $_.Name -eq "InkFlow-Setup-$version.exe.blockmap" -or
+            $_.Name -eq "latest.yml"
+          } | ForEach-Object { $_.FullName })
+          if (-not ($assets | Where-Object { $_ -like "*latest.yml" }) -or -not ($assets | Where-Object { $_ -like "*.exe" })) {
+            throw "The desktop build did not produce the installer and latest.yml required by electron-updater."
+          }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title "墨流（InkFlow）桌面版 $version" --notes "墨流（InkFlow）$version 桌面版。"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          gh release upload $tag @assets --clobber
