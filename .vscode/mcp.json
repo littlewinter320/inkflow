@@ -8,7 +8,7 @@
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        "${workspaceFolder}\\scripts\\inkflow-mcp.ps1"
+        "${workspaceFolder}\\agent\\scripts\\inkflow-mcp.ps1"
       ]
     }
   }

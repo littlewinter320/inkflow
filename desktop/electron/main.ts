@@ -1,5 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from "electron";
-import electronUpdater, { AppUpdater, NsisUpdater } from "electron-updater";
+import { AppUpdater, NsisUpdater, autoUpdater } from "electron-updater";
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -38,7 +38,7 @@ class UpdateManager {
     if (source === "environment") {
       this.updater = new NsisUpdater({ provider: "generic", url: configuredUrl });
     } else if (source === "embedded") {
-      this.updater = electronUpdater.autoUpdater;
+      this.updater = autoUpdater;
     }
     if (!this.updater) return;
     this.updater.autoDownload = false;
@@ -188,7 +188,7 @@ class EngineBridge {
       executable: existsSync(python) ? python : "python",
       args: ["-m", "inkflow.app_server"],
       cwd: repository,
-      env: { PYTHONPATH: path.join(repository, "src") },
+      env: { PYTHONPATH: path.join(repository, "agent", "src") },
     };
   }
 }
@@ -206,8 +206,8 @@ function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1480,
     height: 940,
-    minWidth: 1120,
-    minHeight: 720,
+    minWidth: 960,
+    minHeight: 650,
     backgroundColor: "#11110f",
     title: "墨流 InkFlow",
     show: false,
@@ -221,7 +221,23 @@ function createWindow(): void {
   });
   Menu.setApplicationMenu(null);
   bridge = new EngineBridge(mainWindow);
-  updates = new UpdateManager(mainWindow);
+  try {
+    updates = new UpdateManager(mainWindow);
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    updates = null;
+    const updateWindow = mainWindow;
+    updateWindow.webContents.once("did-finish-load", () => {
+      if (!updateWindow.isDestroyed()) {
+        updateWindow.webContents.send("app:update-status", {
+          status: "error",
+          currentVersion: app.getVersion(),
+          message: `更新模块暂时不可用：${message}`,
+          source: "none",
+        } satisfies UpdateState);
+      }
+    });
+  }
   ipcMain.handle("engine:request", (_event, method: string, params: Record<string, unknown>) =>
     bridge?.request(method, params),
   );

@@ -8,7 +8,7 @@
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        "scripts/inkflow-mcp.ps1"
+        "agent/scripts/inkflow-mcp.ps1"
       ]
     }
   }

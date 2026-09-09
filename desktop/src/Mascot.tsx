@@ -10,11 +10,13 @@ import waitingPoster from "./assets/mascot/animations/mobao-waiting.poster.png";
 import waitingVideo from "./assets/mascot/animations/mobao-waiting.webm";
 import welcomePoster from "./assets/mascot/animations/mobao-welcome.poster.png";
 import welcomeVideo from "./assets/mascot/animations/mobao-welcome.webm";
+import readingImage from "./assets/mascot/animations/mobao-reading.png";
 
-export type MascotMood = "idle" | "thinking" | "waiting" | "success" | "rest" | "welcome";
+export type MascotMood = "idle" | "thinking" | "waiting" | "success" | "rest" | "welcome" | "reading";
 
 type MascotClip = {
-  video: string;
+  video?: string;
+  image?: string;
   poster: string;
   label: string;
   loop: boolean;
@@ -27,6 +29,7 @@ const clips: Record<MascotMood, MascotClip> = {
   success: { video: successVideo, poster: successPoster, label: "这一步完成了", loop: false },
   rest: { video: restVideo, poster: restPoster, label: "工作已暂停，可检查后继续", loop: true },
   welcome: { video: welcomeVideo, poster: welcomePoster, label: "欢迎来到墨流", loop: false },
+  reading: { image: readingImage, poster: readingImage, label: "墨宝正在阅读选中的正文", loop: true },
 };
 
 export const mobaoIdlePoster = idlePoster;
@@ -45,19 +48,23 @@ export function Mascot({
   const clip = clips[mood];
   return (
     <figure className={`mobao ${className}`.trim()} data-mood={mood} aria-label={clip.label}>
-      <video
-        key={mood}
-        className="mobao-video"
-        src={clip.video}
-        poster={clip.poster}
-        autoPlay
-        muted
-        playsInline
-        loop={clip.loop}
-        preload="auto"
-        disablePictureInPicture
-        onEnded={clip.loop ? undefined : onSettled}
-      />
+      {clip.image ? (
+        <img key={mood} className="mobao-video" src={clip.image} alt={clip.label} />
+      ) : (
+        <video
+          key={mood}
+          className="mobao-video"
+          src={clip.video}
+          poster={clip.poster}
+          autoPlay
+          muted
+          playsInline
+          loop={clip.loop}
+          preload="metadata"
+          disablePictureInPicture
+          onEnded={clip.loop ? undefined : onSettled}
+        />
+      )}
       {showLabel && <figcaption>{clip.label}</figcaption>}
     </figure>
   );

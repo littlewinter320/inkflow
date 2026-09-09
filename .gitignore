@@ -12,7 +12,8 @@ dist/
 build/
 release/
 desktop/dist-electron/
-vscode-extension/bin/
+extension/bin/
+artifacts/
 knowledge/
 *.log
 .DS_Store
