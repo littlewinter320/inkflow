@@ -92,4 +92,4 @@ finally {
 }
 
 $extensionNote = if ($IncludeExtension) { ' and artifacts\extension' } else { '' }
-Write-Host "InkFlow desktop 0.4.1 build completed: artifacts\desktop$extensionNote."
+Write-Host "InkFlow desktop 0.4.2 build completed: artifacts\desktop$extensionNote."

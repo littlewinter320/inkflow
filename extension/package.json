@@ -2,7 +2,7 @@
   "name": "inkflow-vscode",
   "displayName": "inkflow墨流",
   "description": "四 Agent 中文长篇小说创作工作台：Coordinator、写作、证据化审查、正史记忆与安全回退",
-  "version": "0.4.0",
+  "version": "0.4.2",
   "publisher": "inkflow",
   "license": "MIT",
   "icon": "media/mobao.png",

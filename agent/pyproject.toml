@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inkflow-novel-agent"
-version = "0.4.1"
+version = "0.4.2"
 description = "墨流（InkFlow）——面向长篇中文网文的四 Agent 协作创作引擎"
 readme = "README.md"
 requires-python = ">=3.11"
