@@ -20,6 +20,12 @@ $system32Directory = Join-Path $env:SystemRoot 'System32'
 # Node runtimes omit the Windows system directories from PATH.
 $env:PATH = "$systemPowerShellDirectory;$system32Directory;$env:PATH"
 
+$desktopVersion = (Get-Content -Raw -LiteralPath (Join-Path $repositoryRoot 'desktop\package.json') | ConvertFrom-Json).version
+$agentVersion = (Get-Content -Raw -LiteralPath (Join-Path $agentRoot 'pyproject.toml') | Select-String -Pattern 'version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+if (-not $desktopVersion -or $desktopVersion -ne $agentVersion) {
+    throw "Desktop and agent versions must match before publishing: desktop=$desktopVersion agent=$agentVersion."
+}
+
 if (-not (Test-Path -LiteralPath $python)) {
     throw 'Missing .venv. Create the Python virtual environment in the repository root first.'
 }
@@ -74,6 +80,11 @@ try {
     npm install
     if ($LASTEXITCODE -ne 0) { throw "Desktop dependency installation failed with exit code $LASTEXITCODE." }
     if ($Publish) {
+        $tag = "v$desktopVersion"
+        $tagExists = (& git ls-remote --tags origin $tag)
+        if (-not $tagExists) {
+            throw "Publishing requires an existing pushed Git tag $tag. Create and push the tag first, then rerun this script."
+        }
         $releaseToken = (& gh auth token).Trim()
         if (-not $releaseToken) { throw 'GitHub login token is unavailable; cannot create a public Release.' }
         $env:GH_TOKEN = $releaseToken
@@ -92,4 +103,4 @@ finally {
 }
 
 $extensionNote = if ($IncludeExtension) { ' and artifacts\extension' } else { '' }
-Write-Host "InkFlow desktop 0.4.2 build completed: artifacts\desktop$extensionNote."
+Write-Host "InkFlow desktop $desktopVersion build completed: artifacts\desktop$extensionNote."

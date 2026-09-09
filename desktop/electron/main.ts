@@ -18,7 +18,7 @@ type UpdateState = {
   availableVersion?: string;
   progress?: number;
   message: string;
-  source: "none" | "embedded" | "environment";
+  source: "none" | "embedded" | "github" | "environment";
 };
 
 class UpdateManager {
@@ -28,7 +28,13 @@ class UpdateManager {
   constructor(private readonly window: BrowserWindow) {
     const configuredUrl = String(process.env.INKFLOW_UPDATE_URL || "").trim();
     const embeddedConfig = path.join(process.resourcesPath, "app-update.yml");
-    const source: UpdateState["source"] = configuredUrl ? "environment" : app.isPackaged && existsSync(embeddedConfig) ? "embedded" : "none";
+    const source: UpdateState["source"] = configuredUrl
+      ? "environment"
+      : app.isPackaged && existsSync(embeddedConfig)
+        ? "embedded"
+        : app.isPackaged
+          ? "github"
+          : "none";
     this.state = {
       status: source === "none" ? "not_configured" : "ready",
       currentVersion: app.getVersion(),
@@ -39,6 +45,16 @@ class UpdateManager {
       this.updater = new NsisUpdater({ provider: "generic", url: configuredUrl });
     } else if (source === "embedded") {
       this.updater = autoUpdater;
+    } else if (source === "github") {
+      // Keep already-installed packages updateable even if an older build was
+      // accidentally produced without app-update.yml. Future releases still
+      // need a published GitHub Release with latest.yml and the NSIS assets.
+      this.updater = new NsisUpdater({
+        provider: "github",
+        owner: "littlewinter320",
+        repo: "inkflow",
+        releaseType: "release",
+      });
     }
     if (!this.updater) return;
     this.updater.autoDownload = false;

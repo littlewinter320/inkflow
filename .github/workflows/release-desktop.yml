@@ -1,0 +1,62 @@
+name: Publish InkFlow desktop release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  desktop:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Build local engine
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "./agent[build]"
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --name inkflow-engine `
+            --paths ./agent/src `
+            --collect-submodules mcp.server `
+            --collect-submodules mcp.shared `
+            --collect-data mcp `
+            --hidden-import mcp.types `
+            --exclude-module mcp.cli `
+            --distpath ./dist/engine `
+            --workpath ./build/pyinstaller `
+            --specpath ./build/pyinstaller `
+            ./agent/scripts/inkflow_app_server_entry.py
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Publish Windows installer and updater metadata
+        working-directory: desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npm run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npx electron-builder --win nsis --publish always
