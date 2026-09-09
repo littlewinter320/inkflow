@@ -33,7 +33,7 @@ export function controlHtml(
 </style></head><body>
 <div class="shell">
   <header class="top">
-    <div class="top-copy"><p class="eyebrow">INKFLOW · 创作伙伴</p><h1>和墨宝一起写</h1><p>说目标、看过程、审结果。三个小说角色仍各守边界。</p></div>
+    <div class="top-copy"><p class="eyebrow">INKFLOW · 四 AGENT 创作伙伴</p><h1>和墨宝一起写</h1><p>Coordinator 理解与派工，三个生产 Agent 各守边界。</p></div>
     <div class="companion"><span class="pet-halo"></span><video id="petVideo" class="pet-media" muted playsinline autoplay loop disablepictureinpicture></video><img id="petImage" class="pet-media" alt="墨宝正在阅读选区" hidden><div id="petSpeech" class="pet-speech" role="status">我在。先告诉我今天想推进哪一步。</div></div>
     <div class="pet-actions" aria-label="与墨宝互动"><button data-pet="welcome">打招呼</button><button data-pet="reading">读选区</button><button data-pet="thinking">想一想</button><button data-pet="success">鼓励我</button><button data-pet="rest">休息</button></div>
   </header>

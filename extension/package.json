@@ -1,7 +1,7 @@
 {
   "name": "inkflow-vscode",
   "displayName": "inkflow墨流",
-  "description": "中文长篇小说创作工作台：自然语言、四级规划、写作、证据化审查、正史记忆与安全回退",
+  "description": "四 Agent 中文长篇小说创作工作台：Coordinator、写作、证据化审查、正史记忆与安全回退",
   "version": "0.4.0",
   "publisher": "inkflow",
   "license": "MIT",
@@ -91,7 +91,7 @@
         "description": "从打开项目到完成一章的中文长篇创作流程。",
         "steps": [
           { "id": "open", "title": "打开墨流小说项目", "description": "先用桌面版新建小说，或打开已有的墨流项目文件夹。", "media": { "markdown": "media/walkthrough-open.md" } },
-          { "id": "plan", "title": "生成四级规划", "description": "在创作主控中先讨论方向，再生成全书、卷、篇章和章节卡。", "media": { "markdown": "media/walkthrough-plan.md" } },
+          { "id": "plan", "title": "生成四级规划", "description": "先由 Coordinator 理解方向，再安排生成全书、卷、篇章和章节卡。", "media": { "markdown": "media/walkthrough-plan.md" } },
           { "id": "draft", "title": "写作与审查", "description": "写作角色生成草稿，审查角色给出证据与扣分；你确认后才进入正史。", "media": { "markdown": "media/walkthrough-draft.md" } },
           { "id": "connect", "title": "连接编程助手", "description": "把墨流合并到当前工作区的 MCP 配置，用自然语言调用同一套引擎。", "media": { "markdown": "media/walkthrough-connect.md" } }
         ]

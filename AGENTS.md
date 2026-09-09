@@ -11,15 +11,20 @@
 
 ## 产品边界
 
-墨流固定使用三个正式小说 Agent：
+墨流固定使用四个正式 AI Agent：
 
+- Coordinator：AI 产品经理与协作管家；理解用户自然语言、维护日常交流、拆解任务、生成任务单、选择预定义工作流、分配工作、汇总分歧并在必要时向用户提问。不能写正文、替 Reviewer 放行或替 Memory Keeper 提交正史。
 - Writer：规划、写作、定点修订。
 - Reviewer：只审查，不直接修改正文。
 - Memory Keeper：只从用户已接受的正文提取并提交正史。
 
-宿主会话只负责理解、讨论和路由，不是第四个小说 Agent。Novel Engine 是确定性 Python 编排器。Context Builder 可以读取多个来源，但每次模型调用只接收一个编译后的 Context Packet。
+其中 Writer、Reviewer、Memory Keeper 是三个小说生产 Agent；Coordinator 是第四个产品与调度 Agent。宿主只提供会话、工具和执行环境，不冒充任何 Agent。Novel Engine 是确定性 Python 编排器，负责校验 Coordinator 的调度计划和所有权限门禁。Context Builder 可以读取多个来源，但每次模型调用只接收一个编译后的 Context Packet。
 
-基础流程：书罗盘 → 卷/篇章/章节卡 → Context Packet → Writer 草稿 → Reviewer 审查 → 用户验收 → Memory Keeper 补丁 → SQLite 事务提交。
+基础流程：用户需求 → Coordinator 任务单与调度计划 → 书罗盘/卷/篇章/章节卡 → Context Packet → Writer 草稿 → Reviewer 审查 → 用户验收 → Memory Keeper 补丁 → SQLite 事务提交 → Coordinator 汇总。
+
+- Coordinator 只能从代码定义的工作流模板中选择，不能自行发明工具、权限或 Agent。
+- Agent 间交流必须写入结构化协作消息，绑定任务、章节、版本、Context Packet 和证据；无结构群聊及“讨论认为可以”不能替代新版本审查。
+- 单个任务默认最多两轮方向讨论；仍有歧义或分歧时由 Coordinator 暂停相关分支并向用户提出最小问题。
 
 - 用户只要草稿时，不自动验收或写入正史。
 - 批量草稿逐章执行 Writer → Reviewer → 必要时 Writer 修订 → 重审，但在用户验收前只使用临时连续性账本。
@@ -41,6 +46,8 @@
 - 不覆盖用户的无关改动，不使用破坏性 Git 命令。
 - 默认不进行额外验收或重复检查：修 Bug、微调、新增功能、删除能力和文档修改后，直接说明改动与可见影响。打包命令自身不可跳过的编译步骤可以执行一次，但不得再额外扩展检查，以免浪费时间、模型额度和 Token。
 - 新功能如果改变 Agent 数量/边界、数据库格式、用户可见文件结构、外部付费服务或模型兼容性，必须明确告诉用户。
+- GitHub 只保留运行、构建、安装、宿主接入、许可证和当前必要说明直接需要的文件。临时测试、评测样本、一次性研究记录、旧发布说明、重复架构计划和生成产物不得提交；一次性验证使用临时目录或内联脚本，完成后不留测试文件。
+- 新增说明文档前先合并进 `README.md`、`AGENTS.md` 或现有必要维护指南；没有运行入口、构建引用或当前维护价值的描述/计划文件应删除，避免仓库成为历史材料堆积区。
 
 ## 完成标准
 

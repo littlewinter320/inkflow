@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from difflib import SequenceMatcher
 import json
 import re
@@ -12,11 +13,15 @@ from .config import Settings
 from .context import ContextBuilder
 from .errors import ProjectError, ProviderError, ValidationGateError
 from .project import InkFlowProject
+from .project_lock import project_mutation_locked, project_mutation_locked_sync
 from .prompts import (
     ARC_AUDIT_SYSTEM,
     MEMORY_EVIDENCE_SYSTEM,
     MEMORY_SYSTEM,
     PLANNER_SYSTEM,
+    REVIEW_CLAIM_CHECK_SYSTEM,
+    REVIEW_CORRECTION_SYSTEM,
+    REVIEW_DISPUTE_SYSTEM,
     REVIEWER_SYSTEM,
     REVISER_SYSTEM,
     SELECTION_REVISER_SYSTEM,
@@ -24,6 +29,13 @@ from .prompts import (
 )
 from .provider import JsonModelProvider
 from .render import render_memory_conflict, render_plan, render_review, render_state
+from .review_verifier import (
+    apply_dispute_decisions,
+    apply_semantic_decisions,
+    findings_for_semantic_check,
+    local_nli_decisions,
+    verify_review,
+)
 from .schemas import (
     ArcAuditReport,
     ArcPlan,
@@ -39,6 +51,9 @@ from .schemas import (
     MemoryPatch,
     PlanBundle,
     ReviewFinding,
+    ReviewFindingBatch,
+    ReviewClaimDecision,
+    ReviewClaimDecisionBatch,
     ReviewReport,
     ReviewScoreDimension,
     SelectionRevisionOutput,
@@ -56,6 +71,15 @@ class InkFlowEngine:
         self.provider = provider
         self.settings = settings or Settings.from_env()
 
+    def _context_builder(self, project: InkFlowProject) -> ContextBuilder:
+        return ContextBuilder(
+            project,
+            self.settings.context_soft_tokens,
+            hard_token_limit=self.settings.context_hard_tokens,
+            embedding_model=self.settings.retrieval_embedding_model,
+            reranker_model=self.settings.retrieval_reranker_model,
+        )
+
     def create_project(self, root: str | Path, brief: BookBrief) -> dict[str, Any]:
         project = InkFlowProject.create(root, brief)
         checkpoint = CheckpointService(project).create(
@@ -70,6 +94,7 @@ class InkFlowEngine:
             "next_action": "生成四级规划",
         }
 
+    @project_mutation_locked
     async def generate_plan(self, root: str | Path) -> dict[str, Any]:
         project = InkFlowProject(root)
         trace = TraceRecorder(project.root, "plan", self.settings.trace_level)
@@ -158,6 +183,7 @@ class InkFlowEngine:
             trace.finish(status="failed", summary="四级规划未提交")
             raise
 
+    @project_mutation_locked
     async def preview_next_arc(self, root: str | Path, *, instruction: str = "") -> dict[str, Any]:
         """Create a small, user-visible rationale before committing a new arc plan."""
 
@@ -342,6 +368,7 @@ class InkFlowEngine:
             trace.finish(status="failed", summary="公开判断单未改变规划或正史")
             raise
 
+    @project_mutation_locked
     async def advance_plan(self, root: str | Path, *, instruction: str = "") -> dict[str, Any]:
         """Open the next rolling planning window after the current arc is canon.
 
@@ -592,7 +619,7 @@ class InkFlowEngine:
 
     def build_context(self, root: str | Path, chapter_no: int, task: str | None = None) -> dict[str, Any]:
         project = InkFlowProject(root)
-        packet = ContextBuilder(project, self.settings.context_soft_tokens).build(
+        packet = self._context_builder(project).build(
             chapter_no,
             task or f"按照已批准章节卡创作第 {chapter_no} 章",
         )
@@ -649,6 +676,7 @@ class InkFlowEngine:
             "confirmation": "可一次确认全部，或按章节号提出局部修改。",
         }
 
+    @project_mutation_locked
     async def write_chapter(
         self,
         root: str | Path,
@@ -669,7 +697,7 @@ class InkFlowEngine:
                 f"本章创意镜头软建议：{creative_lens}。只有在不违背正史、章节卡和人物动机时采用；"
                 "它用于改变信息呈现方式，不得凭空增加事件。"
             )
-            packet = ContextBuilder(project, self.settings.context_soft_tokens).build(
+            packet = self._context_builder(project).build(
                 chapter_no, task, mode="draft", provisional_chapters=provisional_chapters
             )
             packet_path = trace.run_dir / "context-packet.md"
@@ -706,6 +734,20 @@ class InkFlowEngine:
             relative = Path("chapters") / f"chapter_{chapter_no:05d}.draft.md"
             atomic_write_text(project.root / relative, chapter_text)
             version = project.db.upsert_draft(chapter_no, chapter_title, relative.as_posix(), chapter_text)
+            project.db.resolve_pending_collaboration(chapter_no=chapter_no, recipient_role="writer")
+            project.db.append_collaboration_message(
+                thread_id=f"chapter-{chapter_no:05d}-v{version}",
+                run_id=trace.run_id,
+                sender_role="writer",
+                recipient_role="reviewer",
+                message_type="handoff",
+                chapter_no=chapter_no,
+                chapter_version=version,
+                context_packet_id=content_hash(packet.to_markdown()),
+                claim=f"第 {chapter_no} 章草稿 v{version} 已完成，等待独立审查。",
+                evidence_refs=[relative.as_posix(), f"plan:chapter:{chapter_no:05d}"],
+                requested_response="按当前版本和 Context Packet 给出带证据审查；不直接修改正文。",
+            )
             trace.record(
                 "draft.write",
                 "completed",
@@ -729,6 +771,7 @@ class InkFlowEngine:
             trace.finish(status="failed", summary="草稿未完成")
             raise
 
+    @project_mutation_locked
     async def review_chapter(
         self,
         root: str | Path,
@@ -767,10 +810,14 @@ class InkFlowEngine:
                     strengths=[],
                     findings=code_findings,
                     scorecard=_build_review_scorecard(code_findings),
+                    source_hash=content_hash(content),
                 )
                 relative = Path("reviews") / f"chapter_{chapter_no:05d}.review.md"
                 atomic_write_text(project.root / relative, render_review(chapter_no, report, metrics))
                 project.db.save_review(chapter_no, int(chapter["version"]), report, relative.as_posix())
+                self._record_review_collaboration(
+                    project, chapter_no, int(chapter["version"]), report, trace.run_id, ""
+                )
                 trace.record(
                     "review.short_circuit",
                     "completed",
@@ -792,11 +839,12 @@ class InkFlowEngine:
                     "next_action": "按审查意见修改章节",
                     "model_skipped": True,
                 }
-            packet = ContextBuilder(project, self.settings.context_soft_tokens).build(
+            packet = self._context_builder(project).build(
                 chapter_no,
                 f"审查第 {chapter_no} 章草稿",
                 mode="review",
                 provisional_chapters=provisional_chapters,
+                protected_input=content,
             )
             user_prompt = (
                 packet.to_markdown()
@@ -815,15 +863,17 @@ class InkFlowEngine:
                 agent_role="reviewer",
             )
             model_report = result.data
-            findings = [
-                *code_findings,
-                *[_enforce_review_severity(item) for item in model_report.findings],
-            ]
-            verdict = model_report.verdict
-            if any(item.severity == "blocking" for item in findings):
-                verdict = "patch" if verdict != "replan" else verdict
-            elif any(item.severity == "major" for item in findings) and verdict == "pass":
-                verdict = "patch"
+            verified, verdict = await self._verify_review_output(
+                project,
+                model_report,
+                content,
+                packet,
+                trace,
+            )
+            findings = [*code_findings, *verified]
+            current = project.db.get_chapter(chapter_no)
+            if not current or current["version"] != chapter["version"] or current["path"] != chapter["path"] or draft_path.read_text(encoding="utf-8") != content:
+                raise ValidationGateError("审查期间正文已变化，请重新审查当前版本。")
             report = ReviewReport(
                 verdict=verdict,
                 confidence=model_report.confidence,
@@ -831,11 +881,20 @@ class InkFlowEngine:
                 strengths=model_report.strengths,
                 findings=findings,
                 scorecard=_build_review_scorecard(findings),
+                source_hash=content_hash(content),
             )
             trace.record_model("review.model", result, f"综合审查结论：{report.verdict}")
             relative = Path("reviews") / f"chapter_{chapter_no:05d}.review.md"
             atomic_write_text(project.root / relative, render_review(chapter_no, report, metrics))
             project.db.save_review(chapter_no, int(chapter["version"]), report, relative.as_posix())
+            self._record_review_collaboration(
+                project,
+                chapter_no,
+                int(chapter["version"]),
+                report,
+                trace.run_id,
+                content_hash(packet.to_markdown()),
+            )
             trace.record("review.write", "completed", "审查报告已写入", metadata={"path": relative.as_posix()})
             trace.finish(summary=f"审查完成：{report.verdict}")
             return {
@@ -856,6 +915,174 @@ class InkFlowEngine:
             trace.finish(status="failed", summary="审查未完成，章节不会放行")
             raise
 
+    async def _verify_review_output(
+        self,
+        project: InkFlowProject,
+        report: ReviewReport,
+        content: str,
+        packet: ContextPacket,
+        trace: TraceRecorder,
+    ) -> tuple[list[ReviewFinding], str]:
+        findings, verdict = verify_review(report, content, packet)
+        mode = self.settings.review_verification_mode
+        if mode in {"assisted", "strict"} and verdict == "unknown":
+            rejected = [
+                item.model_dump(mode="json")
+                for item in findings
+                if item.verification_status == "unsupported"
+                and item.proposed_severity in {"major", "blocking"}
+            ]
+            if rejected:
+                correction = await self.provider.generate_json(
+                    system_prompt=REVIEW_CORRECTION_SYSTEM,
+                    user_prompt=(
+                        "# 当前 Context Packet\n"
+                        + packet.to_markdown()
+                        + "\n\n# 当前正文\n"
+                        + content
+                        + "\n\n# 当前全部审查意见（请保留其中合格条目）\n"
+                        + json_dumps([item.model_dump(mode="json") for item in findings])
+                        + "\n\n# 被程序拒绝的问题\n"
+                        + json_dumps(rejected)
+                    ),
+                    output_model=ReviewFindingBatch,
+                    effort="low",
+                    max_tokens=6_000,
+                    thinking=False,
+                    agent_role="reviewer",
+                )
+                corrected_report = report.model_copy(update={"findings": correction.data.findings})
+                findings, verdict = verify_review(corrected_report, content, packet)
+                trace.record_model(
+                    "review.correction",
+                    correction,
+                    f"Reviewer 完成唯一一次受约束纠错，保留 {len(findings)} 条意见",
+                )
+
+        targets = findings_for_semantic_check(findings)
+        decision_sets: list[list[ReviewClaimDecision]] = []
+        if targets and mode in {"assisted", "strict"}:
+            checked = await self.provider.generate_json(
+                system_prompt=REVIEW_CLAIM_CHECK_SYSTEM,
+                user_prompt=json_dumps({"findings": targets}),
+                output_model=ReviewClaimDecisionBatch,
+                effort="low",
+                max_tokens=min(4_000, max(800, len(targets) * 320)),
+                thinking=False,
+                agent_role="reviewer_verifier",
+            )
+            decision_sets.append(checked.data.decisions)
+            trace.record_model("review.semantic", checked, f"逐条语义核验 {len(targets)} 个硬问题")
+
+        if targets and self.settings.review_local_nli_model:
+            try:
+                local = await asyncio.to_thread(
+                    local_nli_decisions,
+                    self.settings.review_local_nli_model,
+                    findings,
+                )
+                decision_sets.append(local)
+                trace.record(
+                    "review.local_nli",
+                    "completed",
+                    f"本地 NLI 核验 {len(local)} 个硬问题",
+                    metadata={"model": self.settings.review_local_nli_model},
+                )
+            except Exception as exc:
+                trace.record("review.local_nli", "warning", "本地 NLI 不可用，保留其他核验结果", str(exc))
+
+        if decision_sets:
+            merged = _merge_claim_decisions(decision_sets, [item["finding_index"] for item in targets])
+            findings, verdict = apply_semantic_decisions(findings, merged, source="逐条语义核验")
+
+        if mode == "strict" and verdict == "unknown" and self.settings.review_judge_model:
+            disputed = [
+                {
+                    "finding_index": index,
+                    "finding": item.model_dump(mode="json"),
+                }
+                for index, item in enumerate(findings)
+                if item.verification_status == "uncertain"
+            ]
+            if disputed:
+                judged = await self.provider.generate_json(
+                    system_prompt=REVIEW_DISPUTE_SYSTEM,
+                    user_prompt=json_dumps({"disputed_findings": disputed}),
+                    output_model=ReviewClaimDecisionBatch,
+                    effort="low",
+                    max_tokens=min(4_000, max(800, len(disputed) * 320)),
+                    thinking=False,
+                    agent_role="reviewer_judge",
+                    model_override=self.settings.review_judge_model,
+                )
+                findings, verdict = apply_dispute_decisions(
+                    findings,
+                    judged.data.decisions,
+                    source=f"争议裁判 {judged.model}",
+                )
+                trace.record_model("review.dispute_judge", judged, f"裁决 {len(disputed)} 个语义争议")
+        return findings, verdict
+
+    @staticmethod
+    def _record_review_collaboration(
+        project: InkFlowProject,
+        chapter_no: int,
+        chapter_version: int,
+        report: ReviewReport,
+        run_id: str,
+        context_packet_id: str,
+    ) -> None:
+        project.db.resolve_pending_collaboration(chapter_no=chapter_no, recipient_role="reviewer")
+        hard = [item for item in report.findings if item.severity in {"major", "blocking"}]
+        if report.verdict == "pass":
+            recipient, message_type, status = "memory_keeper", "handoff", "pending"
+            claim = f"第 {chapter_no} 章 v{chapter_version} 已通过 Reviewer，可在用户授权后提取正史记忆。"
+            requested = "验收时重新核对版本与正文哈希，只从已接受正文提取 MemoryPatch。"
+        elif report.verdict == "patch":
+            recipient, message_type, status = "writer", "revision_request", "pending"
+            claim = "；".join(item.explanation for item in hard[:6]) or report.summary
+            requested = "仅按已核验证据定点修订；生成新版本后必须重新审查。"
+        else:
+            recipient, message_type, status = "coordinator", "risk", "escalated"
+            claim = report.summary
+            requested = "材料不足或方向存在分歧，请向用户说明缺口，不要自动修改正文。"
+        project.db.append_collaboration_message(
+            thread_id=f"chapter-{chapter_no:05d}-v{chapter_version}",
+            run_id=run_id,
+            sender_role="reviewer",
+            recipient_role=recipient,
+            message_type=message_type,
+            chapter_no=chapter_no,
+            chapter_version=chapter_version,
+            context_packet_id=context_packet_id,
+            claim=claim,
+            evidence_refs=sorted({ref for item in report.findings for ref in item.canon_refs}),
+            requested_response=requested,
+            status=status,
+        )
+        for finding in report.findings:
+            for source_id in finding.canon_refs:
+                project.db.record_retrieval_feedback(
+                    query=f"第 {chapter_no} 章 v{chapter_version} Reviewer 审查",
+                    source_id=source_id,
+                    outcome="misleading" if finding.verification_status == "unsupported" else "cited",
+                    role="reviewer",
+                    chapter_no=chapter_no,
+                    packet_id=context_packet_id or None,
+                )
+        if report.verdict != "pass":
+            project.db.record_learning_event(
+                "rejected",
+                {
+                    "verdict": report.verdict,
+                    "finding_rules": [item.rule_id for item in report.findings if item.rule_id],
+                    "source_hash": report.source_hash,
+                },
+                chapter_no=chapter_no,
+                chapter_version=chapter_version,
+            )
+
+    @project_mutation_locked
     async def revise_chapter(
         self,
         root: str | Path,
@@ -887,8 +1114,12 @@ class InkFlowEngine:
             current_draft = draft_path.read_text(encoding="utf-8")
             review_text = review_path.read_text(encoding="utf-8")
             task = f"修订第 {chapter_no} 章。用户补充：{instruction or '无'}"
-            packet = ContextBuilder(project, self.settings.context_soft_tokens).build(
-                chapter_no, task, mode="revise", provisional_chapters=provisional_chapters
+            packet = self._context_builder(project).build(
+                chapter_no,
+                task,
+                mode="revise",
+                provisional_chapters=provisional_chapters,
+                protected_input=current_draft + "\n" + review_text,
             )
             atomic_write_text(trace.run_dir / "context-packet.md", packet.to_markdown())
             trace.record(
@@ -933,6 +1164,12 @@ class InkFlowEngine:
                 Path(chapter["path"]).as_posix(),
                 chapter_text,
             )
+            project.db.record_learning_event(
+                "revised",
+                {"previous_version": previous_version, "new_version": version, "source": "reviewer_or_user"},
+                chapter_no=chapter_no,
+                chapter_version=version,
+            )
             trace.record(
                 "draft.revise",
                 "completed",
@@ -957,6 +1194,7 @@ class InkFlowEngine:
             trace.finish(status="failed", summary="草稿未修改")
             raise
 
+    @project_mutation_locked
     async def revise_selection(
         self,
         root: str | Path,
@@ -1001,14 +1239,17 @@ class InkFlowEngine:
                 raise ValidationGateError("一次局部修订最多处理 8000 个字符；更长范围请使用整章修订。")
 
             annotation = studio.create_annotation(relative, start_offset, end_offset, instruction.strip())
+            before = current[max(0, start_offset - 1_200) : start_offset]
+            after = current[end_offset : min(len(current), end_offset + 1_200)]
             task = (
                 f"局部修订第 {chapter_no} 章的一处已锁定选区。"
                 f"只处理这条用户意见：{instruction.strip()}"
             )
-            packet = ContextBuilder(project, self.settings.context_soft_tokens).build(
+            packet = self._context_builder(project).build(
                 chapter_no,
                 task,
                 mode="revise",
+                protected_input=before + "\n" + selected + "\n" + after,
             )
             atomic_write_text(trace.run_dir / "context-packet.md", packet.to_markdown())
             trace.record(
@@ -1018,8 +1259,6 @@ class InkFlowEngine:
                 metadata={"relative_path": relative, "selection_characters": len(selected)},
             )
 
-            before = current[max(0, start_offset - 1_200) : start_offset]
-            after = current[end_offset : min(len(current), end_offset + 1_200)]
             user_prompt = (
                 packet.to_markdown()
                 + "\n\n# 选区前文（只读，不得改写）\n\n"
@@ -1062,6 +1301,17 @@ class InkFlowEngine:
                 raise ValidationGateError(str(saved.get("gate") or "局部修订未能写入草稿。"))
             studio.db.set_annotation_status(str(annotation["annotation_id"]), "resolved")
             current_chapter = project.db.get_chapter(chapter_no) or {}
+            project.db.record_learning_event(
+                "revised",
+                {
+                    "previous_hash": current_hash,
+                    "new_hash": str(saved.get("content_hash") or ""),
+                    "source": "user_selection",
+                    "annotation_id": annotation["annotation_id"],
+                },
+                chapter_no=chapter_no,
+                chapter_version=int(current_chapter.get("version") or 0) or None,
+            )
             trace.record(
                 "draft.selection_revise",
                 "completed",
@@ -1091,7 +1341,16 @@ class InkFlowEngine:
             trace.finish(status="failed", summary="原草稿未被局部修订覆盖")
             raise
 
-    async def accept_chapter(self, root: str | Path, chapter_no: int, *, force: bool = False) -> dict[str, Any]:
+    @project_mutation_locked
+    async def accept_chapter(
+        self,
+        root: str | Path,
+        chapter_no: int,
+        *,
+        force: bool = False,
+        _prepared_patch: MemoryPatch | None = None,
+        _provisional_batch_id: str | None = None,
+    ) -> dict[str, Any]:
         project = InkFlowProject(root)
         trace = TraceRecorder(project.root, f"accept-{chapter_no:05d}", self.settings.trace_level)
         try:
@@ -1111,184 +1370,53 @@ class InkFlowEngine:
                 raise ValidationGateError(f"审查结论为 {review.verdict}，需要修改或显式 force 接受。")
             draft_path = project.root / chapter["path"]
             content = draft_path.read_text(encoding="utf-8")
-            conflict_relative = Path("reviews") / f"chapter_{chapter_no:05d}.memory-conflict.md"
-            conflict_path = project.root / conflict_relative
-            current_state = {
-                "facts": project.db.current_facts(),
-                "threads": project.db.open_threads(),
-            }
-            user_prompt = (
-                f"请从第 {chapter_no} 章已接受正文中提取 MemoryPatch JSON。\n\n"
-                f"# 上一正史状态\n{json_dumps(current_state)}\n\n# 已接受正文\n{content}"
-            )
-            result = await self.provider.generate_json(
-                system_prompt=MEMORY_SYSTEM,
-                user_prompt=user_prompt,
-                output_model=MemoryPatch,
-                effort="low",
-                max_tokens=10_000,
-                agent_role="memory_keeper",
-            )
-            patch = result.data
-            trace.record_model(
-                "memory.model",
-                result,
-                f"提取 {len(patch.facts)} 条事实和 {len(patch.threads)} 条线索变化",
-            )
-            if patch.chapter_no != chapter_no:
-                raise ValidationGateError("记忆补丁章节号与当前章节不一致。")
-            patch, aligned_ids = _align_patch_evidence(patch, content)
-            if aligned_ids:
-                trace.record(
-                    "memory.evidence.align",
-                    "completed",
-                    f"本地高置信对齐 {len(aligned_ids)} 条证据",
-                    metadata={"fact_ids": aligned_ids},
+            if review.source_hash and review.source_hash != content_hash(content):
+                raise ValidationGateError("正文与审查时的内容不一致，必须重新审查。")
+            if _prepared_patch is None:
+                patch, conflict_relative, conflict_path = await self._extract_memory_patch(
+                    project,
+                    chapter_no,
+                    content,
+                    trace,
+                    source_status="accepted",
+                    force=force,
                 )
-            unsupported = [fact.fact_id for fact in patch.facts if not _evidence_in_content(fact.evidence, content)]
-            if unsupported:
-                trace.record(
-                    "memory.evidence",
-                    "retrying",
-                    f"有 {len(unsupported)} 条事实证据无法定位，执行一次受约束原文候选选择",
-                    metadata={"fact_ids": unsupported},
-                )
-                candidate_groups = {
-                    fact.fact_id: _build_evidence_candidates(fact, content)
-                    for fact in patch.facts
-                    if fact.fact_id in unsupported
-                }
-                repair_prompt = (
-                    "# 仅待修事实与程序截取的原文候选\n"
-                    + json_dumps(
-                        [
-                            {
-                                "fact": fact.model_dump(mode="json"),
-                                "candidates": candidate_groups[fact.fact_id],
-                            }
-                            for fact in patch.facts
-                            if fact.fact_id in unsupported
-                        ]
-                    )
-                    + "\n\n请为每个 fact_id 只选择一个 candidate_id，或在没有直接支持时 drop。"
-                )
-                repaired = await self.provider.generate_json(
-                    system_prompt=MEMORY_EVIDENCE_SYSTEM,
-                    user_prompt=repair_prompt,
-                    output_model=EvidenceSelectionBatch,
-                    effort="low",
-                    max_tokens=min(2_000, max(800, len(unsupported) * 180)),
-                    thinking=False,
-                    agent_role="memory_keeper",
-                )
-                patch, selected_evidence = _apply_evidence_selections(
-                    patch,
-                    repaired.data,
-                    unsupported,
-                    candidate_groups,
-                )
-                trace.record_model(
-                    "memory.evidence_select",
-                    repaired,
-                    f"受约束选择后保留 {len(patch.facts)} 条事实",
-                )
-                if selected_evidence:
-                    trace.record(
-                        "memory.evidence.selected",
-                        "completed",
-                        f"按候选 ID 写回 {len(selected_evidence)} 段正文原文",
-                        details="\n".join(
-                            f"- `{item['fact_id']}` → `{item['candidate_id']}`：{item['evidence']}"
-                            for item in selected_evidence
-                        ),
-                    )
+            else:
+                patch = _validate_memory_patch_scope(_prepared_patch, chapter_no)
+                patch, aligned_ids = _align_patch_evidence(patch, content)
                 unsupported = [
                     fact.fact_id for fact in patch.facts if not _evidence_in_content(fact.evidence, content)
                 ]
                 if unsupported:
-                    raise ValidationGateError(f"以下事实证据修复后仍无法在正文中定位：{', '.join(unsupported)}")
-            patch, open_questions = _separate_open_questions(patch)
-            if open_questions:
+                    raise ValidationGateError(
+                        f"批次临时记忆已失效，以下证据无法在当前正文定位：{', '.join(unsupported)}"
+                    )
+                if patch.unresolved_conflicts and not force:
+                    raise ValidationGateError("批次临时记忆仍有未解决冲突，不能提升为正史。")
+                conflict_relative = Path("reviews") / f"chapter_{chapter_no:05d}.memory-conflict.md"
+                conflict_path = project.root / conflict_relative
                 trace.record(
-                    "memory.open_questions",
+                    "memory.promote.prepare",
                     "completed",
-                    f"将 {len(open_questions)} 条未知信息识别为开放问题，不作为正史冲突",
-                    details="\n".join(f"- {item}" for item in open_questions),
+                    "复用并校验 Reviewer 通过后生成的批次临时记忆",
+                    metadata={
+                        "batch_id": _provisional_batch_id,
+                        "aligned_fact_ids": aligned_ids,
+                    },
                 )
-            if patch.unresolved_conflicts and not force:
-                trace.record(
-                    "memory.conflict",
-                    "retrying",
-                    f"Memory Keeper 报告 {len(patch.unresolved_conflicts)} 个冲突，执行一次限次自解析",
-                    details="\n".join(f"- {item}" for item in patch.unresolved_conflicts),
-                )
-                conflict_prompt = (
-                    user_prompt
-                    + "\n\n# 上一次候选补丁\n"
-                    + json_dumps(patch.model_dump(mode="json"))
-                    + "\n\n# 冲突自解析要求\n"
-                    + "用户已经表达接受正文，但 SQLite 正史尚未提交。请仅依据上一正史与正文逐字证据，"
-                    + "重新输出完整 MemoryPatch。能由明确原文消解的误报冲突应删除；真正存在两个无法同时成立的版本时必须保留，"
-                    + "不得猜测、补写或替用户选择。每条 fact evidence 仍须是正文连续原文。"
-                )
-                conflict_result = await self.provider.generate_json(
-                    system_prompt=MEMORY_SYSTEM,
-                    user_prompt=conflict_prompt,
-                    output_model=MemoryPatch,
-                    effort="low",
-                    max_tokens=12_000,
-                    agent_role="memory_keeper",
-                )
-                patch = conflict_result.data
-                patch, open_questions = _separate_open_questions(patch)
-                trace.record_model(
-                    "memory.conflict_resolution",
-                    conflict_result,
-                    f"限次自解析后剩余 {len(patch.unresolved_conflicts)} 个冲突",
-                )
-                if open_questions:
-                    trace.record(
-                        "memory.open_questions",
-                        "completed",
-                        f"自解析结果中 {len(open_questions)} 条属于开放问题，不阻塞提交",
-                        details="\n".join(f"- {item}" for item in open_questions),
-                    )
-                if patch.chapter_no != chapter_no:
-                    raise ValidationGateError("冲突自解析后的记忆补丁章节号与当前章节不一致。")
-                unsupported = [
-                    fact.fact_id for fact in patch.facts if not _evidence_in_content(fact.evidence, content)
-                ]
-                if unsupported:
-                    atomic_write_text(conflict_path, render_memory_conflict(chapter_no, patch))
-                    raise ValidationGateError(
-                        "冲突自解析后仍有无法逐字定位的事实证据："
-                        f"{', '.join(unsupported)}。候选补丁：{conflict_path}"
-                    )
-                if patch.unresolved_conflicts:
-                    atomic_write_text(conflict_path, render_memory_conflict(chapter_no, patch))
-                    conflict_text = "；".join(patch.unresolved_conflicts)
-                    trace.record(
-                        "memory.conflict_report",
-                        "failed",
-                        "冲突无法自动消解，已保存用户可见候选补丁",
-                        details=conflict_text,
-                        metadata={"path": conflict_relative.as_posix()},
-                    )
-                    raise ValidationGateError(
-                        f"记忆补丁仍有未解决冲突：{conflict_text}。详情：{conflict_path}"
-                    )
             final_relative = Path("chapters") / f"chapter_{chapter_no:05d}.md"
             final_path = project.root / final_relative
-            if final_path.exists():
-                project.delete_file(final_relative.as_posix(), permanent=False)
-            atomic_write_text(final_path, content)
+            transaction = project.prepare_file_commit(final_relative, content)
             project.db.accept_chapter(
                 chapter_no,
                 str(chapter["title"]),
                 final_relative.as_posix(),
                 content,
                 patch,
+                provisional_batch_id=_provisional_batch_id,
             )
+            project.mark_file_commit_database(transaction)
+            project.finalize_file_commit(transaction)
             if conflict_path.exists():
                 try:
                     project.delete_file(conflict_relative.as_posix(), permanent=False)
@@ -1305,6 +1433,35 @@ class InkFlowEngine:
             atomic_write_text(
                 project.root / "STATE.md",
                 render_state(project.db.current_facts(), project.db.open_threads(), project.db.project_status()),
+            )
+            project.db.resolve_pending_collaboration(chapter_no=chapter_no, recipient_role="memory_keeper")
+            project.db.append_collaboration_message(
+                thread_id=f"chapter-{chapter_no:05d}-v{chapter['version']}",
+                run_id=trace.run_id,
+                sender_role="memory_keeper",
+                recipient_role="coordinator",
+                message_type="memory_sync",
+                chapter_no=chapter_no,
+                chapter_version=int(chapter["version"]),
+                context_packet_id=review.source_hash,
+                claim=f"第 {chapter_no} 章已进入正史，事实与伏笔同步完成。",
+                evidence_refs=[
+                    final_relative.as_posix(),
+                    *[fact.fact_id for fact in patch.facts],
+                    *[thread.thread_id for thread in patch.threads],
+                ],
+                requested_response="向用户汇报正史、事实和伏笔已同步。",
+                status="resolved",
+            )
+            project.db.record_learning_event(
+                "accepted",
+                {
+                    "source_hash": content_hash(content),
+                    "facts": [fact.fact_id for fact in patch.facts],
+                    "threads": [thread.thread_id for thread in patch.threads],
+                },
+                chapter_no=chapter_no,
+                chapter_version=int(chapter["version"]),
             )
             trace.record(
                 "memory.commit",
@@ -1338,6 +1495,200 @@ class InkFlowEngine:
             trace.finish(status="failed", summary="正史未提交")
             raise
 
+    async def _extract_memory_patch(
+        self,
+        project: InkFlowProject,
+        chapter_no: int,
+        content: str,
+        trace: TraceRecorder,
+        *,
+        source_status: str,
+        provisional_patches: list[dict[str, Any]] | None = None,
+        force: bool = False,
+    ) -> tuple[MemoryPatch, Path, Path]:
+        """Extract and validate a patch without changing canonical memory."""
+
+        if source_status not in {"accepted", "provisional"}:
+            raise ValueError(f"不支持的记忆来源状态：{source_status}")
+        conflict_relative = Path("reviews") / f"chapter_{chapter_no:05d}.memory-conflict.md"
+        conflict_path = project.root / conflict_relative
+        current_state = {
+            "canonical_facts": project.db.current_facts(),
+            "canonical_threads": project.db.open_threads(),
+            "earlier_batch_memory": provisional_patches or [],
+        }
+        if source_status == "provisional":
+            source_description = "已经通过 Reviewer、等待用户验收的批次临时正文"
+            state_description = "上一正史与同一批次更早章节的临时记忆"
+        else:
+            source_description = "用户已经接受、即将提交正史的正文"
+            state_description = "上一正史状态"
+        user_prompt = (
+            f"当前来源状态：{source_status}。请从第 {chapter_no} 章{source_description}中提取 MemoryPatch JSON。\n\n"
+            f"# {state_description}\n{json_dumps(current_state)}\n\n# 当前正文\n{content}"
+        )
+        result = await self.provider.generate_json(
+            system_prompt=MEMORY_SYSTEM,
+            user_prompt=user_prompt,
+            output_model=MemoryPatch,
+            effort="low",
+            max_tokens=10_000,
+            agent_role="memory_keeper",
+        )
+        known_facts = list(current_state["canonical_facts"])
+        for staged_patch in current_state["earlier_batch_memory"]:
+            if isinstance(staged_patch, dict):
+                known_facts.extend(staged_patch.get("facts") or [])
+        patch = _validate_memory_patch_scope(result.data, chapter_no, known_facts=known_facts)
+        trace.record_model(
+            "memory.model",
+            result,
+            f"提取 {len(patch.facts)} 条事实和 {len(patch.threads)} 条线索变化",
+        )
+        patch, aligned_ids = _align_patch_evidence(patch, content)
+        if aligned_ids:
+            trace.record(
+                "memory.evidence.align",
+                "completed",
+                f"本地高置信对齐 {len(aligned_ids)} 条证据",
+                metadata={"fact_ids": aligned_ids},
+            )
+        unsupported = [fact.fact_id for fact in patch.facts if not _evidence_in_content(fact.evidence, content)]
+        if unsupported:
+            trace.record(
+                "memory.evidence",
+                "retrying",
+                f"有 {len(unsupported)} 条事实证据无法定位，执行一次受约束原文候选选择",
+                metadata={"fact_ids": unsupported},
+            )
+            candidate_groups = {
+                fact.fact_id: _build_evidence_candidates(fact, content)
+                for fact in patch.facts
+                if fact.fact_id in unsupported
+            }
+            repair_prompt = (
+                "# 仅待修事实与程序截取的原文候选\n"
+                + json_dumps(
+                    [
+                        {
+                            "fact": fact.model_dump(mode="json"),
+                            "candidates": candidate_groups[fact.fact_id],
+                        }
+                        for fact in patch.facts
+                        if fact.fact_id in unsupported
+                    ]
+                )
+                + "\n\n请为每个 fact_id 只选择一个 candidate_id，或在没有直接支持时 drop。"
+            )
+            repaired = await self.provider.generate_json(
+                system_prompt=MEMORY_EVIDENCE_SYSTEM,
+                user_prompt=repair_prompt,
+                output_model=EvidenceSelectionBatch,
+                effort="low",
+                max_tokens=min(2_000, max(800, len(unsupported) * 180)),
+                thinking=False,
+                agent_role="memory_keeper",
+            )
+            patch, selected_evidence = _apply_evidence_selections(
+                patch,
+                repaired.data,
+                unsupported,
+                candidate_groups,
+            )
+            trace.record_model(
+                "memory.evidence_select",
+                repaired,
+                f"受约束选择后保留 {len(patch.facts)} 条事实",
+            )
+            if selected_evidence:
+                trace.record(
+                    "memory.evidence.selected",
+                    "completed",
+                    f"按候选 ID 写回 {len(selected_evidence)} 段正文原文",
+                    details="\n".join(
+                        f"- `{item['fact_id']}` → `{item['candidate_id']}`：{item['evidence']}"
+                        for item in selected_evidence
+                    ),
+                )
+            unsupported = [
+                fact.fact_id for fact in patch.facts if not _evidence_in_content(fact.evidence, content)
+            ]
+            if unsupported:
+                raise ValidationGateError(f"以下事实证据修复后仍无法在正文中定位：{', '.join(unsupported)}")
+        patch, open_questions = _separate_open_questions(patch)
+        if open_questions:
+            trace.record(
+                "memory.open_questions",
+                "completed",
+                f"将 {len(open_questions)} 条未知信息识别为开放问题，不作为正史冲突",
+                details="\n".join(f"- {item}" for item in open_questions),
+            )
+        if patch.unresolved_conflicts and not force:
+            trace.record(
+                "memory.conflict",
+                "retrying",
+                f"Memory Keeper 报告 {len(patch.unresolved_conflicts)} 个冲突，执行一次限次自解析",
+                details="\n".join(f"- {item}" for item in patch.unresolved_conflicts),
+            )
+            conflict_prompt = (
+                user_prompt
+                + "\n\n# 上一次候选补丁\n"
+                + json_dumps(patch.model_dump(mode="json"))
+                + "\n\n# 冲突自解析要求\n"
+                + "SQLite 正史尚未提交。请仅依据上一状态与正文逐字证据，重新输出完整 MemoryPatch。"
+                + "能由明确原文消解的误报冲突应删除；真正存在两个无法同时成立的版本时必须保留，"
+                + "不得猜测、补写或替用户选择。每条 fact evidence 仍须是正文连续原文。"
+            )
+            conflict_result = await self.provider.generate_json(
+                system_prompt=MEMORY_SYSTEM,
+                user_prompt=conflict_prompt,
+                output_model=MemoryPatch,
+                effort="low",
+                max_tokens=12_000,
+                agent_role="memory_keeper",
+            )
+            patch = _validate_memory_patch_scope(
+                conflict_result.data,
+                chapter_no,
+                known_facts=known_facts,
+            )
+            patch, open_questions = _separate_open_questions(patch)
+            trace.record_model(
+                "memory.conflict_resolution",
+                conflict_result,
+                f"限次自解析后剩余 {len(patch.unresolved_conflicts)} 个冲突",
+            )
+            if open_questions:
+                trace.record(
+                    "memory.open_questions",
+                    "completed",
+                    f"自解析结果中 {len(open_questions)} 条属于开放问题，不阻塞提交",
+                    details="\n".join(f"- {item}" for item in open_questions),
+                )
+            unsupported = [
+                fact.fact_id for fact in patch.facts if not _evidence_in_content(fact.evidence, content)
+            ]
+            if unsupported:
+                atomic_write_text(conflict_path, render_memory_conflict(chapter_no, patch))
+                raise ValidationGateError(
+                    "冲突自解析后仍有无法逐字定位的事实证据："
+                    f"{', '.join(unsupported)}。候选补丁：{conflict_path}"
+                )
+            if patch.unresolved_conflicts:
+                atomic_write_text(conflict_path, render_memory_conflict(chapter_no, patch))
+                conflict_text = "；".join(patch.unresolved_conflicts)
+                trace.record(
+                    "memory.conflict_report",
+                    "failed",
+                    "冲突无法自动消解，已保存用户可见候选补丁",
+                    details=conflict_text,
+                    metadata={"path": conflict_relative.as_posix()},
+                )
+                raise ValidationGateError(
+                    f"记忆补丁仍有未解决冲突：{conflict_text}。详情：{conflict_path}"
+                )
+        return patch, conflict_relative, conflict_path
+
     async def balance(self) -> dict[str, Any]:
         getter = getattr(self.provider, "get_balance", None)
         if getter is None:
@@ -1347,6 +1698,7 @@ class InkFlowEngine:
             raise ProviderError("余额结果缺少可验证的 CNY total_balance。")
         return result
 
+    @project_mutation_locked
     async def draft_batch(
         self,
         root: str | Path,
@@ -1429,6 +1781,54 @@ class InkFlowEngine:
                         current = project.db.get_chapter(chapter_no)
                         assert current is not None
                         content = (project.root / current["path"]).read_text(encoding="utf-8")
+                        earlier_memory = [
+                            item["memory_patch"]
+                            for item in provisional
+                            if isinstance(item.get("memory_patch"), dict)
+                        ]
+                        memory_patch, _, _ = await self._extract_memory_patch(
+                            project,
+                            chapter_no,
+                            content,
+                            trace,
+                            source_status="provisional",
+                            provisional_patches=earlier_memory,
+                            force=False,
+                        )
+                        project.db.save_provisional_memory_patch(
+                            batch_id,
+                            chapter_no,
+                            int(current["version"]),
+                            content,
+                            memory_patch,
+                        )
+                        project.db.append_collaboration_message(
+                            thread_id=f"batch-{batch_id}-chapter-{chapter_no:05d}-v{current['version']}",
+                            run_id=trace.run_id,
+                            sender_role="memory_keeper",
+                            recipient_role="coordinator",
+                            message_type="memory_sync",
+                            chapter_no=chapter_no,
+                            chapter_version=int(current["version"]),
+                            context_packet_id=content_hash(content),
+                            claim=f"第 {chapter_no} 章 Reviewer 已通过；临时事实与伏笔已写入批次记忆，但尚非正史。",
+                            evidence_refs=[
+                                *[fact.fact_id for fact in memory_patch.facts],
+                                *[thread.thread_id for thread in memory_patch.threads],
+                            ],
+                            requested_response="后续章节只作为当前批次临时连续性使用；集中验收时再逐章提升。",
+                            status="resolved",
+                        )
+                        trace.record(
+                            "batch.memory.provisional",
+                            "completed",
+                            f"第 {chapter_no} 章临时记忆已同步，供本批次下一章读取",
+                            metadata={
+                                "facts": len(memory_patch.facts),
+                                "threads": len(memory_patch.threads),
+                                "chapter_version": int(current["version"]),
+                            },
+                        )
                         entry = {
                             "chapter_no": chapter_no,
                             "version": int(current["version"]),
@@ -1441,6 +1841,9 @@ class InkFlowEngine:
                             "finding_count": int(reviewed.get("finding_count", 0)),
                             "score_total": reviewed.get("score_total"),
                             "findings": list(reviewed.get("findings") or []),
+                            "memory_status": "provisional",
+                            "memory_facts": len(memory_patch.facts),
+                            "memory_threads": len(memory_patch.threads),
                         }
                         manifest["chapters"].append(entry)
                         provisional.append(
@@ -1448,6 +1851,7 @@ class InkFlowEngine:
                                 "batch_id": batch_id,
                                 "chapter_no": chapter_no,
                                 "content": content,
+                                "memory_patch": memory_patch.model_dump(mode="json"),
                             }
                         )
                         self._save_batch_manifest(project, manifest)
@@ -1492,6 +1896,7 @@ class InkFlowEngine:
             trace.finish(status="failed", summary="批次未提交正史")
             raise
 
+    @project_mutation_locked
     async def repair_batch(
         self,
         root: str | Path,
@@ -1525,9 +1930,13 @@ class InkFlowEngine:
         batch_start = int(manifest["start_chapter_no"])
         batch_end = int(manifest["end_chapter_no"])
         start = start_chapter_no if start_chapter_no is not None else batch_start
-        end = end_chapter_no if end_chapter_no is not None else batch_end
-        if start < batch_start or end > batch_end or end < start:
+        requested_end = end_chapter_no if end_chapter_no is not None else batch_end
+        if start < batch_start or requested_end > batch_end or requested_end < start:
             raise ValidationGateError(f"修复范围必须位于该批次的第 {batch_start}～{batch_end} 章内。")
+        # Once an earlier chapter changes, every later draft was written from
+        # stale continuity.  Rebuild the remaining suffix instead of allowing
+        # stale provisional memory to reach the acceptance gate.
+        end = batch_end
 
         entry_by_chapter = {int(item["chapter_no"]): item for item in entries}
         selected = list(range(start, end + 1))
@@ -1543,6 +1952,8 @@ class InkFlowEngine:
         manifest["last_repair"] = {
             "started_at": utc_now(),
             "chapter_range": [start, end],
+            "requested_chapter_range": [start, requested_end],
+            "range_expanded_for_continuity": requested_end < batch_end,
             "instruction": instruction,
             "max_additional_revision_rounds": max_additional_revision_rounds,
             "trace_id": trace.run_id,
@@ -1561,7 +1972,19 @@ class InkFlowEngine:
             if not current or current["status"] != "draft":
                 continue
             content = (project.root / current["path"]).read_text(encoding="utf-8")
-            provisional.append({"batch_id": batch_id, "chapter_no": chapter_no, "content": content})
+            staged_memory = project.db.get_provisional_memory_patch(batch_id, chapter_no)
+            provisional.append(
+                {
+                    "batch_id": batch_id,
+                    "chapter_no": chapter_no,
+                    "content": content,
+                    **(
+                        {"memory_patch": staged_memory["patch"].model_dump(mode="json")}
+                        if staged_memory and staged_memory["status"] == "active"
+                        else {}
+                    ),
+                }
+            )
 
         try:
             trace.record(
@@ -1577,6 +2000,18 @@ class InkFlowEngine:
                 current = project.db.get_chapter(chapter_no)
                 if not current or current["status"] != "draft":
                     raise ValidationGateError(f"第 {chapter_no} 章已不是可修复的临时草稿。")
+
+                invalidated = project.db.invalidate_provisional_memory_from(
+                    batch_id,
+                    chapter_no,
+                    f"第 {chapter_no} 章开始修订，当前章及后续临时记忆需要重建",
+                )
+                if invalidated:
+                    trace.record(
+                        "batch.memory.invalidate",
+                        "completed",
+                        f"已使第 {chapter_no} 章起的 {invalidated} 份旧临时记忆失效",
+                    )
 
                 review_record = project.db.latest_review_record(chapter_no)
                 if not review_record or review_record["chapter_version"] != int(current["version"]):
@@ -1635,8 +2070,56 @@ class InkFlowEngine:
 
                     if reviewed["verdict"] == "pass":
                         content = (project.root / current["path"]).read_text(encoding="utf-8")
+                        earlier_memory = [
+                            item["memory_patch"]
+                            for item in provisional
+                            if isinstance(item.get("memory_patch"), dict)
+                        ]
+                        memory_patch, _, _ = await self._extract_memory_patch(
+                            project,
+                            chapter_no,
+                            content,
+                            trace,
+                            source_status="provisional",
+                            provisional_patches=earlier_memory,
+                            force=False,
+                        )
+                        project.db.save_provisional_memory_patch(
+                            batch_id,
+                            chapter_no,
+                            int(current["version"]),
+                            content,
+                            memory_patch,
+                        )
+                        project.db.append_collaboration_message(
+                            thread_id=f"batch-{batch_id}-chapter-{chapter_no:05d}-v{current['version']}",
+                            run_id=trace.run_id,
+                            sender_role="memory_keeper",
+                            recipient_role="coordinator",
+                            message_type="memory_sync",
+                            chapter_no=chapter_no,
+                            chapter_version=int(current["version"]),
+                            context_packet_id=content_hash(content),
+                            claim=f"第 {chapter_no} 章修订版已通过；临时事实与伏笔已重新同步，仍未进入正史。",
+                            evidence_refs=[
+                                *[fact.fact_id for fact in memory_patch.facts],
+                                *[thread.thread_id for thread in memory_patch.threads],
+                            ],
+                            requested_response="后续章节使用当前修订版临时记忆；集中验收时再逐章提升。",
+                            status="resolved",
+                        )
+                        entry_by_chapter[chapter_no]["memory_status"] = "provisional"
+                        entry_by_chapter[chapter_no]["memory_facts"] = len(memory_patch.facts)
+                        entry_by_chapter[chapter_no]["memory_threads"] = len(memory_patch.threads)
                         provisional = [item for item in provisional if int(item["chapter_no"]) != chapter_no]
-                        provisional.append({"batch_id": batch_id, "chapter_no": chapter_no, "content": content})
+                        provisional.append(
+                            {
+                                "batch_id": batch_id,
+                                "chapter_no": chapter_no,
+                                "content": content,
+                                "memory_patch": memory_patch.model_dump(mode="json"),
+                            }
+                        )
                         break
                     if reviewed["verdict"] == "patch" and revision_rounds <= max_additional_revision_rounds:
                         continue
@@ -1696,6 +2179,7 @@ class InkFlowEngine:
             "findings": list(reviewed.get("findings") or []),
         }
 
+    @project_mutation_locked
     async def accept_batch(self, root: str | Path, batch_id: str) -> dict[str, Any]:
         """Commit one reviewed provisional batch as a continuous canonical prefix."""
 
@@ -1732,8 +2216,21 @@ class InkFlowEngine:
                     or int(current["version"]) != int(entry["version"])
                 ):
                     raise ValidationGateError(f"第 {chapter_no} 章的通过审查已失效，不能集中接收。")
-                result = await self.accept_chapter(project.root, chapter_no, force=False)
+                staged_memory = project.db.get_provisional_memory_patch(batch_id, chapter_no)
+                prepared_patch = None
+                provisional_batch_id = None
+                if staged_memory and staged_memory["status"] == "active":
+                    prepared_patch = staged_memory["patch"]
+                    provisional_batch_id = batch_id
+                result = await self.accept_chapter(
+                    project.root,
+                    chapter_no,
+                    force=False,
+                    _prepared_patch=prepared_patch,
+                    _provisional_batch_id=provisional_batch_id,
+                )
                 accepted.append(result)
+                entry["memory_status"] = "canon"
                 trace.record(
                     "batch.memory.accept",
                     "completed",
@@ -1755,6 +2252,7 @@ class InkFlowEngine:
             trace.finish(status="failed", summary="未越过当前接收边界")
             raise
 
+    @project_mutation_locked
     async def audit_range(
         self,
         root: str | Path,
@@ -1774,7 +2272,7 @@ class InkFlowEngine:
                 end_chapter_no,
                 batch_id=batch_id,
             )
-            packet = ContextBuilder(project, self.settings.context_soft_tokens).build_arc_audit(
+            packet = self._context_builder(project).build_arc_audit(
                 start_chapter_no,
                 end_chapter_no,
                 provisional_chapters=provisional,
@@ -1800,19 +2298,60 @@ class InkFlowEngine:
                 agent_role="reviewer",
             )
             report = result.data
-            scorecard = _build_review_scorecard(report.deviations)
-            repair_scope = sorted(
-                {
-                    chapter_no
-                    for chapter_no in report.body_repair_scope
-                    if start_chapter_no <= chapter_no <= end_chapter_no
+            audit_content = next(
+                (section.content for section in packet.sections if section.key == "E"),
+                "",
+            )
+            verification_report = ReviewReport(
+                verdict=(
+                    "unknown"
+                    if report.verdict == "unknown"
+                    else "pass"
+                    if report.verdict == "aligned"
+                    else "patch"
+                ),
+                confidence=report.confidence,
+                summary=report.summary,
+                findings=report.deviations,
+            )
+            verified_deviations, verified_verdict = await self._verify_review_output(
+                project,
+                verification_report,
+                audit_content,
+                packet,
+                trace,
+            )
+            if verified_verdict == "unknown":
+                arc_verdict = "unknown"
+            elif any(item.severity in {"major", "blocking"} for item in verified_deviations):
+                arc_verdict = "needs_replan" if report.verdict == "needs_replan" else "blocked"
+            else:
+                arc_verdict = "aligned"
+            report = report.model_copy(
+                update={
+                    "verdict": arc_verdict,
+                    "deviations": verified_deviations,
+                    "source_hash": content_hash(audit_content),
                 }
             )
-            if not repair_scope and any(item.severity in {"major", "blocking"} for item in report.deviations):
+            scorecard = _build_review_scorecard(report.deviations)
+            verified_hard = any(item.severity in {"major", "blocking"} for item in report.deviations)
+            repair_scope = (
+                sorted(
+                    {
+                        chapter_no
+                        for chapter_no in report.body_repair_scope
+                        if start_chapter_no <= chapter_no <= end_chapter_no
+                    }
+                )
+                if verified_hard
+                else []
+            )
+            if not repair_scope and verified_hard:
                 # A conservative fallback for model outputs that identify a major
                 # prose contradiction but omit the new scope field.
                 repair_scope = list(range(start_chapter_no, end_chapter_no + 1))
-            body_repair_recommended = report.body_repair_recommended or bool(repair_scope)
+            body_repair_recommended = verified_hard and (report.body_repair_recommended or bool(repair_scope))
             audit_id = f"audit-{trace.run_id}"
             relative = Path("reviews") / f"arc_audit_{start_chapter_no:05d}_{end_chapter_no:05d}_{trace.run_id}.md"
             visible_path = project.root / relative
@@ -2081,6 +2620,7 @@ class InkFlowEngine:
             chapters.append({"chapter_no": item["chapter_no"], "characters": characters})
         return {"total_characters": total, "chapter_count": len(chapters), "chapters": chapters}
 
+    @project_mutation_locked
     async def continue_until(
         self,
         root: str | Path,
@@ -2266,9 +2806,11 @@ class InkFlowEngine:
         return {
             "project_id": project.project_id,
             "root": str(project.root),
+            "recovery_warnings": project.recovery_warnings,
             **project.db.project_status(),
         }
 
+    @project_mutation_locked_sync
     def checkpoint_create(self, root: str | Path, label: str = "用户手动检查点") -> dict[str, Any]:
         project = InkFlowProject(root)
         return CheckpointService(project).create(label=label, reason="manual")
@@ -2290,6 +2832,7 @@ class InkFlowEngine:
         resolved = service.resolve(checkpoint_id, boundary_chapter)
         return service.preview_restore(resolved)
 
+    @project_mutation_locked_sync
     def rollback_restore(
         self,
         root: str | Path,
@@ -2535,7 +3078,7 @@ def _render_batch_manifest(manifest: dict[str, Any]) -> str:
         f"- 状态：{manifest['status']}",
         f"- 创建时间：{manifest.get('created_at', '未知')}",
         "",
-        "> 本文件是临时批次投影。每章已即时审查，但在用户明确接收前，均不是 SQLite 正史。",
+        "> 本文件是临时批次投影。每章通过审查后会同步临时记忆供后续章节使用；用户明确接收前，正文和记忆均不是 SQLite 正史。",
         "",
         "## 章节结果",
         "",
@@ -2551,6 +3094,18 @@ def _render_batch_manifest(manifest: dict[str, Any]) -> str:
                 f"- 草稿：[{Path(entry['draft_path']).name}](../{entry['draft_path']})",
                 f"- 审查：[{Path(entry['review_path']).name}](../{entry['review_path']})",
                 f"- 版本：v{entry['version']}；自动修订：{entry['revision_rounds']} 轮；即时审查：{entry['verdict']}",
+                *(
+                    [
+                        f"- 临时记忆：已同步；事实 {entry.get('memory_facts', 0)} 条；"
+                        f"线索 {entry.get('memory_threads', 0)} 条。"
+                    ]
+                    if entry.get("memory_status") == "provisional"
+                    else (
+                        ["- 记忆：已随正文提升为正式正史。"]
+                        if entry.get("memory_status") == "canon"
+                        else ["- 临时记忆：尚未同步或需要重建。"]
+                    )
+                ),
                 *(
                     [f"- 评分：{entry['score_total']}/100；问题数：{entry.get('finding_count', 0)}。"]
                     if entry.get("score_total") is not None
@@ -2584,6 +3139,11 @@ def _render_batch_manifest(manifest: dict[str, Any]) -> str:
                 "## 最近一次批次修复",
                 "",
                 f"- 范围：第 {display_range} 章；结果：{repair.get('status', '进行中')}。",
+                *(
+                    ["- 为防止后续章节沿用旧连续性，本次修复范围已自动延伸到批次末章。"]
+                    if repair.get("range_expanded_for_continuity")
+                    else []
+                ),
                 f"- 开始：{repair.get('started_at', '未知')}；结束：{repair.get('finished_at', '进行中')}。",
                 *([f"- 修订方向：{repair['instruction']}"] if repair.get("instruction") else []),
                 "",
@@ -2667,7 +3227,9 @@ def _render_arc_audit(
                 f"### {index}. [{item.severity}] {item.category}",
                 "",
                 f"- 证据：{item.evidence}",
+                f"- 正史引用：{', '.join(item.canon_refs) if item.canon_refs else '无'}",
                 f"- 说明：{item.explanation}",
+                f"- 证据核验：{item.verification_note or '未记录核验结果'}；语义状态：{item.semantic_status}",
                 f"- 建议：{item.repair_instruction}",
                 "",
             ]
@@ -2719,6 +3281,33 @@ _REVIEW_SCORE_RULES: tuple[tuple[str, int, frozenset[str]], ...] = (
 )
 
 _REVIEW_SCORE_DEDUCTIONS = {"info": 0, "minor": 3, "major": 12, "blocking": 25}
+
+
+def _merge_claim_decisions(
+    decision_sets: list[list[ReviewClaimDecision]],
+    expected_indexes: list[int],
+) -> list[ReviewClaimDecision]:
+    """Require every enabled verifier to support a hard finding."""
+
+    merged: list[ReviewClaimDecision] = []
+    for index in expected_indexes:
+        decisions = [next((item for item in group if item.finding_index == index), None) for group in decision_sets]
+        available = [item for item in decisions if item is not None]
+        if len(available) != len(decision_sets) or any(item.verdict == "uncertain" for item in available):
+            verdict = "uncertain"
+        elif any(item.verdict == "contradicted" for item in available):
+            verdict = "contradicted"
+        else:
+            verdict = "supported"
+        merged.append(
+            ReviewClaimDecision(
+                finding_index=index,
+                verdict=verdict,
+                confidence=min((item.confidence for item in available), default=0.0),
+                reason="；".join(item.reason for item in available) or "核验器未返回结果",
+            )
+        )
+    return merged
 
 
 def _build_review_scorecard(findings: list[ReviewFinding]) -> list[ReviewScoreDimension]:
@@ -2912,6 +3501,39 @@ def _evidence_in_content(evidence: str, content: str) -> bool:
 
     normalized_evidence = normalize(evidence)
     return len(normalized_evidence) >= 4 and normalized_evidence in normalize(content)
+
+
+def _validate_memory_patch_scope(
+    patch: MemoryPatch,
+    chapter_no: int,
+    *,
+    known_facts: list[dict[str, Any]] | None = None,
+) -> MemoryPatch:
+    """Lock a model-produced delta to the current chapter and stable identities."""
+
+    if patch.chapter_no != chapter_no:
+        raise ValidationGateError("记忆补丁章节号与当前章节不一致。")
+    identities: dict[str, tuple[str, str]] = {}
+    for item in known_facts or []:
+        fact_id = str(item.get("fact_id") or "")
+        if fact_id:
+            identities[fact_id] = (str(item.get("subject") or ""), str(item.get("predicate") or ""))
+    seen_relations: set[tuple[str, str]] = set()
+    normalized_facts: list[FactMutation] = []
+    for fact in patch.facts:
+        relation = (fact.subject, fact.predicate)
+        if relation in seen_relations:
+            raise ValidationGateError(
+                f"记忆补丁重复修改同一关系：{fact.subject}/{fact.predicate}。"
+            )
+        seen_relations.add(relation)
+        known_identity = identities.get(fact.fact_id)
+        if known_identity and known_identity != relation:
+            raise ValidationGateError(
+                f"fact_id {fact.fact_id} 已属于其他主体关系，不能覆盖。"
+            )
+        normalized_facts.append(fact.model_copy(update={"valid_from_chapter": chapter_no}))
+    return patch.model_copy(update={"facts": normalized_facts})
 
 
 def _align_patch_evidence(patch: MemoryPatch, content: str) -> tuple[MemoryPatch, list[str]]:

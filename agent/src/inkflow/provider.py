@@ -39,6 +39,7 @@ class JsonModelProvider(Protocol):
         thinking: bool = True,
         timeout_seconds: float | None = None,
         agent_role: str | None = None,
+        model_override: str | None = None,
     ) -> ProviderResult[T]: ...
 
 
@@ -89,6 +90,7 @@ class DeepSeekProvider:
         thinking: bool = True,
         timeout_seconds: float | None = None,
         agent_role: str | None = None,
+        model_override: str | None = None,
     ) -> ProviderResult[T]:
         api_key = self.settings.require_api_key()
         schema = output_model.model_json_schema()
@@ -101,7 +103,7 @@ class DeepSeekProvider:
         )
         requested_max_tokens = min(max(1, int(max_tokens)), self.settings.max_output_tokens)
         payload: dict[str, Any] = {
-            "model": self.settings.model,
+            "model": model_override or self.settings.model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_prompt},
@@ -165,7 +167,7 @@ class DeepSeekProvider:
                 result = _model_from_json_content(content, output_model)
                 return ProviderResult(
                     data=result,
-                    model=str(body.get("model") or self.settings.model),
+                    model=str(body.get("model") or model_override or self.settings.model),
                     response_id=body.get("id"),
                     reasoning_content=message.get("reasoning_content"),
                     usage=dict(body.get("usage") or {}),
@@ -276,6 +278,7 @@ class ScriptedProvider:
         thinking: bool = True,
         timeout_seconds: float | None = None,
         agent_role: str | None = None,
+        model_override: str | None = None,
     ) -> ProviderResult[T]:
         if not self.responses:
             raise ProviderError("ScriptedProvider 没有剩余响应。")
@@ -289,6 +292,7 @@ class ScriptedProvider:
                 "thinking": thinking,
                 "timeout_seconds": timeout_seconds,
                 "agent_role": agent_role,
+                "model_override": model_override,
             }
         )
         value = self.responses.pop(0)

@@ -12,6 +12,7 @@ from typing import Any, Iterator
 
 from .errors import ProjectError, ValidationGateError
 from .project import InkFlowProject
+from .project_lock import project_write_lock_sync
 from .utils import atomic_write_text, content_hash, json_dumps, utc_now
 
 
@@ -70,6 +71,20 @@ CREATE TABLE IF NOT EXISTS scene_notes (
     updated_at TEXT NOT NULL,
     PRIMARY KEY(chapter_no, scene_no)
 );
+
+CREATE TABLE IF NOT EXISTS context_pins (
+    pin_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    chapter_no INTEGER,
+    note TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(source_id, chapter_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_pins_active
+ON context_pins(status, chapter_no, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS task_runs (
     run_id TEXT PRIMARY KEY,
@@ -387,6 +402,66 @@ class StudioDatabase:
             for row in rows
         ]
 
+    def set_context_pin(
+        self,
+        source_id: str,
+        *,
+        chapter_no: int | None = None,
+        note: str = "",
+        pinned: bool = True,
+    ) -> dict[str, Any]:
+        """Lock at most six non-canon work sources for intentional compression."""
+
+        clean_source = source_id.strip()
+        if not clean_source:
+            raise ValidationGateError("要锁定的上下文资料不能为空。")
+        now = utc_now()
+        with self.connect() as connection:
+            is_scene_note = bool(re.fullmatch(r"scene-note:\d+:\d+", clean_source))
+            is_bible_entry = connection.execute(
+                "SELECT 1 FROM bible_entries WHERE entry_id=? AND status='active'",
+                (clean_source,),
+            ).fetchone()
+            if not is_scene_note and not is_bible_entry:
+                raise ValidationGateError("只能锁定当前的场景笔记或人工故事圣经；正史和模型输入本来就受保护。")
+            existing = connection.execute(
+                "SELECT pin_id FROM context_pins WHERE source_id=? AND chapter_no IS ?",
+                (clean_source, chapter_no),
+            ).fetchone()
+            if pinned and not existing:
+                count = connection.execute(
+                    "SELECT COUNT(*) AS amount FROM context_pins WHERE status='active' AND (chapter_no IS NULL OR chapter_no=?)",
+                    (chapter_no,),
+                ).fetchone()
+                if int(count["amount"]) >= 6:
+                    raise ValidationGateError("最多同时锁定 6 条工作资料；请先解除不再需要的锁定。")
+            pin_id = str(existing["pin_id"]) if existing else f"context-pin-{uuid.uuid4().hex}"
+            clean_note = note.strip()[:500]
+            connection.execute(
+                """
+                INSERT INTO context_pins(pin_id,source_id,chapter_no,note,status,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(source_id,chapter_no) DO UPDATE SET
+                    note=excluded.note,status=excluded.status,updated_at=excluded.updated_at
+                """,
+                (pin_id, clean_source, chapter_no, clean_note, "active" if pinned else "released", now, now),
+            )
+            connection.commit()
+        return {"pin_id": pin_id, "source_id": clean_source, "chapter_no": chapter_no, "note": clean_note, "status": "active" if pinned else "released"}
+
+    def list_context_pins(self, chapter_no: int | None = None) -> list[dict[str, Any]]:
+        clauses = ["status='active'"]
+        params: list[Any] = []
+        if chapter_no is not None:
+            clauses.append("(chapter_no IS NULL OR chapter_no=?)")
+            params.append(chapter_no)
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM context_pins WHERE " + " AND ".join(clauses) + " ORDER BY updated_at DESC",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def start_task(
         self,
         run_id: str,
@@ -579,6 +654,7 @@ class StudioService:
         return {
             "project_id": self.project.project_id,
             "root": str(self.project.root),
+            "recovery_warnings": self.project.recovery_warnings,
             "brief": brief.model_dump(mode="json"),
             "status": self.project.db.project_status(),
             "current_plan": (
@@ -680,6 +756,22 @@ class StudioService:
         expected_hash: str | None,
         source: str = "desktop_manual",
     ) -> dict[str, Any]:
+        with project_write_lock_sync(self.project.root):
+            return self._save_document_unlocked(
+                relative_path,
+                content,
+                expected_hash=expected_hash,
+                source=source,
+            )
+
+    def _save_document_unlocked(
+        self,
+        relative_path: str,
+        content: str,
+        *,
+        expected_hash: str | None,
+        source: str = "desktop_manual",
+    ) -> dict[str, Any]:
         relative = relative_path.replace("\\", "/")
         path = self.project.resolve_user_path(relative)
         old_content = path.read_text(encoding="utf-8") if path.is_file() else ""
@@ -730,6 +822,16 @@ class StudioService:
         end_offset: int,
         comment: str,
     ) -> dict[str, Any]:
+        with project_write_lock_sync(self.project.root):
+            return self._create_annotation_unlocked(relative_path, start_offset, end_offset, comment)
+
+    def _create_annotation_unlocked(
+        self,
+        relative_path: str,
+        start_offset: int,
+        end_offset: int,
+        comment: str,
+    ) -> dict[str, Any]:
         relative = relative_path.replace("\\", "/")
         path = self.project.resolve_user_path(relative)
         if not path.is_file():
@@ -750,6 +852,18 @@ class StudioService:
             quote=quote,
             comment=comment.strip(),
         )
+
+    def set_annotation_status(self, annotation_id: str, status: str) -> dict[str, Any]:
+        with project_write_lock_sync(self.project.root):
+            return self.db.set_annotation_status(annotation_id, status)
+
+    def upsert_scene_note(self, chapter_no: int, scene_no: int, data: dict[str, Any]) -> dict[str, Any]:
+        with project_write_lock_sync(self.project.root):
+            return self.db.upsert_scene_note(chapter_no, scene_no, data)
+
+    def upsert_bible_entry(self, **kwargs: Any) -> dict[str, Any]:
+        with project_write_lock_sync(self.project.root):
+            return self.db.upsert_bible_entry(**kwargs)
 
     def search(self, query: str, limit: int = 100) -> dict[str, Any]:
         needle = query.strip()

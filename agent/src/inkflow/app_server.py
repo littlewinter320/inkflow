@@ -17,6 +17,7 @@ from .config import Settings, api_key_status, save_api_key_to_keyring, save_user
 from .engine import InkFlowEngine
 from .errors import InkFlowError, ProviderError
 from .project import InkFlowProject
+from .project_lock import project_write_lock, project_write_lock_sync
 from .provider import DeepSeekProvider
 from .references import ReferenceService
 from .schemas import BookBrief, NovelIdeaBundle, PromptOptimization, ProviderProbe
@@ -43,7 +44,9 @@ class InkFlowAppService:
                     "desktop": True,
                     "mcp": True,
                     "vscode": True,
-                    "formal_agents": ["Writer", "Reviewer", "Memory Keeper"],
+                    "agents": ["Coordinator", "Writer", "Reviewer", "Memory Keeper"],
+                    "formal_agents": ["Coordinator", "Writer", "Reviewer", "Memory Keeper"],
+                    "novel_production_agents": ["Writer", "Reviewer", "Memory Keeper"],
                     "raw_chain_of_thought": False,
                 },
                 "provider": api_key_status(),
@@ -60,6 +63,12 @@ class InkFlowAppService:
                 "max_output_tokens": settings.max_output_tokens,
                 "inquiry_frequency": settings.inquiry_frequency,
                 "agent_generation": settings.agent_generation,
+                "review_verification_mode": settings.review_verification_mode,
+                "review_local_nli_model": settings.review_local_nli_model,
+                "review_judge_model": settings.review_judge_model,
+                "retrieval_embedding_model": settings.retrieval_embedding_model,
+                "retrieval_reranker_model": settings.retrieval_reranker_model,
+                "powershell_enabled": settings.powershell_enabled,
             }
         if method == "provider.configure":
             key = str(params.get("api_key", "")).strip()
@@ -76,8 +85,24 @@ class InkFlowAppService:
                     "max_output_tokens",
                     "inquiry_frequency",
                     "agent_generation",
+                    "review_verification_mode",
+                    "review_local_nli_model",
+                    "review_judge_model",
+                    "retrieval_embedding_model",
+                    "retrieval_reranker_model",
+                    "powershell_enabled",
                 )
-                if name in params and params[name] not in (None, "")
+                if name in params
+                and (
+                    name in {
+                        "review_local_nli_model",
+                        "review_judge_model",
+                        "retrieval_embedding_model",
+                        "retrieval_reranker_model",
+                        "powershell_enabled",
+                    }
+                    or params[name] not in (None, "")
+                )
             }
             if allowed:
                 save_user_settings(allowed)
@@ -252,12 +277,52 @@ class InkFlowAppService:
         studio = StudioService(project)
 
         if method == "project.open":
-            studio.db.reconcile_interrupted_tasks(self.instance_id)
-            return {"dashboard": studio.dashboard(), "tree": studio.tree()}
+            with project_write_lock_sync(project.root):
+                studio.db.reconcile_interrupted_tasks(self.instance_id)
+            return {
+                "dashboard": studio.dashboard(),
+                "tree": studio.tree(),
+                "canon_migration": project.canonical_content_migration_status(),
+            }
+        if method == "project.canon_migration.status":
+            return project.canonical_content_migration_status()
+        if method == "project.canon_migration.apply":
+            return project.apply_canonical_content_migration(str(params.get("confirmation_token") or ""))
         if method == "conversation.history":
             return {"entries": TerminalSession.history(project.root, int(params.get("limit", 100)))}
         if method == "project.status":
             return studio.dashboard()
+        if method == "context.status":
+            settings = Settings.from_env(project.root)
+            status_path = project.internal / "context-status.json"
+            if status_path.is_file():
+                try:
+                    return json.loads(status_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    pass
+            return {
+                "status": "idle",
+                "estimated_tokens": 0,
+                "before_compression_tokens": 0,
+                "soft_limit_tokens": settings.context_soft_tokens,
+                "hard_limit_tokens": settings.context_hard_tokens,
+                "hard_usage_percent": 0,
+                "compression_applied": False,
+                "hard_sections": [],
+                "compressible_sections": [],
+                "warnings": [],
+            }
+        if method == "context.pins.list":
+            chapter_no = int(params["chapter_no"]) if params.get("chapter_no") is not None else None
+            return {"pins": studio.db.list_context_pins(chapter_no)}
+        if method == "context.pins.set":
+            with project_write_lock_sync(project.root):
+                return studio.db.set_context_pin(
+                    str(params.get("source_id") or ""),
+                    chapter_no=int(params["chapter_no"]) if params.get("chapter_no") is not None else None,
+                    note=str(params.get("note") or ""),
+                    pinned=bool(params.get("pinned", True)),
+                )
         if method == "project.tree":
             return studio.tree()
         if method == "document.read":
@@ -291,13 +356,13 @@ class InkFlowAppService:
             await emit({"type": "writer.completed", "summary": "选区已生成新草稿版本，等待重新审查"})
             return result
         if method == "annotation.update":
-            return studio.db.set_annotation_status(str(params["annotation_id"]), str(params["status"]))
+            return studio.set_annotation_status(str(params["annotation_id"]), str(params["status"]))
         if method == "document.search":
             return studio.search(str(params["query"]), int(params.get("limit", 100)))
         if method == "chapter.workspace":
             return studio.chapter_workspace(int(params["chapter_no"]))
         if method == "scene_note.upsert":
-            return studio.db.upsert_scene_note(
+            return studio.upsert_scene_note(
                 int(params["chapter_no"]), int(params["scene_no"]), dict(params.get("data") or {})
             )
         if method == "bible.list":
@@ -307,13 +372,53 @@ class InkFlowAppService:
                 "open_threads": project.db.open_threads(),
             }
         if method == "bible.upsert":
-            return studio.db.upsert_bible_entry(
+            return studio.upsert_bible_entry(
                 entry_id=params.get("entry_id"),
                 kind=str(params["kind"]),
                 name=str(params["name"]),
                 aliases=list(params.get("aliases") or []),
                 data=dict(params.get("data") or {}),
             )
+        if method == "preference.list":
+            return {"preferences": project.db.list_preferences()}
+        if method == "preference.upsert":
+            with project_write_lock_sync(project.root):
+                item = project.db.upsert_preference(
+                    preference_id=params.get("preference_id"),
+                    text=str(params["text"]),
+                    strength=str(params.get("strength") or "weak"),
+                    scope=str(params.get("scope") or "project"),
+                    source="user",
+                )
+                project.db.record_learning_event("preference_changed", item)
+                return item
+        if method == "collaboration.list":
+            return {
+                "messages": project.db.list_collaboration_messages(
+                    chapter_no=int(params["chapter_no"]) if params.get("chapter_no") is not None else None,
+                    active_only=bool(params.get("active_only", False)),
+                    limit=int(params.get("limit", 50)),
+                )
+            }
+        if method == "collaboration.overview":
+            return {
+                "messages": project.db.list_collaboration_messages(active_only=False, limit=int(params.get("limit", 80))),
+                "tasks": studio.db.list_tasks(int(params.get("task_limit", 30))),
+                "batches": _list_batch_summaries(project),
+                "learning_events": project.db.list_learning_events(int(params.get("learning_limit", 12))),
+            }
+        if method == "retrieval.feedback":
+            with project_write_lock_sync(project.root):
+                return {
+                    "feedback_id": project.db.record_retrieval_feedback(
+                        query=str(params["query"]),
+                        source_id=str(params["source_id"]),
+                        outcome=str(params["outcome"]),
+                        role=str(params.get("role") or "coordinator"),
+                        chapter_no=int(params["chapter_no"]) if params.get("chapter_no") is not None else None,
+                        packet_id=str(params.get("packet_id") or "") or None,
+                    )
+                }
         if method == "conversation.send":
             message = str(params.get("message") or "").strip()
             if not message:
@@ -327,7 +432,8 @@ class InkFlowAppService:
         if method == "workflow.run":
             return await self._run_workflow(project, params, emit)
         if method == "reference.import":
-            return ReferenceService(project).import_text(str(params["source_path"]))
+            with project_write_lock_sync(project.root):
+                return ReferenceService(project).import_text(str(params["source_path"]))
         if method == "reference.list":
             return ReferenceService(project).list_references()
         if method == "reference.search":
@@ -338,15 +444,18 @@ class InkFlowAppService:
             )
         if method == "reference.fetch":
             url = str(params["url"])
-            if "fanqienovel.com" in url:
-                return await ReferenceService(project).fetch_fanqie_public(url)
-            return await ReferenceService(project).fetch_url(url)
+            async with project_write_lock(project.root):
+                if "fanqienovel.com" in url:
+                    return await ReferenceService(project).fetch_fanqie_public(url)
+                return await ReferenceService(project).fetch_url(url)
         if method == "reference.analyze":
-            return ReferenceService(project).analyze(str(params["reference_id"]))
+            with project_write_lock_sync(project.root):
+                return ReferenceService(project).analyze(str(params["reference_id"]))
         if method == "task.list":
             return {"tasks": studio.db.list_tasks(int(params.get("limit", 50)))}
         if method == "task.dismiss":
-            return studio.db.finish_task(str(params["task_id"]), status="dismissed")
+            with project_write_lock_sync(project.root):
+                return studio.db.finish_task(str(params["task_id"]), status="dismissed")
         if method == "task.retry":
             task = studio.db.get_task(str(params["task_id"]))
             if not task["retryable"]:
@@ -399,6 +508,8 @@ class InkFlowAppService:
                 instruction=str(params.get("instruction") or ""),
                 max_revision_rounds=int(params.get("max_revision_rounds", 2)),
             )
+        elif action == "batch_accept":
+            result = await engine.accept_batch(project.root, str(params["batch_id"]))
         elif action == "arc_audit":
             result = await engine.audit_range(
                 project.root,
@@ -620,6 +731,43 @@ def _visible_result_summary(result: Any) -> str:
                 if nested.get(key):
                     return str(nested[key])[:300]
     return "工作流返回了可查看结果。"
+
+
+def _list_batch_summaries(project: InkFlowProject) -> list[dict[str, Any]]:
+    """Read visible batch state for the desktop board; malformed files stay invisible."""
+
+    folder = project.internal / "batches"
+    if not folder.is_dir():
+        return []
+    result: list[dict[str, Any]] = []
+    for path in sorted(folder.glob("batch-*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:30]:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict) or not value.get("batch_id"):
+                continue
+            entries = value.get("chapters") if isinstance(value.get("chapters"), list) else []
+            result.append(
+                {
+                    "batch_id": str(value["batch_id"]),
+                    "status": str(value.get("status") or "unknown"),
+                    "start_chapter_no": value.get("start_chapter_no"),
+                    "end_chapter_no": value.get("end_chapter_no"),
+                    "chapters": [
+                        {
+                            "chapter_no": item.get("chapter_no"),
+                            "version": item.get("version"),
+                            "review_verdict": item.get("verdict"),
+                            "memory_status": item.get("memory_status"),
+                        }
+                        for item in entries
+                        if isinstance(item, dict)
+                    ],
+                    "updated_at": value.get("updated_at") or value.get("accepted_at") or "",
+                }
+            )
+        except (OSError, json.JSONDecodeError):
+            continue
+    return result
 
 
 def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:

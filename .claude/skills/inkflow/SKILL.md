@@ -3,9 +3,9 @@ name: inkflow
 description: Use the InkFlow MCP server to plan, write, review, and commit long-form Chinese web fiction.
 ---
 
-# 墨流工作流
+# 墨流四 Agent 工作流
 
-先读取项目的 `BOOK.md`、`PLAN.md`、`STATE.md`，但不要遍历 `.inkflow`。通过 MCP 完成正式状态变更：
+先读取项目的 `BOOK.md`、`PLAN.md`、`STATE.md`，但不要遍历 `.inkflow`。把用户需求交给 Coordinator 理解和调度，再通过 MCP 完成正式状态变更：
 
 1. 没有项目时调用 `novel_project_create`。
 2. 没有四级规划时调用 `novel_plan_generate`。

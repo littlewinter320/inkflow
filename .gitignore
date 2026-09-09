@@ -19,6 +19,16 @@ knowledge/
 .DS_Store
 Thumbs.db
 
+# Keep GitHub focused on runtime/build/install files and current essential guidance.
+agent/tests/
+agent/evals/
+development/docs/research/
+development/docs/*_REFERENCES.md
+development/docs/*_RELEASE_NOTES.md
+development/docs/architecture*.md
+*_PLAN.md
+*_DESIGN.md
+
 # InkFlow project runtime data
 **/.inkflow/inkflow.db*
 **/.inkflow/studio.db*
@@ -27,3 +37,5 @@ Thumbs.db
 **/.inkflow/index/
 **/.inkflow/runs/
 **/.inkflow/trash/
+**/.inkflow/transactions/
+**/.inkflow/context-status.json

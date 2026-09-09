@@ -8,18 +8,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .coordinator import Coordinator
 from .engine import InkFlowEngine
 from .errors import InkFlowError
 from .project import InkFlowProject
+from .project_lock import project_write_lock_sync
 from .schemas import ContextPacket, ContextSection, TerminalIntent
 from .trace import TraceRecorder
-from .utils import atomic_write_text, estimate_tokens, json_dumps
+from .utils import atomic_write_text, content_hash, estimate_tokens, json_dumps
 
 
 TERMINAL_ROUTER_SYSTEM = """
-你是“墨流（InkFlow）终端会话”的受限路由器，不是 Writer、Reviewer 或 Memory Keeper。
+你是墨流的第四个 AI Agent：Coordinator（AI 产品经理与协作管家）。你不是 Writer、Reviewer 或 Memory Keeper。
 
-你的唯一工作是把用户的一条自然语言请求映射到一个已存在、不可跳过门禁的工作流。你绝不能：
+你的工作是理解和维护用户需求、把自然语言整理成任务单，并映射到一个已存在、不可跳过门禁的工作流。你绝不能：
 - 写小说正文、续写任何段落、生成审查意见或记忆事实；
 - 修改文件、数据库、计划、章节状态或调用工具；
 - 选择 force、绕过审查、绕过 Memory Keeper，或把“直接通过/别审查”解释成许可；
@@ -54,6 +56,8 @@ TERMINAL_ROUTER_SYSTEM = """
 - accept：只尝试接受现有、同版本、已经 pass 的草稿；force 永远为 false。
 - help：用户在询问如何使用。
 - exit：用户明确结束会话。
+
+多方案与第二意见规则：用户要求多个 Writer 或多个 Reviewer 时，不能增加正式 Agent、不能让多个角色自由改同一篇正文。将“多个 Writer”理解为同一 Writer 在同一 Context Packet 和硬约束下产出互不重叠的候选方向、章节卡或局部替换提案，等待用户选择后再进入单一正式草稿；将“多个 Reviewer”理解为对同一正文哈希的独立证据意见，任何分歧必须以结构化异议交给 Coordinator 汇总。若当前工作流没有相应的候选/复审入口，action=discuss，说明需要先确定范围与选择标准，不得假装已并行执行。
 
 章节工作流 action 必须给出 chapter_no。若用户未明确章节号且不能从其文字可靠确定，仍返回最接近的 action，chapter_no 设为 null；宿主会安全地要求补充，不可猜测。
 operation_instruction 用简洁中文保留用户对正文的硬约束，但不写正文；visible_reason 只给可展示的、简短的路由理由，不泄露逐步思考。
@@ -177,9 +181,11 @@ class TerminalSession:
                 effort="low",
                 max_tokens=900,
                 thinking=False,
+                agent_role="coordinator",
             )
             raw_intent = route_result.data
             intent, routing_response = self._resolve_intent(project, text, raw_intent)
+            ticket, dispatch_plan = Coordinator(project).compile(intent)
             trace.record(
                 "session.route",
                 "completed",
@@ -197,6 +203,24 @@ class TerminalSession:
                     "usage": route_result.usage,
                 },
             )
+            if intent.authorization == "approved" and dispatch_plan.steps:
+                with project_write_lock_sync(project.root):
+                    for step in dispatch_plan.steps:
+                        if step.role == "engine":
+                            continue
+                        project.db.append_collaboration_message(
+                            thread_id=ticket.ticket_id,
+                            run_id=trace.run_id,
+                            sender_role="coordinator",
+                            recipient_role=step.role,
+                            message_type="task_assignment",
+                            chapter_no=ticket.chapter_no,
+                            chapter_version=ticket.chapter_version,
+                            context_packet_id=content_hash(packet.to_markdown()),
+                            claim=ticket.objective,
+                            evidence_refs=ticket.input_sources,
+                            requested_response=step.required_output,
+                        )
             if routing_response is not None:
                 response = routing_response
             elif intent.action == "discuss":
@@ -213,6 +237,24 @@ class TerminalSession:
                     )
             else:
                 response = await self._dispatch(project.root, intent)
+            if intent.authorization == "approved" and dispatch_plan.steps:
+                with project_write_lock_sync(project.root):
+                    project.db.resolve_collaboration_thread(ticket.ticket_id)
+                    if response.get("gate") or response.get("needs_clarification"):
+                        project.db.append_collaboration_message(
+                            thread_id=ticket.ticket_id,
+                            run_id=trace.run_id,
+                            sender_role="coordinator",
+                            recipient_role="user",
+                            message_type="risk",
+                            chapter_no=ticket.chapter_no,
+                            chapter_version=ticket.chapter_version,
+                            context_packet_id=content_hash(packet.to_markdown()),
+                            claim=str(response.get("gate") or "任务仍需要用户补充信息。"),
+                            evidence_refs=ticket.input_sources,
+                            requested_response="请补充阻塞信息或确认新的处理方向。",
+                            status="escalated",
+                        )
             self._append_dialogue(project, text, intent, response)
             trace.record("session.dispatch", "completed", "受限工作流已返回结果")
             trace.finish(summary="终端自然语言请求处理完成")
@@ -225,6 +267,9 @@ class TerminalSession:
                     "authorization": intent.authorization,
                     "chapter_no": intent.chapter_no,
                     "visible_reason": intent.visible_reason,
+                    "task_ticket": ticket.model_dump(mode="json"),
+                    "dispatch_plan": dispatch_plan.model_dump(mode="json"),
+                    "role_capabilities": Coordinator.capabilities(),
                     "trace_id": trace.run_id,
                     "trace_path": str(trace.trace_path),
                 },
@@ -733,7 +778,7 @@ class TerminalSession:
         parsed: list[dict[str, str]] = []
         for index, entry in enumerate(raw_entries[-max(1, min(limit, 500)) :]):
             match = re.match(
-                r"## 用户\n\n(?P<user>.*?)\n\n## 墨流会话主控\n\n(?P<assistant>.*?)(?:\n\n> (?P<note>.*))?$",
+                r"## 用户\n\n(?P<user>.*?)\n\n## (?:Coordinator|墨流会话主控)\n\n(?P<assistant>.*?)(?:\n\n> (?P<note>.*))?$",
                 entry,
                 flags=re.DOTALL,
             )
@@ -790,7 +835,7 @@ class TerminalSession:
         previous = self._recent_dialogue(project, limit=100)
         recorded_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         entry = (
-            f"## 用户\n\n{user_message}\n\n## 墨流会话主控\n\n{reply}"
+            f"## 用户\n\n{user_message}\n\n## Coordinator\n\n{reply}"
             f"\n\n> 记录时间：{recorded_at} · {action_note}"
         )
         entries = [item for item in (previous.split("\n\n---\n\n") if previous else []) if item.strip()]

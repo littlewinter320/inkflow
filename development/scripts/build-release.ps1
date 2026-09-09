@@ -24,7 +24,7 @@ if (-not (Test-Path -LiteralPath $python)) {
     throw 'Missing .venv. Create the Python virtual environment in the repository root first.'
 }
 
-& $python -m pip install -e "${agentRoot}[dev,build]"
+& $python -m pip install -e "${agentRoot}[build]"
 if ($LASTEXITCODE -ne 0) {
     throw "Python dependency installation failed with exit code $LASTEXITCODE."
 }

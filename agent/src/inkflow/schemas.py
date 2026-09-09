@@ -319,6 +319,14 @@ class ReviewFinding(StrictModel):
     canon_refs: list[str] = Field(default_factory=list)
     explanation: str
     repair_instruction: str
+    rule_id: str = ""
+    reference_evidence: str = ""
+    verification_note: str = ""
+    claim: str = ""
+    verification_status: Literal["unchecked", "anchored", "unsupported", "uncertain"] = "unchecked"
+    semantic_status: Literal["unchecked", "supported", "contradicted", "uncertain"] = "unchecked"
+    verification_confidence: float = Field(default=0.0, ge=0, le=1)
+    proposed_severity: Literal["info", "minor", "major", "blocking"] | None = None
 
 
 ReviewScoreDimensionName = Literal[
@@ -346,10 +354,26 @@ class ReviewReport(StrictModel):
     strengths: list[str] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list)
     scorecard: list[ReviewScoreDimension] = Field(default_factory=list)
+    source_hash: str = ""
+
+
+class ReviewFindingBatch(StrictModel):
+    findings: list[ReviewFinding] = Field(default_factory=list)
+
+
+class ReviewClaimDecision(StrictModel):
+    finding_index: int = Field(ge=0)
+    verdict: Literal["supported", "contradicted", "uncertain"]
+    confidence: float = Field(ge=0, le=1)
+    reason: str
+
+
+class ReviewClaimDecisionBatch(StrictModel):
+    decisions: list[ReviewClaimDecision] = Field(default_factory=list)
 
 
 class ArcAuditReport(StrictModel):
-    verdict: Literal["aligned", "needs_replan", "blocked"]
+    verdict: Literal["aligned", "needs_replan", "blocked", "unknown"]
     confidence: float = Field(ge=0, le=1)
     summary: str
     fulfilled_commitments: list[str] = Field(default_factory=list)
@@ -359,6 +383,7 @@ class ArcAuditReport(StrictModel):
     body_repair_scope: list[int] = Field(default_factory=list)
     replan_recommended: bool = False
     proposed_future_changes: list[str] = Field(default_factory=list)
+    source_hash: str = ""
 
 
 class FactMutation(StrictModel):
@@ -483,6 +508,44 @@ class ContextPacket(StrictModel):
         return "\n".join(output).rstrip() + "\n"
 
 
+class RoleCapability(StrictModel):
+    role: Literal["coordinator", "writer", "reviewer", "memory_keeper"]
+    formal_ai_agent: bool = True
+    novel_production_agent: bool
+    can: list[str]
+    cannot: list[str]
+
+
+class TaskTicket(StrictModel):
+    ticket_id: str
+    objective: str
+    chapter_no: int | None = None
+    end_chapter_no: int | None = None
+    chapter_version: int | None = None
+    hard_constraints: list[str] = Field(default_factory=list)
+    input_sources: list[str] = Field(default_factory=list)
+    deliverables: list[str] = Field(default_factory=list)
+    max_model_calls: int = Field(ge=0, le=100)
+    max_tokens: int = Field(ge=0, le=1_000_000)
+    max_discussion_rounds: int = Field(default=2, ge=0, le=4)
+
+
+class DispatchStep(StrictModel):
+    step_id: str
+    role: Literal["writer", "reviewer", "memory_keeper", "engine"]
+    operation: str
+    depends_on: list[str] = Field(default_factory=list)
+    required_output: str
+    gate: str = ""
+
+
+class DispatchPlan(StrictModel):
+    workflow: str
+    steps: list[DispatchStep] = Field(default_factory=list, max_length=100)
+    parallel: bool = False
+    stop_conditions: list[str] = Field(default_factory=list)
+
+
 TerminalAction = Literal[
     "discuss",
     "status",
@@ -513,11 +576,7 @@ TerminalAction = Literal[
 
 
 class TerminalIntent(StrictModel):
-    """Bounded routing output for the natural-language terminal session.
-
-    It is not a fourth novel-production role: it can select only an existing,
-    gated engine workflow and cannot draft prose or force acceptance.
-    """
+    """Coordinator 的受限路由输出；不能发明工作流、写正文或强制验收。"""
 
     action: TerminalAction
     requested_outcome: str = Field(default="", max_length=1_000)

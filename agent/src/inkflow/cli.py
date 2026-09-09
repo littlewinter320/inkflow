@@ -59,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan_brief.add_argument("--instruction", default="")
     plan_brief.set_defaults(handler=_plan_brief)
 
-    continue_until = sub.add_parser("continue-until", help="按完整三 Agent 门禁续写到指定正史字符数")
+    continue_until = sub.add_parser("continue-until", help="由 Coordinator 调度三个生产 Agent，按完整门禁续写到指定正史字符数")
     continue_until.add_argument("root")
     continue_until.add_argument("--target-characters", type=int)
     continue_until.add_argument("--target-chapter", type=int)

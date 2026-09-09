@@ -28,9 +28,16 @@ PERSISTED_SETTING_NAMES = {
     "show_provider_reasoning",
     "inquiry_frequency",
     "agent_generation",
+    "review_verification_mode",
+    "review_local_nli_model",
+    "review_judge_model",
+    "retrieval_embedding_model",
+    "retrieval_reranker_model",
+    "powershell_enabled",
 }
 
 DEFAULT_AGENT_GENERATION: dict[str, dict[str, float | int | None]] = {
+    "coordinator": {"temperature": 0.25, "top_p": 0.8, "top_k": None},
     "writer": {"temperature": 0.85, "top_p": 0.95, "top_k": None},
     "reviewer": {"temperature": 0.2, "top_p": 0.8, "top_k": None},
     "memory_keeper": {"temperature": 0.1, "top_p": 0.7, "top_k": None},
@@ -112,6 +119,12 @@ class Settings:
     agent_generation: dict[str, dict[str, float | int | None]] = field(
         default_factory=lambda: {name: dict(values) for name, values in DEFAULT_AGENT_GENERATION.items()}
     )
+    review_verification_mode: str = "evidence"
+    review_local_nli_model: str = ""
+    review_judge_model: str = ""
+    retrieval_embedding_model: str = ""
+    retrieval_reranker_model: str = ""
+    powershell_enabled: bool = False
     workspace_root: Path | None = None
 
     @classmethod
@@ -151,6 +164,11 @@ class Settings:
         if inquiry_frequency not in {"low", "medium", "high", "ultra"}:
             raise ConfigurationError("主动询问频率只能是 low、medium、high 或 ultra。")
         agent_generation = _agent_generation(value.get("agent_generation", defaults.agent_generation))
+        review_verification_mode = str(
+            value.get("review_verification_mode", defaults.review_verification_mode)
+        ).lower()
+        if review_verification_mode not in {"evidence", "assisted", "strict"}:
+            raise ConfigurationError("审核核验模式只能是 evidence、assisted 或 strict。")
         return cls(
             base_url=base_url,
             model=model,
@@ -166,6 +184,18 @@ class Settings:
             ),
             inquiry_frequency=inquiry_frequency,
             agent_generation=agent_generation,
+            review_verification_mode=review_verification_mode,
+            review_local_nli_model=str(
+                value.get("review_local_nli_model", defaults.review_local_nli_model)
+            ).strip(),
+            review_judge_model=str(value.get("review_judge_model", defaults.review_judge_model)).strip(),
+            retrieval_embedding_model=str(
+                value.get("retrieval_embedding_model", defaults.retrieval_embedding_model)
+            ).strip(),
+            retrieval_reranker_model=str(
+                value.get("retrieval_reranker_model", defaults.retrieval_reranker_model)
+            ).strip(),
+            powershell_enabled=_as_bool(value.get("powershell_enabled", defaults.powershell_enabled)),
             workspace_root=Path(workspace_root).resolve() if workspace_root else None,
         )
 
@@ -184,6 +214,12 @@ class Settings:
             "trace_level": "INKFLOW_TRACE_LEVEL",
             "show_provider_reasoning": "INKFLOW_SHOW_REASONING",
             "inquiry_frequency": "INKFLOW_INQUIRY_FREQUENCY",
+            "review_verification_mode": "INKFLOW_REVIEW_VERIFICATION_MODE",
+            "review_local_nli_model": "INKFLOW_REVIEW_LOCAL_NLI_MODEL",
+            "review_judge_model": "INKFLOW_REVIEW_JUDGE_MODEL",
+            "retrieval_embedding_model": "INKFLOW_RETRIEVAL_EMBEDDING_MODEL",
+            "retrieval_reranker_model": "INKFLOW_RETRIEVAL_RERANKER_MODEL",
+            "powershell_enabled": "INKFLOW_POWERSHELL_ENABLED",
         }
         for field, environment_name in environment_mapping.items():
             if environment_name in os.environ:

@@ -15,6 +15,7 @@ from . import __version__
 from .config import Settings
 from .engine import InkFlowEngine
 from .project import InkFlowProject
+from .project_lock import project_write_lock, project_write_lock_sync
 from .provider import DeepSeekProvider
 from .references import ReferenceService
 from .schemas import BookBrief
@@ -358,7 +359,8 @@ def novel_reference_import(source_path: str, project_root: str | None = None) ->
     """导入本地 TXT/MD 等文本参考资料。"""
 
     project = InkFlowProject(_root(project_root))
-    return ReferenceService(project).import_text(source_path)
+    with project_write_lock_sync(project.root):
+        return ReferenceService(project).import_text(source_path)
 
 
 @mcp.tool(annotations=EXTERNAL_READ)
@@ -366,7 +368,8 @@ async def novel_reference_fetch(url: str, project_root: str | None = None) -> di
     """读取无需登录即可访问的公开网页并保存清洗文本。"""
 
     project = InkFlowProject(_root(project_root))
-    return await ReferenceService(project).fetch_url(url)
+    async with project_write_lock(project.root):
+        return await ReferenceService(project).fetch_url(url)
 
 
 @mcp.tool(annotations=EXTERNAL_READ)
@@ -374,7 +377,8 @@ async def novel_reference_fetch_fanqie(url: str, project_root: str | None = None
     """抓取无需登录的番茄公开页并标记适配器版本；不会绕过访问控制或登录。"""
 
     project = InkFlowProject(_root(project_root))
-    return await ReferenceService(project).fetch_fanqie_public(url)
+    async with project_write_lock(project.root):
+        return await ReferenceService(project).fetch_fanqie_public(url)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -382,7 +386,8 @@ def novel_reference_analyze(reference_id: str, project_root: str | None = None) 
     """为已导入参考文本生成确定性节奏与文本特征卡。"""
 
     project = InkFlowProject(_root(project_root))
-    return ReferenceService(project).analyze(reference_id)
+    with project_write_lock_sync(project.root):
+        return ReferenceService(project).analyze(reference_id)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -431,7 +436,7 @@ def novel_process_powershell(
     timeout_seconds: int = 60,
     project_root: str | None = None,
 ) -> dict[str, Any]:
-    """以小说项目为 cwd 执行 PowerShell，并返回退出码与截断输出。"""
+    """用户在设置中明确开启后，以小说项目为 cwd 执行 PowerShell。"""
 
     return InkFlowProject(_root(project_root)).run_powershell(command, timeout_seconds)
 
@@ -512,6 +517,35 @@ def novel_story_bible(project_root: str | None = None) -> dict[str, Any]:
         "canon_facts": project.db.current_facts(),
         "open_threads": project.db.open_threads(),
     }
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def novel_preference_remember(
+    text: str,
+    strength: str = "weak",
+    scope: str = "project",
+    project_root: str | None = None,
+) -> dict[str, Any]:
+    """记录用户明确给出的长期硬规则或弱偏好；不会从普通闲聊中自动猜测。"""
+
+    project = InkFlowProject(_root(project_root))
+    with project_write_lock_sync(project.root):
+        item = project.db.upsert_preference(text=text, strength=strength, scope=scope, source="user")
+        project.db.record_learning_event("preference_changed", item)
+        return item
+
+
+@mcp.tool(annotations=READ_ONLY)
+def novel_collaboration_messages(
+    chapter_no: int | None = None,
+    active_only: bool = False,
+    limit: int = 50,
+    project_root: str | None = None,
+) -> dict[str, Any]:
+    """查看四个 Agent 之间带版本与证据的任务、交接、异议和记忆同步消息。"""
+
+    project = InkFlowProject(_root(project_root))
+    return {"messages": project.db.list_collaboration_messages(chapter_no=chapter_no, active_only=active_only, limit=limit)}
 
 
 @mcp.resource(

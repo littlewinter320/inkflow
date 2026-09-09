@@ -107,9 +107,26 @@ type NovelIdea = {
   choice_note: string;
 };
 type UpdateInfo = { status?: string; currentVersion?: string; availableVersion?: string; progress?: number; message?: string; source?: string };
-type AgentRole = "writer" | "reviewer" | "memory_keeper";
+type AgentRole = "coordinator" | "writer" | "reviewer" | "memory_keeper";
 type AgentGeneration = { temperature: number; top_p: number; top_k: number | null };
 type AgentGenerationProfiles = Record<AgentRole, AgentGeneration>;
+type ContextStatus = {
+  status: "idle" | "safe" | "watch" | "near_limit";
+  estimated_tokens: number;
+  before_compression_tokens: number;
+  soft_limit_tokens: number;
+  hard_limit_tokens: number;
+  hard_usage_percent: number;
+  compression_applied: boolean;
+  hard_sections: Array<{ key: string; title: string; reason?: string; source_ids?: string[] }>;
+  compressible_sections: Array<{ key: string; title: string; reason?: string; source_ids?: string[] }>;
+  warnings: string[];
+};
+type CanonMigration = { required: boolean; confirmation_token: string; accepted_chapter_count: number; impact: string; backup_path?: string; unresolved_chapters?: number[]; message?: string };
+type CollaborationMessage = { message_id: string; sender_role: string; recipient_role: string; message_type: string; claim: string; status: string; chapter_no?: number; chapter_version?: number; created_at: string };
+type BatchSummary = { batch_id: string; status: string; start_chapter_no?: number; end_chapter_no?: number; chapters: Array<{ chapter_no?: number; version?: number; review_verdict?: string; memory_status?: string }> };
+type LearningEvent = { event_id: string; event_type: string; chapter_no?: number; created_at: string; payload: Record<string, unknown> };
+type CollaborationOverview = { messages: CollaborationMessage[]; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[] };
 
 const emptyStatistics: Statistics = {
   characters: 0,
@@ -134,7 +151,7 @@ function App() {
     {
       id: "welcome",
       role: "assistant",
-      text: "告诉我你想写什么，或打开一本已有小说。我会先理解目标，再安排写作、审查和记忆三个角色。",
+      text: "告诉 Coordinator 你想写什么，或打开一本已有小说。它会先理解目标，再安排 Writer、Reviewer 和 Memory Keeper。",
     },
   ]);
   const [chatInput, setChatInput] = useState("");
@@ -159,6 +176,10 @@ function App() {
   const [promptOptimizing, setPromptOptimizing] = useState(false);
   const [promptOptimization, setPromptOptimization] = useState<PromptOptimizationResult | null>(null);
   const [promptUndo, setPromptUndo] = useState<string | null>(null);
+  const [contextStatus, setContextStatus] = useState<ContextStatus | null>(null);
+  const [collaboration, setCollaboration] = useState<CollaborationOverview | null>(null);
+  const [canonMigration, setCanonMigration] = useState<CanonMigration | null>(null);
+  const [showMigration, setShowMigration] = useState(false);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
 
@@ -173,11 +194,16 @@ function App() {
   const refresh = useCallback(
     async (root = projectRoot) => {
       if (!root) return;
-      const opened = await window.inkflow.request<{ dashboard: Dashboard; tree: ProjectTree }>("project.open", {
+      const [opened, overview] = await Promise.all([
+        window.inkflow.request<{ dashboard: Dashboard; tree: ProjectTree; canon_migration?: CanonMigration }>("project.open", {
         project_root: root,
-      });
+        }),
+        window.inkflow.request<CollaborationOverview>("collaboration.overview", { project_root: root }),
+      ]);
       setDashboard(opened.dashboard);
       setTree(opened.tree);
+      setCollaboration(overview);
+      setCanonMigration(opened.canon_migration || null);
     },
     [projectRoot],
   );
@@ -187,13 +213,17 @@ function App() {
     setBusy(true);
     setMascotMood("thinking");
     try {
-      const [opened, history] = await Promise.all([
-        window.inkflow.request<{ dashboard: Dashboard; tree: ProjectTree }>("project.open", { project_root: root }),
+      const [opened, history, overview] = await Promise.all([
+        window.inkflow.request<{ dashboard: Dashboard; tree: ProjectTree; canon_migration?: CanonMigration }>("project.open", { project_root: root }),
         window.inkflow.request<{ entries: ConversationHistoryEntry[] }>("conversation.history", { project_root: root, limit: 100 }),
+        window.inkflow.request<CollaborationOverview>("collaboration.overview", { project_root: root }),
       ]);
       setProjectRoot(root);
       setDashboard(opened.dashboard);
       setTree(opened.tree);
+      setCollaboration(overview);
+      setCanonMigration(opened.canon_migration || null);
+      setShowMigration(Boolean(opened.canon_migration?.required));
       setDocument(null);
       setText("");
       setActiveTab("project");
@@ -265,6 +295,23 @@ function App() {
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text, savedText, document?.relative_path, document?.read_only]);
+
+  useEffect(() => {
+    if (!projectRoot) { setContextStatus(null); setCollaboration(null); return; }
+    let active = true;
+    const poll = async () => {
+      try {
+        const [value, overview] = await Promise.all([
+          window.inkflow.request<ContextStatus>("context.status", { project_root: projectRoot }),
+          window.inkflow.request<CollaborationOverview>("collaboration.overview", { project_root: projectRoot }),
+        ]);
+        if (active) { setContextStatus(value); setCollaboration(overview); }
+      } catch { /* 状态面板不能打断正文工作流；下一轮继续读取。 */ }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 4000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [projectRoot]);
 
   const openDocument = async (item: TreeItem) => {
     setError("");
@@ -457,7 +504,7 @@ function App() {
     setMascotSpeech("已经恢复优化前的原文，没有发送任何内容。");
   };
 
-  const runWorkflow = async (action: string) => {
+  const runWorkflow = async (action: string, extra: Record<string, unknown> = {}) => {
     if (!projectRoot || busy) return;
     const chapterNo = currentChapter(document?.relative_path);
     if (["write", "review", "accept"].includes(action) && !chapterNo) {
@@ -466,6 +513,10 @@ function App() {
       return;
     }
     if (action === "accept" && !window.confirm("验收会让记忆角色将本章提交为正史。确认继续吗？")) {
+      setMascotMood("waiting");
+      return;
+    }
+    if (action === "batch_accept" && !window.confirm("接收批次会按连续章节顺序把已审核内容及其临时记忆提交正史。确认继续吗？")) {
       setMascotMood("waiting");
       return;
     }
@@ -479,6 +530,7 @@ function App() {
         action,
         run_id: runId,
         ...(chapterNo ? { chapter_no: chapterNo } : {}),
+        ...extra,
       });
       const visible = visibleResult(result);
       setMessages((items) => [
@@ -513,6 +565,42 @@ function App() {
     }
   };
 
+  const applyCanonMigration = async () => {
+    if (!canonMigration?.required || busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await request<CanonMigration>("project.canon_migration.apply", {
+        confirmation_token: canonMigration.confirmation_token,
+      });
+      setCanonMigration(result);
+      setShowMigration(false);
+      setNotice(result.message || "正史正文数据库升级已完成；备份已保存在项目内部目录。");
+      await refresh();
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const setContextPin = async (sourceId: string, pinned: boolean) => {
+    if (!sourceId || busy) return;
+    const note = pinned ? window.prompt("可选：说明为什么本次任务必须保留这条资料。", "") : "";
+    if (pinned && note === null) return;
+    try {
+      await request("context.pins.set", {
+        source_id: sourceId,
+        chapter_no: currentChapter(document?.relative_path) || undefined,
+        note: note || "",
+        pinned,
+      });
+      setNotice(pinned ? "已锁定这条工作资料；后续 Context Packet 会把它作为不可压缩材料。" : "已解除工作资料锁定。");
+    } catch (cause) {
+      setError(errorMessage(cause));
+    }
+  };
+
   const openFolder = async () => {
     const selected = await window.inkflow.chooseFolder("打开墨流小说项目");
     if (selected) await openProject(selected);
@@ -531,7 +619,7 @@ function App() {
         <div className="welcome-copy">
           <p className="eyebrow">INKFLOW · 长篇创作工作台</p>
           <h1>让灵感流动，<br />让正史站得住。</h1>
-          <p className="lede">自然对话负责理解你；写作、审查与记忆三个角色各守边界。规划、正文、证据和回退都留在你自己的电脑。</p>
+          <p className="lede">Coordinator 像 AI 产品经理一样理解、拆解与派工；Writer、Reviewer、Memory Keeper 各守生产边界。规划、正文、证据和回退都留在你自己的电脑。</p>
           <div className="welcome-actions">
             <button className="primary" onClick={() => setShowCreate(true)}>新建小说</button>
             <button onClick={openFolder}>打开项目</button>
@@ -588,6 +676,8 @@ function App() {
           {(tree?.groups || []).map((group) => (
             <TreeSection key={group.id} label={group.label} items={group.items} onOpen={openDocument} active={document?.relative_path} />
           ))}
+          <ContextBudgetPanel value={contextStatus} onPin={setContextPin} />
+          <CollaborationBoard value={collaboration} onAcceptBatch={(batchId) => void runWorkflow("batch_accept", { batch_id: batchId })} />
           <div className="rail-summary">
             <div><span>草稿</span><strong>{dashboard?.status.chapters?.draft || 0}</strong></div>
             <div><span>正史</span><strong>{dashboard?.status.chapters?.accepted || 0}</strong></div>
@@ -597,7 +687,7 @@ function App() {
 
         <section className="conversation-panel">
           <div className="panel-title">
-            <div><p className="eyebrow">自然对话主控</p><h2>今天写到哪里？</h2></div>
+            <div><p className="eyebrow">COORDINATOR · AI 产品经理</p><h2>今天写到哪里？</h2></div>
             <div className="panel-mascot">
               <button className="history-trigger" onClick={() => setShowHistory(true)}>对话历史 <span>{conversationHistory.length}</span></button>
               <div className="mascot-conversation">
@@ -607,7 +697,7 @@ function App() {
                   onSettled={() => setMascotMood("idle")}
                 />
               </div>
-              <span className="agent-boundary">三个小说角色 · 边界开启</span>
+              <span className="agent-boundary">四个 AI Agent · 边界开启</span>
             </div>
           </div>
           <div className="pet-row" aria-label="与墨宝互动">
@@ -747,8 +837,55 @@ function App() {
         void sendChat(undefined, answer);
       }} />}
       {selectionDraft && <SelectionDialog selection={selectionDraft} busy={busy} onClose={() => { setSelectionDraft(null); setMascotMood("idle"); }} onSubmit={(mode, comment) => void applySelectionAction(mode, comment)} />}
+      {showMigration && canonMigration?.required && <CanonMigrationDialog migration={canonMigration} busy={busy} onClose={() => setShowMigration(false)} onApply={() => void applyCanonMigration()} />}
     </div>
   );
+}
+
+function ContextBudgetPanel({ value, onPin }: { value: ContextStatus | null; onPin: (sourceId: string, pinned: boolean) => void }) {
+  const used = Math.max(0, Math.min(100, Number(value?.hard_usage_percent || 0)));
+  const label = value?.status === "near_limit" ? "接近上限" : value?.status === "watch" ? "注意容量" : value?.status === "safe" ? "容量安全" : "等待上下文";
+  const compressed = Boolean(value?.compression_applied);
+  return <details className={`context-budget ${value?.status || "idle"}`}>
+    <summary><span>上下文容量</span><strong>{used.toFixed(1)}%</strong></summary>
+    <div className="context-meter"><i style={{ width: `${used}%` }} /></div>
+    <p>{label} · {Number(value?.estimated_tokens || 0).toLocaleString()} / {Number(value?.hard_limit_tokens || 0).toLocaleString()} tokens</p>
+    <small>{compressed ? `已从 ${Number(value?.before_compression_tokens || 0).toLocaleString()} tokens 定向压缩；硬约束未动。` : "每 4 秒刷新。接近软预算时只压缩低权威、低相关资料。"}</small>
+    {value && <ul><li>不可压缩：{value.hard_sections.map((item) => item.title).join("、") || "尚未生成"}</li><li>可压缩：{value.compressible_sections.map((item) => item.title).join("、") || "尚未生成"}</li></ul>}
+    {value && <details className="context-explain"><summary>查看保留与压缩理由</summary>{[...value.hard_sections, ...value.compressible_sections].map((item) => <div key={`${item.key}-${item.title}`}><strong>{item.title}</strong><small>{item.reason || "由当前资料优先级决定。"}</small>{["D1", "D2"].includes(item.key) && (item.source_ids || []).slice(0, 6).map((sourceId) => <button key={sourceId} type="button" onClick={() => onPin(sourceId, item.key !== "D2")}>{item.key === "D2" ? `解除 ${sourceId}` : `锁定 ${sourceId}`}</button>)}</div>)}</details>}
+  </details>;
+}
+
+function roleLabel(role: string) {
+  return ({ coordinator: "Coordinator", writer: "Writer", reviewer: "Reviewer", memory_keeper: "Memory Keeper", user: "用户" } as Record<string, string>)[role] || role;
+}
+
+function messageTypeLabel(type: string) {
+  return ({ task_assignment: "任务分配", fact_query: "事实查询", handoff: "交接", review_issue: "审核问题", revision_request: "修订要求", objection: "异议", risk: "风险", memory_sync: "记忆同步", answer: "回应" } as Record<string, string>)[type] || type;
+}
+
+function learningLabel(type: string) {
+  return ({ accepted: "用户接受", rejected: "用户拒绝", revised: "版本修订", rolled_back: "正史回退", preference_changed: "偏好变化" } as Record<string, string>)[type] || type;
+}
+
+function CollaborationBoard({ value, onAcceptBatch }: { value: CollaborationOverview | null; onAcceptBatch: (batchId: string) => void }) {
+  const activeMessages = (value?.messages || []).filter((item) => ["pending", "responded", "escalated"].includes(item.status));
+  const readyBatches = (value?.batches || []).filter((item) => item.status === "ready_for_acceptance");
+  return <details className="collaboration-board" open>
+    <summary><span>协作看板</span><strong>{activeMessages.length} 待处理</strong></summary>
+    <p>Coordinator 只分配和汇总；正文、审查、记忆各自留痕。</p>
+    {readyBatches.length > 0 && <section><h4>可验收批次</h4>{readyBatches.map((batch) => <div className="batch-card" key={batch.batch_id}><strong>第 {batch.start_chapter_no}–{batch.end_chapter_no} 章</strong><small>Reviewer 已通过，Memory Keeper 已保存临时记忆。</small><button type="button" onClick={() => onAcceptBatch(batch.batch_id)}>接收为正史</button></div>)}</section>}
+    <section><h4>协作消息</h4>{activeMessages.length === 0 ? <small>当前没有待回应消息。</small> : activeMessages.slice(0, 5).map((item) => <div className="collaboration-message" key={item.message_id}><span>{roleLabel(item.sender_role)} → {roleLabel(item.recipient_role)}</span><strong>{messageTypeLabel(item.message_type)}</strong><p>{item.claim}</p><small>{item.chapter_no ? `第 ${item.chapter_no} 章 · ` : ""}{item.status}</small></div>)}</section>
+    <section><h4>内部学习信号</h4><small>仅记录接受、拒绝、修订与偏好变化，用于本地优化；不会上传小说正文。</small>{(value?.learning_events || []).slice(0, 3).map((item) => <div className="learning-event" key={item.event_id}>{learningLabel(item.event_type)}{item.chapter_no ? ` · 第 ${item.chapter_no} 章` : ""}</div>)}</section>
+  </details>;
+}
+
+function CanonMigrationDialog({ migration, busy, onClose, onApply }: { migration: CanonMigration; busy: boolean; onClose: () => void; onApply: () => void }) {
+  return <Modal title="正史正文数据库升级" subtitle="这是一次可恢复的本地数据库结构升级，需要你的确认。" onClose={onClose}>
+    <p>{migration.impact}</p>
+    <p>受影响的已接受章节：{migration.accepted_chapter_count}。升级前会先创建 SQLite 备份；无法通过哈希验证的旧正文不会被猜测或覆盖。</p>
+    <div className="dialog-actions"><button onClick={onClose} disabled={busy}>暂不升级</button><button className="primary" onClick={onApply} disabled={busy}>{busy ? "正在备份并升级…" : "创建备份并确认升级"}</button></div>
+  </Modal>;
 }
 
 function TreeSection({ label, items, onOpen, active }: { label: string; items: TreeItem[]; onOpen: (item: TreeItem) => void; active?: string }) {
@@ -1019,12 +1156,14 @@ const SETTINGS_PRESETS = [
 ] as const;
 
 const DEFAULT_AGENT_GENERATION: AgentGenerationProfiles = {
+  coordinator: { temperature: 0.25, top_p: 0.8, top_k: null },
   writer: { temperature: 0.85, top_p: 0.95, top_k: null },
   reviewer: { temperature: 0.2, top_p: 0.8, top_k: null },
   memory_keeper: { temperature: 0.1, top_p: 0.7, top_k: null },
 };
 
 const AGENT_TUNING_META: Array<{ id: AgentRole; label: string; note: string }> = [
+  { id: "coordinator", label: "Coordinator", note: "第四个 AI Agent；理解需求、日常交流、拆解派工与汇总，不碰正文和正史。" },
   { id: "writer", label: "Writer", note: "规划、起草与定点修订；默认保留更多表达空间。" },
   { id: "reviewer", label: "Reviewer", note: "证据审查与篇章复核；默认更稳定、少发散。" },
   { id: "memory_keeper", label: "Memory Keeper", note: "提取正史事实；默认最保守。" },
@@ -1036,7 +1175,7 @@ function agentGenerationFromProvider(value: unknown): AgentGenerationProfiles {
 }
 
 function SettingsDialog({ provider, onClose, onSaved }: { provider: Record<string, unknown> | null; onClose: () => void; onSaved: (value: Record<string, unknown>) => void }) {
-  const [form, setForm] = useState({ api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), max_output_tokens: Number(provider?.max_output_tokens || 16000), agent_generation: agentGenerationFromProvider(provider?.agent_generation) });
+  const [form, setForm] = useState({ api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), max_output_tokens: Number(provider?.max_output_tokens || 16000), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), agent_generation: agentGenerationFromProvider(provider?.agent_generation) });
   const [error, setError] = useState("");
   const [working, setWorking] = useState(false);
   const [stage, setStage] = useState("");
@@ -1072,9 +1211,19 @@ function SettingsDialog({ provider, onClose, onSaved }: { provider: Record<strin
     <div className="form-grid"><label>思考强度<select value={form.reasoning_effort} onChange={(e) => setForm({ ...form, reasoning_effort: e.target.value })}><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最高</option></select></label><label>单次输出上限<input type="number" readOnly value={form.max_output_tokens} /></label></div>
     <label>主动询问频率<select value={form.inquiry_frequency} onChange={(e) => setForm({ ...form, inquiry_frequency: e.target.value })}><option value="low">低：只问执行必需信息</option><option value="medium">中：理解把握较低时询问</option><option value="high">高：重要创作分岔也询问</option><option value="ultra">超高：有明显未知项就先询问</option></select></label>
     <div className="form-grid"><label>常用上下文<input type="number" min={16000} max={512000} value={form.context_soft_tokens} onChange={(e) => setForm({ ...form, context_soft_tokens: Number(e.target.value) })} /></label><label>最大上下文<input type="number" min={16000} max={1000000} value={form.context_hard_tokens} onChange={(e) => setForm({ ...form, context_hard_tokens: Number(e.target.value) })} /></label></div>
-    <button className="advanced-toggle" type="button" aria-expanded={showAdvanced} onClick={() => setShowAdvanced((value) => !value)}><span>{showAdvanced ? "−" : "+"}</span><div><strong>高级生成参数</strong><small>按三个小说 Agent 独立微调 temperature、top_p 与可选 top_k</small></div></button>
+    <button className="advanced-toggle" type="button" aria-expanded={showAdvanced} onClick={() => setShowAdvanced((value) => !value)}><span>{showAdvanced ? "−" : "+"}</span><div><strong>高级生成参数</strong><small>按四个 AI Agent 独立微调 temperature、top_p 与可选 top_k</small></div></button>
     {showAdvanced && <section className="agent-tuning">
       <div className="agent-tuning-notice">temperature 与 top_p 会发送给兼容接口；top_k 留空时不发送。参数越高不代表质量越高，Reviewer 与 Memory Keeper 通常应保持稳定。</div>
+      <article><header><div><strong>审核防幻觉</strong><small>证据门禁始终开启；增强模式会增加模型调用。</small></div></header><div className="agent-tuning-grid">
+        <label>核验模式<select value={form.review_verification_mode} onChange={(event) => setForm({ ...form, review_verification_mode: event.target.value })}><option value="evidence">基础：只做本地证据门禁</option><option value="assisted">增强：纠错并逐条语义核验</option><option value="strict">严格：争议时再调用裁判</option></select></label>
+        <label>本地中文 NLI <small>留空关闭</small><input value={form.review_local_nli_model} onChange={(event) => setForm({ ...form, review_local_nli_model: event.target.value })} placeholder="MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7" /></label>
+        <label>争议裁判模型 <small>留空关闭</small><input value={form.review_judge_model} onChange={(event) => setForm({ ...form, review_judge_model: event.target.value })} placeholder="兼容接口中的 Prometheus 模型名" /></label>
+      </div><div className="agent-tuning-notice">增强模式最多增加一次证据纠错和一次逐条核验；严格模式仅在仍有争议且填写裁判模型时再调用一次。启用本地 NLI 会下载并占用本机模型资源。</div></article>
+      <article><header><div><strong>混合记忆检索</strong><small>精确查询与本地 BM25 始终可用；模型留空时不下载额外资源。</small></div></header><div className="agent-tuning-grid">
+        <label>语义召回模型 <small>可选</small><input value={form.retrieval_embedding_model} onChange={(event) => setForm({ ...form, retrieval_embedding_model: event.target.value })} placeholder="BAAI/bge-m3" /></label>
+        <label>精排模型 <small>可选</small><input value={form.retrieval_reranker_model} onChange={(event) => setForm({ ...form, retrieval_reranker_model: event.target.value })} placeholder="BAAI/bge-reranker-v2-m3" /></label>
+      </div><div className="agent-tuning-notice">检索数量会按问题复杂度和资料规模自适应，不使用固定 Top K。可选 BGE 模型只在本机内测，首次启用需要安装依赖并下载模型。</div></article>
+      <article><header><div><strong>本机 PowerShell</strong><small>默认关闭，仅供明确需要自动化的高级用户。</small></div></header><label className="setting-check"><input type="checkbox" checked={form.powershell_enabled} onChange={(event) => setForm({ ...form, powershell_enabled: event.target.checked })} />允许墨流工具在当前小说项目目录内执行 PowerShell</label><div className="agent-tuning-notice">开启后，命令仍固定以小说项目为工作目录并记录命令摘要、退出码和截断输出；它可能读写项目文件。关闭不影响正常规划、写作、审查与记忆。</div></article>
       {AGENT_TUNING_META.map((meta) => { const values = form.agent_generation[meta.id]; return <article key={meta.id}>
         <header><div><strong>{meta.label}</strong><small>{meta.note}</small></div><button type="button" onClick={() => updateAgentGeneration(meta.id, DEFAULT_AGENT_GENERATION[meta.id])}>恢复默认</button></header>
         <div className="agent-tuning-grid">

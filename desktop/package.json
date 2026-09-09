@@ -3,7 +3,7 @@
   "version": "0.4.1",
   "private": true,
   "author": "InkFlow contributors",
-  "description": "墨流（InkFlow）中文长篇小说桌面工作台",
+  "description": "墨流（InkFlow）四 Agent 中文长篇小说桌面工作台",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "concurrently -k \"vite\" \"tsc -p tsconfig.electron.json --watch\" \"wait-on tcp:5173 file:dist-electron/main.js && cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron .\"",

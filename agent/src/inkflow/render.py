@@ -193,7 +193,7 @@ def render_review(chapter_no: int, report: ReviewReport, code_metrics: dict[str,
             (
                 "- 未发现 major/blocking 级、且有证据支撑的问题；本章可以通过。"
                 if report.verdict == "pass" and not hard_findings
-                else "- 本章未通过或需重规划，因为以下 major/blocking 问题会影响正史："
+                else ("- 审核证据不足，等待核实；不等于正文已证实有错。" if report.verdict == "unknown" else "- 以下 major/blocking 问题需要处理：")
             ),
             *(
                 [f"  - [{item.severity}] {item.evidence}：{item.explanation}" for item in hard_findings]
@@ -219,6 +219,8 @@ def render_review(chapter_no: int, report: ReviewReport, code_metrics: dict[str,
                 f"- 证据：{item.evidence}",
                 f"- 正史引用：{', '.join(item.canon_refs) if item.canon_refs else '无'}",
                 f"- 说明：{item.explanation}",
+                f"- 证据核验：{item.verification_note or '旧报告未记录核验结果'}",
+                f"- 核验状态：{item.verification_status} / 语义状态：{item.semantic_status} / 置信度：{item.verification_confidence:.0%}",
                 f"- 修复：{item.repair_instruction}",
                 "",
             ]

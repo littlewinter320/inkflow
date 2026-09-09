@@ -96,6 +96,35 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .rail-summary div { display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 13px 4px; background: #151512; }
 .rail-summary span { color: var(--faint); font-size: 10px; }
 .rail-summary strong { font-size: 14px; }
+.context-budget { margin-top: auto; padding: 10px 12px; border-top: 1px solid var(--line); background: #151512; }
+.context-budget + .rail-summary { margin-top: 0; }
+.context-budget summary { display: flex; justify-content: space-between; color: var(--muted); cursor: pointer; font-size: 10px; }
+.context-budget summary strong { color: var(--accent); font-variant-numeric: tabular-nums; }
+.context-budget.watch summary strong { color: #d7b667; }
+.context-budget.near_limit summary strong { color: #e17d70; }
+.context-meter { height: 4px; margin-top: 8px; overflow: hidden; border-radius: 999px; background: #292821; }
+.context-meter i { display: block; height: 100%; background: var(--accent); transition: width .25s ease; }
+.context-budget.watch .context-meter i { background: #d7b667; }
+.context-budget.near_limit .context-meter i { background: #e17d70; }
+.context-budget p, .context-budget small { display: block; margin: 7px 0 0; color: var(--faint); font-size: 9px; line-height: 1.45; }
+.context-budget ul { margin: 7px 0 0; padding-left: 15px; color: #8f8b81; font-size: 9px; line-height: 1.5; }
+.context-explain { margin-top: 8px; border-top: 1px solid var(--line-soft); padding-top: 7px; }
+.context-explain summary { color: #b9c991; cursor: pointer; font-size: 9px; }
+.context-explain > div { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+.context-explain strong { width: 100%; color: #d6d2c6; font-size: 9px; }
+.context-explain small { width: 100%; margin: 0; color: #88857c; }
+.context-explain button { padding: 3px 5px; border-color: #4a5539; color: #b9d985; font-size: 8px; }
+.collaboration-board { padding: 10px 12px; border-top: 1px solid var(--line); background: #12150f; }
+.collaboration-board summary { display: flex; justify-content: space-between; color: var(--muted); cursor: pointer; font-size: 10px; }
+.collaboration-board summary strong { color: #c8d99c; font-size: 9px; }
+.collaboration-board > p, .collaboration-board > section > small { display: block; margin: 7px 0; color: var(--faint); font-size: 9px; line-height: 1.45; }
+.collaboration-board section { margin-top: 10px; }
+.collaboration-board h4 { margin: 0 0 5px; color: #d7d2c6; font-size: 9px; letter-spacing: .06em; }
+.batch-card, .collaboration-message { display: flex; flex-direction: column; gap: 3px; margin-top: 5px; padding: 7px; border: 1px solid #373b2c; background: #171a13; }
+.batch-card strong, .collaboration-message strong { color: #dbe5c4; font-size: 9px; }
+.batch-card small, .collaboration-message span, .collaboration-message p, .collaboration-message small { margin: 0; color: var(--muted); font-size: 8px; line-height: 1.4; }
+.batch-card button { align-self: flex-start; margin-top: 3px; padding: 4px 6px; border-color: #668047; color: #cde69d; font-size: 8px; }
+.learning-event { margin-top: 3px; color: #aaa69c; font-size: 8px; }
 
 .conversation-panel { display: grid; grid-template-rows: auto auto auto minmax(0, 1fr) auto; background: #171714; }
 .panel-title { display: flex; justify-content: space-between; align-items: flex-start; padding: 21px 20px 14px; }
@@ -449,6 +478,8 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .agent-tuning-grid label { display: grid; grid-template-columns: auto 1fr; align-items: baseline; gap: 4px; margin: 0; color: #cbc7bc; font-size: 9px; }
 .agent-tuning-grid label small { justify-self: end; color: var(--faint); font-size: 8px; }
 .agent-tuning-grid input { grid-column: 1 / -1; padding: 7px 8px; font-size: 10px; }
+.setting-check { display: flex; align-items: center; gap: 8px; margin: 10px 0; color: #cbc7bc; font-size: 10px; }
+.setting-check input { width: auto; margin: 0; }
 .search-form { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
 .search-results { max-height: 420px; overflow-y: auto; margin-top: 15px; }
 .search-results > button { display: block; width: 100%; margin-bottom: 6px; padding: 10px; text-align: left; }
