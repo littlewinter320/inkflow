@@ -27,6 +27,18 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
+      - name: Check tag and package versions
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $desktopVersion = (Get-Content -Raw -LiteralPath ./desktop/package.json | ConvertFrom-Json).version
+          $agentVersion = (Get-Content -Raw -LiteralPath ./agent/pyproject.toml | Select-String -Pattern 'version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+          $tagVersion = $env:RELEASE_TAG -replace '^v', ''
+          if ($desktopVersion -ne $agentVersion -or $tagVersion -ne $desktopVersion) {
+            throw "Release tag and package versions must match: tag=$tagVersion desktop=$desktopVersion agent=$agentVersion"
+          }
+
       - name: Build local engine
         shell: pwsh
         run: |
