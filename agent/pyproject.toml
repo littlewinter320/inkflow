@@ -19,7 +19,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.3,<10"]
 build = ["pyinstaller>=6.15,<7"]
 
 [project.scripts]
@@ -29,8 +28,3 @@ inkflow-app-server = "inkflow.app_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.pytest.ini_options]
-pythonpath = ["src"]
-testpaths = ["tests"]
-addopts = "-q"

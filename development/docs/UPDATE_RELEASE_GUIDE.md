@@ -7,8 +7,7 @@
 1. 桌面版只同步 `agent/src/inkflow/__init__.py`、`agent/pyproject.toml` 和 `desktop/package.json` 的版本号；VS Code 扩展独立升版。
 2. 在仓库根目录运行 `./development/scripts/build-release.ps1 -Publish`。脚本会使用当前电脑已登录的 GitHub 账号创建或更新桌面版 Release，并上传 Windows 安装包、`latest.yml` 与 `.blockmap`。
 3. 只有明确要同时打包扩展时才附加 `-IncludeExtension`，扩展版本不再影响桌面软件检测更新。
-3. 打开 GitHub Release，确认不是 Draft，检查安装包与 `latest.yml` 都已存在，再把 Release 发布出去。
-4. 用上一版安装的墨流打开“检查更新”验证；发现新版后下载，重启安装。小说项目与 `.inkflow/inkflow.db` 不应受到影响。
+3. 将安装包、`latest.yml` 与 `.blockmap` 附到同一个正式 Release 后发布。
 
 `latest.yml` 是桌面更新器读取的版本清单，不能只上传 `.exe` 而遗漏它。VSIX 目前也随 Release 提供；若以后发布至 VS Code Marketplace，应额外使用 Marketplace 发布者账号，不能把 GitHub 登录令牌交给客户端。
 

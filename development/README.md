@@ -4,18 +4,10 @@
 
 - `config/`：本地环境变量示例。
 - `docs/`：架构、发布说明、研究引用与维护指南。
-- `scripts/`：打包和安装后检查脚本。
+- `scripts/`：桌面版与可选扩展的打包脚本。
 - `tools/`：图标、墨宝素材等离线处理工具。
 
 正式产品代码仍按 `agent/`、`desktop/`、`extension/` 三个独立目录维护。桌面版与 VS Code 扩展独立升版、独立发布。
-
-## 定向验证
-
-```powershell
-.\.venv\Scripts\python.exe -m pytest agent/tests/test_desktop_features.py agent/tests/test_provider.py -q
-Set-Location desktop
-npm run typecheck
-```
 
 ## 构建桌面版
 
