@@ -2,9 +2,10 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from "electron";
 import { AppUpdater, NsisUpdater, autoUpdater } from "electron-updater";
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
+import { pathToFileURL } from "node:url";
 
 type Pending = {
   resolve: (value: unknown) => void;
@@ -298,6 +299,37 @@ function createWindow(): void {
       filters: [{ name: "文本资料", extensions: ["txt", "md", "markdown"] }],
     });
     return result.canceled ? null : result.filePaths[0];
+  });
+  ipcMain.handle("dialog:choose-audio", async (_event, title: string) => {
+    const result = await dialog.showOpenDialog(mainWindow!, {
+      title,
+      properties: ["openFile"],
+      filters: [{ name: "语音文件", extensions: ["wav", "mp3", "m4a", "flac", "ogg", "webm"] }],
+    });
+    return result.canceled ? null : result.filePaths[0];
+  });
+  ipcMain.handle("voice:save-recording", (_event, bytes: Uint8Array, extension = "webm") => {
+    const safeExtension = ["wav", "webm", "ogg", "mp3", "m4a"].includes(extension) ? extension : "webm";
+    const folder = path.join(app.getPath("userData"), "voice-input");
+    mkdirSync(folder, { recursive: true });
+    const target = path.join(folder, `recording-${randomUUID()}.${safeExtension}`);
+    writeFileSync(target, Buffer.from(bytes));
+    return target;
+  });
+  ipcMain.handle("voice:audio-url", (_event, target: string) => {
+    const resolved = path.resolve(target);
+    const allowedRoots = [
+      app.getPath("userData"),
+      app.getPath("temp"),
+      path.join(process.env.LOCALAPPDATA || app.getPath("userData"), "InkFlow"),
+      path.join(process.env.APPDATA || app.getPath("userData"), "InkFlow"),
+    ].map((item) => path.resolve(item));
+    const allowed = allowedRoots.some((root) => {
+      const relative = path.relative(root, resolved);
+      return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+    });
+    if (!allowed || !existsSync(resolved)) throw new Error("音频文件不在墨流允许播放的本地目录中。");
+    return pathToFileURL(resolved).toString();
   });
   ipcMain.handle("shell:open-path", (_event, target: string) => shell.openPath(target));
   ipcMain.handle("shell:show-item", (_event, target: string) => shell.showItemInFolder(target));

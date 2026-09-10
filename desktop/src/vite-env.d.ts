@@ -7,6 +7,9 @@ interface Window {
     request<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>;
     chooseFolder(title: string): Promise<string | null>;
     chooseFile(title: string): Promise<string | null>;
+    chooseAudio(title: string): Promise<string | null>;
+    saveVoiceRecording(bytes: Uint8Array, extension?: string): Promise<string>;
+    audioUrl(target: string): Promise<string>;
     openPath(target: string): Promise<string>;
     showItem(target: string): Promise<void>;
     launchContext(): Promise<{ projectRoot: string | null }>;

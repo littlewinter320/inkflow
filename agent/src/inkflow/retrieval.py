@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from .project import InkFlowProject
+from .utils import content_hash
 
 
 _MODEL_CACHE: dict[str, Any] = {}
@@ -33,6 +34,7 @@ class HybridRetriever:
         self.project = project
         self.embedding_model = embedding_model.strip()
         self.reranker_model = reranker_model.strip()
+        self.last_diagnostics: dict[str, Any] = {}
 
     def retrieve(
         self,
@@ -45,8 +47,10 @@ class HybridRetriever:
     ) -> list[dict[str, Any]]:
         candidates = self._candidates(role=role, chapter_no=chapter_no, chapter_version=chapter_version)
         if not candidates:
+            self.last_diagnostics = {"query": query, "candidate_count": 0, "selected": [], "discarded": []}
             return []
-        limit = top_k if top_k is not None else self._adaptive_top_k(query, len(candidates))
+        factors = self._adaptive_factors(query, candidates, chapter_no)
+        limit = top_k if top_k is not None else self._adaptive_top_k(query, len(candidates), factors)
         limit = max(3, min(int(limit), 32, len(candidates)))
         exact = self._exact_ranking(query, candidates)
         lexical = self._bm25_ranking(query, candidates)
@@ -81,12 +85,37 @@ class HybridRetriever:
             hits.append(item)
         if self.reranker_model and len(hits) > 1:
             hits = self._rerank(query, hits)
-        return hits[:limit]
+        result = hits[:limit]
+        selected_ids = {item["source_id"] for item in result}
+        self.last_diagnostics = {
+            "query": query,
+            "candidate_count": len(candidates),
+            "initial_top_k": limit,
+            "adaptive_factors": factors,
+            "selected": [{"source_id": item["source_id"], "score": item["score"], "reasons": item["retrieval_reasons"]} for item in result],
+            "discarded": [
+                {"source_id": item["source_id"], "reason": "低于动态预算截断线" if item["source_id"] in scores else "未匹配查询"}
+                for item in candidates if item["source_id"] not in selected_ids
+            ][:80],
+        }
+        return result
 
     @staticmethod
-    def _adaptive_top_k(query: str, corpus_size: int) -> int:
+    def _adaptive_top_k(query: str, corpus_size: int, factors: dict[str, int] | None = None) -> int:
         complexity = len(set(_terms(query)))
-        return max(4, min(24, 4 + int(math.log2(max(2, corpus_size))) + min(8, complexity // 6)))
+        values = factors or {}
+        return max(4, min(40, 4 + int(math.log2(max(2, corpus_size))) + min(8, complexity // 6) + min(6, values.get("entity_count", 0) // 2) + min(6, values.get("open_thread_count", 0) // 2) + min(4, values.get("time_span", 0) // 20)))
+
+    def _adaptive_factors(self, query: str, candidates: list[dict[str, Any]], chapter_no: int) -> dict[str, int]:
+        query_entities = set(_entities(query))
+        matched_entities = {entity for item in candidates for entity in item["entities"] if entity in query_entities}
+        chapters = [int(item["chapter_no"]) for item in candidates if item.get("chapter_no") is not None]
+        return {
+            "query_terms": len(set(_terms(query))),
+            "entity_count": len(matched_entities),
+            "open_thread_count": sum(item["source_type"] == "canon_thread" for item in candidates),
+            "time_span": chapter_no - min(chapters) if chapters else 0,
+        }
 
     def _candidates(self, *, role: str, chapter_no: int, chapter_version: int | None) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -181,11 +210,28 @@ class HybridRetriever:
 
     def _semantic_ranking(self, query: str, candidates: list[dict[str, Any]]) -> list[tuple[str, float]]:
         model = _cached_sentence_model(self.embedding_model)
-        texts = [query, *[item["title"] + "\n" + item["body"] for item in candidates]]
-        vectors = model.encode(texts, normalize_embeddings=True)
-        query_vector = vectors[0]
+        query_vector = model.encode([query], normalize_embeddings=True)[0]
+        vectors = []
+        missing_items = []
+        missing_texts = []
+        for item in candidates:
+            text = item["title"] + "\n" + item["body"]
+            source_hash = content_hash(text)
+            cached = self.project.db.get_cached_embedding(item["source_id"], self.embedding_model, source_hash)
+            if cached is None:
+                vectors.append(None)
+                missing_items.append((len(vectors) - 1, item, source_hash))
+                missing_texts.append(text)
+            else:
+                vectors.append(cached)
+        if missing_texts:
+            encoded = model.encode(missing_texts, normalize_embeddings=True)
+            for (index, item, source_hash), vector in zip(missing_items, encoded, strict=True):
+                values = vector.tolist() if hasattr(vector, "tolist") else list(vector)
+                vectors[index] = values
+                self.project.db.cache_embedding(item["source_id"], self.embedding_model, source_hash, values)
         return sorted(
-            [(item["source_id"], float(query_vector @ vector)) for item, vector in zip(candidates, vectors[1:], strict=True)],
+            [(item["source_id"], float(sum(float(a) * float(b) for a, b in zip(query_vector, vector, strict=True)))) for item, vector in zip(candidates, vectors, strict=True)],
             key=lambda value: (-value[1], value[0]),
         )
 

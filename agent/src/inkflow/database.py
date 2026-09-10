@@ -128,6 +128,37 @@ CREATE TABLE IF NOT EXISTS collaboration_messages (
 CREATE INDEX IF NOT EXISTS idx_collaboration_active
 ON collaboration_messages(status, recipient_role, chapter_no, chapter_version);
 
+CREATE TABLE IF NOT EXISTS collaboration_threads (
+    thread_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    chapter_no INTEGER,
+    chapter_version INTEGER,
+    context_packet_id TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    current_round INTEGER NOT NULL DEFAULT 1,
+    max_rounds INTEGER NOT NULL DEFAULT 2,
+    resolution TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    artifact_type TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    chapter_no INTEGER,
+    chapter_version INTEGER,
+    role TEXT NOT NULL,
+    dimension TEXT,
+    status TEXT NOT NULL,
+    data_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_artifacts_chapter
+ON agent_artifacts(chapter_no, chapter_version, artifact_type, status);
+
 CREATE TABLE IF NOT EXISTS user_preferences (
     preference_id TEXT PRIMARY KEY,
     strength TEXT NOT NULL,
@@ -161,6 +192,30 @@ CREATE TABLE IF NOT EXISTS retrieval_feedback (
 
 CREATE INDEX IF NOT EXISTS idx_retrieval_feedback_source
 ON retrieval_feedback(source_id, outcome);
+
+CREATE TABLE IF NOT EXISTS retrieval_embeddings (
+    source_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    vector_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(source_id, model)
+);
+
+CREATE TABLE IF NOT EXISTS learning_strategies (
+    strategy_key TEXT PRIMARY KEY,
+    trials INTEGER NOT NULL DEFAULT 0,
+    reward REAL NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS preference_pairs (
+    pair_id TEXT PRIMARY KEY,
+    chosen_artifact_id TEXT NOT NULL,
+    rejected_artifact_id TEXT NOT NULL,
+    features_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -776,6 +831,15 @@ class ProjectDatabase:
         with self.connect() as connection:
             connection.execute(
                 """
+                INSERT OR IGNORE INTO collaboration_threads(
+                    thread_id,run_id,topic,chapter_no,chapter_version,context_packet_id,
+                    status,current_round,max_rounds,created_at,updated_at
+                ) VALUES (?,?,?,?,?,?,?,1,2,?,?)
+                """,
+                (thread_id, run_id, claim, chapter_no, chapter_version, context_packet_id, "resolved" if status == "resolved" else "open", now, now),
+            )
+            connection.execute(
+                """
                 INSERT INTO collaboration_messages(
                     message_id, thread_id, run_id, sender_role, recipient_role, message_type,
                     chapter_no, chapter_version, context_packet_id, claim, evidence_refs_json,
@@ -789,6 +853,11 @@ class ProjectDatabase:
                     status, expires_at, response_to, now,
                 ),
             )
+            if response_to:
+                connection.execute(
+                    "UPDATE collaboration_messages SET status='responded' WHERE message_id=? AND status='pending'",
+                    (response_to,),
+                )
             connection.commit()
         return {
             "message_id": message_id, "thread_id": thread_id, "run_id": run_id,
@@ -799,6 +868,143 @@ class ProjectDatabase:
             "requested_response": requested_response, "status": status,
             "expires_at": expires_at, "response_to": response_to, "created_at": now,
         }
+
+    def open_collaboration_thread(
+        self,
+        *,
+        run_id: str,
+        topic: str,
+        chapter_no: int | None = None,
+        chapter_version: int | None = None,
+        context_packet_id: str = "",
+        max_rounds: int = 2,
+        thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        clean_topic = topic.strip()
+        if not clean_topic:
+            raise ValueError("协作议题不能为空")
+        bounded_rounds = max(1, min(int(max_rounds), 2))
+        item_id = thread_id or f"thread-{uuid.uuid4().hex}"
+        now = utc_now()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO collaboration_threads(
+                    thread_id,run_id,topic,chapter_no,chapter_version,context_packet_id,
+                    status,current_round,max_rounds,created_at,updated_at
+                ) VALUES (?,?,?,?,?,?,'open',1,?,?,?)
+                """,
+                (item_id, run_id, clean_topic, chapter_no, chapter_version, context_packet_id, bounded_rounds, now, now),
+            )
+            connection.commit()
+        return self.get_collaboration_thread(item_id)
+
+    def get_collaboration_thread(self, thread_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM collaboration_threads WHERE thread_id=?", (thread_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError("协作议题不存在")
+        return dict(row)
+
+    def advance_collaboration_thread(self, thread_id: str, *, resolution: str = "") -> dict[str, Any]:
+        item = self.get_collaboration_thread(thread_id)
+        if item["status"] not in {"open", "waiting"}:
+            return item
+        next_round = int(item["current_round"]) + 1
+        status = "escalated" if next_round > int(item["max_rounds"]) else "open"
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE collaboration_threads SET current_round=?,status=?,resolution=?,updated_at=? WHERE thread_id=?",
+                (min(next_round, int(item["max_rounds"])), status, resolution or None, utc_now(), thread_id),
+            )
+            connection.commit()
+        return self.get_collaboration_thread(thread_id)
+
+    def close_collaboration_thread(self, thread_id: str, resolution: str) -> dict[str, Any]:
+        if not resolution.strip():
+            raise ValueError("关闭协作议题时必须记录可复核结论")
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE collaboration_threads SET status='resolved',resolution=?,updated_at=? WHERE thread_id=?",
+                (resolution.strip(), utc_now(), thread_id),
+            )
+            connection.commit()
+        self.resolve_collaboration_thread(thread_id)
+        return self.get_collaboration_thread(thread_id)
+
+    def list_collaboration_threads(self, limit: int = 30) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM collaboration_threads ORDER BY updated_at DESC LIMIT ?",
+                (max(1, min(limit, 200)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_agent_artifact(
+        self,
+        *,
+        artifact_type: str,
+        run_id: str,
+        role: str,
+        data: dict[str, Any],
+        chapter_no: int | None = None,
+        chapter_version: int | None = None,
+        dimension: str = "",
+        status: str = "candidate",
+    ) -> dict[str, Any]:
+        artifact_id = f"artifact-{uuid.uuid4().hex}"
+        now = utc_now()
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO agent_artifacts VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (artifact_id, artifact_type, run_id, chapter_no, chapter_version, role, dimension or None, status, json_dumps(data, indent=None), now),
+            )
+            connection.commit()
+        return {"artifact_id": artifact_id, "artifact_type": artifact_type, "run_id": run_id, "role": role, "chapter_no": chapter_no, "chapter_version": chapter_version, "dimension": dimension, "status": status, "data": data, "created_at": now}
+
+    def list_agent_artifacts(self, *, chapter_no: int | None = None, artifact_type: str = "", limit: int = 50) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if chapter_no is not None:
+            clauses.append("chapter_no=?")
+            params.append(chapter_no)
+        if artifact_type:
+            clauses.append("artifact_type=?")
+            params.append(artifact_type)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(1, min(limit, 200)))
+        with self.connect() as connection:
+            rows = connection.execute("SELECT * FROM agent_artifacts" + where + " ORDER BY created_at DESC LIMIT ?", params).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["data"] = json.loads(item.pop("data_json"))
+            result.append(item)
+        return result
+
+    def select_agent_artifact(self, artifact_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM agent_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
+            if row is None:
+                raise ValueError("候选方案不存在")
+            connection.execute(
+                "UPDATE agent_artifacts SET status=CASE WHEN artifact_id=? THEN 'selected' ELSE 'not_selected' END WHERE run_id=? AND artifact_type=?",
+                (artifact_id, row["run_id"], row["artifact_type"]),
+            )
+            connection.commit()
+        result = dict(row)
+        result["data"] = json.loads(result.pop("data_json"))
+        result["status"] = "selected"
+        return result
+
+    def set_agent_artifact_status(self, artifact_id: str, status: str) -> None:
+        with self.connect() as connection:
+            cursor = connection.execute("UPDATE agent_artifacts SET status=? WHERE artifact_id=?", (status, artifact_id))
+            connection.commit()
+        if not cursor.rowcount:
+            raise ValueError("Agent 产物不存在")
 
     def list_collaboration_messages(
         self,
@@ -860,6 +1066,10 @@ class ProjectDatabase:
                 """,
                 (utc_now(), thread_id),
             )
+            connection.execute(
+                "UPDATE collaboration_threads SET status='resolved',updated_at=? WHERE thread_id=?",
+                (utc_now(), thread_id),
+            )
             connection.commit()
         return int(cursor.rowcount)
 
@@ -908,7 +1118,10 @@ class ProjectDatabase:
         chapter_no: int | None = None,
         chapter_version: int | None = None,
     ) -> str:
-        if event_type not in {"accepted", "rejected", "revised", "rolled_back", "preference_changed"}:
+        learning_settings = self.get_metadata("learning_settings", {"enabled": True})
+        if isinstance(learning_settings, dict) and learning_settings.get("enabled") is False:
+            return ""
+        if event_type not in {"accepted", "rejected", "revised", "rolled_back", "preference_changed", "comparison"}:
             raise ValueError("学习事件类型不受支持")
         event_id = f"learning-{uuid.uuid4().hex}"
         with self.connect() as connection:
@@ -957,6 +1170,82 @@ class ProjectDatabase:
             "priority_review_rules": [rule for rule, _ in rule_counts.most_common(5)],
             "notice": "来自本地接受、拒绝和修订记录；不包含模型思维链，也不会上传正文。",
         }
+
+    def update_learning_strategy(self, strategy_key: str, reward: float) -> dict[str, Any]:
+        key = strategy_key.strip()
+        if not key:
+            raise ValueError("学习策略名称不能为空")
+        bounded = max(-1.0, min(1.0, float(reward)))
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO learning_strategies(strategy_key,trials,reward,updated_at) VALUES (?,1,?,?)
+                ON CONFLICT(strategy_key) DO UPDATE SET trials=trials+1,reward=reward+excluded.reward,updated_at=excluded.updated_at
+                """,
+                (key, bounded, utc_now()),
+            )
+            connection.commit()
+            row = connection.execute("SELECT * FROM learning_strategies WHERE strategy_key=?", (key,)).fetchone()
+        return dict(row)
+
+    def choose_learning_strategy(self, candidates: list[str]) -> dict[str, Any]:
+        clean = sorted({item.strip() for item in candidates if item.strip()})
+        if not clean:
+            raise ValueError("至少需要一个候选策略")
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM learning_strategies WHERE strategy_key IN (%s)" % ",".join("?" for _ in clean), clean
+            ).fetchall()
+        known = {str(row["strategy_key"]): dict(row) for row in rows}
+        selected = min(
+            clean,
+            key=lambda item: (
+                known.get(item, {}).get("trials", 0) > 0,
+                -(known.get(item, {}).get("reward", 0.0) / max(1, known.get(item, {}).get("trials", 0))),
+                item,
+            ),
+        )
+        state = known.get(selected, {"strategy_key": selected, "trials": 0, "reward": 0.0})
+        return {
+            "selected": selected,
+            "trials": state["trials"],
+            "average_reward": float(state["reward"]) / max(1, int(state["trials"])),
+            "method": "local_explainable_bandit",
+        }
+
+    def save_preference_pair(self, chosen_artifact_id: str, rejected_artifact_id: str, features: dict[str, float]) -> str:
+        if chosen_artifact_id == rejected_artifact_id:
+            raise ValueError("偏好比较的两个候选不能相同")
+        pair_id = f"pair-{uuid.uuid4().hex}"
+        clean_features = {str(key): float(value) for key, value in features.items()}
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO preference_pairs VALUES (?,?,?,?,?)",
+                (pair_id, chosen_artifact_id, rejected_artifact_id, json_dumps(clean_features, indent=None), utc_now()),
+            )
+            connection.commit()
+        return pair_id
+
+    def get_cached_embedding(self, source_id: str, model: str, expected_hash: str) -> list[float] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT vector_json,content_hash FROM retrieval_embeddings WHERE source_id=? AND model=?",
+                (source_id, model),
+            ).fetchone()
+        if row is None or row["content_hash"] != expected_hash:
+            return None
+        return [float(value) for value in json.loads(row["vector_json"])]
+
+    def cache_embedding(self, source_id: str, model: str, source_hash: str, vector: list[float]) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO retrieval_embeddings(source_id,model,content_hash,vector_json,updated_at) VALUES (?,?,?,?,?)
+                ON CONFLICT(source_id,model) DO UPDATE SET content_hash=excluded.content_hash,vector_json=excluded.vector_json,updated_at=excluded.updated_at
+                """,
+                (source_id, model, source_hash, json_dumps(vector, indent=None), utc_now()),
+            )
+            connection.commit()
 
     def record_retrieval_feedback(
         self,

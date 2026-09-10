@@ -194,6 +194,7 @@ class ReferenceService:
         chapter_marks = re.findall(r"(?m)^\s*第[零一二三四五六七八九十百千万\d]+[章节回卷].{0,40}$", text)
         dialogue_chars = sum(len(item) for item in re.findall(r"[“\"]([^”\"]+)[”\"]", text))
         endings = [item[-100:] for item in paragraphs if len(item) >= 100][-20:]
+        ending_characters = sum(len(item) for item in endings)
         feature = {
             "reference_id": reference_id,
             "source_file": matches[0].name,
@@ -205,7 +206,12 @@ class ReferenceService:
             "average_paragraph_chars": round(len(text) / max(1, len(paragraphs)), 2),
             "average_sentence_chars": round(len(text) / max(1, len(sentences)), 2),
             "dialogue_ratio": round(dialogue_chars / max(1, len(text)), 4),
-            "sample_chapter_endings": endings,
+            "ending_features": {
+                "samples_counted": len(endings),
+                "average_characters": round(ending_characters / max(1, len(endings)), 2),
+                "question_ratio": round(sum("？" in item or "?" in item for item in endings) / max(1, len(endings)), 4),
+                "exclamation_ratio": round(sum("！" in item or "!" in item for item in endings) / max(1, len(endings)), 4),
+            },
             "note": "MVP 确定性特征；后续可增加分层模型分析，不直接把全文送入写作上下文。",
         }
         path = self.feature_dir / f"{reference_id}.json"
@@ -261,6 +267,8 @@ class ReferenceService:
             "source": source,
             "stored_path": str(destination.relative_to(self.project.root)),
             "imported_at": utc_now(),
+            "training_allowed": False,
+            "context_mode": "abstract_features_only",
         }
         if source_metadata:
             item["adapter_metadata"] = source_metadata

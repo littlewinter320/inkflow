@@ -508,6 +508,31 @@ class ContextPacket(StrictModel):
         return "\n".join(output).rstrip() + "\n"
 
 
+class PrefillSuggestion(StrictModel):
+    insertion: str = Field(default="", max_length=4_000)
+    confidence: Literal["high", "medium", "low"] = "medium"
+    constraint_notes: list[str] = Field(default_factory=list, max_length=5)
+
+
+class WriterDirection(StrictModel):
+    title: str = Field(min_length=1, max_length=80)
+    scene_goal: str = Field(min_length=1, max_length=500)
+    turning_point: str = Field(min_length=1, max_length=500)
+    ending_hook: str = Field(min_length=1, max_length=500)
+    risks: list[str] = Field(default_factory=list, max_length=6)
+
+
+class WriterDirectionSet(StrictModel):
+    directions: list[WriterDirection] = Field(min_length=2, max_length=5)
+
+
+class CollaborationReply(StrictModel):
+    answer: str = Field(min_length=1, max_length=2_000)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=20)
+    resolved: bool = False
+    remaining_question: str = Field(default="", max_length=500)
+
+
 class RoleCapability(StrictModel):
     role: Literal["coordinator", "writer", "reviewer", "memory_keeper"]
     formal_ai_agent: bool = True

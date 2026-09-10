@@ -30,7 +30,7 @@ if (-not (Test-Path -LiteralPath $python)) {
     throw 'Missing .venv. Create the Python virtual environment in the repository root first.'
 }
 
-& $python -m pip install -e "${agentRoot}[build]"
+& $python -m pip install -e "${agentRoot}[build,lightvoice]"
 if ($LASTEXITCODE -ne 0) {
     throw "Python dependency installation failed with exit code $LASTEXITCODE."
 }
@@ -44,6 +44,7 @@ if ($LASTEXITCODE -ne 0) {
     --collect-submodules mcp.server `
     --collect-submodules mcp.shared `
     --collect-data mcp `
+    --collect-all sherpa_onnx `
     --hidden-import mcp.types `
     --exclude-module mcp.cli `
     --distpath $engineOutput `

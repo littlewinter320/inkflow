@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inkflow-novel-agent"
-version = "0.4.5"
+version = "0.5.0"
 description = "墨流（InkFlow）——面向长篇中文网文的四 Agent 协作创作引擎"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,11 +20,22 @@ dependencies = [
 
 [project.optional-dependencies]
 build = ["pyinstaller>=6.15,<7"]
+lightvoice = [
+  "sherpa-onnx>=1.13,<2",
+  "soundfile>=0.12,<1",
+]
 review = [
   "torch>=2.2,<3",
   "transformers>=4.44,<6",
 ]
 rag = ["sentence-transformers>=3,<6"]
+voice = [
+  "funasr>=1.2,<2",
+  "qwen-tts>=0.1,<1",
+  "soundfile>=0.12,<1",
+  "torch>=2.4,<3",
+  "torchaudio>=2.4,<3",
+]
 
 [project.scripts]
 inkflow = "inkflow.cli:main"

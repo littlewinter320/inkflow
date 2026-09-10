@@ -12,14 +12,14 @@ from typing import Any
 from .config import Settings, save_api_key_to_keyring
 from .engine import InkFlowEngine
 from .errors import InkFlowError
-from .provider import DeepSeekProvider
+from .provider import create_provider
 from .schemas import BookBrief
 from .terminal_session import TerminalSession
 
 
 def _engine(root: str | Path) -> InkFlowEngine:
     settings = Settings.from_env(root)
-    return InkFlowEngine(DeepSeekProvider(settings), settings)
+    return InkFlowEngine(create_provider(settings), settings)
 
 
 def _print(value: Any) -> None:

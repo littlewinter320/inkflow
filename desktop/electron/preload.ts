@@ -5,6 +5,10 @@ contextBridge.exposeInMainWorld("inkflow", {
     ipcRenderer.invoke("engine:request", method, params),
   chooseFolder: (title: string) => ipcRenderer.invoke("dialog:choose-folder", title),
   chooseFile: (title: string) => ipcRenderer.invoke("dialog:choose-file", title),
+  chooseAudio: (title: string) => ipcRenderer.invoke("dialog:choose-audio", title),
+  saveVoiceRecording: (bytes: Uint8Array, extension = "webm") =>
+    ipcRenderer.invoke("voice:save-recording", bytes, extension),
+  audioUrl: (target: string) => ipcRenderer.invoke("voice:audio-url", target),
   openPath: (target: string) => ipcRenderer.invoke("shell:open-path", target),
   showItem: (target: string) => ipcRenderer.invoke("shell:show-item", target),
   launchContext: () => ipcRenderer.invoke("app:launch-context"),

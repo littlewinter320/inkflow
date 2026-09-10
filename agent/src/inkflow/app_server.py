@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import traceback
 import uuid
@@ -16,13 +17,18 @@ from . import __version__
 from .config import Settings, api_key_status, save_api_key_to_keyring, save_user_settings
 from .engine import InkFlowEngine
 from .errors import InkFlowError, ProviderError
+from .learning import LearningService
 from .project import InkFlowProject
 from .project_lock import project_write_lock, project_write_lock_sync
-from .provider import DeepSeekProvider
+from .provider import create_provider
 from .references import ReferenceService
-from .schemas import BookBrief, NovelIdeaBundle, PromptOptimization, ProviderProbe
+from .schemas import BookBrief, CollaborationReply, ContextPacket, ContextSection, MemoryPatch, NovelIdeaBundle, PrefillSuggestion, PromptOptimization, ProviderProbe, ReviewReport, WriterDirectionSet
+from .review_verifier import verify_review
 from .studio import StudioService
 from .terminal_session import TerminalSession
+from .trace import TraceRecorder
+from .utils import content_hash, estimate_tokens
+from .voice import VOICE_SETTING_NAMES, VoiceRuntime
 
 
 EventSink = Callable[[dict[str, Any]], Awaitable[None]]
@@ -33,6 +39,7 @@ class InkFlowAppService:
 
     def __init__(self, instance_id: str | None = None) -> None:
         self.instance_id = instance_id or f"server-{os.getpid()}-{uuid.uuid4().hex}"
+        self.voice = VoiceRuntime()
 
     async def dispatch(self, method: str, params: dict[str, Any], emit: EventSink) -> Any:
         if method == "app.initialize":
@@ -48,13 +55,17 @@ class InkFlowAppService:
                     "formal_agents": ["Coordinator", "Writer", "Reviewer", "Memory Keeper"],
                     "novel_production_agents": ["Writer", "Reviewer", "Memory Keeper"],
                     "raw_chain_of_thought": False,
+                    "voice_runtime": True,
+                    "voice_is_formal_agent": False,
                 },
-                "provider": api_key_status(),
+                "provider": api_key_status(Settings.from_env().provider_kind),
+                "voice": self.voice.status(),
             }
         if method == "provider.status":
             settings = Settings.from_env(params.get("workspace_root"))
             return {
-                **api_key_status(),
+                **api_key_status(settings.provider_kind),
+                "provider_kind": settings.provider_kind,
                 "base_url": settings.base_url,
                 "model": settings.model,
                 "reasoning_effort": settings.reasoning_effort,
@@ -69,14 +80,19 @@ class InkFlowAppService:
                 "retrieval_embedding_model": settings.retrieval_embedding_model,
                 "retrieval_reranker_model": settings.retrieval_reranker_model,
                 "powershell_enabled": settings.powershell_enabled,
+                "input_price_per_million": settings.input_price_per_million,
+                "output_price_per_million": settings.output_price_per_million,
+                "capabilities": create_provider(settings).capabilities(),
             }
         if method == "provider.configure":
+            provider_kind = str(params.get("provider_kind") or Settings.from_env().provider_kind).lower()
             key = str(params.get("api_key", "")).strip()
             if key:
-                save_api_key_to_keyring(key)
+                save_api_key_to_keyring(key, provider_kind)
             allowed = {
                 name: params[name]
                 for name in (
+                    "provider_kind",
                     "base_url",
                     "model",
                     "reasoning_effort",
@@ -91,6 +107,8 @@ class InkFlowAppService:
                     "retrieval_embedding_model",
                     "retrieval_reranker_model",
                     "powershell_enabled",
+                    "input_price_per_million",
+                    "output_price_per_million",
                 )
                 if name in params
                 and (
@@ -106,11 +124,18 @@ class InkFlowAppService:
             }
             if allowed:
                 save_user_settings(allowed)
-            return {"configured": True, **api_key_status(), **allowed}
+            current = Settings.from_env(params.get("workspace_root"))
+            return {"configured": True, **api_key_status(current.provider_kind), **allowed}
+        if method == "provider.capabilities":
+            settings = Settings.from_env(params.get("workspace_root"))
+            return create_provider(settings).capabilities()
+        if method == "provider.models":
+            settings = Settings.from_env(params.get("workspace_root"))
+            return {"models": await create_provider(settings).list_models()}
         if method == "provider.test":
             settings = Settings.from_env(params.get("workspace_root"))
             await emit({"type": "provider.testing", "summary": "正在验证密钥、接口与模型名称"})
-            result = await DeepSeekProvider(settings).generate_json(
+            result = await create_provider(settings).generate_json(
                 system_prompt="你只负责返回 API 连通性检查结果。",
                 user_prompt=(
                     "请用一句简短中文向用户打招呼，明确表示你收到了这次请求；"
@@ -129,6 +154,48 @@ class InkFlowAppService:
                 "reply": result.data.reply,
                 "public_reasoning_summary": result.data.public_reasoning_summary,
             }
+        if method == "voice.status":
+            return self.voice.status(params.get("workspace_root") or params.get("project_root"))
+        if method == "voice.settings.get":
+            return self.voice.settings(params.get("workspace_root") or params.get("project_root"))
+        if method == "voice.settings.configure":
+            updates = {name: params[name] for name in VOICE_SETTING_NAMES if name in params}
+            return self.voice.configure(updates, params.get("workspace_root") or params.get("project_root"))
+        if method == "voice.models.prepare":
+            return await self.voice.prepare_models(
+                params.get("workspace_root") or params.get("project_root"),
+                str(params.get("confirmation") or ""),
+                emit,
+            )
+        if method == "voice.light.install":
+            return await self.voice.prepare_light_models(
+                str(params.get("confirmation") or ""),
+                emit,
+            )
+        if method == "voice.qwen.install":
+            return await self.voice.install_qwen(
+                str(params.get("confirmation") or ""),
+                emit,
+            )
+        if method == "voice.profile.list":
+            return {"profiles": self.voice.list_profiles()}
+        if method == "voice.profile.clone":
+            return await self.voice.create_clone(params)
+        if method == "voice.profile.update":
+            return self.voice.update_profile(str(params.get("profile_id") or ""), params)
+        if method == "voice.profile.prepare_finetune":
+            return self.voice.prepare_finetune(
+                str(params.get("profile_id") or ""),
+                str(params.get("dataset_path") or ""),
+            )
+        if method == "voice.transcribe":
+            text = await self.voice.transcribe(str(params.get("audio_path") or ""))
+            return {"text": text, "language": "zh-CN", "mode": "local_mandarin"}
+        if method == "voice.speak":
+            return await self.voice.speak(
+                str(params.get("text") or ""),
+                str(params.get("profile_id") or "") or None,
+            )
         if method == "prompt.optimize":
             prompt = str(params.get("prompt") or "").strip()
             if not prompt:
@@ -137,7 +204,7 @@ class InkFlowAppService:
                 raise ValueError("提示词超过 8000 字，请先缩小范围后再优化。")
             settings = Settings.from_env(params.get("workspace_root") or params.get("project_root"))
             await emit({"type": "prompt.optimizing", "summary": "正在核对目标、约束与交付格式"})
-            result = await DeepSeekProvider(settings).generate_json(
+            result = await create_provider(settings).generate_json(
                 system_prompt=(
                     "你是墨流输入框的提示词优化工具，不是新的小说 Agent，也不执行提示词。"
                     "先批评原提示词中缺失或含糊的目标、上下文、约束、输出格式和验收标准，再综合为一版可直接提交的中文提示词。"
@@ -172,7 +239,7 @@ class InkFlowAppService:
                 }
             )
             try:
-                result = await DeepSeekProvider(settings).generate_json(
+                result = await create_provider(settings).generate_json(
                     system_prompt=(
                     "你是墨流的 Writer，当前只负责建项前构思，不写正文。面向中文网文读者，"
                     f"严格给出 {requested_count} 个可长线连载的原创方案。每个方案都必须有"
@@ -284,6 +351,24 @@ class InkFlowAppService:
                 "tree": studio.tree(),
                 "canon_migration": project.canonical_content_migration_status(),
             }
+        if method == "voice.roles.get":
+            return self.voice.get_role_map(project.root)
+        if method == "voice.roles.set":
+            return self.voice.set_role_map(project.root, params)
+        if method == "voice.roles.analyze":
+            return self.voice.analyze_roles(str(params.get("text") or ""))
+        if method == "voice.job.create":
+            return self.voice.create_job(project.root, params, emit)
+        if method == "voice.job.list":
+            return {"jobs": self.voice.list_jobs(project.root)}
+        if method == "voice.job.status":
+            return self.voice.job_status(str(params.get("job_id") or ""))
+        if method == "voice.job.pause":
+            return self.voice.pause_job(str(params.get("job_id") or ""))
+        if method == "voice.job.resume":
+            return self.voice.resume_job(str(params.get("job_id") or ""), emit)
+        if method == "voice.job.cancel":
+            return self.voice.cancel_job(str(params.get("job_id") or ""))
         if method == "project.canon_migration.status":
             return project.canonical_content_migration_status()
         if method == "project.canon_migration.apply":
@@ -327,6 +412,55 @@ class InkFlowAppService:
             return studio.tree()
         if method == "document.read":
             return studio.read_document(str(params["relative_path"]))
+        if method == "document.prefill":
+            relative_path = str(params.get("relative_path") or "")
+            chapter_match = re.search(r"chapter_(\d+)\.draft\.md$", relative_path)
+            if not chapter_match:
+                raise ValueError("预填续写只用于章节草稿")
+            chapter_no = int(chapter_match.group(1))
+            content = str(params.get("content") or "")
+            cursor_offset = int(params.get("cursor_offset", len(content)))
+            if cursor_offset < 0 or cursor_offset > len(content):
+                raise ValueError("预填位置已经失效")
+            expected_hash = str(params.get("expected_hash") or "")
+            current_hash = content_hash(content)
+            if expected_hash and expected_hash != current_hash:
+                raise ValueError("正文已经变化，本次预填候选已取消")
+            length = str(params.get("length") or "medium")
+            length_limit = {"short": 80, "medium": 240, "long": 600}.get(length, 240)
+            before = content[max(0, cursor_offset - 6_000):cursor_offset]
+            after = content[cursor_offset:cursor_offset + 2_000]
+            settings = Settings.from_env(project.root)
+            prefill_trace = TraceRecorder(project.root, "prefill", settings.trace_level)
+            packet = self._engine(project.root)._context_builder(project).build(
+                chapter_no, "在光标处生成一段可选续写；不得保存、审查或提交正史。", mode="draft"
+            )
+            packet.sections.append(ContextSection(
+                key="INPUT", title="当前光标附近正文", hard=True,
+                content=json.dumps({"before_cursor": before, "after_cursor": after, "maximum_characters": length_limit}, ensure_ascii=False),
+                source_ids=[f"draft:{chapter_no}:{current_hash}"],
+            ))
+            packet.estimated_tokens = estimate_tokens(packet.to_markdown())
+            result = await create_provider(settings).generate_json(
+                system_prompt=(
+                    "你是墨流的 Writer，只生成编辑器光标处可插入的正文候选。保持人物、时态、视角和声线连续；"
+                    "不要解释，不要重复光标前后的文字，不要修改文件，不要提交正史。"
+                ),
+                user_prompt=packet.to_markdown(),
+                output_model=PrefillSuggestion,
+                max_tokens=min(1_200, settings.max_output_tokens),
+                thinking=False,
+                agent_role="writer",
+            )
+            prefill_trace.record_model("writer.prefill", result, "Writer 已生成未落盘的光标候选")
+            prefill_trace.finish(summary="预填候选已返回；未修改文件")
+            return {
+                **result.data.model_dump(),
+                "document_hash": current_hash,
+                "cursor_offset": cursor_offset,
+                "model": result.model,
+                "usage": result.usage,
+            }
         if method == "document.save":
             return studio.save_document(
                 str(params["relative_path"]),
@@ -361,6 +495,82 @@ class InkFlowAppService:
             return studio.search(str(params["query"]), int(params.get("limit", 100)))
         if method == "chapter.workspace":
             return studio.chapter_workspace(int(params["chapter_no"]))
+        if method == "chapter.writer_candidates":
+            chapter_no = int(params["chapter_no"])
+            chapter = studio.chapter_workspace(chapter_no)
+            count = max(2, min(5, int(params.get("count", 3))))
+            settings = Settings.from_env(project.root)
+            packet = self._engine(project.root)._context_builder(project).build(
+                chapter_no, "为本章提出互相有明显区别的写作方向；只提交方案，不写正文。", mode="draft"
+            )
+            result = await create_provider(settings).generate_json(
+                system_prompt="你是墨流 Writer 的候选方案阶段。只提出方向，最终正文仍由固定主笔统一完成。",
+                user_prompt=packet.to_markdown() + f"\n\n必须给出 {count} 个方向。",
+                output_model=WriterDirectionSet,
+                max_tokens=3_000, thinking=False, agent_role="writer",
+            )
+            run_id = str(params.get("run_id") or uuid.uuid4().hex)
+            artifacts = []
+            with project_write_lock_sync(project.root):
+                for direction in result.data.directions[:count]:
+                    artifacts.append(project.db.save_agent_artifact(
+                        artifact_type="writer_direction", run_id=run_id, role="writer",
+                        chapter_no=chapter_no, chapter_version=(chapter.get("chapter") or {}).get("version"),
+                        data=direction.model_dump(), status="awaiting_selection",
+                    ))
+            return {"candidates": artifacts, "context_packet_id": content_hash(packet.to_markdown()), "model": result.model, "usage": result.usage}
+        if method == "chapter.writer_candidate.select":
+            with project_write_lock_sync(project.root):
+                selected = project.db.select_agent_artifact(str(params["artifact_id"]))
+                project.db.set_metadata(f"writer_selection:{selected['chapter_no']}", selected)
+            return selected
+        if method == "writer.profile.get":
+            return project.db.get_metadata("writer_profile", {"locked": True, "provider": Settings.from_env(project.root).provider_kind, "model": Settings.from_env(project.root).model, "prompt_version": "built-in"})
+        if method == "writer.profile.update":
+            profile = {"locked": bool(params.get("locked", True)), "provider": str(params.get("provider") or Settings.from_env(project.root).provider_kind), "model": str(params.get("model") or Settings.from_env(project.root).model), "prompt_version": str(params.get("prompt_version") or "built-in")}
+            with project_write_lock_sync(project.root):
+                project.db.set_metadata("writer_profile", profile)
+            return profile
+        if method == "chapter.review_panel":
+            chapter_no = int(params["chapter_no"])
+            chapter = project.db.get_chapter(chapter_no)
+            if not chapter or chapter["status"] != "draft":
+                raise ValueError("当前章节没有待审草稿")
+            content = (project.root / chapter["path"]).read_text(encoding="utf-8")
+            dimensions = list(params.get("dimensions") or ["continuity", "character", "narrative", "style"])
+            allowed_dimensions = {"continuity", "character", "narrative", "style"}
+            dimensions = [item for item in dimensions if item in allowed_dimensions][:4]
+            packet = self._engine(project.root)._context_builder(project).build(
+                chapter_no, "多维审查当前草稿", mode="review", protected_input=content
+            )
+            reports = []
+            merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+            run_id = str(params.get("run_id") or uuid.uuid4().hex)
+            for dimension in dimensions:
+                result = await create_provider(Settings.from_env(project.root)).generate_json(
+                    system_prompt="你是墨流 Reviewer。只审查指定维度，逐条引用当前正文或 Context Packet；不直接修改正文，不以投票代替证据。",
+                    user_prompt=packet.to_markdown() + f"\n\n# 审查维度\n{dimension}\n\n# 当前正文\n{content}",
+                    output_model=ReviewReport, max_tokens=5_000, thinking=False, agent_role="reviewer",
+                )
+                verified, verdict = verify_review(result.data, content, packet)
+                payload = result.data.model_dump(mode="json")
+                payload["verdict"] = verdict
+                payload["findings"] = [item.model_dump(mode="json") for item in verified]
+                with project_write_lock_sync(project.root):
+                    current = project.db.get_chapter(chapter_no)
+                    if not current or int(current["version"]) != int(chapter["version"]) or (project.root / current["path"]).read_text(encoding="utf-8") != content:
+                        raise ValueError("多维预审期间正文版本已经变化，请重新运行")
+                    artifact = project.db.save_agent_artifact(
+                        artifact_type="review_dimension", run_id=run_id, role="reviewer", dimension=dimension,
+                        chapter_no=chapter_no, chapter_version=int(chapter["version"]), data=payload, status="evidence_checked",
+                    )
+                reports.append(artifact)
+                for finding in payload["findings"]:
+                    key = (str(finding.get("rule_id")), str(finding.get("evidence")), str(finding.get("explanation")))
+                    merged.setdefault(key, finding)
+            severity_rank = {"blocking": 0, "major": 1, "minor": 2, "info": 3}
+            findings = sorted(merged.values(), key=lambda item: severity_rank.get(str(item.get("severity")), 9))
+            return {"reports": reports, "merged_findings": findings, "merge_method": "evidence_keyed_no_voting", "next_action": "由正式 Reviewer 对当前版本执行最终审查门禁"}
         if method == "scene_note.upsert":
             return studio.upsert_scene_note(
                 int(params["chapter_no"]), int(params["scene_no"]), dict(params.get("data") or {})
@@ -379,6 +589,36 @@ class InkFlowAppService:
                 aliases=list(params.get("aliases") or []),
                 data=dict(params.get("data") or {}),
             )
+        if method == "memory.preview":
+            if params.get("user_accepted") is not True:
+                raise ValueError("只有用户明确接受当前正文后，Memory Keeper 才能准备正史变更预览")
+            chapter_no = int(params["chapter_no"])
+            chapter = project.db.get_chapter(chapter_no)
+            if not chapter or chapter["status"] != "draft":
+                raise ValueError("当前章节没有可验收草稿")
+            review = project.db.latest_review_record(chapter_no)
+            if not review or review["chapter_version"] != int(chapter["version"]) or review["report"].verdict != "pass":
+                raise ValueError("当前草稿版本尚未通过 Reviewer，不能准备正史预览")
+            content = (project.root / chapter["path"]).read_text(encoding="utf-8")
+            trace = TraceRecorder(project.root, f"memory-preview-{chapter_no:05d}", Settings.from_env(project.root).trace_level)
+            patch, _, _ = await self._engine(project.root)._extract_memory_patch(project, chapter_no, content, trace, source_status="accepted")
+            artifact = project.db.save_agent_artifact(
+                artifact_type="memory_patch_preview", run_id=trace.run_id, role="memory_keeper",
+                chapter_no=chapter_no, chapter_version=int(chapter["version"]), data=patch.model_dump(mode="json"), status="awaiting_commit",
+            )
+            trace.finish(summary="正史变更预览已生成，尚未提交 SQLite")
+            return {"preview": artifact, "facts": len(patch.facts), "threads": len(patch.threads), "notice": "正文已经由用户接受；当前只生成变更预览，尚未提交正史。"}
+        if method == "memory.commit_preview":
+            artifacts = project.db.list_agent_artifacts(chapter_no=int(params["chapter_no"]), artifact_type="memory_patch_preview", limit=20)
+            artifact = next((item for item in artifacts if item["artifact_id"] == str(params["artifact_id"]) and item["status"] == "awaiting_commit"), None)
+            if artifact is None:
+                raise ValueError("正史预览不存在或已经失效")
+            chapter = project.db.get_chapter(int(params["chapter_no"]))
+            if not chapter or int(chapter["version"]) != int(artifact["chapter_version"]):
+                raise ValueError("正文版本已经变化，请重新生成正史预览")
+            result = await self._engine(project.root).accept_chapter(project.root, int(params["chapter_no"]), _prepared_patch=MemoryPatch.model_validate(artifact["data"]))
+            project.db.set_agent_artifact_status(artifact["artifact_id"], "committed")
+            return result
         if method == "preference.list":
             return {"preferences": project.db.list_preferences()}
         if method == "preference.upsert":
@@ -394,19 +634,128 @@ class InkFlowAppService:
                 return item
         if method == "collaboration.list":
             return {
+                "threads": project.db.list_collaboration_threads(),
                 "messages": project.db.list_collaboration_messages(
                     chapter_no=int(params["chapter_no"]) if params.get("chapter_no") is not None else None,
                     active_only=bool(params.get("active_only", False)),
                     limit=int(params.get("limit", 50)),
                 )
             }
+        if method == "collaboration.open":
+            with project_write_lock_sync(project.root):
+                thread = project.db.open_collaboration_thread(
+                    run_id=str(params.get("run_id") or uuid.uuid4().hex),
+                    topic=str(params.get("topic") or ""),
+                    chapter_no=int(params["chapter_no"]) if params.get("chapter_no") is not None else None,
+                    chapter_version=int(params["chapter_version"]) if params.get("chapter_version") is not None else None,
+                    context_packet_id=str(params.get("context_packet_id") or ""),
+                )
+                message = project.db.append_collaboration_message(
+                    thread_id=thread["thread_id"], run_id=thread["run_id"],
+                    sender_role=str(params.get("sender_role") or "coordinator"),
+                    recipient_role=str(params.get("recipient_role") or "writer"),
+                    message_type=str(params.get("message_type") or "fact_query"),
+                    claim=str(params.get("claim") or thread["topic"]),
+                    requested_response=str(params.get("requested_response") or "请给出有证据的简短答复"),
+                    evidence_refs=list(params.get("evidence_refs") or []),
+                    chapter_no=thread["chapter_no"], chapter_version=thread["chapter_version"],
+                    context_packet_id=str(thread.get("context_packet_id") or ""),
+                )
+            return {"thread": thread, "message": message}
+        if method == "collaboration.reply":
+            thread = project.db.get_collaboration_thread(str(params["thread_id"]))
+            messages = project.db.list_collaboration_messages(limit=100)
+            scoped = [item for item in messages if item["thread_id"] == thread["thread_id"]]
+            pending = next((item for item in scoped if item["status"] == "pending"), scoped[-1] if scoped else None)
+            recipient = str(params.get("recipient_role") or (pending["recipient_role"] if pending else "writer"))
+            role_boundaries = {
+                "writer": "只回答规划、写作或修订问题，不审批，不提交正史。",
+                "reviewer": "只进行证据化审查，不直接修改正文。",
+                "memory_keeper": "只回答已接受正文的事实问题，不从草稿提交正史。",
+                "coordinator": "只澄清目标、依赖和分工，不写正文、不审批、不提交正史。",
+            }
+            allowed_evidence = {str(ref) for item in scoped for ref in item.get("evidence_refs", [])}
+            discussion_content = json.dumps({"thread": thread, "messages": scoped, "question": params.get("question", "")}, ensure_ascii=False)
+            discussion_packet = ContextPacket(
+                project_id=project.root.name,
+                chapter_no=int(thread.get("chapter_no") or 0),
+                task=f"回答结构化协作议题：{thread['topic']}",
+                sections=[ContextSection(key="A", title="议题、版本与证据", content=discussion_content, source_ids=sorted(allowed_evidence), hard=True)],
+                estimated_tokens=estimate_tokens(discussion_content),
+            )
+            result = await create_provider(Settings.from_env(project.root)).generate_json(
+                system_prompt=f"你是墨流的 {recipient}。{role_boundaries.get(recipient, '')} 最多两轮定向交流，不得自由群聊。",
+                user_prompt=discussion_packet.to_markdown(),
+                output_model=CollaborationReply,
+                max_tokens=2_000,
+                thinking=False,
+                agent_role=recipient,
+            )
+            evidence_refs = [ref for ref in result.data.evidence_refs if ref in allowed_evidence]
+            if result.data.evidence_refs and len(evidence_refs) != len(result.data.evidence_refs):
+                raise ValueError("目标 Agent 引用了本议题 Context Packet 之外的证据，回复已拒绝")
+            with project_write_lock_sync(project.root):
+                response = project.db.append_collaboration_message(
+                    thread_id=thread["thread_id"], run_id=thread["run_id"], sender_role=recipient,
+                    recipient_role="coordinator", message_type="answer", claim=result.data.answer,
+                    evidence_refs=evidence_refs, requested_response=result.data.remaining_question,
+                    chapter_no=thread["chapter_no"], chapter_version=thread["chapter_version"],
+                    context_packet_id=str(thread.get("context_packet_id") or ""), status="responded",
+                    response_to=pending["message_id"] if pending else None,
+                )
+                state = project.db.close_collaboration_thread(thread["thread_id"], result.data.answer) if result.data.resolved else project.db.advance_collaboration_thread(thread["thread_id"], resolution=result.data.remaining_question)
+                if state["status"] == "escalated":
+                    project.db.append_collaboration_message(
+                        thread_id=thread["thread_id"], run_id=thread["run_id"], sender_role="coordinator",
+                        recipient_role="user", message_type="risk",
+                        claim=result.data.remaining_question or f"关于“{thread['topic']}”仍有分歧，需要你确认。",
+                        evidence_refs=evidence_refs, requested_response="请只回答这个最小分歧点；相关分支已暂停。",
+                        chapter_no=thread["chapter_no"], chapter_version=thread["chapter_version"],
+                        context_packet_id=str(thread.get("context_packet_id") or ""), status="escalated",
+                    )
+            return {"thread": state, "message": response, "model": result.model, "usage": result.usage}
         if method == "collaboration.overview":
             return {
+                "threads": project.db.list_collaboration_threads(),
                 "messages": project.db.list_collaboration_messages(active_only=False, limit=int(params.get("limit", 80))),
                 "tasks": studio.db.list_tasks(int(params.get("task_limit", 30))),
                 "batches": _list_batch_summaries(project),
                 "learning_events": project.db.list_learning_events(int(params.get("learning_limit", 12))),
+                "artifacts": project.db.list_agent_artifacts(limit=30),
+                "usage": _usage_overview(project, Settings.from_env(project.root)),
             }
+        if method == "usage.overview":
+            return _usage_overview(project, Settings.from_env(project.root))
+        if method == "learning.settings.get":
+            return project.db.get_metadata("learning_settings", {"enabled": True, "allow_training_exports": False})
+        if method == "learning.settings.update":
+            value = {"enabled": bool(params.get("enabled", True)), "allow_training_exports": bool(params.get("allow_training_exports", False))}
+            with project_write_lock_sync(project.root):
+                project.db.set_metadata("learning_settings", value)
+            return value
+        if method == "learning.strategy.choose":
+            return project.db.choose_learning_strategy(list(params.get("candidates") or []))
+        if method == "learning.strategy.feedback":
+            with project_write_lock_sync(project.root):
+                return project.db.update_learning_strategy(str(params["strategy_key"]), float(params["reward"]))
+        if method == "learning.preference.compare":
+            with project_write_lock_sync(project.root):
+                return {"pair_id": project.db.save_preference_pair(str(params["chosen_artifact_id"]), str(params["rejected_artifact_id"]), dict(params.get("features") or {}))}
+        if method == "learning.overview":
+            return LearningService(project).overview()
+        if method == "learning.dataset.export":
+            with project_write_lock_sync(project.root):
+                return LearningService(project).export_dataset(include_prose=bool(params.get("include_prose", False)))
+        if method == "learning.preference.train":
+            with project_write_lock_sync(project.root):
+                return LearningService(project).train_preference_model()
+        if method == "learning.training.prepare":
+            with project_write_lock_sync(project.root):
+                return LearningService(project).prepare_training(
+                    export_id=str(params["export_id"]),
+                    base_model_path=str(params["base_model_path"]),
+                    method=str(params.get("training_method") or "lora"),
+                )
         if method == "retrieval.feedback":
             with project_write_lock_sync(project.root):
                 return {
@@ -489,8 +838,12 @@ class InkFlowAppService:
         if action == "plan":
             result = await engine.generate_plan(project.root)
         elif action == "write":
+            instruction = str(params.get("instruction") or "")
+            selected = project.db.get_metadata(f"writer_selection:{int(params['chapter_no'])}", None)
+            if isinstance(selected, dict) and selected.get("data"):
+                instruction = instruction + "\n\n已选定候选方向：" + json.dumps(selected["data"], ensure_ascii=False)
             result = await engine.write_chapter(
-                project.root, int(params["chapter_no"]), str(params.get("instruction") or "")
+                project.root, int(params["chapter_no"]), instruction
             )
         elif action == "review":
             result = await engine.review_chapter(project.root, int(params["chapter_no"]))
@@ -549,7 +902,41 @@ class InkFlowAppService:
     @staticmethod
     def _engine(root: Path) -> InkFlowEngine:
         settings = Settings.from_env(root)
-        return InkFlowEngine(DeepSeekProvider(settings), settings)
+        return InkFlowEngine(create_provider(settings), settings)
+
+
+def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, Any]:
+    prompt_tokens = 0
+    completion_tokens = 0
+    calls = 0
+    for event_path in (project.internal / "runs").glob("*/events.jsonl"):
+        try:
+            lines = event_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                usage = dict(json.loads(line).get("metadata", {}).get("usage") or {})
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if not usage:
+                continue
+            calls += 1
+            prompt_tokens += int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+            completion_tokens += int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+    estimated_cost = (
+        prompt_tokens * settings.input_price_per_million
+        + completion_tokens * settings.output_price_per_million
+    ) / 1_000_000
+    return {
+        "calls": calls,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "estimated_cost": round(estimated_cost, 6),
+        "currency": "CNY",
+        "pricing_configured": settings.input_price_per_million > 0 or settings.output_price_per_million > 0,
+    }
 
 
 class JsonLineServer:

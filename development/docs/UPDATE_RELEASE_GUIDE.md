@@ -5,7 +5,7 @@
 ## 发布一个新版本
 
 1. 同步 `agent/src/inkflow/__init__.py`、`agent/pyproject.toml` 和 `desktop/package.json` 的版本号；构建脚本会拒绝不一致的版本。VS Code 扩展可独立升版。
-2. 创建并推送对应标签，例如 `git tag v0.4.2; git push origin v0.4.2`。
+2. 创建并推送对应标签，例如 `git tag v0.5.0; git push origin v0.5.0`。
 3. GitHub Actions 会在 `v*` 标签上自动构建 Windows 安装包，并把安装包、`latest.yml` 与 `.blockmap` 发布到同一个正式 Release。也可以在已推送标签的本地机器运行 `./development/scripts/build-release.ps1 -Publish`。
 4. `latest.yml` 必须和安装包在同一个正式 Release 中；只上传 `.exe` 或只推送代码都不会触发桌面更新。
 

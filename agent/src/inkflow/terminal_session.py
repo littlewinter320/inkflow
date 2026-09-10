@@ -684,6 +684,7 @@ class TerminalSession:
             }
         policy = {
             "roles": {
+                "Coordinator": "理解需求、维护交流、拆解与派工；不写正文、不审批、不提交正史",
                 "写作 Agent": "仅规划、写作、修订",
                 "审查 Agent": "仅独立审查",
                 "记忆 Agent": "仅从已接受正文提取并提交正史",
@@ -723,6 +724,12 @@ class TerminalSession:
                 key="F",
                 title="最近用户讨论与待确认事项",
                 content=self._recent_dialogue(project) or "这是一次新的会话，尚无待确认事项。",
+            ),
+            ContextSection(
+                key="F1",
+                title="结构化 Agent 分歧与待用户回答问题",
+                content=json_dumps(project.db.list_collaboration_messages(active_only=True, limit=20)),
+                source_ids=[item["message_id"] for item in project.db.list_collaboration_messages(active_only=True, limit=20)],
             ),
             ContextSection(
                 key="E",

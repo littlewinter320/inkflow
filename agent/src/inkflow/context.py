@@ -29,6 +29,9 @@ class ContextBuilder:
         self.project = project
         self.soft_token_limit = soft_token_limit
         self.hard_token_limit = hard_token_limit or max(soft_token_limit, 512_000)
+        self.configured_soft_token_limit = self.soft_token_limit
+        self.configured_hard_token_limit = self.hard_token_limit
+        self.output_reserve_tokens = 16_000
         self.retriever = HybridRetriever(
             project,
             embedding_model=embedding_model,
@@ -45,6 +48,16 @@ class ContextBuilder:
         provisional_chapters: list[dict[str, Any]] | None = None,
         protected_input: str = "",
     ) -> ContextPacket:
+        task_budget = {
+            "draft": (192_000, 208_000),
+            "review": (160_000, 176_000),
+            "revise": (192_000, 208_000),
+        }[mode]
+        self.soft_token_limit = min(self.configured_soft_token_limit, task_budget[0])
+        self.hard_token_limit = min(
+            max(self.soft_token_limit, self.configured_hard_token_limit - self.output_reserve_tokens),
+            task_budget[1],
+        )
         database = self.project.db
         brief = database.get_brief()
         bundle = database.get_current_plan_bundle()
@@ -325,7 +338,12 @@ class ContextBuilder:
         result: list[dict] = []
         for path in sorted(folder.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:limit]:
             try:
-                result.append(json.loads(path.read_text(encoding="utf-8")))
+                card = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(card, dict):
+                    # 兼容旧特征卡，但不再把可复用的原文结尾片段送进 Context Packet。
+                    card.pop("sample_chapter_endings", None)
+                    card.pop("samples", None)
+                    result.append(card)
             except (OSError, json.JSONDecodeError):
                 continue
         return result
@@ -604,6 +622,9 @@ class ContextBuilder:
             "before_compression_tokens": before_compression,
             "soft_limit_tokens": self.soft_token_limit,
             "hard_limit_tokens": self.hard_token_limit,
+            "configured_soft_limit_tokens": self.configured_soft_token_limit,
+            "configured_hard_limit_tokens": self.configured_hard_token_limit,
+            "output_reserve_tokens": self.output_reserve_tokens,
             "hard_usage_percent": round(ratio * 100, 1),
             "status": status,
             "hard_sections": [
@@ -636,6 +657,17 @@ class ContextBuilder:
                 for item in soft_sections
             ],
             "compression_applied": before_compression > packet.estimated_tokens,
+            "budget_allocation": [
+                {
+                    "key": item.key,
+                    "title": item.title,
+                    "estimated_tokens": max(1, len(item.content) // 4),
+                    "hard": item.hard,
+                    "source_count": len(item.source_ids),
+                }
+                for item in packet.sections
+            ],
+            "retrieval_diagnostics": self.retriever.last_diagnostics,
             "warnings": packet.warnings,
         }
         atomic_write_text(self.project.internal / "context-status.json", json_dumps(payload))

@@ -16,7 +16,7 @@ from .config import Settings
 from .engine import InkFlowEngine
 from .project import InkFlowProject
 from .project_lock import project_write_lock, project_write_lock_sync
-from .provider import DeepSeekProvider
+from .provider import create_provider
 from .references import ReferenceService
 from .schemas import BookBrief
 from .studio import StudioService
@@ -45,7 +45,7 @@ def _root(value: str | None) -> Path:
 
 def _engine(root: Path) -> InkFlowEngine:
     settings = Settings.from_env(root)
-    return InkFlowEngine(DeepSeekProvider(settings), settings)
+    return InkFlowEngine(create_provider(settings), settings)
 
 
 @mcp.tool(annotations=LOCAL_WRITE)

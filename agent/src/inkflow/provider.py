@@ -42,12 +42,47 @@ class JsonModelProvider(Protocol):
         model_override: str | None = None,
     ) -> ProviderResult[T]: ...
 
+    def capabilities(self) -> dict[str, Any]: ...
+
+    async def list_models(self) -> list[str]: ...
+
 
 class DeepSeekProvider:
     """OpenAI 兼容 Chat Completions 适配器，并为 DeepSeek 启用官方扩展字段。"""
 
     def __init__(self, settings: Settings):
         self.settings = settings
+
+    def capabilities(self) -> dict[str, Any]:
+        kind = self.settings.provider_kind
+        return {
+            "provider": kind,
+            "protocol": "openai_compatible",
+            "json_mode": kind != "ollama",
+            "reasoning_effort": kind in {"deepseek", "openai"},
+            "top_k": False,
+            "balance": self.settings.is_deepseek,
+            "api_key_required": kind != "ollama",
+            "context_hard_tokens": self.settings.context_hard_tokens,
+            "max_output_tokens": self.settings.max_output_tokens,
+        }
+
+    async def list_models(self) -> list[str]:
+        headers = {"Content-Type": "application/json"}
+        api_key = self.settings.require_api_key()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        try:
+            async with httpx.AsyncClient(timeout=min(self.settings.request_timeout_seconds, 30.0)) as client:
+                response = await client.get(f"{self.settings.base_url}/models", headers=headers)
+            if response.status_code >= 400:
+                raise ProviderError(f"模型列表接口返回 HTTP {response.status_code}：{_safe_error_message(response)}")
+            body = response.json()
+            values = body.get("data", body.get("models", [])) if isinstance(body, dict) else []
+            models = [str(item.get("id") or item.get("name")) for item in values if isinstance(item, dict)]
+            return sorted({item for item in models if item})
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            raise ProviderError(f"无法读取模型列表：{exc}") from exc
 
     async def get_balance(self) -> dict[str, Any]:
         if not self.settings.is_deepseek:
@@ -124,6 +159,8 @@ class DeepSeekProvider:
             payload["reasoning_effort"] = effort or self.settings.reasoning_effort
         url = f"{self.settings.base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        if not api_key:
+            headers.pop("Authorization", None)
 
         last_error: Exception | None = None
         for attempt in range(2):
@@ -203,6 +240,111 @@ class DeepSeekProvider:
                     continue
                 break
         raise ProviderError(f"模型 JSON 调用两次均未通过验证：{last_error}") from last_error
+
+
+class AnthropicProvider:
+    """Anthropic Messages API 适配器。"""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    def capabilities(self) -> dict[str, Any]:
+        return {
+            "provider": "anthropic",
+            "protocol": "anthropic_messages",
+            "json_mode": False,
+            "reasoning_effort": False,
+            "top_k": True,
+            "balance": False,
+            "api_key_required": True,
+            "context_hard_tokens": self.settings.context_hard_tokens,
+            "max_output_tokens": self.settings.max_output_tokens,
+        }
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "x-api-key": self.settings.require_api_key(),
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+
+    async def list_models(self) -> list[str]:
+        try:
+            async with httpx.AsyncClient(timeout=min(self.settings.request_timeout_seconds, 30.0)) as client:
+                response = await client.get(f"{self.settings.base_url}/v1/models", headers=self._headers())
+            if response.status_code >= 400:
+                raise ProviderError(f"Anthropic 模型列表返回 HTTP {response.status_code}：{_safe_error_message(response)}")
+            body = response.json()
+            return sorted(
+                {str(item.get("id")) for item in body.get("data", []) if isinstance(item, dict) and item.get("id")}
+            )
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            raise ProviderError(f"无法读取 Anthropic 模型列表：{exc}") from exc
+
+    async def get_balance(self) -> dict[str, Any]:
+        raise ProviderError("Anthropic Messages API 不提供余额查询；请在服务商控制台查看。")
+
+    async def generate_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        output_model: type[T],
+        effort: str | None = None,
+        max_tokens: int = 16_000,
+        thinking: bool = True,
+        timeout_seconds: float | None = None,
+        agent_role: str | None = None,
+        model_override: str | None = None,
+    ) -> ProviderResult[T]:
+        del effort, thinking
+        schema_prompt = json.dumps(output_model.model_json_schema(), ensure_ascii=False)
+        generation = self.settings.agent_generation.get(agent_role or "", {})
+        payload: dict[str, Any] = {
+            "model": model_override or self.settings.model,
+            "system": system_prompt.rstrip() + "\n\n只输出满足下列 JSON Schema 的 JSON 对象，不要使用 Markdown：\n" + schema_prompt,
+            "messages": [{"role": "user", "content": user_prompt}],
+            "max_tokens": min(max(1, int(max_tokens)), self.settings.max_output_tokens),
+        }
+        if generation:
+            payload["temperature"] = generation.get("temperature")
+            payload["top_p"] = generation.get("top_p")
+            if generation.get("top_k") is not None:
+                payload["top_k"] = generation["top_k"]
+        request_timeout = timeout_seconds or self.settings.request_timeout_seconds
+        try:
+            async with httpx.AsyncClient(timeout=request_timeout) as client:
+                response = await asyncio.wait_for(
+                    client.post(f"{self.settings.base_url}/v1/messages", headers=self._headers(), json=payload),
+                    timeout=request_timeout,
+                )
+            if response.status_code >= 400:
+                raise ProviderError(f"Anthropic API 返回 HTTP {response.status_code}：{_safe_error_message(response)}")
+            body = response.json()
+            blocks = body.get("content") or []
+            content = "".join(str(block.get("text") or "") for block in blocks if block.get("type") == "text")
+            result = _model_from_json_content(content, output_model)
+            usage = dict(body.get("usage") or {})
+            usage.setdefault("prompt_tokens", usage.get("input_tokens", 0))
+            usage.setdefault("completion_tokens", usage.get("output_tokens", 0))
+            usage.setdefault("total_tokens", usage["prompt_tokens"] + usage["completion_tokens"])
+            return ProviderResult(
+                data=result,
+                model=str(body.get("model") or model_override or self.settings.model),
+                response_id=body.get("id"),
+                reasoning_content=None,
+                usage=usage,
+            )
+        except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError, ValidationError, ProviderError) as exc:
+            if isinstance(exc, ProviderError):
+                raise
+            raise ProviderError(f"Anthropic JSON 调用失败：{exc}") from exc
+
+
+def create_provider(settings: Settings) -> JsonModelProvider:
+    if settings.provider_kind == "anthropic":
+        return AnthropicProvider(settings)
+    return DeepSeekProvider(settings)
 
 
 def _safe_error_message(response: httpx.Response) -> str:
