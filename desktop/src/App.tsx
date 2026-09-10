@@ -443,13 +443,12 @@ function App() {
       if (message.includes("内置引擎") && message.includes("不兼容")) setShowUpdate(true);
       setMascotMood("rest");
     };
-    // 先用本机记住的项目立即渲染主工作区；引擎、模型状态和项目资料各自后台加载。
-    const storedProject = localStorage.getItem("inkflow.lastProject");
-    if (storedProject) void openProject(storedProject, { optimistic: true });
+    // 先立即渲染启动主界面；引擎、模型状态和更新检查各自后台加载。
+    // 最近项目只在主界面展示，用户点击后再进入工作区，避免启动时误跳到项目页。
     void window.inkflow.launchContext()
       .then((launch) => {
         const projectRootFromArgs = launch.projectRoot;
-        if (projectRootFromArgs && projectRootFromArgs !== storedProject) void openProject(projectRootFromArgs, { optimistic: true });
+        if (projectRootFromArgs) void openProject(projectRootFromArgs, { optimistic: true });
       })
       .catch(showStartupError);
     void window.inkflow.request<Record<string, unknown>>("app.initialize").then(setAppInfo).catch(showStartupError);
