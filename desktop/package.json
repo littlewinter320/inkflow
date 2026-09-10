@@ -1,6 +1,6 @@
 {
   "name": "inkflow-desktop",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "private": true,
   "author": "InkFlow contributors",
   "description": "墨流（InkFlow）四 Agent 中文长篇小说桌面工作台",
@@ -45,7 +45,7 @@
       "en-US"
     ],
     "directories": {
-      "output": "../artifacts/desktop/0.5.1"
+      "output": "../artifacts/desktop/0.5.2"
     },
     "files": [
       "dist/**/*",
