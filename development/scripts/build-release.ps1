@@ -45,6 +45,7 @@ if ($LASTEXITCODE -ne 0) {
     --collect-submodules mcp.shared `
     --collect-data mcp `
     --collect-all sherpa_onnx `
+    --hidden-import soundfile `
     --hidden-import mcp.types `
     --exclude-module mcp.cli `
     --distpath $engineOutput `
