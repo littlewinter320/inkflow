@@ -1642,13 +1642,41 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
     setWorking(true); setError(""); setResult("");
     try {
       const saved = await withDeadline(window.inkflow.request<Record<string, unknown>>("provider.configure", form), 15000, "本机保存没有及时返回。请重新打开设置核对保存结果后再试。");
-      const savedVoice = await window.inkflow.request<VoiceSettings>("voice.settings.configure", voiceForm);
-      const latestVoiceStatus = await window.inkflow.request<VoiceStatus>("voice.status", projectRoot ? { project_root: projectRoot } : {});
-      if (projectRoot) await window.inkflow.request("learning.settings.update", { project_root: projectRoot, ...learningSettings });
       setForm((value) => ({ ...value, api_key: "" }));
       onSaved({ ...provider, ...saved });
-      onVoiceSaved(savedVoice, latestVoiceStatus);
-      setResult("设置已保存。");
+      const followUpErrors: string[] = [];
+      try {
+        const savedVoice = await window.inkflow.request<VoiceSettings>("voice.settings.configure", voiceForm);
+        const latestVoiceStatus = await window.inkflow.request<VoiceStatus>("voice.status", projectRoot ? { project_root: projectRoot } : {});
+        onVoiceSaved(savedVoice, latestVoiceStatus);
+      } catch (cause) {
+        followUpErrors.push(`语音设置未更新：${errorMessage(cause)}`);
+      }
+      if (projectRoot) {
+        try {
+          await window.inkflow.request("learning.settings.update", { project_root: projectRoot, ...learningSettings });
+        } catch (cause) {
+          followUpErrors.push(`学习设置未更新：${errorMessage(cause)}`);
+        }
+      }
+      setResult(followUpErrors.length > 0 ? `模型设置已保存。${followUpErrors.join("；")}` : "设置已保存。");
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally { setWorking(false); }
+  };
+  const saveModelSettings = async () => {
+    setWorking(true); setError(""); setResult("");
+    try {
+      const saved = await withDeadline(window.inkflow.request<Record<string, unknown>>("provider.configure", form), 15000, "本机保存没有及时返回。请重新打开设置核对保存结果后再试。");
+      setForm((value) => ({ ...value, api_key: "" }));
+      onSaved({ ...provider, ...saved });
+      try {
+        const value = await withDeadline(window.inkflow.request<{ models: string[] }>("provider.models", {}), 15000, "读取模型列表超时");
+        setRemoteModels(value.models);
+        setResult(`模型设置已保存，读取到 ${value.models.length} 个模型。`);
+      } catch (cause) {
+        setResult(`模型设置已保存；模型列表暂时读取失败，可直接使用已填写的模型名称。原因：${errorMessage(cause)}`);
+      }
     } catch (cause) {
       setError(errorMessage(cause));
     } finally { setWorking(false); }
@@ -1732,7 +1760,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
           <div className="provider-grid">{PROVIDER_OPTIONS.map((item) => <button type="button" key={item.id} className={inferredProvider === item.id ? "active" : ""} onClick={() => chooseProvider(item.id)}><strong>{item.name}</strong><span>{item.note}</span></button>)}</div>
           <div className={`provider-status ${provider?.api_key_configured ? "ready" : "missing"}`}><strong>{provider?.api_key_configured ? "模型密钥已保存" : "尚未保存模型密钥"}</strong><span>{provider?.api_key_configured ? `凭据来源：${credentialLabel(String(provider?.api_key_storage || ""))}` : "密钥只交给本机引擎，并保存在系统凭据库。"}</span></div>
           <div className="settings-fields"><label>模型名称<input list="provider-models" value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} placeholder="填写平台当前模型 ID" /><datalist id="provider-models">{[...PROVIDER_OPTIONS.flatMap((item) => Array.from(item.models)), ...remoteModels].map((model) => <option key={model} value={model} />)}</datalist></label><label>接口地址<input value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} /></label><label>更换密钥 <small>{provider?.api_key_configured ? "留空继续使用当前服务商的已有密钥" : "本机模型可以留空"}</small><input type="password" autoComplete="new-password" value={form.api_key} onChange={(event) => setForm({ ...form, api_key: event.target.value })} placeholder="不会回显" /></label></div>
-          <div className="settings-inline-actions"><button type="button" onClick={async () => { try { const saved = await window.inkflow.request<Record<string, unknown>>("provider.configure", form); onSaved({ ...provider, ...saved }); const value = await window.inkflow.request<{ models: string[] }>("provider.models", {}); setRemoteModels(value.models); setResult(`读取到 ${value.models.length} 个模型`); } catch (cause) { setError(errorMessage(cause)); } }}>保存并读取模型列表</button><span>这会访问所选服务商，但不会发起内容生成。</span></div>
+           <div className="settings-inline-actions"><button type="button" disabled={working} onClick={() => void saveModelSettings()}>保存并读取模型列表</button><span>先保存模型配置，再尝试读取列表；读取失败不会撤销已保存的 Key。</span></div>
           <SettingGroup title="费用估算" note="按服务商账单货币填写；留 0 时只统计 Token，不猜价格。"><div className="settings-fields two"><label>输入单价 / 百万 Token<input type="number" min={0} step={0.01} value={form.input_price_per_million} onChange={(event) => setForm({ ...form, input_price_per_million: Number(event.target.value) })} /></label><label>输出单价 / 百万 Token<input type="number" min={0} step={0.01} value={form.output_price_per_million} onChange={(event) => setForm({ ...form, output_price_per_million: Number(event.target.value) })} /></label></div></SettingGroup>
         </SettingsPane>}
         {section === "creation" && <SettingsPane title="创作" note="预设会同时调整上下文、询问策略、审查模式和四个角色的生成参数。">
