@@ -1,6 +1,6 @@
 import type { editor as MonacoEditor } from "monaco-editor";
 import { FormEvent, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { MutableRefObject, ReactNode } from "react";
+import type { CSSProperties, MutableRefObject, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import { Mascot, mobaoIdlePoster } from "./Mascot";
 import type { MascotMood } from "./Mascot";
 import { ProjectCenter } from "./ProjectCenter";
@@ -127,6 +127,62 @@ type CollaborationMessage = { message_id: string; sender_role: string; recipient
 type BatchSummary = { batch_id: string; status: string; start_chapter_no?: number; end_chapter_no?: number; chapters: Array<{ chapter_no?: number; version?: number; review_verdict?: string; memory_status?: string }> };
 type LearningEvent = { event_id: string; event_type: string; chapter_no?: number; created_at: string; payload: Record<string, unknown> };
 type CollaborationOverview = { messages: CollaborationMessage[]; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[] };
+type WorkspacePreset = "balanced" | "writing" | "planning" | "review";
+type WorkspaceResizeTarget = "navigation" | "assistant" | "inspector";
+type WorkspaceLayout = {
+  navigationVisible: boolean;
+  assistantVisible: boolean;
+  inspectorVisible: boolean;
+  assistantPosition: "left" | "right";
+  navigationWidth: number;
+  assistantWidth: number;
+  inspectorWidth: number;
+};
+
+const workspaceLayoutStorageKey = "inkflow.workspace-layout.v1";
+const defaultWorkspaceLayout: WorkspaceLayout = {
+  navigationVisible: true,
+  assistantVisible: true,
+  inspectorVisible: true,
+  assistantPosition: "left",
+  navigationWidth: 246,
+  assistantWidth: 430,
+  inspectorWidth: 236,
+};
+
+const workspacePresets: Record<WorkspacePreset, WorkspaceLayout> = {
+  balanced: defaultWorkspaceLayout,
+  writing: { ...defaultWorkspaceLayout, navigationWidth: 218, assistantVisible: false, inspectorVisible: false },
+  planning: { ...defaultWorkspaceLayout, navigationWidth: 260, assistantWidth: 500, inspectorVisible: false },
+  review: { ...defaultWorkspaceLayout, navigationWidth: 226, assistantWidth: 390, assistantPosition: "right", inspectorVisible: true },
+};
+
+function clampWorkspaceWidth(target: WorkspaceResizeTarget, value: number) {
+  const bounds: Record<WorkspaceResizeTarget, [number, number]> = {
+    navigation: [180, 420],
+    assistant: [320, 760],
+    inspector: [170, 420],
+  };
+  const [minimum, maximum] = bounds[target];
+  return Math.round(Math.max(minimum, Math.min(maximum, value)));
+}
+
+function loadWorkspaceLayout(): WorkspaceLayout {
+  try {
+    const stored = JSON.parse(localStorage.getItem(workspaceLayoutStorageKey) || "{}") as Partial<WorkspaceLayout>;
+    return {
+      navigationVisible: stored.navigationVisible !== false,
+      assistantVisible: stored.assistantVisible !== false,
+      inspectorVisible: stored.inspectorVisible !== false,
+      assistantPosition: stored.assistantPosition === "right" ? "right" : "left",
+      navigationWidth: clampWorkspaceWidth("navigation", Number(stored.navigationWidth) || defaultWorkspaceLayout.navigationWidth),
+      assistantWidth: clampWorkspaceWidth("assistant", Number(stored.assistantWidth) || defaultWorkspaceLayout.assistantWidth),
+      inspectorWidth: clampWorkspaceWidth("inspector", Number(stored.inspectorWidth) || defaultWorkspaceLayout.inspectorWidth),
+    };
+  } catch {
+    return defaultWorkspaceLayout;
+  }
+}
 
 const emptyStatistics: Statistics = {
   characters: 0,
@@ -166,6 +222,7 @@ function App() {
   const [showUpdate, setShowUpdate] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showLayout, setShowLayout] = useState(false);
   const [pendingQuestions, setPendingQuestions] = useState<QuestionCard[]>([]);
   const [selectionDraft, setSelectionDraft] = useState<SelectionDraft | null>(null);
   const [mascotSpeech, setMascotSpeech] = useState("我在。先说今天想推进哪一步。");
@@ -180,8 +237,50 @@ function App() {
   const [collaboration, setCollaboration] = useState<CollaborationOverview | null>(null);
   const [canonMigration, setCanonMigration] = useState<CanonMigration | null>(null);
   const [showMigration, setShowMigration] = useState(false);
+  const [workspaceLayout, setWorkspaceLayout] = useState<WorkspaceLayout>(loadWorkspaceLayout);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
+  const resizeRef = useRef<{ target: WorkspaceResizeTarget; startX: number; startWidth: number; direction: 1 | -1 } | null>(null);
+
+  const updateWorkspaceLayout = useCallback((change: Partial<WorkspaceLayout>) => {
+    setWorkspaceLayout((current) => ({ ...current, ...change }));
+  }, []);
+
+  const applyWorkspacePreset = useCallback((preset: WorkspacePreset) => {
+    setWorkspaceLayout({ ...workspacePresets[preset] });
+  }, []);
+
+  const startWorkspaceResize = useCallback((target: WorkspaceResizeTarget, direction: 1 | -1, event: ReactPointerEvent<HTMLDivElement>) => {
+    const widthKey = target === "navigation" ? "navigationWidth" : target === "assistant" ? "assistantWidth" : "inspectorWidth";
+    resizeRef.current = { target, startX: event.clientX, startWidth: workspaceLayout[widthKey], direction };
+    event.preventDefault();
+    document.body.classList.add("layout-resizing");
+  }, [workspaceLayout]);
+
+  useEffect(() => {
+    localStorage.setItem(workspaceLayoutStorageKey, JSON.stringify(workspaceLayout));
+  }, [workspaceLayout]);
+
+  useEffect(() => {
+    const resize = (event: PointerEvent) => {
+      const activeResize = resizeRef.current;
+      if (!activeResize) return;
+      const width = clampWorkspaceWidth(activeResize.target, activeResize.startWidth + (event.clientX - activeResize.startX) * activeResize.direction);
+      const widthKey = activeResize.target === "navigation" ? "navigationWidth" : activeResize.target === "assistant" ? "assistantWidth" : "inspectorWidth";
+      setWorkspaceLayout((current) => ({ ...current, [widthKey]: width }));
+    };
+    const stop = () => {
+      resizeRef.current = null;
+      document.body.classList.remove("layout-resizing");
+    };
+    window.addEventListener("pointermove", resize);
+    window.addEventListener("pointerup", stop);
+    return () => {
+      window.removeEventListener("pointermove", resize);
+      window.removeEventListener("pointerup", stop);
+      document.body.classList.remove("layout-resizing");
+    };
+  }, []);
 
   const request = useCallback(
     async <T,>(method: string, params: Record<string, unknown> = {}): Promise<T> => {
@@ -625,7 +724,7 @@ function App() {
             <button onClick={openFolder}>打开项目</button>
           </div>
           <div className="welcome-meta">
-            <span>版本 {String(appInfo?.version || "0.4.2")}</span>
+            <span>版本 {String(appInfo?.version || "0.4.3")}</span>
             <span>{provider?.api_key_configured ? "模型已配置" : "尚未配置模型 Key"}</span>
             <button className="text-button" onClick={() => setShowSettings(true)}>模型设置</button>
             <button className="text-button" onClick={() => setShowUpdate(true)}>检查更新</button>
@@ -649,6 +748,17 @@ function App() {
     );
   }
 
+  const workspaceGridClass = [
+    "workspace-grid",
+    workspaceLayout.navigationVisible ? "navigation-visible" : "navigation-hidden",
+    workspaceLayout.assistantVisible ? "assistant-visible" : "assistant-hidden",
+    `assistant-${workspaceLayout.assistantPosition}`,
+  ].join(" ");
+  const workspaceGridStyle = {
+    "--navigation-width": `${workspaceLayout.navigationWidth}px`,
+    "--assistant-width": `${workspaceLayout.assistantWidth}px`,
+  } as CSSProperties;
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -664,12 +774,14 @@ function App() {
           <button onClick={() => setShowSearch(true)}>⌕ 搜索</button>
           <button onClick={() => void refresh()}>↻ 刷新</button>
           <button onClick={() => void window.inkflow.openPath(projectRoot)}>打开文件夹</button>
+          <button onClick={() => setShowLayout(true)}>布局</button>
           <button onClick={() => setShowSettings(true)}>设置</button>
           <button onClick={() => setShowUpdate(true)}>{updateInfo.status === "downloaded" ? "安装更新" : "检查更新"}</button>
         </nav>
       </header>
 
-      <main className="workspace-grid">
+      <main className={workspaceGridClass} style={workspaceGridStyle}>
+        {workspaceLayout.navigationVisible && <>
         <aside className="left-rail">
           <div className="rail-heading"><span>小说结构</span><button title="新建小说" onClick={() => setShowCreate(true)}>＋</button></div>
           <TreeSection label="核心文档" items={tree?.items || []} onOpen={openDocument} active={document?.relative_path} />
@@ -684,7 +796,10 @@ function App() {
             <div><span>伏笔</span><strong>{dashboard?.status.open_threads || 0}</strong></div>
           </div>
         </aside>
+        <ResizeHandle className="navigation-resize" label="调整小说结构栏宽度" onResizeStart={(event) => startWorkspaceResize("navigation", 1, event)} />
+        </>}
 
+        {workspaceLayout.assistantVisible && <>
         <section className="conversation-panel">
           <div className="panel-title">
             <div><p className="eyebrow">COORDINATOR · AI 产品经理</p><h2>今天写到哪里？</h2></div>
@@ -758,6 +873,8 @@ function App() {
             </div>
           </form>
         </section>
+        <ResizeHandle className="assistant-resize" label="调整 AI 对话栏宽度" onResizeStart={(event) => startWorkspaceResize("assistant", workspaceLayout.assistantPosition === "left" ? 1 : -1, event)} />
+        </>}
 
         <section className="workbench">
           <div className="tabbar">
@@ -805,6 +922,9 @@ function App() {
                   setDocument(loaded);
                 }
               }}
+              inspectorVisible={workspaceLayout.inspectorVisible}
+              inspectorWidth={workspaceLayout.inspectorWidth}
+              onResizeInspector={(event) => startWorkspaceResize("inspector", -1, event)}
             />
           )}
           {activeTab === "chapter" && <ChapterPanel workspace={chapterWorkspace} onPrompt={(value) => setChatInput(value)} />}
@@ -818,6 +938,7 @@ function App() {
       {(notice || error) && <Toast kind={error ? "error" : "info"} text={error || notice} onClose={() => { setError(""); setNotice(""); setMascotMood("idle"); }} />}
       {showCreate && <CreateProject onClose={() => setShowCreate(false)} onCreated={openProject} />}
       {showSettings && <SettingsDialog provider={provider} onClose={() => setShowSettings(false)} onSaved={setProvider} />}
+      {showLayout && <WorkspaceLayoutDialog layout={workspaceLayout} onChange={updateWorkspaceLayout} onPreset={applyWorkspacePreset} onReset={() => setWorkspaceLayout({ ...defaultWorkspaceLayout })} onClose={() => setShowLayout(false)} />}
       {showUpdate && <UpdateDialog info={updateInfo} onClose={() => setShowUpdate(false)} />}
       {showSearch && <SearchDialog request={request} result={searchResult} setResult={setSearchResult} onClose={() => setShowSearch(false)} onOpen={async (relativePath) => {
         const item = [...(tree?.items || []), ...(tree?.groups.flatMap((group) => group.items) || [])].find((entry) => entry.relative_path === relativePath);
@@ -920,6 +1041,9 @@ function EditorPanel(props: {
   onCompare: (versionId: string) => void;
   onStopCompare: () => void;
   onResolve: (annotationId: string) => void;
+  inspectorVisible: boolean;
+  inspectorWidth: number;
+  onResizeInspector: (event: ReactPointerEvent<HTMLDivElement>) => void;
 }) {
   const [side, setSide] = useState<"comments" | "versions">("comments");
   if (!props.document) return <EmptyPanel title="选择一份文档" text="从左侧打开正文、规划或审查报告。" />;
@@ -933,7 +1057,7 @@ function EditorPanel(props: {
         </div>
       </div>
       {props.document.read_only && <div className="canon-banner"><strong>正史保护</strong>{props.document.reason}</div>}
-      <div className="editor-body">
+      <div className={`editor-body ${props.inspectorVisible ? "inspector-visible" : "inspector-hidden"}`} style={{ "--inspector-width": `${props.inspectorWidth}px` } as CSSProperties}>
         <div className="monaco-wrap">
           {props.compareContent !== null ? (
             <>
@@ -952,6 +1076,8 @@ function EditorPanel(props: {
             /></Suspense>
           )}
         </div>
+        {props.inspectorVisible && <>
+        <ResizeHandle className="inspector-resize" label="调整批注与版本栏宽度" onResizeStart={props.onResizeInspector} />
         <aside className="inspector">
           <div className="inspector-tabs"><button className={side === "comments" ? "active" : ""} onClick={() => setSide("comments")}>批注</button><button className={side === "versions" ? "active" : ""} onClick={() => setSide("versions")}>版本</button></div>
           {side === "comments" ? (
@@ -976,6 +1102,7 @@ function EditorPanel(props: {
             </div>
           )}
         </aside>
+        </>}
       </div>
       <footer className="status-strip"><span>{props.statistics.characters.toLocaleString()} 字</span><span>{props.statistics.paragraphs} 段</span><span>对白 {Math.round(props.statistics.dialogue_ratio * 100)}%</span><span>约 {props.statistics.estimated_reading_minutes} 分钟</span></footer>
     </div>
@@ -1237,6 +1364,47 @@ function SettingsDialog({ provider, onClose, onSaved }: { provider: Record<strin
   </form></Modal>;
 }
 
+function WorkspaceLayoutDialog({ layout, onChange, onPreset, onReset, onClose }: { layout: WorkspaceLayout; onChange: (change: Partial<WorkspaceLayout>) => void; onPreset: (preset: WorkspacePreset) => void; onReset: () => void; onClose: () => void }) {
+  const presets: Array<{ id: WorkspacePreset; name: string; note: string }> = [
+    { id: "balanced", name: "均衡", note: "导航、对话和正文同时可见" },
+    { id: "writing", name: "专注写作", note: "收起对话与批注，正文最大化" },
+    { id: "planning", name: "规划协作", note: "加宽 Coordinator 对话，保留导航" },
+    { id: "review", name: "审查对照", note: "AI 置右，批注与版本保持展开" },
+  ];
+  const setWidth = (target: WorkspaceResizeTarget, value: number) => {
+    const key = target === "navigation" ? "navigationWidth" : target === "assistant" ? "assistantWidth" : "inspectorWidth";
+    onChange({ [key]: clampWorkspaceWidth(target, value) });
+  };
+  return <Modal title="工作区布局" subtitle="正文是主工作区；你可以折叠辅助面板、拖动分隔线，或在此精确设置尺寸。所有选择只保存在这台电脑。" onClose={onClose}>
+    <section className="layout-presets"><div><strong>快速布局</strong><small>切换后仍可继续微调</small></div><div className="layout-preset-grid">{presets.map((preset) => <button key={preset.id} type="button" onClick={() => onPreset(preset.id)}><strong>{preset.name}</strong><span>{preset.note}</span></button>)}</div></section>
+    <section className="layout-settings-section">
+      <div className="layout-settings-heading"><strong>显示哪些面板</strong><small>关闭不会删除内容，随时可从顶部“布局”重新打开。</small></div>
+      <div className="layout-toggles">
+        <label><input type="checkbox" checked={layout.navigationVisible} onChange={(event) => onChange({ navigationVisible: event.target.checked })} /><span><strong>小说结构</strong><small>文档树、上下文容量与协作看板</small></span></label>
+        <label><input type="checkbox" checked={layout.assistantVisible} onChange={(event) => onChange({ assistantVisible: event.target.checked })} /><span><strong>Coordinator 对话</strong><small>自然语言协作与工作流入口</small></span></label>
+        <label><input type="checkbox" checked={layout.inspectorVisible} onChange={(event) => onChange({ inspectorVisible: event.target.checked })} /><span><strong>批注与版本</strong><small>正文编辑器右侧的检查面板</small></span></label>
+      </div>
+    </section>
+    <section className="layout-settings-section">
+      <div className="layout-settings-heading"><strong>对话位置</strong><small>让对话跟随你的阅读与输入习惯。</small></div>
+      <div className="layout-position-switch"><button type="button" className={layout.assistantPosition === "left" ? "active" : ""} onClick={() => onChange({ assistantPosition: "left" })}>AI 在正文左侧</button><button type="button" className={layout.assistantPosition === "right" ? "active" : ""} onClick={() => onChange({ assistantPosition: "right" })}>AI 在正文右侧</button></div>
+    </section>
+    <section className="layout-settings-section">
+      <div className="layout-settings-heading"><strong>精确宽度</strong><small>也可以直接拖拽工作区中的发光分隔线。</small></div>
+      <div className="layout-sliders">
+        <label>小说结构 <output>{layout.navigationWidth}px</output><input type="range" min="180" max="420" value={layout.navigationWidth} onChange={(event) => setWidth("navigation", Number(event.target.value))} /></label>
+        <label>Coordinator 对话 <output>{layout.assistantWidth}px</output><input type="range" min="320" max="760" value={layout.assistantWidth} onChange={(event) => setWidth("assistant", Number(event.target.value))} /></label>
+        <label>批注与版本 <output>{layout.inspectorWidth}px</output><input type="range" min="170" max="420" value={layout.inspectorWidth} onChange={(event) => setWidth("inspector", Number(event.target.value))} /></label>
+      </div>
+    </section>
+    <div className="dialog-actions"><button type="button" onClick={onReset}>恢复默认</button><button className="primary" type="button" onClick={onClose}>完成</button></div>
+  </Modal>;
+}
+
+function ResizeHandle({ className, label, onResizeStart }: { className: string; label: string; onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void }) {
+  return <div className={`resize-handle ${className}`} role="separator" aria-orientation="vertical" aria-label={label} onPointerDown={onResizeStart}><span /></div>;
+}
+
 function SearchDialog({ request, result, setResult, onClose, onOpen }: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; result: Record<string, unknown> | null; setResult: (value: Record<string, unknown> | null) => void; onClose: () => void; onOpen: (path: string) => void }) {
   const [query, setQuery] = useState("");
   const matches = (result?.matches || []) as Array<Record<string, unknown>>;
@@ -1286,7 +1454,7 @@ function UpdateDialog({ info, onClose }: { info: UpdateInfo; onClose: () => void
     } finally { setWorking(false); }
   };
   const sourceLabel = local.source === "embedded" ? "发布包内置更新源" : local.source === "github" ? "GitHub Releases" : local.source === "environment" ? "自定义公开更新源" : "尚未配置";
-  return <Modal title="软件更新" subtitle="新版会下载后在重启时安装；小说正文、正史数据库和本地项目不会被删除。" onClose={onClose}><section className={`update-card ${local.status || "ready"}`}><div><small>当前版本</small><strong>{local.currentVersion || "0.4.2"}</strong></div><div><small>可用版本</small><strong>{local.availableVersion || "—"}</strong></div><div><small>更新来源</small><strong>{sourceLabel}</strong></div>{typeof local.progress === "number" && <div className="update-progress"><span style={{ width: `${Math.max(0, Math.min(local.progress, 100))}%` }} /></div>}<p>{local.message || "可以检查是否有新版本。"}</p></section>{local.status === "not_configured" && <p className="form-hint">私密仓库的下载需要账号令牌，不适合写进大众软件。仓库或独立发布仓库公开后，只需在构建时配置发布源即可启用在线更新。</p>}<div className="dialog-actions"><button onClick={onClose}>关闭</button>{!new Set(["available", "downloading", "downloaded"]).has(String(local.status)) && <button className="primary" disabled={working || local.status === "not_configured" || local.status === "checking"} onClick={() => void action("check")}>{local.status === "checking" ? "正在检查…" : "检查新版本"}</button>}{local.status === "available" && <button className="primary" disabled={working} onClick={() => void action("download")}>下载更新</button>}{local.status === "downloading" && <button className="primary" disabled>正在下载 {Math.round(Number(local.progress || 0))}%</button>}{local.status === "downloaded" && <button className="primary" disabled={working} onClick={() => void action("install")}>重启并安装</button>}</div></Modal>;
+  return <Modal title="软件更新" subtitle="新版会下载后在重启时安装；小说正文、正史数据库和本地项目不会被删除。" onClose={onClose}><section className={`update-card ${local.status || "ready"}`}><div><small>当前版本</small><strong>{local.currentVersion || "0.4.3"}</strong></div><div><small>可用版本</small><strong>{local.availableVersion || "—"}</strong></div><div><small>更新来源</small><strong>{sourceLabel}</strong></div>{typeof local.progress === "number" && <div className="update-progress"><span style={{ width: `${Math.max(0, Math.min(local.progress, 100))}%` }} /></div>}<p>{local.message || "可以检查是否有新版本。"}</p></section>{local.status === "not_configured" && <p className="form-hint">私密仓库的下载需要账号令牌，不适合写进大众软件。仓库或独立发布仓库公开后，只需在构建时配置发布源即可启用在线更新。</p>}<div className="dialog-actions"><button onClick={onClose}>关闭</button>{!new Set(["available", "downloading", "downloaded"]).has(String(local.status)) && <button className="primary" disabled={working || local.status === "not_configured" || local.status === "checking"} onClick={() => void action("check")}>{local.status === "checking" ? "正在检查…" : "检查新版本"}</button>}{local.status === "available" && <button className="primary" disabled={working} onClick={() => void action("download")}>下载更新</button>}{local.status === "downloading" && <button className="primary" disabled>正在下载 {Math.round(Number(local.progress || 0))}%</button>}{local.status === "downloaded" && <button className="primary" disabled={working} onClick={() => void action("install")}>重启并安装</button>}</div></Modal>;
 }
 
 function SelectionDialog({ selection, busy, onClose, onSubmit }: { selection: SelectionDraft; busy: boolean; onClose: () => void; onSubmit: (mode: "comment" | "revise", comment: string) => void }) {
