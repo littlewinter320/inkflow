@@ -20,8 +20,8 @@ $system32Directory = Join-Path $env:SystemRoot 'System32'
 # Node runtimes omit the Windows system directories from PATH.
 $env:PATH = "$systemPowerShellDirectory;$system32Directory;$env:PATH"
 
-$desktopVersion = (Get-Content -Raw -LiteralPath (Join-Path $repositoryRoot 'desktop\package.json') | ConvertFrom-Json).version
-$agentVersion = (Get-Content -Raw -LiteralPath (Join-Path $agentRoot 'pyproject.toml') | Select-String -Pattern 'version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+$desktopVersion = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $repositoryRoot 'desktop\package.json') | ConvertFrom-Json).version
+$agentVersion = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $agentRoot 'pyproject.toml') | Select-String -Pattern 'version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
 if (-not $desktopVersion -or $desktopVersion -ne $agentVersion) {
     throw "Desktop and agent versions must match before publishing: desktop=$desktopVersion agent=$agentVersion."
 }
