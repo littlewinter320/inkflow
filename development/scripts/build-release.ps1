@@ -103,7 +103,7 @@ try {
         }
         & gh release view $tag *> $null
         if ($LASTEXITCODE -ne 0) {
-            & gh release create $tag --title "墨流（InkFlow）桌面版 $desktopVersion" --notes "墨流（InkFlow）$desktopVersion 桌面版。"
+            & gh release create $tag --title ('InkFlow desktop {0}' -f $desktopVersion) --notes ('InkFlow desktop release {0}.' -f $desktopVersion)
             if ($LASTEXITCODE -ne 0) { throw "GitHub Release creation failed with exit code $LASTEXITCODE." }
         }
         & gh release upload $tag @desktopAssets --clobber
@@ -120,4 +120,4 @@ finally {
 }
 
 $extensionNote = if ($IncludeExtension) { ' and artifacts\extension' } else { '' }
-Write-Host "InkFlow desktop $desktopVersion build completed: artifacts\desktop$extensionNote."
+Write-Host ('InkFlow desktop {0} build completed: artifacts\desktop{1}.' -f $desktopVersion, $extensionNote)
