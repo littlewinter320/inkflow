@@ -254,7 +254,7 @@ function App() {
     const widthKey = target === "navigation" ? "navigationWidth" : target === "assistant" ? "assistantWidth" : "inspectorWidth";
     resizeRef.current = { target, startX: event.clientX, startWidth: workspaceLayout[widthKey], direction };
     event.preventDefault();
-    document.body.classList.add("layout-resizing");
+    window.document.body.classList.add("layout-resizing");
   }, [workspaceLayout]);
 
   useEffect(() => {
@@ -271,14 +271,14 @@ function App() {
     };
     const stop = () => {
       resizeRef.current = null;
-      document.body.classList.remove("layout-resizing");
+      window.document.body.classList.remove("layout-resizing");
     };
     window.addEventListener("pointermove", resize);
     window.addEventListener("pointerup", stop);
     return () => {
       window.removeEventListener("pointermove", resize);
       window.removeEventListener("pointerup", stop);
-      document.body.classList.remove("layout-resizing");
+      window.document.body.classList.remove("layout-resizing");
     };
   }, []);
 
