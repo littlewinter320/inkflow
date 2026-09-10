@@ -185,21 +185,23 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .history-entry > div p { margin: 0; color: #cdc9bf; font-size: 11px; line-height: 1.6; white-space: pre-wrap; }
 .history-entry > button { grid-column: 2; grid-row: 2 / span 2; align-self: center; color: var(--accent); font-size: 10px; }
 
-.workbench { display: grid; grid-template-rows: 43px minmax(0, 1fr); border-right: 0; background: #10100e; }
-.tabbar { display: flex; align-items: end; gap: 3px; padding: 0 14px; border-bottom: 1px solid var(--line); background: #151512; }
+.workbench { display: grid; grid-template-rows: 43px minmax(0, 1fr); height: 100%; min-height: 0; overflow: hidden; border-right: 0; background: #10100e; }
+.tabbar { display: flex; min-width: 0; align-items: end; gap: 3px; overflow-x: auto; padding: 0 14px; border-bottom: 1px solid var(--line); background: #151512; scrollbar-width: thin; }
 .tabbar button { position: relative; height: 42px; border: 0; border-radius: 0; background: transparent; color: var(--muted); font-size: 13px; }
 .tabbar button.active { color: var(--text); }
 .tabbar button.active::after { content: ""; position: absolute; right: 10px; bottom: -1px; left: 10px; height: 2px; background: var(--accent); }
-.editor-layout { display: grid; grid-template-rows: 48px auto minmax(0, 1fr) 29px; min-height: 0; }
-.document-toolbar { display: flex; justify-content: space-between; align-items: center; padding: 0 12px 0 16px; border-bottom: 1px solid var(--line-soft); }
-.document-toolbar > div { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.editor-layout { display: grid; grid-template-rows: 48px minmax(0, 1fr) 29px; height: 100%; min-height: 0; overflow: hidden; }
+.editor-layout.has-canon-banner { grid-template-rows: 48px auto minmax(0, 1fr) 29px; }
+.document-toolbar { display: flex; min-width: 0; justify-content: space-between; align-items: center; gap: 10px; overflow: hidden; padding: 0 12px 0 16px; border-bottom: 1px solid var(--line-soft); }
+.document-toolbar > div { display: flex; min-width: 0; align-items: center; gap: 9px; }
+.document-toolbar > div:last-child { flex: 0 0 auto; }
 .document-toolbar strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .document-toolbar span { color: var(--faint); font-size: 10px; }
 .document-toolbar button { padding: 6px 9px; font-size: 11px; }
 .canon-banner { padding: 7px 12px; border-bottom: 1px solid #514427; background: #2a2417; color: #c8b78b; font-size: 11px; line-height: 1.45; }
 .canon-banner strong { margin-right: 9px; color: #e1bd68; }
-.editor-body { display: grid; grid-template-columns: minmax(0, 1fr) 205px; min-height: 0; }
-.monaco-wrap { min-width: 0; min-height: 0; border-right: 1px solid var(--line); }
+.editor-body { display: grid; grid-template-columns: minmax(0, 1fr) 205px; height: 100%; min-height: 0; overflow: hidden; }
+.monaco-wrap { min-width: 0; min-height: 0; height: 100%; border-right: 1px solid var(--line); }
 .editor-loading { display: grid; place-items: center; width: 100%; height: 100%; min-height: 180px; color: var(--faint); font-size: 11px; background: #10100e; }
 .diff-head { display: flex; justify-content: space-between; align-items: center; height: 34px; padding: 0 10px; background: #1d1c18; color: var(--muted); font-size: 10px; }
 .diff-head button { padding: 3px 7px; font-size: 10px; }
@@ -218,7 +220,7 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .version-card { display: flex; flex-direction: column; align-items: flex-start; }
 .version-card strong { font-size: 11px; }
 .version-card span { color: var(--muted); }
-.status-strip { display: flex; justify-content: flex-end; align-items: center; gap: 14px; padding: 0 11px; border-top: 1px solid var(--line); color: var(--faint); font-size: 10px; }
+.status-strip { display: flex; min-height: 29px; height: 29px; justify-content: flex-end; align-items: center; gap: 14px; overflow: hidden; padding: 0 11px; border-top: 1px solid var(--line); color: var(--faint); font-size: 10px; line-height: 1; white-space: nowrap; }
 
 .scroll-panel { min-height: 0; overflow-y: auto; padding: 24px; }
 .project-center { padding-bottom: 60px; }
@@ -599,4 +601,43 @@ body.layout-resizing, body.layout-resizing * { cursor: col-resize !important; us
 @media (max-width: 1120px) {
   .layout-toggles, .layout-sliders { grid-template-columns: 1fr; }
   .layout-toggles label { min-height: 0; }
+}
+
+/* Keep the user-selected layout usable on ordinary 100% DPI laptops and
+   smaller desktop windows. Configured widths remain the upper bound; the
+   viewport gets the final say so the workbench never collapses to a sliver. */
+@media (max-width: 1240px) {
+  .workspace-grid.navigation-visible.assistant-visible.assistant-left {
+    grid-template-columns: minmax(168px, min(var(--navigation-width), 22vw)) 8px minmax(260px, min(var(--assistant-width), 31vw)) 8px minmax(0, 1fr);
+  }
+  .workspace-grid.navigation-visible.assistant-visible.assistant-right {
+    grid-template-columns: minmax(168px, min(var(--navigation-width), 22vw)) 8px minmax(0, 1fr) 8px minmax(260px, min(var(--assistant-width), 31vw));
+  }
+  .workspace-grid.navigation-visible.assistant-hidden {
+    grid-template-columns: minmax(168px, min(var(--navigation-width), 22vw)) 8px minmax(0, 1fr);
+  }
+  .workspace-grid.navigation-hidden.assistant-visible.assistant-left {
+    grid-template-columns: minmax(260px, min(var(--assistant-width), 31vw)) 8px minmax(0, 1fr);
+  }
+  .workspace-grid.navigation-hidden.assistant-visible.assistant-right {
+    grid-template-columns: minmax(0, 1fr) 8px minmax(260px, min(var(--assistant-width), 31vw));
+  }
+  .topbar { grid-template-columns: minmax(185px, 20vw) minmax(0, 1fr) auto; }
+  .top-actions { min-width: 0; max-width: 42vw; overflow-x: auto; scrollbar-width: thin; }
+  .top-actions button { flex: 0 0 auto; padding-inline: 7px; }
+  .editor-body.inspector-visible { grid-template-columns: minmax(0, 1fr) 8px minmax(170px, min(var(--inspector-width), 24vw)); }
+}
+
+@media (max-width: 1020px) {
+  .editor-body.inspector-visible { grid-template-columns: minmax(0, 1fr); }
+  .editor-body.inspector-visible > .inspector-resize,
+  .editor-body.inspector-visible > .inspector { display: none; }
+  .panel-title { min-width: 0; gap: 8px; }
+  .panel-title > div:first-child { min-width: 0; }
+  .panel-title h2 { overflow: hidden; font-size: 18px; text-overflow: ellipsis; white-space: nowrap; }
+  .panel-mascot { min-width: 0; }
+  .mascot-speech { display: none; }
+  .status-strip { gap: 8px; padding-inline: 8px; font-size: 9px; }
+  .document-toolbar { padding-inline: 10px; }
+  .document-toolbar button { padding-inline: 7px; }
 }
