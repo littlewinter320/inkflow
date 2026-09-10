@@ -257,6 +257,7 @@ function App() {
   ]);
   const [chatInput, setChatInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [projectLoading, setProjectLoading] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [mascotMood, setMascotMood] = useState<MascotMood>("idle");
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>(loadRecentProjects);
@@ -292,6 +293,7 @@ function App() {
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
+  const startupStartedRef = useRef(false);
   const resizeRef = useRef<{ target: WorkspaceResizeTarget; startX: number; startWidth: number; direction: 1 | -1 } | null>(null);
   const voiceRecorderRef = useRef<LocalWavRecorder | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -383,9 +385,11 @@ function App() {
     [projectRoot],
   );
 
-  const openProject = useCallback(async (root: string) => {
+  const openProject = useCallback(async (root: string, options: { optimistic?: boolean } = {}) => {
     setError("");
     setBusy(true);
+    setProjectLoading(true);
+    if (options.optimistic) setProjectRoot(root);
     setMascotMood("thinking");
     try {
       const [opened, history, overview] = await Promise.all([
@@ -418,9 +422,11 @@ function App() {
     } catch (cause) {
       setError(errorMessage(cause));
       setMascotMood("rest");
+      if (options.optimistic) setProjectRoot("");
       localStorage.removeItem("inkflow.lastProject");
     } finally {
       setBusy(false);
+      setProjectLoading(false);
     }
   }, []);
 
@@ -429,29 +435,28 @@ function App() {
   }, [messages, busy]);
 
   useEffect(() => {
-    void Promise.all([
-      window.inkflow.request<Record<string, unknown>>("app.initialize"),
-      window.inkflow.request<Record<string, unknown>>("provider.status"),
-      window.inkflow.request<VoiceSettings>("voice.settings.get"),
-      window.inkflow.request<VoiceStatus>("voice.status"),
-      window.inkflow.launchContext(),
-      window.inkflow.updateStatus(),
-    ])
-      .then(([info, status, loadedVoiceSettings, loadedVoiceStatus, launch, update]) => {
-        setAppInfo(info);
-        setProvider(status);
-        setVoiceSettings(loadedVoiceSettings);
-        setVoiceStatus(loadedVoiceStatus);
-        setUpdateInfo(update as UpdateInfo);
-        const recent = launch.projectRoot || localStorage.getItem("inkflow.lastProject");
-        if (recent) void openProject(recent);
+    if (startupStartedRef.current) return;
+    startupStartedRef.current = true;
+    const showStartupError = (cause: unknown) => {
+      const message = errorMessage(cause);
+      setError(message);
+      if (message.includes("内置引擎") && message.includes("不兼容")) setShowUpdate(true);
+      setMascotMood("rest");
+    };
+    // 先用本机记住的项目立即渲染主工作区；引擎、模型状态和项目资料各自后台加载。
+    const storedProject = localStorage.getItem("inkflow.lastProject");
+    if (storedProject) void openProject(storedProject, { optimistic: true });
+    void window.inkflow.launchContext()
+      .then((launch) => {
+        const projectRootFromArgs = launch.projectRoot;
+        if (projectRootFromArgs && projectRootFromArgs !== storedProject) void openProject(projectRootFromArgs, { optimistic: true });
       })
-      .catch((cause) => {
-        const message = errorMessage(cause);
-        setError(message);
-        if (message.includes("内置引擎") && message.includes("不兼容")) setShowUpdate(true);
-        setMascotMood("rest");
-      });
+      .catch(showStartupError);
+    void window.inkflow.request<Record<string, unknown>>("app.initialize").then(setAppInfo).catch(showStartupError);
+    void window.inkflow.request<Record<string, unknown>>("provider.status").then(setProvider).catch(() => undefined);
+    void window.inkflow.request<VoiceSettings>("voice.settings.get").then(setVoiceSettings).catch(() => undefined);
+    void window.inkflow.request<VoiceStatus>("voice.status").then(setVoiceStatus).catch(() => undefined);
+    void window.inkflow.updateStatus().then((update) => setUpdateInfo(update as UpdateInfo)).catch(() => undefined);
     const removeEvent = window.inkflow.onEvent((value) => {
       const event = value as EngineEvent;
       setEvents((items) => [...items.slice(-199), { ...event, timestamp: new Date().toISOString() }]);
@@ -942,7 +947,7 @@ function App() {
         <div className="project-heading">
           <strong>{title}</strong>
           <span>{dashboard?.accepted_characters.toLocaleString() || 0} 字正史</span>
-          {busy && <span className="working-dot">正在工作</span>}
+          {projectLoading ? <span className="working-dot">正在载入项目</span> : busy && <span className="working-dot">正在工作</span>}
         </div>
         <nav className="top-actions">
           <button onClick={() => setShowCreate(true)}>＋ 新建</button>
@@ -1012,7 +1017,7 @@ function App() {
                 </div>
               </article>
             ))}
-            {busy && <article className="message assistant pending" aria-live="polite"><span className="avatar">墨</span><div><p>{[...events].reverse().find(item => item.run_id === activeRunId && item.summary)?.summary || "已收到，先理解你的目标，再把回答或需要确认的问题发在这里。"}</p><small>完成后直接显示答复；也可随时停止。</small></div></article>}
+            {busy && activeRunId && <article className="message assistant pending" aria-live="polite"><span className="avatar">墨</span><div><p>{[...events].reverse().find(item => item.run_id === activeRunId && item.summary)?.summary || "已收到，先理解你的目标，再把回答或需要确认的问题发在这里。"}</p><small>完成后直接显示答复；也可随时停止。</small></div></article>}
           </div>
           <form className="composer" onSubmit={sendChat}>
             <textarea
