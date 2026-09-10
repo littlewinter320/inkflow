@@ -2817,8 +2817,13 @@ class InkFlowEngine:
 
     def checkpoint_list(self, root: str | Path, limit: int = 50) -> dict[str, Any]:
         project = InkFlowProject(root)
-        checkpoints = CheckpointService(project).list(limit)
-        return {"checkpoints": checkpoints, "count": len(checkpoints)}
+        service = CheckpointService(project)
+        checkpoints = service.list(limit)
+        return {
+            "checkpoints": checkpoints,
+            "count": len(checkpoints),
+            "pending_recovery": service.pending_recovery(),
+        }
 
     def rollback_preview(
         self,
@@ -2845,6 +2850,13 @@ class InkFlowEngine:
         service = CheckpointService(project)
         resolved = service.resolve(checkpoint_id, boundary_chapter)
         return service.restore(resolved, confirmation_token)
+
+    @project_mutation_locked_sync
+    def rollback_recover(self, root: str | Path) -> dict[str, Any]:
+        """收拾中断的回退，回到回退前的安全检查点。"""
+
+        project = InkFlowProject(root)
+        return CheckpointService(project).recover_interrupted()
 
 
 def _creative_lens(chapter_no: int) -> str:

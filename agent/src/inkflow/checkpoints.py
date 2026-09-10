@@ -169,12 +169,23 @@ class CheckpointService:
         }
 
     def restore(self, checkpoint_id: str, confirmation_token: str) -> dict[str, Any]:
+        return self._restore(checkpoint_id, confirmation_token)
+
+    def _restore(
+        self,
+        checkpoint_id: str,
+        confirmation_token: str,
+        *,
+        allow_pending_journal: bool = False,
+    ) -> dict[str, Any]:
         preview = self.preview_restore(checkpoint_id)
         if confirmation_token != preview["confirmation_token"]:
             raise ValidationGateError("确认码无效或当前项目在预览后已变化；请重新预览回退影响。")
-        if self.journal_path.exists():
+        if not allow_pending_journal and self.journal_path.exists():
             raise ValidationGateError(
-                f"发现未完成恢复日志：{self.journal_path}。请先检查并恢复上一操作。"
+                f"发现未完成恢复日志：{self.journal_path}。"
+                "上一次回退没有完成，之后的回退已被阻止；"
+                "请在“检查点与分支式回退”点击“恢复到中断前的状态”，再重新预览回退。"
             )
         self._acquire_lock(checkpoint_id)
         safety: dict[str, Any] | None = None
@@ -207,6 +218,9 @@ class CheckpointService:
                 shutil.move(str(source), str(destination))
 
             self._restore_database(self.root / checkpoint_id / "inkflow.db", trash_dir)
+            # 旧版检查点可能来自更早的数据库结构（缺少后来新增的表）。
+            # 先按当前结构补齐，再校验状态，否则旧清单会因为“no such table”而无法恢复。
+            self.project.db.initialize()
             files_root = (self.root / checkpoint_id / "files").resolve()
             for record in manifest["files"]:
                 relative = self._validate_managed_relative(str(record["path"]))
@@ -219,9 +233,17 @@ class CheckpointService:
                 atomic_write_bytes(target, source.read_bytes())
 
             restored_status = self.project.db.project_status()
-            if restored_status != manifest["status"]:
+            # 只比较清单里记录过的字段：旧检查点由更早的引擎写入，
+            # 缺少后来新增的状态字段不应被判定为“恢复失败”。
+            mismatched = {
+                key: {"expected": expected, "actual": restored_status.get(key)}
+                for key, expected in manifest["status"].items()
+                if restored_status.get(key) != expected
+            }
+            if mismatched:
                 raise ProjectError(
-                    f"恢复后数据库状态不一致：期望 {manifest['status']}，实际 {restored_status}"
+                    f"恢复后数据库状态不一致：{mismatched}"
+                    f"（清单记录 {manifest['status']}，实际 {restored_status}）"
                 )
             branch_id = f"branch-{stamp}-{uuid.uuid4().hex[:6]}"
             self._write_current(checkpoint_id, branch_id, restored_from=safety["checkpoint_id"])
@@ -252,6 +274,62 @@ class CheckpointService:
             ) from exc
         finally:
             self.lock_path.unlink(missing_ok=True)
+
+    def pending_recovery(self) -> dict[str, Any] | None:
+        """报告上一次未完成的回退；没有则返回 None。"""
+
+        journal = self._read_json(self.journal_path, None)
+        if not isinstance(journal, dict) or not journal:
+            return None
+        safety_id = str(journal.get("safety_checkpoint_id") or "")
+        return {
+            "failed_checkpoint_id": str(journal.get("checkpoint_id") or ""),
+            "safety_checkpoint_id": safety_id,
+            "trash_dir": str(journal.get("trash_dir") or ""),
+            "started_at": str(journal.get("started_at") or ""),
+            "safety_checkpoint_available": bool(safety_id)
+            and (self.root / safety_id / "manifest.json").is_file(),
+        }
+
+    def recover_interrupted(self) -> dict[str, Any]:
+        """收拾中断的回退：恢复到回退前创建的安全检查点并清理残留日志与锁。"""
+
+        journal = self._read_json(self.journal_path, None)
+        if not isinstance(journal, dict) or not journal:
+            raise ValidationGateError("当前没有未完成的回退需要恢复。")
+        safety_id = str(journal.get("safety_checkpoint_id") or "")
+        if not safety_id or not _CHECKPOINT_ID.fullmatch(safety_id):
+            raise ProjectError("恢复日志缺少可用的安全检查点，无法自动回到中断前的状态。")
+        self._load_manifest(safety_id)
+        self._append_history(
+            {
+                "event": "restore_recovery_started",
+                "failed_checkpoint_id": journal.get("checkpoint_id"),
+                "safety_checkpoint_id": safety_id,
+                "created_at": utc_now(),
+            }
+        )
+        self.lock_path.unlink(missing_ok=True)
+        preview = self.preview_restore(safety_id)
+        result = self._restore(
+            safety_id,
+            preview["confirmation_token"],
+            allow_pending_journal=True,
+        )
+        self._append_history(
+            {
+                "event": "restore_recovered",
+                "safety_checkpoint_id": safety_id,
+                "new_branch_id": result.get("new_branch_id"),
+                "created_at": utc_now(),
+            }
+        )
+        return {
+            **result,
+            "status": "recovered",
+            "recovered_from": str(journal.get("checkpoint_id") or ""),
+            "message": "已回到上一次回退中断前的状态；残留日志和锁已清理。",
+        }
 
     def _managed_files(self) -> list[tuple[Path, str]]:
         result: list[tuple[Path, str]] = []

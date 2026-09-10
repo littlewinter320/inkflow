@@ -45,6 +45,14 @@ type RollbackPreview = {
   instruction: string;
 };
 
+type PendingRecovery = {
+  failed_checkpoint_id: string;
+  safety_checkpoint_id: string;
+  trash_dir: string;
+  started_at: string;
+  safety_checkpoint_available: boolean;
+};
+
 export function ProjectCenter({
   dashboard,
   request,
@@ -62,6 +70,7 @@ export function ProjectCenter({
 }) {
   const [tasks, setTasks] = useState<TaskRun[]>([]);
   const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
+  const [pendingRecovery, setPendingRecovery] = useState<PendingRecovery | null>(null);
   const [preview, setPreview] = useState<RollbackPreview | null>(null);
   const [working, setWorking] = useState(false);
 
@@ -69,10 +78,11 @@ export function ProjectCenter({
     try {
       const [taskResult, checkpointResult] = await Promise.all([
         request<{ tasks: TaskRun[] }>("task.list", { limit: 30 }),
-        request<{ checkpoints: Checkpoint[] }>("workflow.run", { action: "checkpoint_list", limit: 30 }),
+        request<{ checkpoints: Checkpoint[]; pending_recovery?: PendingRecovery | null }>("workflow.run", { action: "checkpoint_list", limit: 30 }),
       ]);
       setTasks(taskResult.tasks || []);
       setCheckpoints(checkpointResult.checkpoints || []);
+      setPendingRecovery(checkpointResult.pending_recovery || null);
     } catch (cause) {
       onError(errorMessage(cause));
     }
@@ -134,6 +144,26 @@ export function ProjectCenter({
       onNotice(String(result.next_action || "已在新分支恢复检查点。"));
     } catch (cause) {
       onError(errorMessage(cause));
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const recoverRollback = async () => {
+    if (!pendingRecovery) return;
+    const confirmed = window.confirm(
+      "这次回退上次没有完成，之后所有回退都被阻止。\n\n现在回到回退中断前的状态吗？墨流会恢复回退前自动保存的安全点，并清理残留日志和锁；被移走的文件仍保留在可恢复回收目录。",
+    );
+    if (!confirmed) return;
+    setWorking(true);
+    try {
+      const result = await request<Record<string, unknown>>("workflow.run", { action: "rollback_recover" });
+      setPreview(null);
+      await Promise.all([load(), onRefresh()]);
+      onNotice(String(result.message || "已回到回退中断前的状态。"));
+    } catch (cause) {
+      onError(errorMessage(cause));
+      await load();
     } finally {
       setWorking(false);
     }
@@ -242,6 +272,18 @@ export function ProjectCenter({
           <div><h3>检查点与分支式回退</h3><p>先预览影响，再确认恢复；不会用删文件代替正史回退。</p></div>
           <button disabled={working} onClick={() => void createCheckpoint()}>＋ 创建检查点</button>
         </div>
+        {pendingRecovery && (
+          <article className="rollback-preview">
+            <div><strong>上一次回退没有完成</strong></div>
+            <p>
+              {pendingRecovery.safety_checkpoint_available
+                ? "回退卡在恢复过程中，残留日志已阻止之后的所有回退。可以回到中断前的状态，再重新预览回退。"
+                : "回退卡在恢复过程中，但回退前的安全点已不可用。请先备份项目目录，再联系维护者处理。"}
+            </p>
+            {pendingRecovery.safety_checkpoint_available && <small>中断前安全点：{pendingRecovery.safety_checkpoint_id} · 中断时间：{formatTime(pendingRecovery.started_at)}</small>}
+            <button className="danger-action" disabled={working || !pendingRecovery.safety_checkpoint_available} onClick={() => void recoverRollback()}>恢复到中断前的状态</button>
+          </article>
+        )}
         {preview && (
           <article className="rollback-preview">
             <div><strong>将恢复：{preview.checkpoint.label}</strong><button onClick={() => setPreview(null)}>关闭</button></div>
@@ -307,6 +349,7 @@ function taskLabel(task: TaskRun): string {
     checkpoint_create: "创建检查点",
     rollback_preview: "预览回退",
     rollback_restore: "正式回退",
+    rollback_recover: "恢复到中断前状态",
   };
   if (task.action && actionLabels[task.action]) return actionLabels[task.action];
   if (task.method === "conversation.send") return "自然语言任务";

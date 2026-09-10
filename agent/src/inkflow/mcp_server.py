@@ -169,6 +169,14 @@ def novel_rollback_restore(
     )
 
 
+@mcp.tool(annotations=RECOVERY_WRITE)
+def novel_rollback_recover(project_root: str | None = None) -> dict[str, Any]:
+    """收拾中断的回退：回到回退前自动创建的安全检查点，并清理残留日志与锁。"""
+
+    root = _root(project_root)
+    return _engine(root).rollback_recover(root)
+
+
 @mcp.tool(annotations=MODEL_WRITE)
 async def novel_plan_generate(project_root: str | None = None) -> dict[str, Any]:
     """调用写作 Agent 的 PLAN 模式，生成全书、卷、篇章和章节卡四级规划。"""

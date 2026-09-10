@@ -37,6 +37,9 @@ PERSISTED_SETTING_NAMES = {
     "trace_level",
     "show_provider_reasoning",
     "inquiry_frequency",
+    "dialogue_history_mode",
+    "dialogue_history_interval",
+    "dialogue_history_limit",
     "agent_generation",
     "review_verification_mode",
     "review_local_nli_model",
@@ -150,6 +153,9 @@ class Settings:
     trace_level: str = "full"
     show_provider_reasoning: bool = True
     inquiry_frequency: str = "medium"
+    dialogue_history_mode: str = "auto"
+    dialogue_history_interval: int = 1
+    dialogue_history_limit: int = 100
     agent_generation: dict[str, dict[str, float | int | None]] = field(
         default_factory=lambda: {name: dict(values) for name, values in DEFAULT_AGENT_GENERATION.items()}
     )
@@ -223,6 +229,23 @@ class Settings:
         inquiry_frequency = str(value.get("inquiry_frequency", defaults.inquiry_frequency)).lower()
         if inquiry_frequency not in {"low", "medium", "high", "ultra"}:
             raise ConfigurationError("主动询问频率只能是 low、medium、high 或 ultra。")
+        dialogue_history_mode = _choice(
+            value.get("dialogue_history_mode", defaults.dialogue_history_mode),
+            "对话历史保存方式",
+            {"manual", "auto", "both"},
+        )
+        dialogue_history_interval = _bounded_int_range(
+            value.get("dialogue_history_interval", defaults.dialogue_history_interval),
+            "对话历史自动保存间隔",
+            1,
+            50,
+        )
+        dialogue_history_limit = _bounded_int_range(
+            value.get("dialogue_history_limit", defaults.dialogue_history_limit),
+            "对话历史保留上限",
+            5,
+            1000,
+        )
         agent_generation = _agent_generation(value.get("agent_generation", defaults.agent_generation))
         review_verification_mode = str(
             value.get("review_verification_mode", defaults.review_verification_mode)
@@ -244,6 +267,9 @@ class Settings:
                 value.get("show_provider_reasoning", defaults.show_provider_reasoning)
             ),
             inquiry_frequency=inquiry_frequency,
+            dialogue_history_mode=dialogue_history_mode,
+            dialogue_history_interval=dialogue_history_interval,
+            dialogue_history_limit=dialogue_history_limit,
             agent_generation=agent_generation,
             review_verification_mode=review_verification_mode,
             review_local_nli_model=str(

@@ -900,7 +900,7 @@ function App() {
             <button onClick={openFolder}>打开项目</button>
           </div>
           <div className="welcome-meta">
-            <span>版本 {String(appInfo?.version || "0.5.0")}</span>
+            <span>版本 {String(appInfo?.version || "0.5.1")}</span>
             <span>{provider?.api_key_configured ? "模型已配置" : "尚未配置模型 Key"}</span>
             <button className="text-button" onClick={() => setShowSettings(true)}>模型设置</button>
             <button className="text-button" onClick={() => setShowUpdate(true)}>检查更新</button>
@@ -1120,14 +1120,28 @@ function App() {
         if (item) await openDocument(item);
         setShowSearch(false);
       }} />}
-      {showHistory && <ConversationHistoryDialog entries={conversationHistory} onClose={() => setShowHistory(false)} onReuse={(value) => {
-        setChatInput(value);
-        setPromptOptimization(null);
-        setPromptUndo(null);
-        setShowHistory(false);
-        setMascotMood("waiting");
-        setMascotSpeech("这条旧问题已经放回输入框，你可以修改后再发送。");
-      }} />}
+      {showHistory && <ConversationHistoryDialog
+        entries={conversationHistory}
+        mode={String(provider?.dialogue_history_mode || "auto")}
+        limit={Number(provider?.dialogue_history_limit || 100)}
+        onSaveLast={async () => {
+          const reversed = [...messages].reverse();
+          const lastAssistant = reversed.find((item) => item.role === "assistant");
+          const lastUser = reversed.find((item) => item.role === "user");
+          if (!lastUser || !lastAssistant) throw new Error("还没有可以保存的一轮对话。");
+          await request("conversation.history.save", { user_message: lastUser.text, reply: lastAssistant.text });
+          const history = await request<{ entries: ConversationHistoryEntry[] }>("conversation.history", {});
+          setConversationHistory(history.entries);
+        }}
+        onClose={() => setShowHistory(false)}
+        onReuse={(value) => {
+          setChatInput(value);
+          setPromptOptimization(null);
+          setPromptUndo(null);
+          setShowHistory(false);
+          setMascotMood("waiting");
+          setMascotSpeech("这条旧问题已经放回输入框，你可以修改后再发送。");
+        }} />}
       {pendingQuestions.length > 0 && <QuestionDialog questions={pendingQuestions} onClose={() => setPendingQuestions([])} onSubmit={(answer) => {
         setPendingQuestions([]);
         void sendChat(undefined, answer);
@@ -1593,7 +1607,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   onSaved: (value: Record<string, unknown>) => void;
   onVoiceSaved: (settings: VoiceSettings, status: VoiceStatus) => void;
 }) {
-  const [form, setForm] = useState({ provider_kind: String(provider?.provider_kind || "deepseek"), api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), max_output_tokens: Number(provider?.max_output_tokens || 16000), input_price_per_million: Number(provider?.input_price_per_million || 0), output_price_per_million: Number(provider?.output_price_per_million || 0), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), agent_generation: agentGenerationFromProvider(provider?.agent_generation) });
+  const [form, setForm] = useState({ provider_kind: String(provider?.provider_kind || "deepseek"), api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), dialogue_history_mode: String(provider?.dialogue_history_mode || "auto"), dialogue_history_interval: Number(provider?.dialogue_history_interval || 1), dialogue_history_limit: Number(provider?.dialogue_history_limit || 100), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), max_output_tokens: Number(provider?.max_output_tokens || 16000), input_price_per_million: Number(provider?.input_price_per_million || 0), output_price_per_million: Number(provider?.output_price_per_million || 0), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), agent_generation: agentGenerationFromProvider(provider?.agent_generation) });
   const [voiceForm, setVoiceForm] = useState<VoiceSettings>(voiceSettings || {
     voice_enabled: false, voice_input_enabled: true, voice_output_enabled: true, voice_auto_read: false, voice_auto_send: false,
     voice_default_profile: "narrator_female", voice_speed: 1, voice_volume: 1, voice_input_device: "", voice_output_device: "",
@@ -1721,6 +1735,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
           <div className="preset-grid">{SETTINGS_PRESETS.map((preset) => <button type="button" key={preset.id} className={activePreset === preset.id ? "active" : ""} onClick={() => applyCreationPreset(preset)}><strong>{activePreset === preset.id ? "✓ " : ""}{preset.name}</strong><span>{preset.note}</span><small>{preset.context_soft_tokens / 10000} 万常用上下文</small></button>)}</div>
           <div className="settings-fields two"><label>思考强度<select value={form.reasoning_effort} onChange={(event) => setForm({ ...form, reasoning_effort: event.target.value })}><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最高</option></select></label><label>主动询问<select value={form.inquiry_frequency} onChange={(event) => setForm({ ...form, inquiry_frequency: event.target.value })}><option value="low">只问必需信息</option><option value="medium">把握较低时询问</option><option value="high">重要创作分岔也询问</option><option value="ultra">有明显未知项就询问</option></select></label></div>
           <SettingGroup title="预填续写" note="启用后，编辑停顿会调用当前 Writer 模型，因此可能产生费用。"><label className="setting-check"><input type="checkbox" checked={preferences.prefillEnabled} onChange={(event) => onPreferencesChange({ ...preferences, prefillEnabled: event.target.checked })} />允许在编辑器中手动开启灰字预填候选</label><div className="settings-fields two"><label>等待时间 <small>{preferences.prefillDelayMs} 毫秒</small><input type="range" min="300" max="3000" step="100" value={preferences.prefillDelayMs} onChange={(event) => onPreferencesChange({ ...preferences, prefillDelayMs: Number(event.target.value) })} /></label><label>候选长度<select value={preferences.prefillLength} onChange={(event) => onPreferencesChange({ ...preferences, prefillLength: event.target.value as PrefillLength })}><option value="short">短句</option><option value="medium">一小段</option><option value="long">长段落</option></select></label></div></SettingGroup>
+          <SettingGroup title="对话历史" note="记录只写入项目里的 DIALOGUE.md，不保存原始思维链、API Key 或模型内部推理。"><div className="settings-fields two"><label>保存方式<select value={form.dialogue_history_mode} onChange={(event) => setForm({ ...form, dialogue_history_mode: event.target.value })}><option value="auto">主动保存（自动写入）</option><option value="manual">被动保存（只在对话历史里手动保存）</option><option value="both">两者都有</option></select></label><label>最多保留 <small>条记录</small><input type="number" min={5} max={1000} value={form.dialogue_history_limit} onChange={(event) => setForm({ ...form, dialogue_history_limit: Number(event.target.value) })} /></label></div><div className="settings-fields"><label>自动保存间隔 <small>每 N 轮写入一次</small><input type="number" min={1} max={50} value={form.dialogue_history_interval} disabled={form.dialogue_history_mode === "manual"} onChange={(event) => setForm({ ...form, dialogue_history_interval: Number(event.target.value) })} /></label></div><p className="form-hint">主动保存会在满 N 轮时写入一次；“两者都有”同时开放对话历史里的手动保存。超出保留上限时只删除最旧的记录，不会改动正史。</p></SettingGroup>
         </SettingsPane>}
         {section === "voice" && <SettingsPane title="本地语音" note="只有一种普通话模式；语音运行时不是新的 Agent，也不会接触小说正史。">
           <div className={`provider-status ${voiceStatus?.ready_for_input && voiceStatus?.ready_for_output ? "ready" : "missing"}`}><strong>{voiceStatus?.message || "正在读取本地语音状态"}</strong><span>{voiceStatus?.backend ? `当前引擎：${voiceStatus.backend}` : "保存设置不会自动下载模型；依赖与模型由安装环节单独处理。"}</span></div>
@@ -1853,7 +1868,7 @@ function UpdateDialog({ info, onClose }: { info: UpdateInfo; onClose: () => void
     } finally { setWorking(false); }
   };
   const sourceLabel = local.source === "embedded" ? "发布包内置更新源" : local.source === "github" ? "GitHub Releases" : local.source === "environment" ? "自定义公开更新源" : "尚未配置";
-  return <Modal title="软件更新" subtitle="新版会自动下载，并在关闭或重启墨流时安装；小说正文、正史数据库和本地项目不会被删除。" onClose={onClose}><section className={`update-card ${local.status || "ready"}`}><div><small>当前版本</small><strong>{local.currentVersion || "0.5.0"}</strong></div><div><small>可用版本</small><strong>{local.availableVersion || "—"}</strong></div><div><small>更新来源</small><strong>{sourceLabel}</strong></div>{typeof local.progress === "number" && <div className="update-progress"><span style={{ width: `${Math.max(0, Math.min(local.progress, 100))}%` }} /></div>}<p>{local.message || "墨流会自动检查新版本，也可以在这里立即检查。"}</p></section>{local.status === "not_configured" && <p className="form-hint">私密仓库的下载需要账号令牌，不适合写进大众软件。仓库或独立发布仓库公开后，只需在构建时配置发布源即可启用在线更新。</p>}<div className="dialog-actions"><button onClick={onClose}>关闭</button>{!new Set(["available", "downloading", "downloaded"]).has(String(local.status)) && <button className="primary" disabled={working || local.status === "not_configured" || local.status === "checking"} onClick={() => void action("check")}>{local.status === "checking" ? "正在检查…" : "检查新版本"}</button>}{local.status === "available" && <button className="primary" disabled>正在准备自动下载…</button>}{local.status === "downloading" && <button className="primary" disabled>正在下载 {Math.round(Number(local.progress || 0))}%</button>}{local.status === "downloaded" && <button className="primary" disabled={working} onClick={() => void action("install")}>重启并安装</button>}</div></Modal>;
+  return <Modal title="软件更新" subtitle="新版会自动下载，并在关闭或重启墨流时安装；小说正文、正史数据库和本地项目不会被删除。" onClose={onClose}><section className={`update-card ${local.status || "ready"}`}><div><small>当前版本</small><strong>{local.currentVersion || "0.5.1"}</strong></div><div><small>可用版本</small><strong>{local.availableVersion || "—"}</strong></div><div><small>更新来源</small><strong>{sourceLabel}</strong></div>{typeof local.progress === "number" && <div className="update-progress"><span style={{ width: `${Math.max(0, Math.min(local.progress, 100))}%` }} /></div>}<p>{local.message || "墨流会自动检查新版本，也可以在这里立即检查。"}</p></section>{local.status === "not_configured" && <p className="form-hint">私密仓库的下载需要账号令牌，不适合写进大众软件。仓库或独立发布仓库公开后，只需在构建时配置发布源即可启用在线更新。</p>}<div className="dialog-actions"><button onClick={onClose}>关闭</button>{!new Set(["available", "downloading", "downloaded"]).has(String(local.status)) && <button className="primary" disabled={working || local.status === "not_configured" || local.status === "checking"} onClick={() => void action("check")}>{local.status === "checking" ? "正在检查…" : "检查新版本"}</button>}{local.status === "available" && <button className="primary" disabled>正在准备自动下载…</button>}{local.status === "downloading" && <button className="primary" disabled>正在下载 {Math.round(Number(local.progress || 0))}%</button>}{local.status === "downloaded" && <button className="primary" disabled={working} onClick={() => void action("install")}>重启并安装</button>}</div></Modal>;
 }
 
 function SelectionDialog({ selection, busy, onClose, onSubmit }: { selection: SelectionDraft; busy: boolean; onClose: () => void; onSubmit: (mode: "comment" | "revise", comment: string) => void }) {
@@ -1876,17 +1891,26 @@ function SelectionDialog({ selection, busy, onClose, onSubmit }: { selection: Se
   </Modal>;
 }
 
-function ConversationHistoryDialog({ entries, onClose, onReuse }: { entries: ConversationHistoryEntry[]; onClose: () => void; onReuse: (value: string) => void }) {
+function ConversationHistoryDialog({ entries, mode, limit, onSaveLast, onClose, onReuse }: { entries: ConversationHistoryEntry[]; mode: string; limit: number; onSaveLast: () => Promise<void>; onClose: () => void; onReuse: (value: string) => void }) {
   const [query, setQuery] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveNotice, setSaveNotice] = useState("");
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase("zh-CN");
     const source = [...entries].reverse();
     if (!normalized) return source;
     return source.filter((entry) => `${entry.user}\n${entry.assistant}\n${entry.action_note}`.toLocaleLowerCase("zh-CN").includes(normalized));
   }, [entries, query]);
-  return <Modal title="对话历史" subtitle="按项目保留最近 100 轮可见对话；不保存原始思维链、API Key 或模型内部推理。" onClose={onClose}>
+  const saveLast = async () => {
+    setSaving(true); setSaveNotice("");
+    try { await onSaveLast(); setSaveNotice("已保存这一轮对话。"); }
+    catch (cause) { setSaveNotice(errorMessage(cause)); }
+    finally { setSaving(false); }
+  };
+  return <Modal title="对话历史" subtitle={`按项目保留最近 ${limit} 轮可见对话；不保存原始思维链、API Key 或模型内部推理。${mode === "manual" ? "当前是“被动保存”，需要你手动保存。" : ""}`} onClose={onClose}>
     <div className="history-dialog">
-      <div className="history-search"><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索问题、回答或工作流状态" /><span>{filtered.length} / {entries.length} 轮</span></div>
+      <div className="history-search"><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索问题、回答或工作流状态" /><span>{filtered.length} / {entries.length} 轮</span>{mode !== "auto" && <button type="button" disabled={saving} onClick={() => void saveLast()}>{saving ? "正在保存…" : "保存当前这一轮"}</button>}</div>
+      {saveNotice && <p className="form-hint">{saveNotice}</p>}
       <div className="history-list">
         {filtered.length === 0 && <p className="empty-mini">没有找到匹配的对话。</p>}
         {filtered.map((entry) => <article className="history-entry" key={entry.id}>

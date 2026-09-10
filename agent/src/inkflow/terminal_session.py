@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .config import Settings
 from .coordinator import Coordinator
 from .engine import InkFlowEngine
 from .errors import InkFlowError
@@ -835,19 +836,95 @@ class TerminalSession:
         user_message: str,
         reply: str,
         action_note: str,
-    ) -> None:
-        """Append one bounded, user-visible history entry."""
+        *,
+        force: bool = False,
+    ) -> bool:
+        """按用户设置追加一条可见对话记录；返回本次是否真正写入文件。"""
 
-        path = self._dialogue_path(project)
-        previous = self._recent_dialogue(project, limit=100)
+        settings = Settings.from_env(project.root)
+        if not force:
+            if settings.dialogue_history_mode == "manual":
+                return False
+            interval = max(1, settings.dialogue_history_interval)
+            if interval > 1:
+                # 自动保存按“每 N 轮”计数；计数放在项目元数据里，不新增文件。
+                pending = int(project.db.get_metadata("dialogue_turns_since_save", 0) or 0) + 1
+                if pending < interval:
+                    project.db.set_metadata("dialogue_turns_since_save", pending)
+                    return False
+        project.db.set_metadata("dialogue_turns_since_save", 0)
+        self._write_dialogue_entry(
+            project,
+            user_message,
+            reply,
+            action_note,
+            settings.dialogue_history_limit,
+        )
+        return True
+
+    @classmethod
+    def save_manual_entry(
+        cls,
+        root: str | Path,
+        user_message: str,
+        reply: str,
+        action_note: str = "用户手动保存",
+    ) -> dict[str, Any]:
+        """用户明确要求时保存一条记录，不受“被动/主动”设置限制。"""
+
+        project = InkFlowProject(root)
+        message = user_message.strip()
+        answer = reply.strip()
+        if not message or not answer:
+            raise ValueError("没有可保存的对话内容。")
+        settings = Settings.from_env(project.root)
+        cls._write_dialogue_entry(
+            project, message, answer, action_note, settings.dialogue_history_limit
+        )
+        project.db.set_metadata("dialogue_turns_since_save", 0)
+        return {
+            "saved": True,
+            "entries": len(cls._dialogue_entries(project)),
+            "limit": settings.dialogue_history_limit,
+        }
+
+    @staticmethod
+    def _dialogue_entries(project: InkFlowProject) -> list[str]:
+        """读取 DIALOGUE.md 的原始条目；不截断长度。"""
+
+        path = TerminalSession._dialogue_path(project)
+        if not path.is_file():
+            return []
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        if content.startswith("# 墨流对话记录\n\n"):
+            content = content.removeprefix("# 墨流对话记录\n\n")
+        return [item.strip() for item in content.split("\n\n---\n\n") if item.strip()]
+
+    @staticmethod
+    def _write_dialogue_entry(
+        project: InkFlowProject,
+        user_message: str,
+        reply: str,
+        action_note: str,
+        limit: int,
+    ) -> None:
+        """写入一条记录，并按保留上限裁剪旧记录。"""
+
         recorded_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         entry = (
             f"## 用户\n\n{user_message}\n\n## Coordinator\n\n{reply}"
             f"\n\n> 记录时间：{recorded_at} · {action_note}"
         )
-        entries = [item for item in (previous.split("\n\n---\n\n") if previous else []) if item.strip()]
+        entries = TerminalSession._dialogue_entries(project)
         entries.append(entry)
-        atomic_write_text(path, "# 墨流对话记录\n\n" + "\n\n---\n\n".join(entries[-100:]) + "\n")
+        keep = max(1, limit)
+        atomic_write_text(
+            TerminalSession._dialogue_path(project),
+            "# 墨流对话记录\n\n" + "\n\n---\n\n".join(entries[-keep:]) + "\n",
+        )
 
     async def _dispatch(self, root: Path, intent: TerminalIntent) -> dict[str, Any]:
         if (

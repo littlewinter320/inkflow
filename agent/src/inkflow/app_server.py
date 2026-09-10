@@ -8,6 +8,7 @@ import re
 import sys
 import traceback
 import uuid
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -22,7 +23,7 @@ from .project import InkFlowProject
 from .project_lock import project_write_lock, project_write_lock_sync
 from .provider import create_provider
 from .references import ReferenceService
-from .schemas import BookBrief, CollaborationReply, ContextPacket, ContextSection, MemoryPatch, NovelIdeaBundle, PrefillSuggestion, PromptOptimization, ProviderProbe, ReviewReport, WriterDirectionSet
+from .schemas import BookBrief, CollaborationReply, ContextPacket, ContextSection, MemoryPatch, NovelIdeaBundle, NovelIdeaCandidate, PrefillSuggestion, PromptOptimization, ProviderProbe, ReviewReport, WriterDirectionSet
 from .review_verifier import verify_review
 from .studio import StudioService
 from .terminal_session import TerminalSession
@@ -73,6 +74,9 @@ class InkFlowAppService:
                 "context_hard_tokens": settings.context_hard_tokens,
                 "max_output_tokens": settings.max_output_tokens,
                 "inquiry_frequency": settings.inquiry_frequency,
+                "dialogue_history_mode": settings.dialogue_history_mode,
+                "dialogue_history_interval": settings.dialogue_history_interval,
+                "dialogue_history_limit": settings.dialogue_history_limit,
                 "agent_generation": settings.agent_generation,
                 "review_verification_mode": settings.review_verification_mode,
                 "review_local_nli_model": settings.review_local_nli_model,
@@ -100,6 +104,9 @@ class InkFlowAppService:
                     "context_hard_tokens",
                     "max_output_tokens",
                     "inquiry_frequency",
+                    "dialogue_history_mode",
+                    "dialogue_history_interval",
+                    "dialogue_history_limit",
                     "agent_generation",
                     "review_verification_mode",
                     "review_local_nli_model",
@@ -239,39 +246,47 @@ class InkFlowAppService:
                 }
             )
             try:
-                result = await create_provider(settings).generate_json(
-                    system_prompt=(
-                    "你是墨流的 Writer，当前只负责建项前构思，不写正文。面向中文网文读者，"
-                    f"严格给出 {requested_count} 个可长线连载的原创方案。每个方案都必须有"
-                    "清晰主角欲望、持续矛盾、前三章抓手与可升级的长期叙事引擎。不要依赖用户已有小说。"
-                    "书名简洁可辨识；premise 至少写清人物、触发事件、目标与主要阻力。"
-                    "用户偏好中已经明确说出的受众、主角性别、题材、时代、基调、禁区和开篇方式均是硬约束，"
-                    "不得为了追求新奇而换掉。出现‘女频’且用户没有另行指定时，默认使用女性主角和女频叙事重点；"
-                    "出现‘从……开始’时，opening_hook 必须从该事件或场面起笔。把这些明确约束逐条写入 user_rules。"
-                    "绝不能把 Writer 自己选择的时代、题材或情节说成用户偏好；原文没有的内容只能称为创意提案。"
-                    "user_rules 只能复述用户明确说过的内容，不能把本次方案细节升级为用户硬约束。"
-                    "public_reasoning_summary 用 2～4 条简短中文公开说明你核对了哪些偏好、为何选择这个方向、"
-                    "还有什么可调整；这是给用户看的判断摘要，不是隐藏思维链。"
-                    ),
-                    user_prompt=(
-                    f"用户可以完全没有想法。请生成 {requested_count} 个可直接建立项目的开书方案。"
-                    f"\n用户可选偏好：{preferences or '无，请主动做多样化选择。'}"
-                    "\n默认单章 3000 字、约 200 章、6 卷；可按题材合理微调。"
-                    ),
-                    output_model=NovelIdeaBundle,
-                    # 建项构思不是正文推演。关闭推理可以避免部分模型先耗尽
-                    # reasoning token、却来不及返回小型 JSON 的兼容性故障。
-                    effort="low",
-                    max_tokens=1200 if fast else 2800,
-                    thinking=False,
-                    timeout_seconds=min(settings.request_timeout_seconds, 90.0)
-                    if fast
-                    else min(settings.planning_timeout_seconds, 180.0),
-                    agent_role="writer",
-                )
+                if fast:
+                    result = await self._ideate_direction(
+                        settings, preferences, angle=None, fast=True
+                    )
+                    candidates = list(result.data.candidates[:1])
+                    reasoning = list(result.data.public_reasoning_summary)
+                    model_names = [result.model]
+                else:
+                    # 三个方向分开调用，每次只负责一条互斥的叙事引擎。让模型在一次
+                    # 调用里同时给出三个方案时，低推理预算下很容易复读同一份内容。
+                    settled = await asyncio.gather(
+                        *(
+                            self._ideate_direction(settings, preferences, angle=angle, fast=False)
+                            for angle in _IDEA_ANGLES
+                        ),
+                        return_exceptions=True,
+                    )
+                    usable = [item for item in settled if not isinstance(item, BaseException)]
+                    if not usable:
+                        failure = next(
+                            (item for item in settled if isinstance(item, BaseException)),
+                            None,
+                        )
+                        raise failure if isinstance(failure, ProviderError) else ProviderError(
+                            "模型没有返回任何可用的开书方向。"
+                        )
+                    candidates = await self._separate_repeated_directions(
+                        settings,
+                        preferences,
+                        [item.data.candidates[0] for item in usable],
+                    )
+                    reasoning = [
+                        note for item in usable for note in item.data.public_reasoning_summary
+                    ]
+                    model_names = [item.model for item in usable]
                 fallback_used = False
-                model_name = result.model
-                idea_payload = result.data.model_dump()
+                model_name = "、".join(dict.fromkeys(model_names))
+                idea_payload = NovelIdeaBundle(
+                    candidates=candidates[:requested_count],
+                    public_reasoning_summary=_idea_reasoning_summary(reasoning),
+                ).model_dump()
             except ProviderError as exc:
                 # 建项窗口不能因模型一次结构化输出截断而让用户无法创建项目。
                 # 保底方案只是可编辑的起点，明确标注来源，不伪装成模型成功产物。
@@ -374,7 +389,23 @@ class InkFlowAppService:
         if method == "project.canon_migration.apply":
             return project.apply_canonical_content_migration(str(params.get("confirmation_token") or ""))
         if method == "conversation.history":
-            return {"entries": TerminalSession.history(project.root, int(params.get("limit", 100)))}
+            settings = Settings.from_env(project.root)
+            return {
+                "entries": TerminalSession.history(
+                    project.root, settings.dialogue_history_limit
+                ),
+                "settings": {
+                    "dialogue_history_mode": settings.dialogue_history_mode,
+                    "dialogue_history_interval": settings.dialogue_history_interval,
+                    "dialogue_history_limit": settings.dialogue_history_limit,
+                },
+            }
+        if method == "conversation.history.save":
+            return TerminalSession.save_manual_entry(
+                project.root,
+                str(params.get("user_message") or ""),
+                str(params.get("reply") or ""),
+            )
         if method == "project.status":
             return studio.dashboard()
         if method == "context.status":
@@ -887,9 +918,108 @@ class InkFlowAppService:
                 boundary_chapter=params.get("boundary_chapter"),
                 confirmation_token=str(params["confirmation_token"]),
             )
+        elif action == "rollback_recover":
+            result = engine.rollback_recover(project.root)
         else:
             raise ValueError(f"不支持的工作流动作：{action}")
         await emit({"type": "workflow.completed", "action": action, "summary": _visible_result_summary(result)})
+        return result
+
+    async def _ideate_direction(
+        self,
+        settings: Settings,
+        preferences: str,
+        *,
+        angle: tuple[str, str] | None,
+        fast: bool,
+        avoid: list[NovelIdeaCandidate] | None = None,
+    ) -> Any:
+        """生成一个开书方向；angle 指定本次必须采用的差异化叙事引擎。"""
+
+        system_prompt = (
+            "你是墨流的 Writer，当前只负责建项前构思，不写正文。面向中文网文读者。"
+            "本次只提交 1 个方案。每个方案都必须有清晰主角欲望、持续矛盾、前三章抓手与可升级的长期叙事引擎。"
+            "不要依赖用户已有小说。书名简洁可辨识；premise 至少写清人物、触发事件、目标与主要阻力。"
+            "用户偏好中已经明确说出的受众、主角性别、题材、时代、基调、禁区和开篇方式均是硬约束，"
+            "不得为了追求新奇而换掉。出现‘女频’且用户没有另行指定时，默认使用女性主角和女频叙事重点；"
+            "出现‘从……开始’时，opening_hook 必须从该事件或场面起笔。把这些明确约束逐条写入 user_rules。"
+            "绝不能把 Writer 自己选择的时代、题材或情节说成用户偏好；原文没有的内容只能称为创意提案。"
+            "user_rules 只能复述用户明确说过的内容，不能把本次方案细节升级为用户硬约束。"
+            "public_reasoning_summary 用 2～4 条简短中文公开说明你核对了哪些偏好、为何选择这个方向、"
+            "还有什么可调整；这是给用户看的判断摘要，不是隐藏思维链。"
+        )
+        if angle is not None:
+            system_prompt += (
+                f"这一次只提交 1 个方案，并且它的叙事引擎必须是“{angle[0]}”：{angle[1]}"
+                "在满足用户全部硬约束的前提下，围绕这个引擎设计主角动机、主要阻力和前三章抓手。"
+            )
+        if avoid:
+            system_prompt += (
+                "下面这些方向已经确定，本次必须与它们在题材细分、主角动机、矛盾来源和开篇场面上都明显不同："
+                + json.dumps(
+                    [
+                        {
+                            "title": item.title,
+                            "premise": item.premise,
+                            "opening_hook": item.opening_hook,
+                        }
+                        for item in avoid
+                    ],
+                    ensure_ascii=False,
+                )
+            )
+        return await create_provider(settings).generate_json(
+            system_prompt=system_prompt,
+            user_prompt=(
+                "用户可以完全没有想法。请生成 1 个可直接建立项目的开书方案。"
+                f"\n用户可选偏好：{preferences or '无，请主动做多样化选择。'}"
+                "\n默认单章 3000 字、约 200 章、6 卷；可按题材合理微调。"
+            ),
+            output_model=NovelIdeaBundle,
+            # 建项构思不是正文推演。关闭推理可以避免部分模型先耗尽
+            # reasoning token、却来不及返回小型 JSON 的兼容性故障。
+            effort="low",
+            max_tokens=1200 if fast else 1600,
+            thinking=False,
+            timeout_seconds=min(settings.request_timeout_seconds, 90.0)
+            if fast
+            else min(settings.planning_timeout_seconds, 180.0),
+            agent_role="writer",
+        )
+
+    async def _separate_repeated_directions(
+        self,
+        settings: Settings,
+        preferences: str,
+        candidates: list[NovelIdeaCandidate],
+    ) -> list[NovelIdeaCandidate]:
+        """检出实质重复的方向，并对重复项各补一次定向重写。"""
+
+        result = list(candidates)
+        for index in range(len(result)):
+            duplicate_of = next(
+                (
+                    other
+                    for other in range(index)
+                    if _direction_similarity(result[index], result[other])
+                    >= _IDEA_DUPLICATE_RATIO
+                ),
+                None,
+            )
+            if duplicate_of is None:
+                continue
+            try:
+                replacement = await self._ideate_direction(
+                    settings,
+                    preferences,
+                    angle=_IDEA_ANGLES[index % len(_IDEA_ANGLES)],
+                    fast=False,
+                    avoid=list(result[:index]),
+                )
+            except ProviderError:
+                # 重写失败时保留原方向：三个方案仍可比较，只是可能偏近。
+                continue
+            result[index] = replacement.data.candidates[0]
         return result
 
     @staticmethod
@@ -1028,6 +1158,56 @@ class JsonLineServer:
         async with self.write_lock:
             sys.stdout.write(text + "\n")
             sys.stdout.flush()
+
+
+# 三个对比方向各自的叙事引擎。它们只改变矛盾来源与长线动力，
+# 不改变用户在偏好里写下的题材、受众、性别、时代与基调等硬约束。
+_IDEA_ANGLES: tuple[tuple[str, str], ...] = (
+    (
+        "外部压迫",
+        "让主角被一个具体、持续升级的外在压力推着走：生存、竞争、追捕或期限；"
+        "矛盾主要来自对手和环境做了什么。",
+    ),
+    (
+        "关系拉扯",
+        "让主线成立在人与人的信任、误解、背叛与结盟上；矛盾主要来自重要的人如何选择，"
+        "外部事件只作为放大器。",
+    ),
+    (
+        "规则解谜",
+        "先立下一条读者能理解的规则，再让主角一层层试探它的边界与代价；"
+        "矛盾主要来自规则本身藏着什么，长线靠真相递进。",
+    ),
+)
+
+# 标题、前提与开篇抓手的文本相似度超过该阈值即视为实质重复。
+_IDEA_DUPLICATE_RATIO = 0.72
+
+
+def _direction_similarity(first: NovelIdeaCandidate, second: NovelIdeaCandidate) -> float:
+    """用一个方向的标题、前提与开篇抓手判断两个方向是否实质重复。"""
+
+    title = SequenceMatcher(None, first.title, second.title).ratio()
+    body = (
+        SequenceMatcher(None, first.premise, second.premise).ratio()
+        + SequenceMatcher(None, first.opening_hook, second.opening_hook).ratio()
+    ) / 2
+    return max(title, body)
+
+
+def _idea_reasoning_summary(notes: list[str]) -> list[str]:
+    """合并多个方向的公开说明，并保持 Schema 要求的 2～6 条。"""
+
+    unique = list(dict.fromkeys(note.strip() for note in notes if note and note.strip()))
+    for filler in (
+        "除用户原始偏好外，其余题材与情节细节都可以继续修改。",
+        "这些方向只用于填写建项信息，采用前不会写入任何文件。",
+    ):
+        if len(unique) >= 2:
+            break
+        if filler not in unique:
+            unique.append(filler)
+    return unique[:6]
 
 
 def _fallback_idea_bundle(preferences: str, requested_count: int) -> NovelIdeaBundle:
