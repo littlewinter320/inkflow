@@ -312,11 +312,13 @@ def _as_bool(value: Any) -> bool:
 def _agent_generation(value: Any) -> dict[str, dict[str, float | int | None]]:
     if not isinstance(value, dict):
         raise ConfigurationError("Agent 高级生成参数必须是对象。")
-    unknown = set(value) - set(DEFAULT_AGENT_GENERATION)
-    if unknown:
-        raise ConfigurationError(f"未知的 Agent 参数组：{', '.join(sorted(unknown))}")
     result = {name: dict(defaults) for name, defaults in DEFAULT_AGENT_GENERATION.items()}
+    # Agent roles may be added by a newer desktop. Ignore role groups this
+    # engine does not know so one forward-version setting cannot block startup;
+    # known roles and their fields are still validated strictly below.
     for role, raw in value.items():
+        if role not in result:
+            continue
         if not isinstance(raw, dict):
             raise ConfigurationError(f"{role} 的高级生成参数必须是对象。")
         extra = set(raw) - {"temperature", "top_p", "top_k"}

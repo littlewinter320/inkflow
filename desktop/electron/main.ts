@@ -57,14 +57,19 @@ class UpdateManager {
       });
     }
     if (!this.updater) return;
-    this.updater.autoDownload = false;
-    this.updater.autoInstallOnAppQuit = false;
+    this.updater.autoDownload = true;
+    this.updater.autoInstallOnAppQuit = true;
     this.updater.on("checking-for-update", () => this.setState({ status: "checking", message: "正在检查新版本…" }));
-    this.updater.on("update-available", (info: { version: string }) => this.setState({ status: "available", availableVersion: info.version, message: `发现新版本 ${info.version}，可在软件内下载。` }));
+    this.updater.on("update-available", (info: { version: string }) => this.setState({ status: "available", availableVersion: info.version, message: `发现新版本 ${info.version}，正在自动下载。` }));
     this.updater.on("update-not-available", () => this.setState({ status: "current", availableVersion: undefined, message: "当前已经是最新版本。" }));
     this.updater.on("download-progress", (progress: { percent: number }) => this.setState({ status: "downloading", progress: Math.round(progress.percent), message: `正在下载更新：${Math.round(progress.percent)}%` }));
-    this.updater.on("update-downloaded", (info: { version: string }) => this.setState({ status: "downloaded", availableVersion: info.version, progress: 100, message: "更新已经下载完成；重启墨流即可安装。" }));
+    this.updater.on("update-downloaded", (info: { version: string }) => this.setState({ status: "downloaded", availableVersion: info.version, progress: 100, message: "更新已经下载完成；关闭墨流或点击重启后会自动安装。" }));
     this.updater.on("error", (cause: Error) => this.setState({ status: "error", message: `更新失败：${cause.message}` }));
+    this.window.webContents.once("did-finish-load", () => {
+      setTimeout(() => {
+        if (!this.window.isDestroyed()) void this.check().catch(() => undefined);
+      }, 1200);
+    });
   }
 
   status(): UpdateState { return { ...this.state }; }
@@ -101,6 +106,7 @@ class EngineBridge {
   private process: ChildProcessWithoutNullStreams | null = null;
   private pending = new Map<string, Pending>();
   private window: BrowserWindow;
+  private compatibilityCheck: Promise<void> | null = null;
 
   constructor(window: BrowserWindow) {
     this.window = window;
@@ -129,6 +135,26 @@ class EngineBridge {
   }
 
   async request(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+    if (method !== "app.initialize") await this.ensureCompatible();
+    return this.requestRaw(method, params);
+  }
+
+  private async ensureCompatible(): Promise<void> {
+    if (!this.compatibilityCheck) {
+      this.compatibilityCheck = this.requestRaw("app.initialize").then((value) => {
+        const details = value as { version?: string; protocol_version?: number };
+        const desktopVersion = app.getVersion();
+        const engineVersion = String(details.version || "");
+        const protocolVersion = Number(details.protocol_version || 0);
+        if (engineVersion !== desktopVersion || protocolVersion !== 1) {
+          throw new Error(`桌面程序 ${desktopVersion} 与内置引擎 ${engineVersion || "未知"} 不兼容。为避免损坏配置，已停止本次请求；请重新安装当前版本。`);
+        }
+      });
+    }
+    await this.compatibilityCheck;
+  }
+
+  private async requestRaw(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
     this.start();
     const child = this.process;
     if (!child || child.killed || child.exitCode !== null) {
@@ -150,6 +176,7 @@ class EngineBridge {
   stop(): void {
     const child = this.process;
     this.process = null;
+    this.compatibilityCheck = null;
     child?.kill();
   }
 
