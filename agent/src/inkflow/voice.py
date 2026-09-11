@@ -937,7 +937,8 @@ class VoiceRuntime:
             text = str(result.get("text") or "")
         else:
             text = str(result or "")
-        text = text.strip()
+        # 双保险：funasr 输出偶尔也带 <|zh|>、<|NEUTRAL|> 之类的内联标记。
+        text = re.sub(r"<\|[^|]*\|>", "", text).strip()
         if not text:
             raise RuntimeError("没有识别到清晰的普通话内容，请更换安静环境下的录音。")
         return text
@@ -984,7 +985,20 @@ class VoiceRuntime:
         stream = recognizer.create_stream()
         stream.accept_waveform(int(sample_rate), samples)
         recognizer.decode_stream(stream)
-        text = str(getattr(stream, "result", "") or "").strip()
+        # 部分 sherpa-onnx SenseVoice 构建会把整段识别结果包成 JSON 字符串
+        # （含 lang/emotion/event 等标记），不能直接当正文返回给输入框。
+        raw = str(getattr(stream, "result", "") or "").strip()
+        text = ""
+        if raw.startswith("{"):
+            try:
+                payload = json.loads(raw)
+                text = str(payload.get("text") or "") if isinstance(payload, dict) else ""
+            except json.JSONDecodeError:
+                text = raw
+        else:
+            text = raw
+        # 去掉 <|yue|>、<|NEUTRAL|>、<|Speech|> 之类的内联标记，只留自然语言。
+        text = re.sub(r"<\|[^|]*\|>", "", text).strip()
         if not text:
             raise RuntimeError("没有识别到清晰的普通话内容，请更换安静环境下的录音。")
         return text

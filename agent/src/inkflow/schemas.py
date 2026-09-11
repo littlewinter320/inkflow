@@ -54,6 +54,25 @@ class PromptOptimization(StrictModel):
     preserved_constraints: list[str] = Field(default_factory=list, max_length=12)
 
 
+class CreativeBrainstorm(StrictModel):
+    """Writer 创意分身的输出：无依据可查时的纯创意提案，不写正文、不入正史。"""
+
+    reply: str = Field(min_length=1, max_length=6_000)
+
+
+class SuggestedPrompt(StrictModel):
+    """一条按当前对话与项目状态预测的用户下一步提示词。"""
+
+    label: str = Field(min_length=1, max_length=24)
+    prompt: str = Field(min_length=1, max_length=200)
+
+
+class SuggestedPrompts(StrictModel):
+    """对话输入区的动态提示词预测结果；失败时由本地规则兜底。"""
+
+    suggestions: list[SuggestedPrompt] = Field(min_length=1, max_length=5)
+
+
 class VolumeCompass(StrictModel):
     volume_no: int = Field(ge=1)
     title: str
@@ -572,6 +591,8 @@ class DispatchPlan(StrictModel):
 
 
 TerminalAction = Literal[
+    "chat",
+    "ideate",
     "discuss",
     "status",
     "plan",

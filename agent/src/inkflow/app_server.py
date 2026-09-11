@@ -21,9 +21,10 @@ from .errors import InkFlowError, ProviderError
 from .learning import LearningService
 from .project import InkFlowProject
 from .project_lock import project_write_lock, project_write_lock_sync
+from .prompts import ASSISTANT_SUGGEST_SYSTEM
 from .provider import create_provider
 from .references import ReferenceService
-from .schemas import BookBrief, CollaborationReply, ContextPacket, ContextSection, MemoryPatch, NovelIdeaBundle, NovelIdeaCandidate, PrefillSuggestion, PromptOptimization, ProviderProbe, ReviewReport, WriterDirectionSet
+from .schemas import BookBrief, CollaborationReply, ContextPacket, ContextSection, MemoryPatch, NovelIdeaBundle, NovelIdeaCandidate, PrefillSuggestion, PromptOptimization, ProviderProbe, ReviewReport, SuggestedPrompts, SuggestedPrompt, WriterDirectionSet
 from .review_verifier import verify_review
 from .studio import StudioService
 from .terminal_session import TerminalSession
@@ -234,6 +235,47 @@ class InkFlowAppService:
                 "model": result.model,
                 "source_method": "critique_then_synthesize",
             }
+        if method == "assistant.suggest":
+            # 输入区动态提示词：预测用户下一步想说的话。模型失败时用本地规则兜底，绝不抛错打断对话。
+            settings = Settings.from_env(params.get("workspace_root") or params.get("project_root"))
+            recent = params.get("recent_messages")
+            recent_messages = [
+                {"role": str(item.get("role") or "user"), "text": str(item.get("text") or "")[:400]}
+                for item in (recent if isinstance(recent, list) else [])
+                if isinstance(item, dict)
+            ][-6:]
+            project = self._try_project(params.get("workspace_root") or params.get("project_root"))
+            fallback = _local_suggested_prompts(project)
+            try:
+                context_lines = []
+                if project is not None:
+                    context_lines.append(f"项目状态：{json.dumps(_project_status_summary(project), ensure_ascii=False)}")
+                if recent_messages:
+                    context_lines.append(
+                        "最近对话：\n"
+                        + "\n".join(
+                            f"[{item['role']}] {item['text']}" for item in recent_messages
+                        )
+                    )
+                user_prompt = (
+                    "请预测用户下一步最想说的 3～5 条提示词。\n"
+                    + ("\n".join(context_lines) if context_lines else "暂无项目与对话信息，给最通用的建议。")
+                )
+                result = await create_provider(settings).generate_json(
+                    system_prompt=ASSISTANT_SUGGEST_SYSTEM,
+                    user_prompt=user_prompt,
+                    output_model=SuggestedPrompts,
+                    effort="low",
+                    max_tokens=600,
+                    thinking=False,
+                    timeout_seconds=min(settings.request_timeout_seconds, 45.0),
+                    agent_role="coordinator",
+                )
+                suggestions = [item.model_dump() for item in result.data.suggestions]
+                return {"suggestions": suggestions, "model": result.model, "fallback": False}
+            except Exception:
+                # 预测失败不影响对话主流程，静默回退到本地规则。
+                return {"suggestions": fallback, "model": "", "fallback": True}
         if method == "project.ideate":
             settings = Settings.from_env(params.get("workspace_root"))
             preferences = str(params.get("preferences") or "").strip()
@@ -1030,6 +1072,20 @@ class InkFlowAppService:
         return InkFlowProject(Path(str(value)).resolve())
 
     @staticmethod
+    def _try_project(root: str | Path | None) -> InkFlowProject | None:
+        """尽力解析项目；路径无效或尚未开书时返回 None，不抛错。"""
+
+        if not root:
+            return None
+        try:
+            project = InkFlowProject(Path(str(root)).resolve())
+            if not project.project_id:
+                return None
+            return project
+        except Exception:
+            return None
+
+    @staticmethod
     def _engine(root: Path) -> InkFlowEngine:
         settings = Settings.from_env(root)
         return InkFlowEngine(create_provider(settings), settings)
@@ -1335,6 +1391,72 @@ def _list_batch_summaries(project: InkFlowProject) -> list[dict[str, Any]]:
         except (OSError, json.JSONDecodeError):
             continue
     return result
+
+
+def _local_suggested_prompts(project: InkFlowProject | None) -> list[dict[str, str]]:
+    """提示词预测的本地规则兜底：不调用模型，按项目阶段给固定建议。"""
+
+    prompts = [
+        {
+            "label": "先问我",
+            "prompt": "先不要执行任务。请根据当前项目状态和最近讨论，用选项卡主动问我一到三个最值得确认、容易回答的问题。",
+        }
+    ]
+    if project is None:
+        prompts.extend(
+            [
+                {"label": "想想点子", "prompt": "帮我想几个全新的故事点子"},
+                {"label": "查看状态", "prompt": "查看当前项目状态"},
+            ]
+        )
+        return prompts
+    has_plan = False
+    drafts: list[int] = []
+    try:
+        has_plan = project.db.get_current_plan_bundle() is not None
+        drafts = list(project.db.chapter_numbers_by_status("draft"))
+    except Exception:
+        pass
+    if not has_plan:
+        prompts.extend(
+            [
+                {"label": "规划当前篇章", "prompt": "帮我规划当前篇章"},
+                {"label": "想想点子", "prompt": "帮我想几个全新的故事点子"},
+            ]
+        )
+    else:
+        prompts.append({"label": "规划当前篇章", "prompt": "帮我规划当前篇章"})
+        if drafts:
+            first = drafts[0]
+            prompts.extend(
+                [
+                    {"label": "审查当前章", "prompt": f"审查第 {first} 章"},
+                    {"label": "验收进正史", "prompt": f"审查第 {first} 章，通过后入正史"},
+                ]
+            )
+        else:
+            prompts.append({"label": "写当前章", "prompt": "写当前章的草稿，先不要审查"})
+    prompts.append({"label": "查看状态", "prompt": "查看当前项目状态"})
+    return prompts[:5]
+
+
+def _project_status_summary(project: InkFlowProject) -> dict[str, Any]:
+    """给提示词预测器的小型项目状态摘要，只取稳定字段。"""
+
+    summary: dict[str, Any] = {}
+    try:
+        summary["latest_accepted_chapter"] = project.db.latest_accepted_chapter_no()
+        summary["draft_chapters"] = project.db.chapter_numbers_by_status("draft")
+        bundle = project.db.get_current_plan_bundle()
+        if bundle is not None:
+            summary["current_arc"] = {
+                "arc_id": bundle.current_arc.arc_id,
+                "chapter_start": bundle.current_arc.chapter_start,
+                "chapter_end": bundle.current_arc.chapter_end,
+            }
+    except Exception:
+        pass
+    return summary
 
 
 def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:

@@ -13,6 +13,7 @@ from .coordinator import Coordinator
 from .engine import InkFlowEngine
 from .errors import InkFlowError
 from .project import InkFlowProject
+from .prompts import MOBAO_PERSONA
 from .project_lock import project_write_lock_sync
 from .schemas import ContextPacket, ContextSection, TerminalIntent
 from .trace import TraceRecorder
@@ -36,6 +37,8 @@ TERMINAL_ROUTER_SYSTEM = """
 - 一条消息有多个目标时，requested_outcome 保留完整目标，action 只选择安全的第一步；不要自行拼接任意工具链。
 
 可选 action 的语义固定如下：
+- chat：寒暄、闲聊、情绪表达、与创作无关的日常提问（如“晚上好”“我该怎么称呼你”），或用户明显只想聊天。conversation_reply 以墨宝口吻直接、完整地回应，不进入工作流、不说跑题、不催促干活。
+- ideate：用户要从零构思、想要灵感、点子或天马行空的提案，且当前没有正史或规划依据可查（如“帮我想几个故事点子”“给我一个全新的方向”）。这会交给 Writer 的灵感分身产出创意提案，不写正文、不入正史、不做证据核验；用户明确要求出点子时 authorization=approved。
 - status：只读取项目状态。
 - plan：让 Writer 生成四级规划。
 - plan_preview：集中查看已经存在的连续章节卡，不调用 Writer、不改规划。chapter_no 是起始章，end_chapter_no 是结束章；最多 20 章。用户说“把第7到11章规划一起给我看”时使用此动作。
@@ -74,6 +77,7 @@ checkpoint_id 与 confirmation_token 必须逐字复制用户输入；用户未�
 batch_id 必须逐字复制用户输入；用户未提供时设为 null。
 target_characters 只表示“已接受正文”的有效字符目标，不把草稿、审查或日志计入。end_chapter_no 对 plan_preview、arc_audit 表示结束章，对 continue_run 表示长跑结束章。plan_change_confirmed 根据整句与最近待确认事项的明确执行语义判断，不做关键词匹配。
 轻量会话规则：
+- 闲聊优先 chat：寒暄、情绪表达和与创作无关的日常问题用 action=chat 正常回应，像一个懂分寸的朋友；只有讨论创作话题（题材、人物、节奏、方案）才是 discuss；只有明确要具体点子或提案才是 ideate。不要把闲聊判定为跑题，也不要一味追求效率。
 - 用户在讨论题材、人物、节奏、选择、方案或表达意见，而没有明确要求执行时，action 必须是 discuss。conversation_reply 用自然中文复述已理解的重点、给出一个建议和下一步确认问句；不调用 Writer、Reviewer 或 Memory Keeper。
 - 用户用任何明确肯定表达接受最近方案时，可结合本次 Context Packet 中的最近对话，将其路由为相应既有 action；不要要求固定口令。
 - 用户只要求“写草稿”“先写出来我看看”“不要审查”时，action=write_draft；只让 Writer 写草稿，绝不自动审查或接收。
@@ -83,6 +87,9 @@ target_characters 只表示“已接受正文”的有效字符目标，不把�
 - 用户只要求“按意见修改第 N 章，先给我看”时，action=revise_draft；只让 Writer 修订，不自动重审。
 - 除非用户明确进入连续长跑或要求入正史，不能把普通写作升级为写作—审查—接收全链路。
 """.strip()
+
+# 墨宝口吻统一注入：路由与回复都由 Coordinator 负责，但对用户说话时始终以墨宝的身份。
+TERMINAL_ROUTER_SYSTEM = TERMINAL_ROUTER_SYSTEM + "\n\n墨宝口吻（适用于你写出的所有 conversation_reply）：\n" + MOBAO_PERSONA
 
 
 _SENSITIVE_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
@@ -236,6 +243,20 @@ class TerminalSession:
                             "questions": self._question_cards(intent),
                         }
                     )
+            elif intent.action == "chat":
+                # 闲聊不进工作流：路由模型已按墨宝口吻写出完整回复，这里只兜底空回复。
+                response: dict[str, Any] = {
+                    "reply": intent.conversation_reply.strip()
+                    or "我在呢。想聊点什么，或者继续你的故事都可以。"
+                }
+            elif intent.action == "ideate":
+                # Writer 灵感分身：零依据构思不做证据核验，产出提案不入正史。
+                if intent.authorization != "approved":
+                    response = {
+                        "gate": "想让我出点子的话，直接说就行，例如“帮我想几个故事点子”。"
+                    }
+                else:
+                    response = await self.engine.brainstorm(project.root, text, packet)
             else:
                 response = await self._dispatch(project.root, intent)
             if intent.authorization == "approved" and dispatch_plan.steps:
@@ -391,7 +412,8 @@ class TerminalSession:
         ):
             resolved = resolved.model_copy(update={"plan_change_confirmed": True})
 
-        if resolved.action == "discuss":
+        if resolved.action in {"discuss", "chat"}:
+            # 闲聊与讨论都不要求执行授权，直接由墨宝口吻回复。
             return resolved, None
 
         if resolved.missing_fields:
@@ -930,6 +952,7 @@ class TerminalSession:
         if (
             intent.action not in _READ_ONLY_ACTIONS
             and intent.action != "discuss"
+            and intent.action != "chat"
             and intent.authorization != "approved"
         ):
             return {

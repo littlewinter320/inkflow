@@ -25,6 +25,7 @@ from .prompts import (
     REVIEWER_SYSTEM,
     REVISER_SYSTEM,
     SELECTION_REVISER_SYSTEM,
+    WRITER_IDEATE_SYSTEM,
     WRITER_SYSTEM,
 )
 from .provider import JsonModelProvider
@@ -44,6 +45,7 @@ from .schemas import (
     BookBrief,
     ContextPacket,
     ContextSection,
+    CreativeBrainstorm,
     DraftOutput,
     EvidenceRepairBatch,
     EvidenceSelectionBatch,
@@ -79,6 +81,46 @@ class InkFlowEngine:
             embedding_model=self.settings.retrieval_embedding_model,
             reranker_model=self.settings.retrieval_reranker_model,
         )
+
+    async def brainstorm(self, root: str | Path, prompt: str, packet: ContextPacket) -> dict[str, Any]:
+        """Writer 灵感分身：零依据构思只出创意提案，不做证据核验、不写正文、不入正史。"""
+
+        project = InkFlowProject(root)
+        trace = TraceRecorder(project.root, "writer-brainstorm", self.settings.trace_level)
+        try:
+            # 灵感分身只把最近对话当作背景参考，不做证据核验，也不引用正史结论。
+            context = packet.to_markdown()
+            if len(context) > 6_000:
+                context = context[-6_000:]
+            result = await self.provider.generate_json(
+                system_prompt=WRITER_IDEATE_SYSTEM,
+                user_prompt=(
+                    f"用户当前的想法：\n{prompt}\n\n"
+                    f"最近对话与项目状态（背景参考，不需要核验）：\n{context}"
+                ),
+                output_model=CreativeBrainstorm,
+                effort="low",
+                max_tokens=2_400,
+                thinking=False,
+                agent_role="writer",
+                timeout_seconds=min(self.settings.request_timeout_seconds, 120.0),
+            )
+            trace.record_model(
+                "writer.brainstorm",
+                result,
+                "Writer 灵感分身完成零依据创意提案",
+            )
+            trace.finish(summary="创意提案已生成，未写入任何正文或正史")
+            return {
+                "reply": result.data.reply,
+                "model": result.model,
+                "next_action": "选中哪个方向告诉我；确认后再进入正式规划流程。",
+                "trace_id": trace.run_id,
+            }
+        except Exception as exc:
+            trace.record("brainstorm", "failed", "创意提案生成失败", str(exc))
+            trace.finish(status="failed", summary="灵感分身未产出提案")
+            raise
 
     def create_project(self, root: str | Path, brief: BookBrief) -> dict[str, Any]:
         project = InkFlowProject.create(root, brief)

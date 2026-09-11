@@ -72,6 +72,8 @@ _WORKFLOWS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
     "checkpoint_create": (("engine", "checkpoint.create", "", "新检查点"),),
     "rollback_preview": (("engine", "rollback.preview", "", "回退影响和确认码"),),
     "rollback_restore": (("engine", "rollback.restore", "", "分支式恢复结果"),),
+    "chat": (),
+    "ideate": (("writer", "idea.brainstorm", "", "创意提案"),),
     "discuss": (),
     "exit": (),
 }
@@ -166,7 +168,7 @@ class Coordinator:
     def _model_call_budget(intent: TerminalIntent, chapter_count: int) -> int:
         if intent.action in {"status", "help", "plan_preview", "checkpoint_list", "rollback_preview", "exit"}:
             return 0
-        if intent.action == "discuss":
+        if intent.action in {"discuss", "chat"}:
             return 1
         if intent.action in {"batch_draft", "batch_repair", "continue_run"}:
             return min(100, chapter_count * (2 + max(0, intent.max_revision_rounds)))

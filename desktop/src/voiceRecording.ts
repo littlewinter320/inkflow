@@ -46,6 +46,18 @@ export class LocalWavRecorder {
     }
     return encodeMonoWav(samples, sampleRate);
   }
+
+  // 边听边出字：把当前已积累的音频编码成 WAV 快照，不停止录音。
+  // JS 单线程，编码期间 onaudioprocess 不会并发写入 chunks，安全。
+  snapshot(): Uint8Array {
+    const samples = new Float32Array(this.length);
+    let offset = 0;
+    for (const chunk of this.chunks) {
+      samples.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return encodeMonoWav(samples, this.context.sampleRate);
+  }
 }
 
 function encodeMonoWav(samples: Float32Array, sampleRate: number): Uint8Array {

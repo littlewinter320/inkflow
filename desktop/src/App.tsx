@@ -73,6 +73,16 @@ type EngineEvent = {
 };
 type Message = { id: string; role: "user" | "assistant" | "system"; text: string; details?: string; reasoning?: string[]; animate?: boolean; createdAt?: string };
 type ConversationHistoryEntry = { id: string; user: string; assistant: string; action_note: string; recorded_at: string };
+type SuggestedPromptItem = { label: string; prompt: string };
+
+// 输入区动态提示词的本地兜底：模型预测失败或尚未返回时显示这组固定建议。
+const defaultSuggestedPrompts: SuggestedPromptItem[] = [
+  { label: "先问我", prompt: "先不要执行任务。请根据当前项目状态和最近讨论，用选项卡主动问我一到三个最值得确认、容易回答的问题。" },
+  { label: "规划当前篇章", prompt: "帮我规划当前篇章" },
+  { label: "写当前章", prompt: "写当前章的草稿，先不要审查" },
+  { label: "审查当前章", prompt: "审查当前章" },
+  { label: "查看状态", prompt: "查看当前项目状态" },
+];
 type PromptOptimizationResult = {
   original_prompt: string;
   optimized_prompt: string;
@@ -156,6 +166,7 @@ type UiPreferences = {
   prefillEnabled: boolean;
   prefillDelayMs: number;
   prefillLength: PrefillLength;
+  suggestedPromptsEnabled: boolean;
 };
 
 const workspaceLayoutStorageKey = "inkflow.workspace-layout.v1";
@@ -184,6 +195,7 @@ const defaultUiPreferences: UiPreferences = {
   prefillEnabled: false,
   prefillDelayMs: 900,
   prefillLength: "medium",
+  suggestedPromptsEnabled: true,
 };
 
 function clampWorkspaceWidth(target: WorkspaceResizeTarget, value: number) {
@@ -223,6 +235,7 @@ function loadUiPreferences(): UiPreferences {
       prefillEnabled: stored.prefillEnabled === true,
       prefillDelayMs: Math.max(300, Math.min(3000, Number(stored.prefillDelayMs) || defaultUiPreferences.prefillDelayMs)),
       prefillLength: ["short", "medium", "long"].includes(String(stored.prefillLength)) ? stored.prefillLength as PrefillLength : defaultUiPreferences.prefillLength,
+      suggestedPromptsEnabled: stored.suggestedPromptsEnabled !== false,
     };
   } catch {
     return defaultUiPreferences;
@@ -291,8 +304,11 @@ function App() {
   const [voiceRecording, setVoiceRecording] = useState(false);
   const [voiceTranscribing, setVoiceTranscribing] = useState(false);
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
+  const [suggestedPrompts, setSuggestedPrompts] = useState<SuggestedPromptItem[]>(defaultSuggestedPrompts);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
+  const voiceLiveTimerRef = useRef<number | null>(null);
+  const voiceLiveBusyRef = useRef(false);
   const startupStartedRef = useRef(false);
   const resizeRef = useRef<{ target: WorkspaceResizeTarget; startX: number; startWidth: number; direction: 1 | -1 } | null>(null);
   const voiceRecorderRef = useRef<LocalWavRecorder | null>(null);
@@ -481,6 +497,13 @@ function App() {
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [text, savedText, document?.relative_path, document?.read_only]);
+
+  // 打开或切换项目后刷新一次动态提示词，让快捷按钮贴合当前项目阶段。
+  useEffect(() => {
+    if (!projectRoot) return;
+    void refreshSuggestedPrompts();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectRoot]);
 
   useEffect(() => {
     if (!projectRoot) { setContextStatus(null); setCollaboration(null); return; }
@@ -674,6 +697,77 @@ function App() {
     setActiveTab("listen");
   };
 
+  const copyMessageText = async (message: Message) => {
+    try {
+      await navigator.clipboard.writeText(message.text);
+      setNotice("已复制这条消息。");
+    } catch {
+      setError("复制失败：剪贴板当前不可用。");
+    }
+  };
+
+  // 对话回退只截断前端消息列表：user 消息回退后原文回到输入框可编辑重发，
+  // assistant 消息回退到这条之后；不改动 DIALOGUE.md、正史或 SQLite。
+  const rollbackToMessage = (messageId: string) => {
+    const index = messages.findIndex((item) => item.id === messageId);
+    if (index < 0) return;
+    const target = messages[index];
+    if (target.role === "user") {
+      setMessages((items) => items.slice(0, index));
+      setChatInput(target.text);
+      setNotice("已回退：原文放回输入框，可修改后重新发送。");
+    } else {
+      setMessages((items) => items.slice(0, index + 1));
+      setNotice("已回退到这条回复之后。");
+    }
+    setPendingQuestions([]);
+  };
+
+  const rerunMessage = (messageId: string) => {
+    if (busy) return;
+    const index = messages.findIndex((item) => item.id === messageId);
+    if (index < 0) return;
+    const target = messages[index];
+    setMessages((items) => items.slice(0, index));
+    setPendingQuestions([]);
+    void sendChat(undefined, target.text);
+  };
+
+  // 每轮对话后刷新输入区动态提示词；模型失败时静默保留当前建议。
+  const refreshSuggestedPrompts = async (recent?: { role: string; text: string }[]) => {
+    if (!uiPreferences.suggestedPromptsEnabled || !projectRoot) return;
+    try {
+      const history = recent ?? messages.slice(-6).map((item) => ({ role: item.role, text: item.text }));
+      const result = await request<{ suggestions: SuggestedPromptItem[] }>("assistant.suggest", { workspace_root: projectRoot, recent_messages: history });
+      if (Array.isArray(result?.suggestions)) {
+        const cleaned = result.suggestions
+          .map((item) => ({ label: String(item?.label || "继续"), prompt: String(item?.prompt || "").trim() }))
+          .filter((item) => item.prompt);
+        if (cleaned.length > 0) setSuggestedPrompts(cleaned);
+      }
+    } catch {
+      // 预测失败保持当前建议，不打断对话。
+    }
+  };
+
+  // 边听边出字：录音中每 2.5 秒对当前累计音频做一次快照转写，结果实时填入输入框。
+  const transcribeLiveSnapshot = async () => {
+    const recorder = voiceRecorderRef.current;
+    if (!recorder || voiceLiveBusyRef.current) return;
+    voiceLiveBusyRef.current = true;
+    try {
+      const bytes = recorder.snapshot();
+      if (bytes.length <= 44) return;
+      const path = await window.inkflow.saveVoiceRecording(bytes, "wav");
+      const result = await request<{ text: string }>("voice.transcribe", { audio_path: path });
+      if (result.text.trim()) setChatInput(result.text);
+    } catch {
+      // 实时识别失败不打断录音，停止后的完整转写会兜底。
+    } finally {
+      voiceLiveBusyRef.current = false;
+    }
+  };
+
   const sendChat = async (event?: FormEvent, overrideMessage?: string) => {
     event?.preventDefault();
     const message = (overrideMessage ?? chatInput).trim();
@@ -687,9 +781,11 @@ function App() {
     setMascotMood("thinking");
     const runId = `desktop-${crypto.randomUUID()}`;
     setActiveRunId(runId);
+    let assistantReply = "";
     try {
       const result = await request<unknown>("conversation.send", { message, run_id: runId });
       const visible = visibleResult(result);
+      assistantReply = visible.summary;
       const questionSource = result && typeof result === "object" ? (result as Record<string, unknown>).questions : null;
       if (Array.isArray(questionSource)) setPendingQuestions(questionSource as QuestionCard[]);
       const assistantMessageId = crypto.randomUUID();
@@ -716,11 +812,21 @@ function App() {
     } finally {
       setBusy(false);
       setActiveRunId(null);
+      // 每轮对话后刷新动态提示词（设置关闭或无项目时内部直接跳过）。
+      void refreshSuggestedPrompts([
+        { role: "user", text: message },
+        ...(assistantReply ? [{ role: "assistant", text: assistantReply }] : []),
+      ]);
     }
   };
 
   const toggleVoiceInput = async () => {
     if (voiceRecording) {
+      // 停止录音：先停实时快照定时器，再做一次完整转写；结果只填入输入框，不自动发送。
+      if (voiceLiveTimerRef.current !== null) {
+        window.clearInterval(voiceLiveTimerRef.current);
+        voiceLiveTimerRef.current = null;
+      }
       setVoiceRecording(false);
       setVoiceTranscribing(true);
       try {
@@ -746,7 +852,9 @@ function App() {
     try {
       voiceRecorderRef.current = await LocalWavRecorder.start(voiceSettings.voice_input_device);
       setVoiceRecording(true);
-      setNotice("正在听普通话，再点一次麦克风即可停止并填入文字。");
+      setNotice("正在听普通话，识别结果会实时出现在输入框；再点一次麦克风停止。");
+      // 边听边出字：定时对累计音频做快照转写；可接受轻微延迟。
+      voiceLiveTimerRef.current = window.setInterval(() => { void transcribeLiveSnapshot(); }, 2500);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法使用麦克风，请检查 Windows 权限。");
     }
@@ -904,7 +1012,7 @@ function App() {
             <button onClick={openFolder}>打开项目</button>
           </div>
           <div className="welcome-meta">
-            <span>版本 {String(appInfo?.version || "0.5.2")}</span>
+            <span>版本 {String(appInfo?.version || "0.5.3")}</span>
             <span>{provider?.api_key_configured ? "模型已配置" : "尚未配置模型 Key"}</span>
             <button className="text-button" onClick={() => setShowSettings(true)}>模型设置</button>
             <button className="text-button" onClick={() => setShowUpdate(true)}>检查更新</button>
@@ -997,13 +1105,13 @@ function App() {
             <button onClick={() => { setMascotMood("thinking"); setMascotSpeech("我会先核对目标、正史与人物知识边界。"); }}>想一想</button>
             <button onClick={() => { setMascotMood("waiting"); setMascotSpeech("卡住时先缩小问题：人物此刻最怕失去什么？"); }}>找灵感</button>
           </div>
-          <div className="quick-row">
-            <button onClick={() => void sendChat(undefined, "先不要执行任务。请根据当前项目状态和最近讨论，用选项卡主动问我一到三个最值得确认、容易回答的问题；说明每个答案会影响什么，最后保留让我自己填写的其他选项。")}>先问我</button>
-            <button onClick={() => void runWorkflow("plan")}>规划当前篇章</button>
-            <button onClick={() => void runWorkflow("write")}>写当前章</button>
-            <button onClick={() => void runWorkflow("review")}>审查当前章</button>
-            <button onClick={() => void runWorkflow("accept")}>验收进正史</button>
-          </div>
+          {uiPreferences.suggestedPromptsEnabled && (
+            <div className="quick-row">
+              {suggestedPrompts.map((item) => (
+                <button key={item.prompt} type="button" title={item.prompt} disabled={busy} onClick={() => void sendChat(undefined, item.prompt)}>{item.label}</button>
+              ))}
+            </div>
+          )}
           <div className="messages" ref={messagesRef}>
             {messages.map((message) => (
               <article key={message.id} className={`message ${message.role}`}>
@@ -1012,7 +1120,16 @@ function App() {
                   <RevealText text={message.text} animate={Boolean(message.animate)} />
                   {message.createdAt && <time className="message-time" dateTime={message.createdAt}>{formatTime(message.createdAt)}</time>}
                   {(message.reasoning?.length || message.details) && <details><summary>查看判断摘要与可复核过程</summary>{Boolean(message.reasoning?.length) && <ol className="reasoning-list">{message.reasoning?.map((item, index) => <li key={index}>{item}</li>)}</ol>}{message.details && <pre>{message.details}</pre>}</details>}
-                  <button className={`message-speak ${speakingMessageId === message.id ? "playing" : ""}`} title="朗读这条对话" aria-label="朗读这条对话" onClick={() => void speakText(message.id, message.text)}>{speakingMessageId === message.id ? "■" : "◖))"}</button>
+                  <div className="message-actions">
+                    {message.id !== "welcome" && (
+                      <>
+                        <button type="button" className="message-action" title="复制这条消息的文字" onClick={() => void copyMessageText(message)}>复制</button>
+                        <button type="button" className="message-action" title={message.role === "user" ? "回退到这里：原文放回输入框，可修改后重发" : "回退到这条回复之后，清掉后面的消息"} onClick={() => rollbackToMessage(message.id)}>回退</button>
+                        {message.role === "user" && <button type="button" className="message-action" title="清掉这条之后的消息并原样重发" disabled={busy} onClick={() => rerunMessage(message.id)}>重新运行</button>}
+                      </>
+                    )}
+                    <button className={`message-speak ${speakingMessageId === message.id ? "playing" : ""}`} title="朗读这条对话" aria-label="朗读这条对话" onClick={() => void speakText(message.id, message.text)}>{speakingMessageId === message.id ? "■" : "◖))"}</button>
+                  </div>
                 </div>
               </article>
             ))}
@@ -1767,6 +1884,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
           <div className="preset-grid">{SETTINGS_PRESETS.map((preset) => <button type="button" key={preset.id} className={activePreset === preset.id ? "active" : ""} onClick={() => applyCreationPreset(preset)}><strong>{activePreset === preset.id ? "✓ " : ""}{preset.name}</strong><span>{preset.note}</span><small>{preset.context_soft_tokens / 10000} 万常用上下文</small></button>)}</div>
           <div className="settings-fields two"><label>思考强度<select value={form.reasoning_effort} onChange={(event) => setForm({ ...form, reasoning_effort: event.target.value })}><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最高</option></select></label><label>主动询问<select value={form.inquiry_frequency} onChange={(event) => setForm({ ...form, inquiry_frequency: event.target.value })}><option value="low">只问必需信息</option><option value="medium">把握较低时询问</option><option value="high">重要创作分岔也询问</option><option value="ultra">有明显未知项就询问</option></select></label></div>
           <SettingGroup title="预填续写" note="启用后，编辑停顿会调用当前 Writer 模型，因此可能产生费用。"><label className="setting-check"><input type="checkbox" checked={preferences.prefillEnabled} onChange={(event) => onPreferencesChange({ ...preferences, prefillEnabled: event.target.checked })} />允许在编辑器中手动开启灰字预填候选</label><div className="settings-fields two"><label>等待时间 <small>{preferences.prefillDelayMs} 毫秒</small><input type="range" min="300" max="3000" step="100" value={preferences.prefillDelayMs} onChange={(event) => onPreferencesChange({ ...preferences, prefillDelayMs: Number(event.target.value) })} /></label><label>候选长度<select value={preferences.prefillLength} onChange={(event) => onPreferencesChange({ ...preferences, prefillLength: event.target.value as PrefillLength })}><option value="short">短句</option><option value="medium">一小段</option><option value="long">长段落</option></select></label></div></SettingGroup>
+          <SettingGroup title="智能提示词" note="输入框上方的快捷按钮会按最近对话和项目阶段实时预测你下一步想说的话。"><label className="setting-check"><input type="checkbox" checked={preferences.suggestedPromptsEnabled} onChange={(event) => onPreferencesChange({ ...preferences, suggestedPromptsEnabled: event.target.checked })} />显示预测的下一步提示词 <small>每轮对话后会调用一次模型预测，可能产生少量费用；关闭后隐藏整行快捷按钮</small></label></SettingGroup>
           <SettingGroup title="对话历史" note="记录只写入项目里的 DIALOGUE.md，不保存原始思维链、API Key 或模型内部推理。"><div className="settings-fields two"><label>保存方式<select value={form.dialogue_history_mode} onChange={(event) => setForm({ ...form, dialogue_history_mode: event.target.value })}><option value="auto">主动保存（自动写入）</option><option value="manual">被动保存（只在对话历史里手动保存）</option><option value="both">两者都有</option></select></label><label>最多保留 <small>条记录</small><input type="number" min={5} max={1000} value={form.dialogue_history_limit} onChange={(event) => setForm({ ...form, dialogue_history_limit: Number(event.target.value) })} /></label></div><div className="settings-fields"><label>自动保存间隔 <small>每 N 轮写入一次</small><input type="number" min={1} max={50} value={form.dialogue_history_interval} disabled={form.dialogue_history_mode === "manual"} onChange={(event) => setForm({ ...form, dialogue_history_interval: Number(event.target.value) })} /></label></div><p className="form-hint">主动保存会在满 N 轮时写入一次；“两者都有”同时开放对话历史里的手动保存。超出保留上限时只删除最旧的记录，不会改动正史。</p></SettingGroup>
         </SettingsPane>}
         {section === "voice" && <SettingsPane title="本地语音" note="只有一种普通话模式；语音运行时不是新的 Agent，也不会接触小说正史。">
@@ -1900,7 +2018,7 @@ function UpdateDialog({ info, onClose }: { info: UpdateInfo; onClose: () => void
     } finally { setWorking(false); }
   };
   const sourceLabel = local.source === "embedded" ? "发布包内置更新源" : local.source === "github" ? "GitHub Releases" : local.source === "environment" ? "自定义公开更新源" : "尚未配置";
-  return <Modal title="软件更新" subtitle="新版会自动下载，并在关闭或重启墨流时安装；小说正文、正史数据库和本地项目不会被删除。" onClose={onClose}><section className={`update-card ${local.status || "ready"}`}><div><small>当前版本</small><strong>{local.currentVersion || "0.5.2"}</strong></div><div><small>可用版本</small><strong>{local.availableVersion || "—"}</strong></div><div><small>更新来源</small><strong>{sourceLabel}</strong></div>{typeof local.progress === "number" && <div className="update-progress"><span style={{ width: `${Math.max(0, Math.min(local.progress, 100))}%` }} /></div>}<p>{local.message || "墨流会自动检查新版本，也可以在这里立即检查。"}</p></section>{local.status === "not_configured" && <p className="form-hint">私密仓库的下载需要账号令牌，不适合写进大众软件。仓库或独立发布仓库公开后，只需在构建时配置发布源即可启用在线更新。</p>}<div className="dialog-actions"><button onClick={onClose}>关闭</button>{!new Set(["available", "downloading", "downloaded"]).has(String(local.status)) && <button className="primary" disabled={working || local.status === "not_configured" || local.status === "checking"} onClick={() => void action("check")}>{local.status === "checking" ? "正在检查…" : "检查新版本"}</button>}{local.status === "available" && <button className="primary" disabled>正在准备自动下载…</button>}{local.status === "downloading" && <button className="primary" disabled>正在下载 {Math.round(Number(local.progress || 0))}%</button>}{local.status === "downloaded" && <button className="primary" disabled={working} onClick={() => void action("install")}>重启并安装</button>}</div></Modal>;
+  return <Modal title="软件更新" subtitle="新版会自动下载，并在关闭或重启墨流时安装；小说正文、正史数据库和本地项目不会被删除。" onClose={onClose}><section className={`update-card ${local.status || "ready"}`}><div><small>当前版本</small><strong>{local.currentVersion || "0.5.3"}</strong></div><div><small>可用版本</small><strong>{local.availableVersion || "—"}</strong></div><div><small>更新来源</small><strong>{sourceLabel}</strong></div>{typeof local.progress === "number" && <div className="update-progress"><span style={{ width: `${Math.max(0, Math.min(local.progress, 100))}%` }} /></div>}<p>{local.message || "墨流会自动检查新版本，也可以在这里立即检查。"}</p></section>{local.status === "not_configured" && <p className="form-hint">私密仓库的下载需要账号令牌，不适合写进大众软件。仓库或独立发布仓库公开后，只需在构建时配置发布源即可启用在线更新。</p>}<div className="dialog-actions"><button onClick={onClose}>关闭</button>{!new Set(["available", "downloading", "downloaded"]).has(String(local.status)) && <button className="primary" disabled={working || local.status === "not_configured" || local.status === "checking"} onClick={() => void action("check")}>{local.status === "checking" ? "正在检查…" : "检查新版本"}</button>}{local.status === "available" && <button className="primary" disabled>正在准备自动下载…</button>}{local.status === "downloading" && <button className="primary" disabled>正在下载 {Math.round(Number(local.progress || 0))}%</button>}{local.status === "downloaded" && <button className="primary" disabled={working} onClick={() => void action("install")}>重启并安装</button>}</div></Modal>;
 }
 
 function SelectionDialog({ selection, busy, onClose, onSubmit }: { selection: SelectionDraft; busy: boolean; onClose: () => void; onSubmit: (mode: "comment" | "revise", comment: string) => void }) {
