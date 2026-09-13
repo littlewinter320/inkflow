@@ -2,7 +2,7 @@
   "name": "inkflow-vscode",
   "displayName": "inkflow墨流",
   "description": "四 Agent 中文长篇小说创作工作台：Coordinator、写作、证据化审查、正史记忆与安全回退",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "publisher": "inkflow",
   "license": "MIT",
   "icon": "media/mobao.png",
@@ -23,7 +23,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js",
-    "package": "npm run build && vsce package --no-dependencies -o ../artifacts/extension/inkflow-vscode-0.6.0.vsix"
+    "package": "npm run build && vsce package --no-dependencies -o ../artifacts/extension/inkflow-vscode-0.6.1.vsix"
   },
   "dependencies": {
     "jsonc-parser": "^3.3.1"

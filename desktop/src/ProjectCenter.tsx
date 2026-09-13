@@ -222,12 +222,20 @@ export function ProjectCenter({
 
       {currentWorkspace && <section className="project-section" aria-label="当前章节状态"><div className="project-section-title"><div><h3>当前章节</h3><p>第 {String(currentWorkspace.chapter_no || "—")} 章 · v{String(currentWorkspace.record?.version || "—")} · {currentWorkspace.record?.status === "accepted" ? "已进入正史" : currentWorkspace.can_accept ? "当前版本可验收" : currentWorkspace.review?.matches_current_version ? `Reviewer：${String(currentWorkspace.review?.report?.verdict || "待审查")}` : "等待当前版本审查"}</p></div><span>{currentWorkspace.can_accept ? "可验收" : "进行中"}</span></div></section>}
 
-      <section className="project-metrics" aria-label="项目统计">
-        <Metric label="已接受正文" value={`${(dashboard?.accepted_characters || 0).toLocaleString()} 字`} />
-        <Metric label="草稿章节" value={String(chapterStatus.draft || 0)} />
-        <Metric label="正史章节" value={String(chapterStatus.accepted || 0)} />
-        <Metric label="开放线索" value={String(dashboard?.status.open_threads || 0)} />
+      <section className="project-metrics" aria-label={"\u9879\u76ee\u7edf\u8ba1"}>
+        <Metric label={"\u5df2\u63a5\u53d7\u6b63\u6587"} value={`${(dashboard?.accepted_characters || 0).toLocaleString()} \u5b57`} />
+        <Metric label={"\u8349\u7a3f\u7ae0\u8282"} value={String(chapterStatus.draft || 0)} />
+        <Metric label={"\u6b63\u53f2\u7ae0\u8282"} value={String(chapterStatus.accepted || 0)} />
+        <Metric label={"\u5f00\u653e\u7ebf\u7d22"} value={String(dashboard?.status.open_threads || 0)} />
       </section>
+
+      <ProjectSnapshot
+        planned={chapterCards.length}
+        draft={numberValue(chapterStatus.draft)}
+        accepted={numberValue(chapterStatus.accepted)}
+        activeFacts={numberValue(dashboard?.status.active_facts)}
+        openThreads={numberValue(dashboard?.status.open_threads)}
+      />
 
       <section className="project-section plan-overview">
         <div className="project-section-title"><div><h3>四级规划与章节卡</h3><p>这里直接展示当前卷、篇章、章节功能和钩子；完整版本仍保存在“当前规划”文档。</p></div>{chapterCards.length > 0 && <button onClick={() => onPrompt(`请把第 ${String(arc.chapter_start)} 到第 ${String(arc.chapter_end)} 章的章节卡一次性整理给我看，只预览，不改规划。`)}>集中预览本篇</button>}</div>
@@ -327,6 +335,65 @@ export function ProjectCenter({
 
 function Metric({ label, value }: { label: string; value: string }) {
   return <article><span>{label}</span><strong>{value}</strong></article>;
+}
+
+function ProjectSnapshot({
+  planned,
+  draft,
+  accepted,
+  activeFacts,
+  openThreads,
+}: {
+  planned: number;
+  draft: number;
+  accepted: number;
+  activeFacts: number;
+  openThreads: number;
+}) {
+  const bars = [
+    { label: "\u5f53\u524d\u7ae0\u8282\u5361", value: planned, tone: "planned" },
+    { label: "\u8349\u7a3f\u7ae0\u8282", value: draft, tone: "draft" },
+    { label: "\u6b63\u53f2\u7ae0\u8282", value: accepted, tone: "accepted" },
+  ];
+  const maximum = Math.max(1, ...bars.map((item) => item.value));
+  return (
+    <section className="project-section snapshot-section" aria-label={"\u9879\u76ee\u72b6\u6001\u56fe"}>
+      <div className="project-section-title">
+        <div><h3>{"\u9879\u76ee\u72b6\u6001\u56fe"}</h3><p>{"\u53ea\u5c55\u793a\u5f53\u524d\u672c\u5730\u5feb\u7167\uff1b\u7ae0\u8282\u5361\u3001\u8349\u7a3f\u548c\u6b63\u53f2\u662f\u4e09\u4e2a\u72ec\u7acb\u6307\u6807\uff0c\u4e0d\u505a\u91cd\u590d\u7d2f\u52a0\u3002"}</p></div>
+        <span className="snapshot-source">{"\u672c\u5730\u5b9e\u65f6\u8bfb\u53d6"}</span>
+      </div>
+      <div className="snapshot-grid">
+        <div className="snapshot-chart-card">
+          <svg className="snapshot-chart" viewBox="0 0 520 170" role="img" aria-labelledby="snapshot-chart-title snapshot-chart-desc">
+            <title id="snapshot-chart-title">{"\u5f53\u524d\u7ae0\u8282\u72b6\u6001\u6570\u91cf"}</title>
+            <desc id="snapshot-chart-desc">{"\u663e\u793a\u7ae0\u8282\u5361\u3001\u8349\u7a3f\u7ae0\u8282\u548c\u6b63\u53f2\u7ae0\u8282\u7684\u5f53\u524d\u6570\u91cf\u3002"}</desc>
+            {bars.map((item, index) => {
+              const y = 18 + index * 49;
+              const width = item.value > 0 ? Math.max(8, 330 * item.value / maximum) : 0;
+              return <g key={item.label} className="snapshot-row">
+                <text x="0" y={y + 15} className="snapshot-label">{item.label}</text>
+                <rect x="145" y={y} width="330" height="22" rx="5" className="snapshot-track" />
+                <rect x="145" y={y} width={width} height="22" rx="5" className={`snapshot-bar ${item.tone}`} />
+                <text x="492" y={y + 15} textAnchor="end" className="snapshot-value">{item.value}</text>
+              </g>;
+            })}
+          </svg>
+          <p className="snapshot-caption">{"\u6761\u5f62\u957f\u5ea6\u6309\u5f53\u524d\u5feb\u7167\u4e2d\u7684\u6700\u5927\u503c\u7f29\u653e\uff0c\u4e0d\u4ee3\u8868\u5b8c\u6210\u7387\u6216\u65f6\u95f4\u8d8b\u52bf\u3002"}</p>
+        </div>
+        <div className="snapshot-pulse" aria-label={"\u77e5\u8bc6\u4e0e\u7ebf\u7d22\u5feb\u7167"}>
+          <div className="snapshot-pulse-head"><strong>{"\u77e5\u8bc6\u72b6\u6001"}</strong><span>{"\u540c\u4e00\u4efd\u9879\u76ee\u6570\u636e"}</span></div>
+          <div className="snapshot-stat"><span>{"\u5f53\u524d\u4e8b\u5b9e"}</span><strong>{activeFacts}</strong><small>{"Memory Keeper \u53ef\u8bfb\u53d6\u7684\u6d3b\u8dc3\u4e8b\u5b9e"}</small></div>
+          <div className="snapshot-stat"><span>{"\u5f00\u653e\u7ebf\u7d22"}</span><strong>{openThreads}</strong><small>{"\u4ecd\u9700 Writer \u6216\u7528\u6237\u63a8\u8fdb\u7684\u7ebf\u7d22"}</small></div>
+          <div className="snapshot-note">{"\u6570\u636e\u6765\u81ea\u9879\u76ee\u6570\u636e\u5e93\u548c\u5f53\u524d\u7bc7\u7ae0\u89c4\u5212\u3002\u56fe\u8868\u4e0d\u4f1a\u521b\u5efa\u865a\u6784\u7684\u5386\u53f2\u8d70\u52bf\u3002"}</div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function numberValue(value: unknown): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : 0;
 }
 
 function projectSuggestions(dashboard: DashboardLike | null) {

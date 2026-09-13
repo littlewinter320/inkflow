@@ -56,10 +56,16 @@ QWEN_REQUIREMENTS = (
     "torch>=2.4,<3",
     "torchaudio>=2.4,<3",
 )
-KOKORO_TTS_MODEL_ID = "kokoro-int8-multi-lang-v1_1"
-KOKORO_TTS_MODEL_URL = (
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/"
-    "kokoro-int8-multi-lang-v1_1.tar.bz2"
+MOSS_TTS_MODEL_ID = "MOSS-TTS-Nano-100M-ONNX"
+MOSS_CODEC_MODEL_ID = "MOSS-Audio-Tokenizer-Nano-ONNX"
+MOSS_TTS_REPO_ID = "OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX"
+MOSS_CODEC_REPO_ID = "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX"
+MOSS_REPOSITORY = "git+https://github.com/OpenMOSS/MOSS-TTS-Nano.git"
+MOSS_REQUIREMENTS = (
+    f"moss-tts-nano @ {MOSS_REPOSITORY}",
+    "huggingface_hub>=0.23,<1",
+    "onnxruntime-gpu>=1.20,<2",
+    "soundfile>=0.12,<1",
 )
 LEGACY_VITS_MODEL_ID = "sherpa-onnx-vits-zh-ll"
 SHERPA_ASR_MODEL_ID = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09"
@@ -75,8 +81,7 @@ BUILTIN_PROFILES: tuple[dict[str, Any], ...] = (
         "kind": "builtin",
         "gender": "female",
         "speaker": "Serena",
-        "kokoro_speaker_id": 3,
-        "kokoro_speed_multiplier": 0.98,
+        "moss_voice": "Lingyu",
         "description": "温和、稳定，适合大多数正文旁白。",
         "instruction": "自然普通话，叙述清楚，情绪克制。",
     },
@@ -86,8 +91,7 @@ BUILTIN_PROFILES: tuple[dict[str, Any], ...] = (
         "kind": "builtin",
         "gender": "female",
         "speaker": "Vivian",
-        "kokoro_speaker_id": 15,
-        "kokoro_speed_multiplier": 1.04,
+        "moss_voice": "Xiaoyu",
         "description": "明亮年轻，适合活泼角色。",
         "instruction": "自然普通话，明快但不要夸张。",
     },
@@ -97,8 +101,7 @@ BUILTIN_PROFILES: tuple[dict[str, Any], ...] = (
         "kind": "builtin",
         "gender": "female",
         "speaker": "Serena",
-        "kokoro_speaker_id": 32,
-        "kokoro_speed_multiplier": 0.92,
+        "moss_voice": "Yuewen",
         "description": "温暖舒缓，适合成熟或安静的女性角色。",
         "instruction": "自然普通话，温柔舒缓，吐字清晰。",
     },
@@ -108,8 +111,7 @@ BUILTIN_PROFILES: tuple[dict[str, Any], ...] = (
         "kind": "builtin",
         "gender": "male",
         "speaker": "Uncle_Fu",
-        "kokoro_speaker_id": 58,
-        "kokoro_speed_multiplier": 0.94,
+        "moss_voice": "Weiguo",
         "description": "沉稳低缓，适合悬疑或历史叙事。",
         "instruction": "自然普通话，沉稳克制，保持叙述感。",
     },
@@ -119,8 +121,7 @@ BUILTIN_PROFILES: tuple[dict[str, Any], ...] = (
         "kind": "builtin",
         "gender": "male",
         "speaker": "Uncle_Fu",
-        "kokoro_speaker_id": 72,
-        "kokoro_speed_multiplier": 0.92,
+        "moss_voice": "Zhiming",
         "description": "沉静自然，适合成年男性角色。",
         "instruction": "自然普通话，语气平静，避免播音腔。",
     },
@@ -130,8 +131,7 @@ BUILTIN_PROFILES: tuple[dict[str, Any], ...] = (
         "kind": "builtin",
         "gender": "male",
         "speaker": "Uncle_Fu",
-        "kokoro_speaker_id": 86,
-        "kokoro_speed_multiplier": 1.02,
+        "moss_voice": "Junhao",
         "description": "更有力度，适合行动型角色。",
         "instruction": "自然普通话，坚定有力，但不要喊叫。",
     },
@@ -143,32 +143,21 @@ def _now() -> str:
 
 
 def _mandarin_speech_units(text: str) -> list[tuple[str, float]]:
-    """Split Chinese prose into speakable units and retain a natural pause hint.
+    """Split prose one sentence at a time and retain a pause hint.
 
-    Kokoro does not consistently pause at every written punctuation mark, so
-    punctuation has to become audio silence instead of relying on the model to
-    infer prose rhythm from one long input string.
+    MOSS benefits from short, complete requests: the runtime stays loaded while
+    each sentence can be decoded and committed independently. Unicode escapes
+    keep this splitter reliable even when a Windows console uses another code page.
     """
-
     normalized = _clean_text_for_speech(text)
     if not normalized:
         return []
     pause_seconds = {
-        "、": 0.10,
-        "，": 0.16,
-        ",": 0.16,
-        "；": 0.24,
-        ";": 0.24,
-        "：": 0.20,
-        ":": 0.20,
-        "。": 0.34,
-        ".": 0.34,
-        "！": 0.36,
-        "!": 0.36,
-        "？": 0.38,
-        "?": 0.38,
-        "…": 0.42,
-        "—": 0.28,
+        "\u3002": 0.34, "\uff01": 0.36, "!": 0.36,
+        "\uff1f": 0.38, "?": 0.38, "\uff1b": 0.24, ";": 0.24,
+        "\uff0c": 0.16, ",": 0.16, "\u3001": 0.14,
+        "\uff1a": 0.20, ":": 0.20, "\u2026": 0.42,
+        "\u2014": 0.28, "-": 0.16,
     }
     terminal_marks = set(pause_seconds)
     units: list[tuple[str, float]] = []
@@ -182,21 +171,15 @@ def _mandarin_speech_units(text: str) -> list[tuple[str, float]]:
 
     for character in normalized:
         if character == "\n":
-            previous_count = len(units)
             flush(0.46)
-            if len(units) == previous_count and units:
-                units[-1] = (units[-1][0], max(units[-1][1], 0.46))
             continue
         buffer.append(character)
         if character in terminal_marks:
             flush(pause_seconds[character])
         elif len(buffer) >= 96:
-            # A hard safety split for long unpunctuated text. It is shorter
-            # than the outer job segment so the voice keeps stable breath length.
             flush(0.12)
     flush(0.0)
     return units
-
 
 def _clean_text_for_speech(text: str) -> str:
     """把屏幕文本变成适合朗读的普通话文本，避免念出 Markdown 和链接。"""
@@ -298,10 +281,15 @@ class VoiceRuntime:
         self.qwen_model_cache_dir = self.qwen_root / "models"
         self.qwen_state_path = self.qwen_root / "install.json"
         self.qwen_models_path = self.qwen_root / "models.json"
+        # MOSS is the default local TTS. Keep the old sherpa path only for a
+        # clear "input is unavailable" status; do not recreate its files.
+        self.moss_root = self.root / "moss"
+        self.moss_packages_dir = self.moss_root / "packages"
+        self.moss_model_dir = self.moss_root / "models"
+        self.moss_state_path = self.moss_root / "install.json"
         self.sherpa_root = self.root / "sherpa"
-        self.kokoro_root = self.root / "kokoro"
-        self.kokoro_tts_dir = self.kokoro_root / KOKORO_TTS_MODEL_ID
         self.sherpa_asr_dir = self.sherpa_root / "asr" / SHERPA_ASR_MODEL_ID
+        self.kokoro_root = self.root / "kokoro"  # legacy path; never created or loaded
         self.migrations_dir = self.root / "migrations"
         for folder in (
             self.profiles_dir,
@@ -310,8 +298,9 @@ class VoiceRuntime:
             self.short_cache_dir,
             self.qwen_root,
             self.qwen_model_cache_dir,
-            self.sherpa_root,
-            self.kokoro_root,
+            self.moss_root,
+            self.moss_packages_dir,
+            self.moss_model_dir,
             self.migrations_dir,
         ):
             folder.mkdir(parents=True, exist_ok=True)
@@ -321,9 +310,10 @@ class VoiceRuntime:
         self._inference_lock: asyncio.Lock | None = None
         self._qwen_install_lock: asyncio.Lock | None = None
         self._qwen_install_task: asyncio.Task[dict[str, Any]] | None = None
-        self._kokoro_model_lock: asyncio.Lock | None = None
+        self._moss_install_lock: asyncio.Lock | None = None
+        self._moss_install_task: asyncio.Task[dict[str, Any]] | None = None
         self._tts_models: dict[str, Any] = {}
-        self._kokoro_tts_models: dict[str, Any] = {}
+        self._moss_tts_models: dict[str, Any] = {}
         self._sherpa_asr_models: dict[str, Any] = {}
         self._activate_optional_packages()
         self._migrate_legacy_voice_assets()
@@ -336,8 +326,23 @@ class VoiceRuntime:
     def configure(self, updates: dict[str, Any], workspace_root: str | Path | None = None) -> dict[str, Any]:
         allowed = {name: updates[name] for name in VOICE_SETTING_NAMES if name in updates}
         if allowed:
+            # Validate and persist the complete normalized value in one atomic write.
             save_user_settings(allowed)
+            if {"voice_engine", "voice_compute_device", "voice_debug", "voice_tts_model", "voice_light_tts_model"} & set(allowed):
+                self._clear_loaded_tts()
         return self.settings(workspace_root)
+
+    def _clear_loaded_tts(self) -> None:
+        self._tts_models.clear()
+        self._moss_tts_models.clear()
+        gc.collect()
+        torch = sys.modules.get("torch")
+        if torch is not None and getattr(torch, "cuda", None) is not None:
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
     def _migrate_legacy_voice_assets(self) -> None:
         """Remove only the replaced, downloaded engines once after this upgrade.
@@ -347,16 +352,14 @@ class VoiceRuntime:
         and is retried on the next application start.
         """
 
-        marker = self.migrations_dir / "kokoro-qwen-1.7.json"
+        marker = self.migrations_dir / "moss-voice-upgrade.json"
         existing = _read_json(marker)
         if existing.get("completed"):
             return
-        safe_roots = (
-            (self.sherpa_root / "tts").resolve(),
-            (self.qwen_model_cache_dir / "hub").resolve(),
-        )
+        safe_root = self.root.resolve()
         targets = (
-            self.sherpa_root / "tts" / LEGACY_VITS_MODEL_ID,
+            self.sherpa_root,
+            self.kokoro_root,
             self.qwen_model_cache_dir / "hub" / "models--Qwen--Qwen3-TTS-12Hz-0.6B-CustomVoice",
             self.qwen_model_cache_dir / "hub" / "models--Qwen--Qwen3-TTS-12Hz-0.6B-Base",
         )
@@ -366,7 +369,7 @@ class VoiceRuntime:
             resolved = target.resolve()
             if not target.exists():
                 continue
-            if resolved != target.absolute() or self.root.resolve() not in resolved.parents or not any(root in resolved.parents for root in safe_roots):
+            if resolved != target.absolute() or resolved == safe_root or safe_root not in resolved.parents:
                 errors.append(f"{target.name}: 路径被重定向，未清理应用目录以外的数据。")
                 continue
             try:
@@ -381,7 +384,7 @@ class VoiceRuntime:
                 "completed_at": _now() if not errors else "",
                 "removed": list(dict.fromkeys([*existing.get("removed", []), *removed])),
                 "errors": errors,
-                "scope": "only legacy VITS and Qwen 0.6B model caches",
+                "scope": "legacy sherpa/Kokoro directories and Qwen 0.6B model caches",
             },
         )
 
@@ -389,48 +392,57 @@ class VoiceRuntime:
         settings = Settings.from_env(workspace_root)
         self._activate_optional_packages()
         packages = {
+            "moss_tts": self._moss_package_ready(),
             "qwen_tts": _package_available("qwen_tts"),
             "torch": _package_available("torch"),
             "soundfile": _package_available("soundfile"),
-            "sherpa_onnx": _package_available("sherpa_onnx"),
+            # sherpa is intentionally not part of the current voice bundle.
+            "sherpa_onnx": False,
         }
-        sherpa = self._sherpa_status(packages)
-        kokoro = self._kokoro_status(packages)
+        moss = self._moss_status(packages)
         qwen = self._qwen_status(packages)
-        ready_for_input = sherpa["asr_ready"]
-        backend = self._selected_backend(settings, kokoro, qwen)
-        ready_for_output = backend != "unavailable"
+        asr = {
+            "package_installed": False,
+            "asr_ready": False,
+            "model_root": str(self.sherpa_asr_dir),
+            "model_size_mb": 0.0,
+            "estimated_download_mb": 0,
+            "message": "sherpa 已移除；当前版本只提供 MOSS 本地朗读。",
+        }
+        backend = self._selected_backend(settings, moss, qwen)
         return {
             "enabled": settings.voice_enabled,
-            "ready_for_input": ready_for_input,
-            "ready_for_output": ready_for_output,
+            "ready_for_input": False,
+            "ready_for_output": backend != "unavailable",
             "packages": packages,
             "compute_device": settings.voice_compute_device,
             "data_root": str(self.root),
             "formal_agent": False,
             "mode": "local_mandarin",
             "backend": backend,
-            "kokoro": kokoro,
-            "asr": sherpa,
+            "moss": moss,
+            "asr": asr,
             "qwen": qwen,
-            "migration": _read_json(self.migrations_dir / "kokoro-qwen-1.7.json"),
+            "migration": _read_json(self.migrations_dir / "moss-voice-upgrade.json"),
             "models_loaded": {
-                "asr": bool(self._sherpa_asr_models),
-                "tts": bool(self._tts_models or self._kokoro_tts_models),
+                "asr": False,
+                "tts": bool(self._tts_models or self._moss_tts_models),
             },
             "message": (
-                "Kokoro 中文朗读已就绪。"
-                if backend == "kokoro"
+                "MOSS 本地朗读已就绪。"
+                if backend == "moss"
                 else "Qwen 高品质中文朗读已就绪。"
                 if backend == "qwen"
-                else "当前选择的朗读模型尚未就绪，请在设置中完成对应安装。"
+                else "当前选择的朗读模型尚未就绪，请在设置中安装 MOSS 或 Qwen。"
             ),
         }
 
     def _activate_optional_packages(self) -> None:
-        package_path = str(self.qwen_packages_dir.resolve())
-        if self.qwen_packages_dir.is_dir() and package_path not in sys.path:
-            sys.path.insert(0, package_path)
+        # MOSS and Qwen are isolated under the application voice directory.
+        for package_dir in (self.moss_packages_dir, self.qwen_packages_dir):
+            package_path = str(package_dir.resolve())
+            if package_dir.is_dir() and package_path not in sys.path:
+                sys.path.insert(0, package_path)
 
     def _sherpa_status(self, packages: dict[str, bool] | None = None) -> dict[str, Any]:
         package_ready = bool((packages or {}).get("sherpa_onnx", _package_available("sherpa_onnx")))
@@ -444,16 +456,70 @@ class VoiceRuntime:
             "estimated_download_mb": 230,
         }
 
-    def _kokoro_status(self, packages: dict[str, bool] | None = None) -> dict[str, Any]:
-        package_ready = bool((packages or {}).get("sherpa_onnx", _package_available("sherpa_onnx")))
-        model_path = self._kokoro_tts_model_path()
+    def _moss_package_ready(self) -> bool:
+        self._activate_optional_packages()
+        # onnx_tts_runtime imports these modules directly; report unavailable
+        # until the isolated MOSS environment is complete.
+        return all(
+            _package_available(name)
+            for name in ("onnx_tts_runtime", "onnxruntime", "sentencepiece", "numpy", "soundfile", "torch", "torchaudio")
+        )
+
+    def _moss_manifest_path(self) -> Path | None:
+        candidates = (
+            self.moss_model_dir / MOSS_TTS_MODEL_ID / "browser_poc_manifest.json",
+            self.moss_model_dir / "browser_poc_manifest.json",
+        )
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return next(self.moss_model_dir.rglob("browser_poc_manifest.json"), None) if self.moss_model_dir.is_dir() else None
+
+    def _moss_codec_meta_path(self) -> Path | None:
+        candidates = (
+            self.moss_model_dir / MOSS_CODEC_MODEL_ID / "codec_browser_onnx_meta.json",
+            self.moss_model_dir / "codec_browser_onnx_meta.json",
+        )
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return next(self.moss_model_dir.rglob("codec_browser_onnx_meta.json"), None) if self.moss_model_dir.is_dir() else None
+
+    def _moss_tts_meta_path(self) -> Path | None:
+        manifest_path = self._moss_manifest_path()
+        if manifest_path is None:
+            return None
+        manifest = _read_json(manifest_path)
+        model_files = manifest.get("model_files") if isinstance(manifest.get("model_files"), dict) else {}
+        relative = str(model_files.get("tts_meta") or "tts_browser_onnx_meta.json")
+        candidate = (manifest_path.parent / relative).resolve()
+        return candidate if candidate.is_file() else None
+
+    def _moss_models_ready(self) -> bool:
+        return (
+            self._moss_manifest_path() is not None
+            and self._moss_tts_meta_path() is not None
+            and self._moss_codec_meta_path() is not None
+        )
+
+    def _moss_status(self, packages: dict[str, bool] | None = None) -> dict[str, Any]:
+        package_ready = bool((packages or {}).get("moss_tts", self._moss_package_ready()))
+        state = _read_json(self.moss_state_path)
+        models_ready = self._moss_models_ready()
         return {
             "package_installed": package_ready,
-            "tts_ready": package_ready and _package_available("soundfile") and model_path is not None,
-            "tts_model": str(model_path) if model_path else "",
-            "model_root": str(self.kokoro_root),
-            "model_size_mb": round(_directory_size(self.kokoro_root) / 1024 / 1024, 1),
-            "estimated_download_mb": 500,
+            "dependencies_ready": package_ready,
+            "tts_ready": package_ready and models_ready,
+            "models_ready": models_ready,
+            "model_root": str(self.moss_model_dir),
+            "model_size_mb": round(_directory_size(self.moss_model_dir) / 1024 / 1024, 1),
+            "estimated_download_mb": 900,
+            "estimated_dependency_download_mb": 1800,
+            "estimated_model_download_mb": 900,
+            "installing": bool(self._moss_install_task and not self._moss_install_task.done()),
+            "python_available": bool(self._python_command()),
+            "last_error": str(state.get("error") or ""),
+            "source": "local_optional" if state.get("status") == "installed" else "none",
         }
 
     def _qwen_status(self, packages: dict[str, bool] | None = None) -> dict[str, Any]:
@@ -488,10 +554,10 @@ class VoiceRuntime:
             "last_error": str(state.get("error") or ""),
         }
 
-    def _selected_backend(self, settings: Settings, kokoro: dict[str, Any], qwen: dict[str, Any]) -> str:
+    def _selected_backend(self, settings: Settings, moss: dict[str, Any], qwen: dict[str, Any]) -> str:
         if settings.voice_engine == "qwen":
             return "qwen" if qwen["installed"] and self._qwen_model_path(settings.voice_tts_model) else "unavailable"
-        return "kokoro" if kokoro["tts_ready"] else "unavailable"
+        return "moss" if moss["tts_ready"] else "unavailable"
 
     def _python_command(self) -> list[str] | None:
         configured = os.getenv("INKFLOW_PYTHON")
@@ -509,18 +575,6 @@ class VoiceRuntime:
         if launcher:
             return [launcher, "-3.12"]
         return None
-
-    def _kokoro_tts_model_path(self) -> Path | None:
-        if not all((self.kokoro_tts_dir / name).exists() for name in (
-            "voices.bin", "tokens.txt", "lexicon-zh.txt", "espeak-ng-data",
-            "phone-zh.fst", "date-zh.fst", "number-zh.fst",
-        )):
-            return None
-        candidates = (
-            self.kokoro_tts_dir / "model.int8.onnx",
-            self.kokoro_tts_dir / "model.onnx",
-        )
-        return next((path for path in candidates if path.is_file()), None)
 
     def _sherpa_asr_model_path(self) -> Path | None:
         if not (self.sherpa_asr_dir / "tokens.txt").is_file():
@@ -627,26 +681,158 @@ class VoiceRuntime:
                 await emit({"type": "voice.qwen.ready", "summary": "Qwen 高品质语音已安装并完成适配"})
             return result
 
-    async def prepare_kokoro_models(self, confirmation: str, emit: VoiceEventSink) -> dict[str, Any]:
-        if confirmation != "download_kokoro_voice_models":
-            raise ValueError("下载 Kokoro 前需要确认约 500MB 下载量，解压还需额外磁盘空间。")
-        if not _package_available("sherpa_onnx"):
-            raise RuntimeError("当前安装包未包含 Kokoro 所需的 sherpa-onnx 运行库，请使用包含本地语音组件的安装包。")
-        if self._kokoro_model_lock is None:
-            self._kokoro_model_lock = asyncio.Lock()
-        async with self._kokoro_model_lock:
-            await emit({"type": "voice.kokoro.installing", "stage": "tts", "summary": "正在下载 Kokoro 多语种中文朗读模型（约 270MB）"})
-            await asyncio.to_thread(
-                self._download_voice_model, KOKORO_TTS_MODEL_URL, self.kokoro_tts_dir,
-                ("tokens.txt", "voices.bin", "lexicon-zh.txt", "espeak-ng-data/phontab",
-                 "phone-zh.fst", "date-zh.fst", "number-zh.fst"),
-            )
-            await emit({"type": "voice.kokoro.installing", "stage": "asr", "summary": "正在下载普通话识别模型（约 230MB）"})
-            await asyncio.to_thread(self._download_voice_model, SHERPA_ASR_MODEL_URL, self.sherpa_asr_dir)
-            save_user_settings({"voice_engine": "kokoro"})
+    async def install_moss(self, confirmation: str, emit: VoiceEventSink) -> dict[str, Any]:
+        if confirmation != "install_moss_voice":
+            raise ValueError("安装 MOSS 前需要确认约 900MB 模型和 1.8GB 依赖下载，实际占用会随环境变化。")
+        if self._moss_install_task and not self._moss_install_task.done():
+            return await self._moss_install_task
+        self._moss_install_task = asyncio.create_task(self._install_moss_impl(emit))
+        try:
+            return await self._moss_install_task
+        finally:
+            self._moss_install_task = None
+
+    async def _install_moss_impl(self, emit: VoiceEventSink) -> dict[str, Any]:
+        if self._moss_install_lock is None:
+            self._moss_install_lock = asyncio.Lock()
+        async with self._moss_install_lock:
+            self._activate_optional_packages()
+            if not self._moss_package_ready():
+                command = self._python_command()
+                if not command:
+                    raise RuntimeError("没有找到可用的 Python。请设置 INKFLOW_PYTHON 指向 python.exe。")
+                staging = self.moss_root / f"packages-staging-{uuid.uuid4().hex}"
+                staging.mkdir(parents=True, exist_ok=False)
+                _atomic_json(self.moss_state_path, {"status": "installing", "started_at": _now(), "error": ""})
+                await emit({"type": "voice.moss.installing", "stage": "dependencies", "summary": "正在安装 MOSS ONNX 运行库，完成后会单独准备模型。"})
+                args = command + [
+                    "-m", "pip", "install", "--disable-pip-version-check", "--no-cache-dir", "--upgrade",
+                    "--target", str(staging), *MOSS_REQUIREMENTS,
+                ]
+                process = await asyncio.create_subprocess_exec(
+                    *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                )
+                output: list[str] = []
+                assert process.stdout is not None
+                while True:
+                    line = await process.stdout.readline()
+                    if not line:
+                        break
+                    value = line.decode("utf-8", errors="replace").strip()
+                    if value:
+                        output.append(value)
+                        await emit({"type": "voice.moss.install.progress", "stage": "dependencies", "summary": value[-240:]})
+                return_code = await process.wait()
+                if return_code != 0:
+                    message = next((line for line in reversed(output) if "error" in line.casefold()), "MOSS 依赖安装失败，请查看上方安装日志。")
+                    _atomic_json(self.moss_state_path, {"status": "failed", "finished_at": _now(), "error": message[:500]})
+                    shutil.rmtree(staging, ignore_errors=True)
+                    raise RuntimeError(message[:500])
+                if self.moss_packages_dir.exists():
+                    previous = self.moss_root / "packages-previous"
+                    if previous.exists():
+                        shutil.rmtree(previous, ignore_errors=True)
+                    self.moss_packages_dir.replace(previous)
+                staging.replace(self.moss_packages_dir)
+                _atomic_json(self.moss_state_path, {"status": "installed", "installed_at": _now(), "python": " ".join(command), "requirements": list(MOSS_REQUIREMENTS), "error": ""})
+                self._activate_optional_packages()
+            await emit({"type": "voice.moss.install.progress", "stage": "models", "summary": "正在准备 MOSS 的 ONNX 语音模型。"})
+            model_error = ""
+            try:
+                await asyncio.to_thread(self._prepare_moss_models_sync)
+            except Exception as exc:
+                model_error = str(exc)[:500]
+                state = _read_json(self.moss_state_path)
+                state.update({"status": "installed", "error": model_error})
+                _atomic_json(self.moss_state_path, state)
+            else:
+                state = _read_json(self.moss_state_path)
+                state.update({"status": "installed", "error": "", "models_ready_at": _now()})
+                _atomic_json(self.moss_state_path, state)
+                save_user_settings({"voice_engine": "moss", "voice_light_tts_model": MOSS_TTS_MODEL_ID})
             result = self.status()
-            await emit({"type": "voice.kokoro.ready", "summary": "Kokoro 本地普通话语音已准备完成"})
+            if model_error:
+                result["moss_setup"] = "installed_but_models_pending"
+                result["moss"]["last_error"] = model_error
+                await emit({"type": "voice.moss.models_failed", "summary": model_error})
+            else:
+                result["moss_setup"] = "ready"
+                await emit({"type": "voice.moss.ready", "summary": "MOSS 本地普通话朗读已准备完成。"})
             return result
+
+    def _prepare_moss_models_sync(self) -> None:
+        """Download MOSS ONNX assets only from an explicit settings action."""
+        self._activate_optional_packages()
+        try:
+            from huggingface_hub import snapshot_download
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("MOSS 需要 huggingface_hub 下载模型；请先完成依赖安装。")
+        tts_dir = self.moss_model_dir / MOSS_TTS_MODEL_ID
+        codec_dir = self.moss_model_dir / MOSS_CODEC_MODEL_ID
+        if self._moss_manifest_path() is None:
+            snapshot_download(
+                repo_id=MOSS_TTS_REPO_ID,
+                local_dir=str(tts_dir),
+                allow_patterns=["*.onnx", "*.data", "*.json", "tokenizer.model"],
+            )
+        if self._moss_codec_meta_path() is None:
+            snapshot_download(
+                repo_id=MOSS_CODEC_REPO_ID,
+                local_dir=str(codec_dir),
+                allow_patterns=["*.onnx", "*.data", "*.json"],
+            )
+        if not self._moss_models_ready():
+            raise RuntimeError("MOSS 模型不完整：缺少 browser_poc_manifest.json 或 codec_browser_onnx_meta.json。")
+
+    async def delete_voice_component(self, component: str, confirmation: str) -> dict[str, Any]:
+        """Delete downloaded voice files without blocking the event loop."""
+        component = str(component or "").strip().lower()
+        confirmations = {
+            "moss": "delete_moss_voice",
+            "qwen": "delete_qwen_voice",
+            "sherpa": "delete_sherpa_voice",
+            "kokoro": "delete_kokoro_voice",
+        }
+        if component not in confirmations:
+            raise ValueError("只支持删除 moss 或 qwen；sherpa/kokoro 已在升级时移除。")
+        if confirmation != confirmations[component]:
+            raise ValueError("删除前需要确认；只会删除语音组件文件，不会删除录音和声音档案。")
+        if self._inference_lock is not None and self._inference_lock.locked():
+            raise ValueError("当前有朗读任务正在使用语音模型，请先暂停或取消任务后再删除。")
+        return await asyncio.to_thread(self._delete_voice_component_sync, component)
+
+    def _delete_voice_component_sync(self, component: str) -> dict[str, Any]:
+        self._clear_loaded_tts()
+        target_map = {
+            "moss": (self.moss_packages_dir, self.moss_model_dir, self.moss_state_path),
+            "qwen": (self.qwen_packages_dir, self.qwen_model_cache_dir, self.qwen_state_path, self.qwen_models_path),
+            "sherpa": (self.sherpa_root,),
+            "kokoro": (self.kokoro_root,),
+        }
+        removed: list[str] = []
+        errors: list[str] = []
+        root = self.root.resolve()
+        for target in target_map[component]:
+            resolved = target.resolve()
+            if resolved == root or root not in resolved.parents:
+                errors.append(f"删除失败：{target}")
+                continue
+            if not target.exists():
+                continue
+            try:
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+                removed.append(str(target))
+            except OSError as exc:
+                errors.append(f"{target}: {exc}")
+        if errors:
+            raise RuntimeError("语音组件删除失败：" + "；".join(errors))
+        settings = Settings.from_env()
+        if component == "qwen" and settings.voice_engine == "qwen":
+            save_user_settings({"voice_engine": "moss"})
+        return self.status()
 
     @staticmethod
     def _download_voice_model(url: str, destination: Path, required: tuple[str, ...] = ("tokens.txt",)) -> None:
@@ -723,7 +909,7 @@ class VoiceRuntime:
         name = str(params.get("name") or "我的声音").strip()[:40]
         reference_text = str(params.get("reference_text") or "").strip()
         if not reference_text:
-            reference_text = await self.transcribe(source, allow_disabled=True)
+            raise ValueError("当前版本已移除 sherpa 语音输入；请先让 Writer 生成朗读稿，并填写与录音一致的原文。")
         if len(re.sub(r"\s+", "", reference_text)) > 400:
             raise ValueError("声音克隆参考朗读稿最多 400 字；请使用 Writer 生成的朗读稿或截短后重试。")
         profile_id = f"clone-{uuid.uuid4().hex}"
@@ -839,18 +1025,11 @@ class VoiceRuntime:
     async def transcribe(self, audio_path: str | Path, *, allow_disabled: bool = False) -> str:
         settings = Settings.from_env()
         if not allow_disabled and (not settings.voice_enabled or not settings.voice_input_enabled):
-            raise ValueError("请先在设置中开启本地语音与语音输入。")
+            raise ValueError("语音输入已关闭，请先在设置中开启。")
         source = Path(audio_path).resolve()
         if not source.is_file() or source.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
-            raise ValueError("没有找到可识别的语音文件。")
-        self._activate_optional_packages()
-        sherpa = self._sherpa_status()
-        if not sherpa["asr_ready"]:
-            raise RuntimeError("尚未安装本地普通话识别组件；请在设置中下载 Kokoro 语音组件。")
-        if self._inference_lock is None:
-            self._inference_lock = asyncio.Lock()
-        async with self._inference_lock:
-            return await asyncio.to_thread(self._transcribe_sherpa_sync, source, settings)
+            raise ValueError("音频文件不存在或格式不受支持。")
+        raise RuntimeError("sherpa 已移除；当前版本暂不提供语音输入（MOSS 只负责朗读）。")
 
     async def speak(self, text: str, profile_id: str | None = None) -> dict[str, Any]:
         settings = Settings.from_env()
@@ -1026,7 +1205,7 @@ class VoiceRuntime:
             await emit({"type": "voice.job.failed", "job": self._public_job(value), "summary": value["error"]})
 
     def _split_segments(self, text: str, role_map: dict[str, Any], max_chars: int = 360) -> list[dict[str, Any]]:
-        chunks = [chunk.strip() for chunk in re.split(r"(?<=[。！？!?])\s*|\n+", text) if chunk.strip()]
+        chunks = [chunk.strip() for chunk in re.split(r"(?<=[\u3002\uff01\uff1f!\uff1b;])\s*|\n+", text) if chunk.strip()]
         characters = role_map.get("characters") if isinstance(role_map.get("characters"), dict) else {}
         narrator = str(role_map.get("narrator_profile_id") or "narrator_female")
         result: list[dict[str, Any]] = []
@@ -1187,118 +1366,130 @@ class VoiceRuntime:
 
     def _synthesize_sync(self, text: str, profile: dict[str, Any], output: Path, settings: Settings) -> None:
         self._activate_optional_packages()
-        kokoro = self._kokoro_status()
+        moss = self._moss_status()
         qwen = self._qwen_status()
         use_clone = profile.get("kind") == "clone"
         if use_clone or settings.voice_engine == "qwen":
             backend = "qwen"
-        elif kokoro["tts_ready"]:
-            backend = "kokoro"
+        elif moss["tts_ready"]:
+            backend = "moss"
         else:
-            raise RuntimeError("尚未安装可用的本地语音输出组件，请在设置中下载 Kokoro 或安装 Qwen。")
-        if backend == "kokoro":
-            if self._tts_models:
-                self._tts_models.clear()
-                gc.collect()
-                if "torch" in sys.modules and sys.modules["torch"].cuda.is_available():
-                    sys.modules["torch"].cuda.empty_cache()
-            self._synthesize_kokoro_sync(text, profile, output, settings)
+            raise RuntimeError("没有可用的朗读模型，请在设置中安装 MOSS 或 Qwen。")
+        if backend == "moss":
+            self._clear_loaded_qwen_if_needed()
+            self._synthesize_moss_sync(text, profile, output, settings)
             return
         if not qwen["installed"]:
-            raise RuntimeError("声音克隆只使用 Qwen3-TTS；请先在设置中安装 Qwen 高品质组件。")
+            raise RuntimeError("当前选择了 Qwen，但 Qwen 依赖或模型尚未安装。")
         self._synthesize_qwen_sync(text, profile, output, settings)
 
-    def _synthesize_kokoro_sync(self, text: str, profile: dict[str, Any], output: Path, settings: Settings) -> None:
-        if not _package_available("sherpa_onnx") or not _package_available("soundfile"):
-            raise RuntimeError("sherpa-onnx 或 soundfile 尚未安装。")
-        model_path = self._kokoro_tts_model_path()
-        voices = self.kokoro_tts_dir / "voices.bin"
-        tokens = self.kokoro_tts_dir / "tokens.txt"
-        data_dir = self.kokoro_tts_dir / "espeak-ng-data"
-        lexicons = [
-            self.kokoro_tts_dir / name
-            for name in ("lexicon-us-en.txt", "lexicon-zh.txt")
-            if (self.kokoro_tts_dir / name).is_file()
-        ]
-        if model_path is None or not voices.is_file() or not tokens.is_file() or not data_dir.is_dir() or not lexicons:
-            raise RuntimeError("Kokoro 模型尚未下载完整，请在设置中点击‘下载 Kokoro’后重试。")
-        import sherpa_onnx
-        import soundfile as sf
+    def _clear_loaded_qwen_if_needed(self) -> None:
+        if self._tts_models:
+            self._tts_models.clear()
+            gc.collect()
 
-        cache_key = f"kokoro:{model_path}:{settings.voice_compute_device}:{settings.voice_debug}"
-        tts = self._kokoro_tts_models.get(cache_key)
-        if tts is None:
-            config = sherpa_onnx.OfflineTtsConfig(
-                model=sherpa_onnx.OfflineTtsModelConfig(
-                    kokoro=sherpa_onnx.OfflineTtsKokoroModelConfig(
-                        model=str(model_path),
-                        voices=str(voices),
-                        tokens=str(tokens),
-                        lexicon=",".join(str(item) for item in lexicons),
-                        data_dir=str(data_dir),
-                    ),
-                    provider="cuda" if settings.voice_compute_device == "cuda" else "cpu",
-                    debug=settings.voice_debug,
-                    num_threads=2,
-                ),
-                rule_fsts=",".join(str(self.kokoro_tts_dir / name) for name in ("phone-zh.fst", "date-zh.fst", "number-zh.fst")),
+    def _moss_execution_provider(self, settings: Settings) -> str:
+        if settings.voice_compute_device == "cpu":
+            return "cpu"
+        try:
+            import onnxruntime as ort
+            providers = set(ort.get_available_providers())
+        except Exception:
+            providers = set()
+        cuda_available = "CUDAExecutionProvider" in providers
+        if settings.voice_compute_device == "cuda":
+            if not cuda_available:
+                raise RuntimeError("MOSS 已要求 CUDA，但当前 onnxruntime 没有 CUDAExecutionProvider；请安装 onnxruntime-gpu 和 CUDA/cuDNN，或改为自动/CPU。")
+            return "cuda"
+        return "cuda" if cuda_available else "cpu"
+
+    def _synthesize_moss_sync(self, text: str, profile: dict[str, Any], output: Path, settings: Settings) -> None:
+        if not self._moss_package_ready() or not self._moss_models_ready():
+            raise RuntimeError("MOSS 的 ONNX 依赖或模型尚未准备好，请先在设置中安装 MOSS。")
+        try:
+            import numpy as np
+            import soundfile as sf
+            from onnx_tts_runtime import OnnxTtsRuntime
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise RuntimeError("MOSS ONNX 运行库加载失败，请重新安装 MOSS 依赖。")
+        provider = self._moss_execution_provider(settings)
+        thread_count = min(8, max(2, (os.cpu_count() or 4) // 2))
+        cache_key = f"moss:{self.moss_model_dir}:{provider}:{thread_count}:{settings.voice_debug}"
+        runtime = self._moss_tts_models.get(cache_key)
+        if runtime is None:
+            runtime = OnnxTtsRuntime(
+                model_dir=self.moss_model_dir,
+                thread_count=thread_count,
+                max_new_frames=375,
+                do_sample=True,
+                sample_mode="fixed",
+                execution_provider=provider,
             )
-            if not config.validate():
-                raise RuntimeError("Kokoro 中文朗读模型配置无效。")
-            tts = sherpa_onnx.OfflineTts(config)
-            self._kokoro_tts_models[cache_key] = tts
-        import numpy as np
-
+            self._moss_tts_models.clear()
+            self._moss_tts_models[cache_key] = runtime
         units = _mandarin_speech_units(text)
         if not units:
-            raise RuntimeError("没有可朗读的有效文字。")
-        generation = sherpa_onnx.GenerationConfig()
-        generation.sid = max(3, min(102, int(profile.get("kokoro_speaker_id", 3))))
-        base_speed = _clamp_float(profile.get("speed", settings.voice_speed), 0.75, 1.35)
-        natural_speed = _clamp_float(
-            base_speed * float(profile.get("kokoro_speed_multiplier", 1.0)),
-            0.75,
-            1.35,
-        )
+            raise RuntimeError("没有可朗读的文字。")
+        voice = str(profile.get("moss_voice") or "Junhao")
+        reference_audio = str(profile.get("reference_audio") or "").strip() if profile.get("kind") == "clone" else ""
+        if reference_audio and not Path(reference_audio).is_file():
+            raise RuntimeError("声音克隆参考音频不存在，请重新录音或选择文件。")
+        speed = _clamp_float(profile.get("speed", settings.voice_speed), 0.75, 1.35)
+        volume = _clamp_float(profile.get("volume", settings.voice_volume), 0.25, 1.5)
         pause_scale = _clamp_float(settings.voice_pause_scale, 0.6, 1.8)
-        sample_rate = 0
-        rendered: list[Any] = []
-        for phrase, pause in units:
-            phrase_speed = natural_speed
-            if phrase.endswith(("？", "?", "……", "…")):
-                phrase_speed *= 0.96
-            elif phrase.endswith(("！", "!")):
-                phrase_speed *= 1.02
-            elif len(phrase) > 55:
-                phrase_speed *= 0.98
-            generation.speed = _clamp_float(phrase_speed, 0.75, 1.35)
-            audio = tts.generate(phrase, generation)
-            samples = getattr(audio, "samples", None)
-            current_rate = int(getattr(audio, "sample_rate", 16_000) or 16_000)
-            if samples is None or len(samples) == 0:
-                raise RuntimeError("Kokoro 语音模型没有生成有效音频。")
-            if sample_rate and current_rate != sample_rate:
-                raise RuntimeError("Kokoro 在同一次朗读中返回了不同采样率。")
-            sample_rate = current_rate
-            phrase_samples = np.asarray(samples, dtype=np.float32)
-            fade_samples = min(len(phrase_samples) // 2, max(1, int(current_rate * 0.008)))
+        rendered: list[np.ndarray] = []
+        sample_rate = 48_000
+        for index, (sentence, pause) in enumerate(units, start=1):
+            # The model stays warm; only the text request is split. This gives
+            # predictable memory use and lets long jobs publish progress per sentence.
+            temporary = output.parent / f".{output.stem}.moss-{index}.wav"
+            try:
+                result = runtime.synthesize(
+                    text=sentence,
+                    voice=voice,
+                    prompt_audio_path=reference_audio or None,
+                    output_audio_path=temporary,
+                    sample_mode="fixed",
+                    do_sample=True,
+                    streaming=True,
+                    max_new_frames=375,
+                    voice_clone_max_text_tokens=96,
+                    enable_wetext=False,
+                    enable_normalize_tts_text=True,
+                )
+                audio = np.asarray(result.get("waveform"), dtype=np.float32)
+                sample_rate = int(result.get("sample_rate") or sample_rate)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+            if audio.size == 0:
+                raise RuntimeError("MOSS 没有生成有效音频。")
+            if audio.ndim == 1:
+                audio = audio.reshape(-1, 1)
+            if abs(speed - 1.0) > 0.01 and audio.shape[0] > 1:
+                target_length = max(1, int(audio.shape[0] / speed))
+                original = np.arange(audio.shape[0])
+                target = np.linspace(0, audio.shape[0] - 1, target_length)
+                audio = np.stack([np.interp(target, original, audio[:, channel]) for channel in range(audio.shape[1])], axis=1).astype(np.float32)
+            fade_samples = min(audio.shape[0] // 2, max(1, int(sample_rate * 0.008)))
             if fade_samples > 1:
-                phrase_samples[:fade_samples] *= np.linspace(0.15, 1.0, fade_samples, dtype=np.float32)
-                phrase_samples[-fade_samples:] *= np.linspace(1.0, 0.15, fade_samples, dtype=np.float32)
-            rendered.append(phrase_samples)
-            silence_samples = int(current_rate * pause * pause_scale)
-            if silence_samples:
-                rendered.append(np.zeros(silence_samples, dtype=np.float32))
-        samples_array = np.concatenate(rendered)
-        samples_array = np.clip(samples_array * _clamp_float(profile.get("volume", settings.voice_volume), 0.25, 1.5), -1.0, 1.0)
+                fade = np.linspace(0.15, 1.0, fade_samples, dtype=np.float32)
+                audio[:fade_samples] *= fade[:, None]
+                audio[-fade_samples:] *= fade[::-1, None]
+            rendered.append(audio)
+            silence_samples = int(sample_rate * pause * pause_scale)
+            if silence_samples and index < len(units):
+                rendered.append(np.zeros((silence_samples, audio.shape[1]), dtype=np.float32))
+        samples = np.concatenate(rendered, axis=0)
+        samples = np.clip(samples * volume, -1.0, 1.0)
         target_rate = int(settings.voice_sample_rate)
-        if target_rate != sample_rate and samples_array.size > 1:
-            original = np.arange(samples_array.size)
-            target = np.linspace(0, samples_array.size - 1, max(1, int(samples_array.size * target_rate / sample_rate)))
-            samples_array = np.interp(target, original, samples_array).astype(np.float32)
+        if target_rate != sample_rate and samples.shape[0] > 1:
+            original = np.arange(samples.shape[0])
+            target = np.linspace(0, samples.shape[0] - 1, max(1, int(samples.shape[0] * target_rate / sample_rate)))
+            samples = np.stack([np.interp(target, original, samples[:, channel]) for channel in range(samples.shape[1])], axis=1).astype(np.float32)
             sample_rate = target_rate
         output.parent.mkdir(parents=True, exist_ok=True)
-        sf.write(str(output), samples_array, sample_rate, subtype="PCM_16")
+        sf.write(str(output), samples, sample_rate, subtype="PCM_16")
 
     def _synthesize_qwen_sync(self, text: str, profile: dict[str, Any], output: Path, settings: Settings) -> None:
         if not _package_available("qwen_tts") or not _package_available("soundfile"):
@@ -1320,7 +1511,7 @@ class VoiceRuntime:
         model = self._tts_models.get(cache_key)
         if model is None:
             self._tts_models.clear()
-            self._kokoro_tts_models.clear()
+            self._moss_tts_models.clear()
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

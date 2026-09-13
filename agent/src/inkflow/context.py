@@ -11,7 +11,7 @@ from .project import InkFlowProject
 from .retrieval import HybridRetriever
 from .schemas import ContextPacket, ContextSection
 from .studio import StudioDatabase
-from .utils import atomic_write_text, estimate_tokens, json_dumps, utc_now
+from .utils import atomic_write_text, estimate_tokens, json_dumps, project_source_revision, utc_now
 
 
 _COMPRESSED_NOTE = "（已按完整条目压缩；完整资料仍保存在本地）"
@@ -788,6 +788,8 @@ class ContextBuilder:
         ratio = packet.estimated_tokens / max(1, self.hard_token_limit)
         status = "safe" if ratio < 0.7 else "watch" if ratio < 0.9 else "near_limit"
         payload = {
+            "project_id": self.project.project_id,
+            "source_revision": project_source_revision(self.project.root, self.project.internal),
             "updated_at": utc_now(),
             "chapter_no": packet.chapter_no,
             "task": packet.task,

@@ -30,7 +30,7 @@ from .review_verifier import verify_review
 from .studio import StudioService
 from .terminal_session import TerminalSession
 from .trace import TraceRecorder, recent_trace_runs
-from .utils import content_hash, estimate_tokens
+from .utils import content_hash, estimate_tokens, project_source_revision
 from .voice import VOICE_SETTING_NAMES, VoiceRuntime
 
 
@@ -68,7 +68,9 @@ class InkFlowAppService:
                     "voice_is_formal_agent": False,
                 },
                 "provider": api_key_status(Settings.from_env().provider_kind),
-                "voice": self.voice.status(),
+                # Startup status may inspect an existing model tree; keep the
+                # first paint and settings dialog responsive while it runs.
+                "voice": await asyncio.to_thread(self.voice.status),
             }
         if method == "provider.status":
             settings = Settings.from_env(params.get("workspace_root"))
@@ -105,7 +107,9 @@ class InkFlowAppService:
             provider_kind = str(params.get("provider_kind") or Settings.from_env().provider_kind).lower()
             key = str(params.get("api_key", "")).strip()
             if key:
-                save_api_key_to_keyring(key, provider_kind)
+                # Windows credential APIs can be slow or show a system prompt;
+                # never make the asyncio loop wait for them.
+                await asyncio.to_thread(save_api_key_to_keyring, key, provider_kind)
             allowed = {
                 name: params[name]
                 for name in (
@@ -148,8 +152,8 @@ class InkFlowAppService:
                 )
             }
             if allowed:
-                save_user_settings(allowed)
-            current = Settings.from_env(params.get("workspace_root"))
+                await asyncio.to_thread(save_user_settings, allowed)
+            current = await asyncio.to_thread(Settings.from_env, params.get("workspace_root"))
             return {"configured": True, **api_key_status(current.provider_kind), **allowed}
         if method == "provider.capabilities":
             settings = Settings.from_env(params.get("workspace_root"))
@@ -180,22 +184,40 @@ class InkFlowAppService:
                 "public_reasoning_summary": result.data.public_reasoning_summary,
             }
         if method == "voice.status":
-            return self.voice.status(params.get("workspace_root") or params.get("project_root"))
+            # Directory-size checks and optional package discovery can touch a
+            # large local model tree. Keep them off the asyncio event loop so
+            # a settings click cannot freeze the desktop while status refreshes.
+            return await asyncio.to_thread(
+                self.voice.status,
+                params.get("workspace_root") or params.get("project_root"),
+            )
         if method == "voice.settings.get":
-            return self.voice.settings(params.get("workspace_root") or params.get("project_root"))
+            return await asyncio.to_thread(
+                self.voice.settings,
+                params.get("workspace_root") or params.get("project_root"),
+            )
         if method == "voice.settings.configure":
             updates = {name: params[name] for name in VOICE_SETTING_NAMES if name in params}
-            return self.voice.configure(updates, params.get("workspace_root") or params.get("project_root"))
+            return await asyncio.to_thread(
+                self.voice.configure,
+                updates,
+                params.get("workspace_root") or params.get("project_root"),
+            )
         if method == "voice.models.prepare":
             return await self.voice.prepare_models(
                 params.get("workspace_root") or params.get("project_root"),
                 str(params.get("confirmation") or ""),
                 emit,
             )
-        if method == "voice.light.install":
-            raise ValueError("旧轻量语音包已替换为 Kokoro，请在新版设置中确认下载 Kokoro。")
-        if method == "voice.kokoro.install":
-            return await self.voice.prepare_kokoro_models(str(params.get("confirmation") or ""), emit)
+        if method == "voice.moss.install":
+            return await self.voice.install_moss(str(params.get("confirmation") or ""), emit)
+        if method == "voice.models.delete":
+            return await self.voice.delete_voice_component(
+                str(params.get("component") or ""),
+                str(params.get("confirmation") or ""),
+            )
+        if method in {"voice.light.install", "voice.kokoro.install"}:
+            raise ValueError("旧 sherpa/Kokoro 组件已移除，请在设置中安装 MOSS。")
         if method == "voice.qwen.install":
             return await self.voice.install_qwen(
                 str(params.get("confirmation") or ""),
@@ -473,7 +495,21 @@ class InkFlowAppService:
             status_path = project.internal / "context-status.json"
             if status_path.is_file():
                 try:
-                    return json.loads(status_path.read_text(encoding="utf-8"))
+                    value = json.loads(status_path.read_text(encoding="utf-8"))
+                    if isinstance(value, dict):
+                        saved_project_id = str(value.get("project_id") or "")
+                        if saved_project_id in {"", project.project_id}:
+                            saved_revision = str(value.get("source_revision") or "")
+                            current_revision = project_source_revision(project.root, project.internal)
+                            if saved_revision and saved_revision != current_revision:
+                                return {
+                                    **value,
+                                    "status": "stale",
+                                    "stale": True,
+                                    "stale_reason": "项目资料已经变化，下一次 Writer、Reviewer 或修订任务会重新编译 Context Packet。",
+                                    "current_source_revision": current_revision,
+                                }
+                            return value
                 except (OSError, json.JSONDecodeError):
                     pass
             return {

@@ -19,6 +19,39 @@ def content_hash(value: str | bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def project_source_revision(project_root: str | Path, internal: str | Path | None = None) -> str:
+    """Return a cheap revision token for files that can affect a Context Packet."""
+
+    root = Path(project_root)
+    internal_path = Path(internal) if internal is not None else root / ".inkflow"
+    candidates: set[Path] = set()
+    for relative in ("BOOK.md", "PLAN.md", "STATE.md", "DIALOGUE.md"):
+        candidates.add(root / relative)
+    for name in ("project.json", "inkflow.db", "studio.db"):
+        candidates.add(internal_path / name)
+    for pattern in (
+        "chapters/**/*.md",
+        "reviews/**/*.md",
+        "references/**/*.md",
+        ".inkflow/references/features/**/*.json",
+    ):
+        candidates.update(root.glob(pattern))
+
+    entries: list[str] = []
+    for path in sorted(candidates):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if path.is_file():
+            try:
+                relative = path.relative_to(root).as_posix()
+            except ValueError:
+                relative = path.name
+            entries.append(f"{relative}:{stat.st_mtime_ns}:{stat.st_size}")
+    return content_hash("\n".join(entries))[:24]
+
+
 def json_dumps(value: Any, *, indent: int | None = 2) -> str:
     return json.dumps(value, ensure_ascii=False, indent=indent, sort_keys=False)
 

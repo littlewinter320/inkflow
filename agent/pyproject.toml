@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inkflow-novel-agent"
-version = "0.6.0"
+version = "0.6.1"
 description = "墨流（InkFlow）——面向长篇中文网文的四 Agent 协作创作引擎"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,8 +20,10 @@ dependencies = [
 
 [project.optional-dependencies]
 build = ["pyinstaller>=6.15,<7"]
-lightvoice = [
-  "sherpa-onnx>=1.13,<2",
+mossvoice = [
+  "moss-tts-nano @ git+https://github.com/OpenMOSS/MOSS-TTS-Nano.git",
+  "huggingface_hub>=0.23,<1",
+  "onnxruntime-gpu>=1.20,<2",
   "soundfile>=0.12,<1",
 ]
 review = [

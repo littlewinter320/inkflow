@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -92,6 +93,11 @@ DEFAULT_AGENT_CONTEXT_BUDGETS: dict[str, dict[str, int]] = {
     "memory_keeper": {"soft": 96_000, "hard": 128_000},
 }
 
+# Settings can be written by the voice and provider routes at the same time.
+# Serializing the read/validate/replace sequence prevents a fast toggle from
+# being overwritten by another request that started with an older snapshot.
+_SETTINGS_WRITE_LOCK = threading.RLock()
+
 
 def user_settings_path() -> Path:
     """返回全局非敏感设置路径，不把桌面偏好写入小说项目。"""
@@ -127,26 +133,27 @@ def save_user_settings(updates: dict[str, Any]) -> dict[str, Any]:
     unknown = set(updates) - PERSISTED_SETTING_NAMES
     if unknown:
         raise ConfigurationError(f"不支持的设置项：{', '.join(sorted(unknown))}")
-    current = load_user_settings()
-    current.update(updates)
-    validated = Settings.from_mapping(current)
-    clean = {
-        key: value
-        for key, value in asdict(validated).items()
-        if key in PERSISTED_SETTING_NAMES
-    }
-    path = user_settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle, temporary_name = tempfile.mkstemp(prefix="settings-", suffix=".tmp", dir=path.parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
-            json.dump(clean, stream, ensure_ascii=False, indent=2)
-            stream.write("\n")
-        temporary.replace(path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    with _SETTINGS_WRITE_LOCK:
+        current = load_user_settings()
+        current.update(updates)
+        validated = Settings.from_mapping(current)
+        clean = {
+            key: value
+            for key, value in asdict(validated).items()
+            if key in PERSISTED_SETTING_NAMES
+        }
+        path = user_settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle, temporary_name = tempfile.mkstemp(prefix="settings-", suffix=".tmp", dir=path.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+                json.dump(clean, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+            temporary.replace(path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
     return clean
 
 
@@ -197,12 +204,12 @@ class Settings:
     voice_input_device: str = ""
     voice_output_device: str = ""
     voice_compute_device: str = "auto"
-    voice_engine: str = "kokoro"
-    voice_asr_model: str = "paraformer-zh-streaming"
+    voice_engine: str = "moss"
+    voice_asr_model: str = ""
     voice_tts_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     voice_clone_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-    voice_light_asr_model: str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09"
-    voice_light_tts_model: str = "kokoro-int8-multi-lang-v1_1"
+    voice_light_asr_model: str = ""
+    voice_light_tts_model: str = "MOSS-TTS-Nano-100M-ONNX"
     voice_sample_rate: int = 24000
     voice_segment_chars: int = 360
     voice_cache_limit_mb: int = 1024
@@ -231,7 +238,10 @@ class Settings:
         for key, previous, current in (
             ("voice_tts_model", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"),
             ("voice_clone_model", "Qwen/Qwen3-TTS-12Hz-0.6B-Base", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
-            ("voice_light_tts_model", "sherpa-onnx-vits-zh-ll", "kokoro-int8-multi-lang-v1_1"),
+            ("voice_light_tts_model", "sherpa-onnx-vits-zh-ll", "MOSS-TTS-Nano-100M-ONNX"),
+            ("voice_light_tts_model", "kokoro-int8-multi-lang-v1_1", "MOSS-TTS-Nano-100M-ONNX"),
+            ("voice_asr_model", "paraformer-zh-streaming", ""),
+            ("voice_light_asr_model", "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09", ""),
         ):
             if str(value.get(key, "")).strip() == previous:
                 value[key] = current
@@ -382,14 +392,13 @@ class Settings:
                 "语音计算设备",
                 {"auto", "cpu", "cuda"},
             ),
-            # 旧版本的 auto / sherpa 都迁移到当前默认的 Kokoro，避免已有设置
-            # 因为引擎名称更新而无法启动。
+            # ??? auto / sherpa / Kokoro ????????? MOSS?
             voice_engine=_choice(
-                "kokoro"
-                if str(value.get("voice_engine", defaults.voice_engine)).strip().lower() in {"", "auto", "sherpa"}
+                "moss"
+                if str(value.get("voice_engine", defaults.voice_engine)).strip().lower() in {"", "auto", "sherpa", "kokoro"}
                 else value.get("voice_engine", defaults.voice_engine),
                 "语音引擎",
-                {"kokoro", "qwen"},
+                {"moss", "qwen"},
             ),
             voice_asr_model=str(value.get("voice_asr_model", defaults.voice_asr_model)).strip()
             or defaults.voice_asr_model,

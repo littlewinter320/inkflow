@@ -22,7 +22,7 @@ export type VoiceSettings = {
   voice_input_device: string;
   voice_output_device: string;
   voice_compute_device: "auto" | "cpu" | "cuda";
-  voice_engine: "kokoro" | "qwen";
+  voice_engine: "moss" | "qwen";
   voice_asr_model: string;
   voice_tts_model: string;
   voice_clone_model: string;
@@ -44,12 +44,20 @@ export type VoiceStatus = {
   message: string;
   backend?: string;
   migration?: { completed: boolean; removed: string[]; errors: string[] };
-  kokoro?: {
+  moss?: {
     package_installed: boolean;
+    dependencies_ready: boolean;
     tts_ready: boolean;
+    models_ready: boolean;
     model_root: string;
     model_size_mb: number;
     estimated_download_mb: number;
+    estimated_dependency_download_mb: number;
+    estimated_model_download_mb: number;
+    installing?: boolean;
+    python_available?: boolean;
+    last_error?: string;
+    source?: string;
   };
   asr?: {
     package_installed: boolean;
@@ -380,7 +388,7 @@ function VoiceCloneDialog({ projectRoot, request, onClose, onCreated, onNotice, 
     {scriptInfo && <p className="form-hint">发音覆盖：{scriptInfo.coverage_summary.join("；")}。</p>}
     <label>照读文字 / 录音原文 <small>{referenceText.length}/400 字</small><textarea maxLength={400} value={referenceText} disabled={recording || scriptWorking} onChange={(event) => { setReferenceText(event.target.value); setScriptInfo(null); }} placeholder="可以让 Writer 先生成朗读稿，也可以填写已有录音的准确原文；留空时使用本地识别。" /></label>
     <section className="voice-clone-recording"><strong>二、参考录音</strong><p>只负责采集声音，限制为 3～120 秒；达到 120 秒自动停止。请在安静环境用平常声音朗读，并确保录音与上方文字一致。</p><div className="clone-source"><button disabled={recording || working} onClick={() => void choose()}>上传语音</button><button disabled={working || scriptWorking} className={recording ? "recording" : ""} onClick={() => void toggleRecording()}>{recording ? "■ 停止录音" : "● 照稿录音"}</button><span>{audioPath || "尚未选择录音"}</span></div></section>
-    <p className="form-hint">重写朗读稿后需要重新录音。声音克隆使用 Qwen，普通朗读默认使用 Kokoro。朗读稿只是参考材料，不是训练。</p>
+    <p className="form-hint">重写朗读稿后需要重新录音。声音克隆使用 Qwen，普通朗读默认使用 MOSS。朗读稿只是参考材料，不是训练。</p>
     <label>声音名称<input value={name} onChange={(event) => setName(event.target.value)} /></label>
     <label>声音类型<select value={gender} onChange={(event) => setGender(event.target.value)}><option value="female">女声</option><option value="male">男声</option><option value="other">其他 / 不指定</option></select></label>
     <label>朗读要求<input value={instruction} onChange={(event) => setInstruction(event.target.value)} /></label>
