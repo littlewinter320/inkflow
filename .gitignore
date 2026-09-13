@@ -19,13 +19,14 @@ knowledge/
 .DS_Store
 Thumbs.db
 
-# Keep GitHub focused on runtime/build/install files and current essential guidance.
+# Keep GitHub focused on runtime, build, install, and user-facing files.
 agent/tests/
 agent/evals/
-development/docs/research/
-development/docs/*_REFERENCES.md
-development/docs/*_RELEASE_NOTES.md
-development/docs/architecture*.md
+development/
+.claude/
+.trae/
+CLAUDE.md
+AGENTS.md
 *_PLAN.md
 *_DESIGN.md
 

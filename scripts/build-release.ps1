@@ -5,7 +5,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$repositoryRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$repositoryRoot = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $repositoryRoot '.venv\Scripts\python.exe'
 $pyinstaller = Join-Path $repositoryRoot '.venv\Scripts\pyinstaller.exe'
 $engineOutput = Join-Path $repositoryRoot 'dist\engine'
