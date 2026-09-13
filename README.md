@@ -10,7 +10,7 @@
   <a href="https://github.com/littlewinter320/inkflow/issues">反馈问题</a>
 </p>
 
-当前源码版本：**0.6.0**。GitHub 下载页始终提供最新已发布的 Windows 安装包；如果下载页的版本低于源码版本，表示新版本正在等待单独打包发布，不能把源码压缩包当作安装程序使用。
+当前版本：**0.6.0**。Windows 安装包、差分更新文件和完整更新说明都放在 [GitHub Releases](https://github.com/littlewinter320/inkflow/releases/latest)；源码版本、Release 标签和安装包版本保持一致。
 
 ## 目录
 
