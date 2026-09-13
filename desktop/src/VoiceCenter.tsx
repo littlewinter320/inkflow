@@ -18,10 +18,11 @@ export type VoiceSettings = {
   voice_default_profile: string;
   voice_speed: number;
   voice_volume: number;
+  voice_pause_scale: number;
   voice_input_device: string;
   voice_output_device: string;
   voice_compute_device: "auto" | "cpu" | "cuda";
-  voice_engine: "auto" | "sherpa" | "qwen";
+  voice_engine: "kokoro" | "qwen";
   voice_asr_model: string;
   voice_tts_model: string;
   voice_clone_model: string;
@@ -42,9 +43,16 @@ export type VoiceStatus = {
   data_root: string;
   message: string;
   backend?: string;
-  sherpa?: {
+  migration?: { completed: boolean; removed: string[]; errors: string[] };
+  kokoro?: {
     package_installed: boolean;
     tts_ready: boolean;
+    model_root: string;
+    model_size_mb: number;
+    estimated_download_mb: number;
+  };
+  asr?: {
+    package_installed: boolean;
     asr_ready: boolean;
     model_root: string;
     model_size_mb: number;
@@ -60,6 +68,7 @@ export type VoiceStatus = {
     packages_dir: string;
     model_cache_dir: string;
     model_loaded: boolean;
+    models_ready: boolean;
     package_size_mb: number;
     model_size_mb: number;
     estimated_dependency_download_mb: number;
@@ -109,6 +118,11 @@ type VoiceRoleMap = {
   narrator_profile_id: string;
   characters: Record<string, string>;
   updated_at: string;
+};
+
+type VoiceCloneReadingScript = {
+  reading_text: string;
+  coverage_summary: string[];
 };
 
 export function VoiceCenter({
@@ -266,11 +280,11 @@ export function VoiceCenter({
       </div>
     </section>
 
-    {showClone && <VoiceCloneDialog request={request} onClose={() => setShowClone(false)} onCreated={() => { setShowClone(false); void load(); }} onNotice={onNotice} onError={onError} />}
+    {showClone && <VoiceCloneDialog projectRoot={projectRoot} request={request} onClose={() => setShowClone(false)} onCreated={() => { setShowClone(false); void load(); }} onNotice={onNotice} onError={onError} />}
   </section>;
 }
 
-function VoiceCloneDialog({ request, onClose, onCreated, onNotice, onError }: { request: Request; onClose: () => void; onCreated: () => void; onNotice: (message: string) => void; onError: (message: string) => void }) {
+function VoiceCloneDialog({ projectRoot, request, onClose, onCreated, onNotice, onError }: { projectRoot: string; request: Request; onClose: () => void; onCreated: () => void; onNotice: (message: string) => void; onError: (message: string) => void }) {
   const [audioPath, setAudioPath] = useState("");
   const [name, setName] = useState("我的声音");
   const [gender, setGender] = useState("other");
@@ -281,8 +295,33 @@ function VoiceCloneDialog({ request, onClose, onCreated, onNotice, onError }: { 
   const [consent, setConsent] = useState(false);
   const [recording, setRecording] = useState(false);
   const [working, setWorking] = useState(false);
+  const [scriptWorking, setScriptWorking] = useState(false);
+  const [scriptInfo, setScriptInfo] = useState<VoiceCloneReadingScript | null>(null);
   const recorderRef = useRef<LocalWavRecorder | null>(null);
   useEffect(() => () => { if (recorderRef.current) void recorderRef.current.stop(); }, []);
+
+  const finishRecording = useCallback(async () => {
+    const recorder = recorderRef.current;
+    if (!recorder) return;
+    recorderRef.current = null;
+    setRecording(false);
+    try {
+      const bytes = await recorder.stop();
+      if (!bytes.length) throw new Error("录音内容为空，请重新录制。");
+      setAudioPath(await window.inkflow.saveVoiceRecording(bytes, "wav"));
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }, [onError]);
+
+  useEffect(() => {
+    if (!recording) return;
+    const timer = window.setTimeout(() => {
+      void finishRecording();
+      onNotice("已达到两分钟，录音已自动停止。请核对文字是否与实际录音一致。");
+    }, 120_000);
+    return () => window.clearTimeout(timer);
+  }, [recording, finishRecording, onNotice]);
 
   const choose = async () => {
     const selected = await window.inkflow.chooseAudio("选择用于克隆的普通话参考语音");
@@ -291,21 +330,13 @@ function VoiceCloneDialog({ request, onClose, onCreated, onNotice, onError }: { 
 
   const toggleRecording = async () => {
     if (recording) {
-      setRecording(false);
-      try {
-        const bytes = await recorderRef.current?.stop();
-        recorderRef.current = null;
-        if (!bytes?.length) throw new Error("录音内容为空，请重新录制。");
-        const target = await window.inkflow.saveVoiceRecording(bytes, "wav");
-        setAudioPath(target);
-      } catch (cause) {
-        onError(cause instanceof Error ? cause.message : String(cause));
-      }
+      await finishRecording();
       return;
     }
     try {
       const settings = await request<VoiceSettings>("voice.settings.get");
-      recorderRef.current = await LocalWavRecorder.start(settings.voice_input_device);
+      recorderRef.current = await LocalWavRecorder.start(settings.voice_input_device, 120);
+      setAudioPath("");
       setRecording(true);
     } catch (cause) {
       onError(cause instanceof Error ? cause.message : "无法使用麦克风，请检查 Windows 权限。");
@@ -326,5 +357,35 @@ function VoiceCloneDialog({ request, onClose, onCreated, onNotice, onError }: { 
     }
   };
 
-  return <div className="modal-backdrop"><section className="modal voice-clone-dialog" role="dialog" aria-modal="true"><button className="modal-close" onClick={onClose}>×</button><p className="eyebrow">只保存在本机</p><h2>克隆我的声音</h2><p className="modal-subtitle">建议使用安静环境下 10–30 秒、单人、无背景音乐的普通话。没有填写参考文本时，会先在本地识别。</p><div className="clone-source"><button onClick={() => void choose()}>上传语音</button><button className={recording ? "recording" : ""} onClick={() => void toggleRecording()}>{recording ? "■ 停止录音" : "● 录制语音"}</button><span>{audioPath || "尚未选择"}</span></div><label>声音名称<input value={name} onChange={(event) => setName(event.target.value)} /></label><label>声音类型<select value={gender} onChange={(event) => setGender(event.target.value)}><option value="female">女声</option><option value="male">男声</option><option value="other">其他 / 不指定</option></select></label><label>参考语音文字 <small>可留空，由本地识别</small><textarea value={referenceText} onChange={(event) => setReferenceText(event.target.value)} placeholder="请准确填写录音里说的内容。" /></label><label>朗读要求<input value={instruction} onChange={(event) => setInstruction(event.target.value)} /></label><div className="clone-sliders"><label>语速 <output>{speed.toFixed(2)}</output><input type="range" min="0.75" max="1.35" step="0.05" value={speed} onChange={(event) => setSpeed(Number(event.target.value))} /></label><label>音量 <output>{volume.toFixed(2)}</output><input type="range" min="0.25" max="1.5" step="0.05" value={volume} onChange={(event) => setVolume(Number(event.target.value))} /></label></div><label className="consent-row"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} /><span>我拥有这段声音的使用权，并已获得克隆与本地使用所需的同意。</span></label><div className="dialog-actions"><button onClick={onClose}>取消</button><button className="primary" disabled={working || !audioPath || !consent} onClick={() => void create()}>{working ? "正在创建…" : "创建本地声音"}</button></div></section></div>;
+  const generateReadingScript = async () => {
+    setScriptWorking(true);
+    try {
+      const script = await request<VoiceCloneReadingScript>("voice.clone_script.generate", { project_root: projectRoot });
+      setReferenceText(script.reading_text);
+      setAudioPath("");
+      setScriptInfo(script);
+      onNotice("Writer 已生成朗读稿。请照读后录音；文字可以在下方按实际录音微调。");
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setScriptWorking(false);
+    }
+  };
+
+  return <div className="modal-backdrop"><section className="modal voice-clone-dialog" role="dialog" aria-modal="true">
+    <button className="modal-close" onClick={onClose}>×</button>
+    <p className="eyebrow">只保存在本机</p><h2>克隆我的声音</h2>
+    <p className="modal-subtitle">先准备朗读文字，再单独录音。两个步骤各自检查自己的限制。</p>
+    <section className="voice-clone-script"><strong>一、Writer 朗读稿</strong><p>只负责生成自然普通话材料，限制为 180～400 字；不会控制或判断录音时长。</p><div className="voice-actions"><button type="button" disabled={scriptWorking || recording || working} onClick={() => void generateReadingScript()}>{scriptWorking ? "Writer 正在生成…" : "让 Writer 生成朗读稿"}</button><small>点击将调用当前 Writer 模型，可能产生少量费用。</small></div></section>
+    {scriptInfo && <p className="form-hint">发音覆盖：{scriptInfo.coverage_summary.join("；")}。</p>}
+    <label>照读文字 / 录音原文 <small>{referenceText.length}/400 字</small><textarea maxLength={400} value={referenceText} disabled={recording || scriptWorking} onChange={(event) => { setReferenceText(event.target.value); setScriptInfo(null); }} placeholder="可以让 Writer 先生成朗读稿，也可以填写已有录音的准确原文；留空时使用本地识别。" /></label>
+    <section className="voice-clone-recording"><strong>二、参考录音</strong><p>只负责采集声音，限制为 3～120 秒；达到 120 秒自动停止。请在安静环境用平常声音朗读，并确保录音与上方文字一致。</p><div className="clone-source"><button disabled={recording || working} onClick={() => void choose()}>上传语音</button><button disabled={working || scriptWorking} className={recording ? "recording" : ""} onClick={() => void toggleRecording()}>{recording ? "■ 停止录音" : "● 照稿录音"}</button><span>{audioPath || "尚未选择录音"}</span></div></section>
+    <p className="form-hint">重写朗读稿后需要重新录音。声音克隆使用 Qwen，普通朗读默认使用 Kokoro。朗读稿只是参考材料，不是训练。</p>
+    <label>声音名称<input value={name} onChange={(event) => setName(event.target.value)} /></label>
+    <label>声音类型<select value={gender} onChange={(event) => setGender(event.target.value)}><option value="female">女声</option><option value="male">男声</option><option value="other">其他 / 不指定</option></select></label>
+    <label>朗读要求<input value={instruction} onChange={(event) => setInstruction(event.target.value)} /></label>
+    <div className="clone-sliders"><label>语速 <output>{speed.toFixed(2)}</output><input type="range" min="0.75" max="1.35" step="0.05" value={speed} onChange={(event) => setSpeed(Number(event.target.value))} /></label><label>音量 <output>{volume.toFixed(2)}</output><input type="range" min="0.25" max="1.5" step="0.05" value={volume} onChange={(event) => setVolume(Number(event.target.value))} /></label></div>
+    <label className="consent-row"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} /><span>我拥有这段声音的使用权，并已获得克隆与本地使用所需的同意。</span></label>
+    <div className="dialog-actions"><button onClick={onClose}>取消</button><button className="primary" disabled={working || recording || scriptWorking || !audioPath || !consent} onClick={() => void create()}>{working ? "正在创建…" : "创建本地声音"}</button></div>
+  </section></div>;
 }

@@ -53,8 +53,16 @@ type PendingRecovery = {
   safety_checkpoint_available: boolean;
 };
 
+type ChapterWorkspaceLike = {
+  chapter_no?: number;
+  record?: { version?: number; status?: string } | null;
+  review?: { matches_current_version?: boolean; report?: { verdict?: string } } | null;
+  can_accept?: boolean;
+};
+
 export function ProjectCenter({
   dashboard,
+  workspace,
   request,
   onPrompt,
   onRefresh,
@@ -62,6 +70,7 @@ export function ProjectCenter({
   onError,
 }: {
   dashboard: DashboardLike | null;
+  workspace: Record<string, unknown> | null;
   request: Request;
   onPrompt: (prompt: string) => void;
   onRefresh: () => Promise<unknown>;
@@ -195,6 +204,7 @@ export function ProjectCenter({
   };
 
   const chapterStatus = dashboard?.status.chapters || {};
+  const currentWorkspace = workspace as ChapterWorkspaceLike | null;
   const suggestions = projectSuggestions(dashboard);
   const currentPlan = dashboard?.current_plan || null;
   const volume = (currentPlan?.volume || {}) as Record<string, unknown>;
@@ -209,6 +219,8 @@ export function ProjectCenter({
         <p>这里显示可复核状态、下一步建议、任务记录和分支式回退；不展示模型原始思维链。</p>
         <button disabled={working} onClick={() => void load()}>刷新</button>
       </header>
+
+      {currentWorkspace && <section className="project-section" aria-label="当前章节状态"><div className="project-section-title"><div><h3>当前章节</h3><p>第 {String(currentWorkspace.chapter_no || "—")} 章 · v{String(currentWorkspace.record?.version || "—")} · {currentWorkspace.record?.status === "accepted" ? "已进入正史" : currentWorkspace.can_accept ? "当前版本可验收" : currentWorkspace.review?.matches_current_version ? `Reviewer：${String(currentWorkspace.review?.report?.verdict || "待审查")}` : "等待当前版本审查"}</p></div><span>{currentWorkspace.can_accept ? "可验收" : "进行中"}</span></div></section>}
 
       <section className="project-metrics" aria-label="项目统计">
         <Metric label="已接受正文" value={`${(dashboard?.accepted_characters || 0).toLocaleString()} 字`} />

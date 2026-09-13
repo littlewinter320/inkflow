@@ -47,6 +47,11 @@ _WORKFLOWS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
         ("writer", "chapter.write", "", "章节草稿"),
         ("reviewer", "chapter.review", "step-1", "证据化审查报告"),
     ),
+    "write_review_accept": (
+        ("writer", "chapter.write", "", "章节草稿"),
+        ("reviewer", "chapter.review", "step-1", "当前版本审查报告"),
+        ("memory_keeper", "chapter.accept", "step-2", "正史记忆补丁与提交结果"),
+    ),
     "review": (("reviewer", "chapter.review", "", "证据化审查报告"),),
     "revise_draft": (("writer", "chapter.revise", "", "新草稿版本"),),
     "revise_review": (
@@ -65,6 +70,10 @@ _WORKFLOWS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
     "accept": (("memory_keeper", "chapter.accept", "", "正史记忆补丁与提交结果"),),
     "arc_audit": (("reviewer", "arc.audit", "", "篇章复审报告"),),
     "batch_draft": (("engine", "batch.draft_loop", "", "逐章草稿、审查和临时记忆"),),
+    "batch_draft_accept": (
+        ("engine", "batch.draft_loop", "", "逐章草稿、审查和临时记忆"),
+        ("engine", "batch.accept_loop", "step-1", "仅连续通过章节的正史提交结果"),
+    ),
     "batch_repair": (("engine", "batch.repair_loop", "", "逐章修订和复审结果"),),
     "batch_accept": (("engine", "batch.accept_loop", "", "连续正史提交结果"),),
     "continue_run": (("engine", "chapter.gated_loop", "", "门禁循环进度"),),
@@ -74,6 +83,7 @@ _WORKFLOWS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
     "rollback_restore": (("engine", "rollback.restore", "", "分支式恢复结果"),),
     "chat": (),
     "ideate": (("writer", "idea.brainstorm", "", "创意提案"),),
+    "voice_clone_script": (("writer", "voice.clone_script", "", "声音克隆参考朗读稿"),),
     "discuss": (),
     "exit": (),
 }
@@ -125,6 +135,12 @@ class Coordinator:
             max_model_calls=estimated_calls,
             max_tokens=min(1_000_000, estimated_calls * 16_000),
             max_discussion_rounds=2,
+            authorization_source=(
+                intent.authorization_source
+                if intent.authorization_source != "none"
+                else ("current_request" if intent.authorization == "approved" else "none")
+            ),
+            acceptance_confirmation_mode=intent.acceptance_confirmation_mode,
         )
         plan = DispatchPlan(
             workflow=intent.action,
@@ -157,6 +173,8 @@ class Coordinator:
 
     @staticmethod
     def _input_sources(intent: TerminalIntent) -> list[str]:
+        if intent.action == "voice_clone_script":
+            return ["user:current", "voice:local-only"]
         sources = ["user:current", "canon:sqlite", "preferences:active", "plan:current"]
         if intent.chapter_no:
             sources.extend([f"chapter:{intent.chapter_no:05d}", f"review:{intent.chapter_no:05d}"])
@@ -170,7 +188,7 @@ class Coordinator:
             return 0
         if intent.action in {"discuss", "chat"}:
             return 1
-        if intent.action in {"batch_draft", "batch_repair", "continue_run"}:
+        if intent.action in {"batch_draft", "batch_draft_accept", "batch_repair", "continue_run"}:
             return min(100, chapter_count * (2 + max(0, intent.max_revision_rounds)))
         if intent.action == "batch_accept":
             return min(100, chapter_count)

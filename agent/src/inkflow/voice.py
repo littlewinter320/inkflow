@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import importlib.util
 import json
@@ -33,6 +34,7 @@ VOICE_SETTING_NAMES = (
     "voice_default_profile",
     "voice_speed",
     "voice_volume",
+    "voice_pause_scale",
     "voice_input_device",
     "voice_output_device",
     "voice_compute_device",
@@ -49,17 +51,17 @@ VOICE_SETTING_NAMES = (
 )
 
 QWEN_REQUIREMENTS = (
-    "funasr>=1.2,<2",
     "qwen-tts>=0.1,<1",
     "soundfile>=0.12,<1",
     "torch>=2.4,<3",
     "torchaudio>=2.4,<3",
 )
-SHERPA_TTS_MODEL_ID = "sherpa-onnx-vits-zh-ll"
-SHERPA_TTS_MODEL_URL = (
+KOKORO_TTS_MODEL_ID = "kokoro-int8-multi-lang-v1_1"
+KOKORO_TTS_MODEL_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/"
-    "sherpa-onnx-vits-zh-ll.tar.bz2"
+    "kokoro-int8-multi-lang-v1_1.tar.bz2"
 )
+LEGACY_VITS_MODEL_ID = "sherpa-onnx-vits-zh-ll"
 SHERPA_ASR_MODEL_ID = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09"
 SHERPA_ASR_MODEL_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
@@ -73,7 +75,8 @@ BUILTIN_PROFILES: tuple[dict[str, Any], ...] = (
         "kind": "builtin",
         "gender": "female",
         "speaker": "Serena",
-        "speaker_id": 0,
+        "kokoro_speaker_id": 3,
+        "kokoro_speed_multiplier": 0.98,
         "description": "温和、稳定，适合大多数正文旁白。",
         "instruction": "自然普通话，叙述清楚，情绪克制。",
     },
@@ -83,7 +86,8 @@ BUILTIN_PROFILES: tuple[dict[str, Any], ...] = (
         "kind": "builtin",
         "gender": "female",
         "speaker": "Vivian",
-        "speaker_id": 1,
+        "kokoro_speaker_id": 15,
+        "kokoro_speed_multiplier": 1.04,
         "description": "明亮年轻，适合活泼角色。",
         "instruction": "自然普通话，明快但不要夸张。",
     },
@@ -93,7 +97,8 @@ BUILTIN_PROFILES: tuple[dict[str, Any], ...] = (
         "kind": "builtin",
         "gender": "female",
         "speaker": "Serena",
-        "speaker_id": 2,
+        "kokoro_speaker_id": 32,
+        "kokoro_speed_multiplier": 0.92,
         "description": "温暖舒缓，适合成熟或安静的女性角色。",
         "instruction": "自然普通话，温柔舒缓，吐字清晰。",
     },
@@ -103,7 +108,8 @@ BUILTIN_PROFILES: tuple[dict[str, Any], ...] = (
         "kind": "builtin",
         "gender": "male",
         "speaker": "Uncle_Fu",
-        "speaker_id": 3,
+        "kokoro_speaker_id": 58,
+        "kokoro_speed_multiplier": 0.94,
         "description": "沉稳低缓，适合悬疑或历史叙事。",
         "instruction": "自然普通话，沉稳克制，保持叙述感。",
     },
@@ -113,7 +119,8 @@ BUILTIN_PROFILES: tuple[dict[str, Any], ...] = (
         "kind": "builtin",
         "gender": "male",
         "speaker": "Uncle_Fu",
-        "speaker_id": 4,
+        "kokoro_speaker_id": 72,
+        "kokoro_speed_multiplier": 0.92,
         "description": "沉静自然，适合成年男性角色。",
         "instruction": "自然普通话，语气平静，避免播音腔。",
     },
@@ -123,7 +130,8 @@ BUILTIN_PROFILES: tuple[dict[str, Any], ...] = (
         "kind": "builtin",
         "gender": "male",
         "speaker": "Uncle_Fu",
-        "speaker_id": 4,
+        "kokoro_speaker_id": 86,
+        "kokoro_speed_multiplier": 1.02,
         "description": "更有力度，适合行动型角色。",
         "instruction": "自然普通话，坚定有力，但不要喊叫。",
     },
@@ -132,6 +140,78 @@ BUILTIN_PROFILES: tuple[dict[str, Any], ...] = (
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _mandarin_speech_units(text: str) -> list[tuple[str, float]]:
+    """Split Chinese prose into speakable units and retain a natural pause hint.
+
+    Kokoro does not consistently pause at every written punctuation mark, so
+    punctuation has to become audio silence instead of relying on the model to
+    infer prose rhythm from one long input string.
+    """
+
+    normalized = _clean_text_for_speech(text)
+    if not normalized:
+        return []
+    pause_seconds = {
+        "、": 0.10,
+        "，": 0.16,
+        ",": 0.16,
+        "；": 0.24,
+        ";": 0.24,
+        "：": 0.20,
+        ":": 0.20,
+        "。": 0.34,
+        ".": 0.34,
+        "！": 0.36,
+        "!": 0.36,
+        "？": 0.38,
+        "?": 0.38,
+        "…": 0.42,
+        "—": 0.28,
+    }
+    terminal_marks = set(pause_seconds)
+    units: list[tuple[str, float]] = []
+    buffer: list[str] = []
+
+    def flush(pause: float) -> None:
+        phrase = "".join(buffer).strip()
+        buffer.clear()
+        if phrase and any(character.isalnum() or "\u4e00" <= character <= "\u9fff" for character in phrase):
+            units.append((phrase, pause))
+
+    for character in normalized:
+        if character == "\n":
+            previous_count = len(units)
+            flush(0.46)
+            if len(units) == previous_count and units:
+                units[-1] = (units[-1][0], max(units[-1][1], 0.46))
+            continue
+        buffer.append(character)
+        if character in terminal_marks:
+            flush(pause_seconds[character])
+        elif len(buffer) >= 96:
+            # A hard safety split for long unpunctuated text. It is shorter
+            # than the outer job segment so the voice keeps stable breath length.
+            flush(0.12)
+    flush(0.0)
+    return units
+
+
+def _clean_text_for_speech(text: str) -> str:
+    """把屏幕文本变成适合朗读的普通话文本，避免念出 Markdown 和链接。"""
+
+    value = text.replace("\r\n", "\n").replace("\r", "\n")
+    value = re.sub(r"```[\s\S]*?```", " 代码内容已省略。 ", value)
+    value = re.sub(r"`([^`]+)`", r"\1", value)
+    value = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", value)
+    value = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", value)
+    value = re.sub(r"https?://\S+", " 链接 ", value)
+    value = re.sub(r"(?m)^\s{0,3}(?:#{1,6}|>|[-*+] |\d+[.)] )\s*", "", value)
+    value = re.sub(r"[*_~]{1,3}", "", value)
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
 
 
 def _voice_root() -> Path:
@@ -217,9 +297,12 @@ class VoiceRuntime:
         self.qwen_packages_dir = self.qwen_root / "packages"
         self.qwen_model_cache_dir = self.qwen_root / "models"
         self.qwen_state_path = self.qwen_root / "install.json"
+        self.qwen_models_path = self.qwen_root / "models.json"
         self.sherpa_root = self.root / "sherpa"
-        self.sherpa_tts_dir = self.sherpa_root / "tts" / SHERPA_TTS_MODEL_ID
+        self.kokoro_root = self.root / "kokoro"
+        self.kokoro_tts_dir = self.kokoro_root / KOKORO_TTS_MODEL_ID
         self.sherpa_asr_dir = self.sherpa_root / "asr" / SHERPA_ASR_MODEL_ID
+        self.migrations_dir = self.root / "migrations"
         for folder in (
             self.profiles_dir,
             self.projects_dir,
@@ -228,6 +311,8 @@ class VoiceRuntime:
             self.qwen_root,
             self.qwen_model_cache_dir,
             self.sherpa_root,
+            self.kokoro_root,
+            self.migrations_dir,
         ):
             folder.mkdir(parents=True, exist_ok=True)
         self._jobs: dict[str, asyncio.Task[None]] = {}
@@ -236,12 +321,12 @@ class VoiceRuntime:
         self._inference_lock: asyncio.Lock | None = None
         self._qwen_install_lock: asyncio.Lock | None = None
         self._qwen_install_task: asyncio.Task[dict[str, Any]] | None = None
-        self._light_model_lock: asyncio.Lock | None = None
+        self._kokoro_model_lock: asyncio.Lock | None = None
         self._tts_models: dict[str, Any] = {}
-        self._asr_models: dict[str, Any] = {}
-        self._sherpa_tts_models: dict[str, Any] = {}
+        self._kokoro_tts_models: dict[str, Any] = {}
         self._sherpa_asr_models: dict[str, Any] = {}
         self._activate_optional_packages()
+        self._migrate_legacy_voice_assets()
         self._mark_interrupted_jobs()
 
     def settings(self, workspace_root: str | Path | None = None) -> dict[str, Any]:
@@ -254,21 +339,67 @@ class VoiceRuntime:
             save_user_settings(allowed)
         return self.settings(workspace_root)
 
+    def _migrate_legacy_voice_assets(self) -> None:
+        """Remove only the replaced, downloaded engines once after this upgrade.
+
+        Profiles, reference audio, generated audio, jobs and the whole voice root are
+        deliberately outside this list. A failed deletion stays visible in the marker
+        and is retried on the next application start.
+        """
+
+        marker = self.migrations_dir / "kokoro-qwen-1.7.json"
+        existing = _read_json(marker)
+        if existing.get("completed"):
+            return
+        safe_roots = (
+            (self.sherpa_root / "tts").resolve(),
+            (self.qwen_model_cache_dir / "hub").resolve(),
+        )
+        targets = (
+            self.sherpa_root / "tts" / LEGACY_VITS_MODEL_ID,
+            self.qwen_model_cache_dir / "hub" / "models--Qwen--Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            self.qwen_model_cache_dir / "hub" / "models--Qwen--Qwen3-TTS-12Hz-0.6B-Base",
+        )
+        removed: list[str] = []
+        errors: list[str] = []
+        for target in targets:
+            resolved = target.resolve()
+            if not target.exists():
+                continue
+            if resolved != target.absolute() or self.root.resolve() not in resolved.parents or not any(root in resolved.parents for root in safe_roots):
+                errors.append(f"{target.name}: 路径被重定向，未清理应用目录以外的数据。")
+                continue
+            try:
+                shutil.rmtree(resolved)
+                removed.append(target.name)
+            except OSError as exc:
+                errors.append(f"{target.name}: {exc}")
+        _atomic_json(
+            marker,
+            {
+                "completed": not errors,
+                "completed_at": _now() if not errors else "",
+                "removed": list(dict.fromkeys([*existing.get("removed", []), *removed])),
+                "errors": errors,
+                "scope": "only legacy VITS and Qwen 0.6B model caches",
+            },
+        )
+
     def status(self, workspace_root: str | Path | None = None) -> dict[str, Any]:
         settings = Settings.from_env(workspace_root)
         self._activate_optional_packages()
         packages = {
-            "funasr": _package_available("funasr"),
             "qwen_tts": _package_available("qwen_tts"),
             "torch": _package_available("torch"),
             "soundfile": _package_available("soundfile"),
             "sherpa_onnx": _package_available("sherpa_onnx"),
         }
         sherpa = self._sherpa_status(packages)
+        kokoro = self._kokoro_status(packages)
         qwen = self._qwen_status(packages)
-        ready_for_input = sherpa["asr_ready"] or (packages["funasr"] and packages["torch"])
-        ready_for_output = sherpa["tts_ready"] or (packages["qwen_tts"] and packages["torch"] and packages["soundfile"])
-        backend = self._selected_backend(settings, sherpa, qwen)
+        ready_for_input = sherpa["asr_ready"]
+        backend = self._selected_backend(settings, kokoro, qwen)
+        ready_for_output = backend != "unavailable"
         return {
             "enabled": settings.voice_enabled,
             "ready_for_input": ready_for_input,
@@ -279,20 +410,20 @@ class VoiceRuntime:
             "formal_agent": False,
             "mode": "local_mandarin",
             "backend": backend,
-            "sherpa": sherpa,
+            "kokoro": kokoro,
+            "asr": sherpa,
             "qwen": qwen,
+            "migration": _read_json(self.migrations_dir / "kokoro-qwen-1.7.json"),
             "models_loaded": {
-                "asr": bool(self._asr_models or self._sherpa_asr_models),
-                "tts": bool(self._tts_models or self._sherpa_tts_models),
+                "asr": bool(self._sherpa_asr_models),
+                "tts": bool(self._tts_models or self._kokoro_tts_models),
             },
             "message": (
-                "轻量本地普通话语音已就绪。"
-                if sherpa["tts_ready"] and sherpa["asr_ready"]
-                else "Qwen 高品质语音已加载。"
-                if qwen["installed"] and qwen["model_loaded"]
-                else "Qwen 组件已安装，首次朗读时仍需下载或加载模型。"
-                if qwen["installed"]
-                else "界面与任务队列已就绪；请在设置中安装轻量语音包或可选 Qwen。"
+                "Kokoro 中文朗读已就绪。"
+                if backend == "kokoro"
+                else "Qwen 高品质中文朗读已就绪。"
+                if backend == "qwen"
+                else "当前选择的朗读模型尚未就绪，请在设置中完成对应安装。"
             ),
         }
 
@@ -303,33 +434,42 @@ class VoiceRuntime:
 
     def _sherpa_status(self, packages: dict[str, bool] | None = None) -> dict[str, Any]:
         package_ready = bool((packages or {}).get("sherpa_onnx", _package_available("sherpa_onnx")))
-        tts_model = self._sherpa_tts_model_path()
         asr_model = self._sherpa_asr_model_path()
         return {
             "package_installed": package_ready,
-            "tts_ready": package_ready and tts_model is not None,
-            "asr_ready": package_ready and asr_model is not None,
-            "tts_model": str(tts_model) if tts_model else "",
+            "asr_ready": package_ready and _package_available("soundfile") and asr_model is not None,
             "asr_model": str(asr_model) if asr_model else "",
-            "model_root": str(self.sherpa_root),
-            "model_size_mb": round(_directory_size(self.sherpa_root) / 1024 / 1024, 1),
-            "estimated_download_mb": 360,
+            "model_root": str(self.sherpa_asr_dir),
+            "model_size_mb": round(_directory_size(self.sherpa_asr_dir) / 1024 / 1024, 1),
+            "estimated_download_mb": 230,
+        }
+
+    def _kokoro_status(self, packages: dict[str, bool] | None = None) -> dict[str, Any]:
+        package_ready = bool((packages or {}).get("sherpa_onnx", _package_available("sherpa_onnx")))
+        model_path = self._kokoro_tts_model_path()
+        return {
+            "package_installed": package_ready,
+            "tts_ready": package_ready and _package_available("soundfile") and model_path is not None,
+            "tts_model": str(model_path) if model_path else "",
+            "model_root": str(self.kokoro_root),
+            "model_size_mb": round(_directory_size(self.kokoro_root) / 1024 / 1024, 1),
+            "estimated_download_mb": 500,
         }
 
     def _qwen_status(self, packages: dict[str, bool] | None = None) -> dict[str, Any]:
         self._activate_optional_packages()
         values = packages or {
-            "funasr": _package_available("funasr"),
             "qwen_tts": _package_available("qwen_tts"),
             "torch": _package_available("torch"),
             "soundfile": _package_available("soundfile"),
         }
-        dependencies_ready = all(values.get(name, False) for name in ("funasr", "qwen_tts", "torch", "soundfile"))
+        dependencies_ready = all(values.get(name, False) for name in ("qwen_tts", "torch", "soundfile"))
         state = _read_json(self.qwen_state_path)
         optional_ready = self.qwen_packages_dir.is_dir() and bool(state.get("status") == "installed")
         installed = dependencies_ready
         source = "optional" if optional_ready else "current_environment" if installed else "none"
         python_command = self._python_command()
+        settings = Settings.from_env()
         return {
             "installed": installed,
             "dependencies_ready": dependencies_ready,
@@ -340,23 +480,18 @@ class VoiceRuntime:
             "packages_dir": str(self.qwen_packages_dir),
             "model_cache_dir": str(self.qwen_model_cache_dir),
             "model_loaded": bool(self._tts_models),
+            "models_ready": all(self._qwen_model_path(name) is not None for name in (settings.voice_tts_model, settings.voice_clone_model)),
             "package_size_mb": round(_directory_size(self.qwen_packages_dir) / 1024 / 1024, 1),
             "model_size_mb": round(_directory_size(self.qwen_model_cache_dir) / 1024 / 1024, 1),
             "estimated_dependency_download_mb": 7000,
-            "estimated_model_download_mb": 7000,
+            "estimated_model_download_mb": 9200,
             "last_error": str(state.get("error") or ""),
         }
 
-    def _selected_backend(self, settings: Settings, sherpa: dict[str, Any], qwen: dict[str, Any]) -> str:
+    def _selected_backend(self, settings: Settings, kokoro: dict[str, Any], qwen: dict[str, Any]) -> str:
         if settings.voice_engine == "qwen":
-            return "qwen" if qwen["installed"] else "unavailable"
-        if settings.voice_engine == "sherpa":
-            return "sherpa" if sherpa["tts_ready"] or sherpa["asr_ready"] else "unavailable"
-        if sherpa["tts_ready"] or sherpa["asr_ready"]:
-            return "sherpa"
-        if qwen["installed"]:
-            return "qwen"
-        return "unavailable"
+            return "qwen" if qwen["installed"] and self._qwen_model_path(settings.voice_tts_model) else "unavailable"
+        return "kokoro" if kokoro["tts_ready"] else "unavailable"
 
     def _python_command(self) -> list[str] | None:
         configured = os.getenv("INKFLOW_PYTHON")
@@ -375,14 +510,21 @@ class VoiceRuntime:
             return [launcher, "-3.12"]
         return None
 
-    def _sherpa_tts_model_path(self) -> Path | None:
+    def _kokoro_tts_model_path(self) -> Path | None:
+        if not all((self.kokoro_tts_dir / name).exists() for name in (
+            "voices.bin", "tokens.txt", "lexicon-zh.txt", "espeak-ng-data",
+            "phone-zh.fst", "date-zh.fst", "number-zh.fst",
+        )):
+            return None
         candidates = (
-            self.sherpa_tts_dir / "model.onnx",
-            self.sherpa_tts_dir / f"{SHERPA_TTS_MODEL_ID}.onnx",
+            self.kokoro_tts_dir / "model.int8.onnx",
+            self.kokoro_tts_dir / "model.onnx",
         )
         return next((path for path in candidates if path.is_file()), None)
 
     def _sherpa_asr_model_path(self) -> Path | None:
+        if not (self.sherpa_asr_dir / "tokens.txt").is_file():
+            return None
         candidates = (
             self.sherpa_asr_dir / "model.int8.onnx",
             self.sherpa_asr_dir / "model.onnx",
@@ -406,8 +548,7 @@ class VoiceRuntime:
         async with self._qwen_install_lock:
             self._activate_optional_packages()
             existing = self._qwen_status()
-            if existing.get("installed") and existing.get("model_loaded"):
-                save_user_settings({"voice_engine": "qwen"})
+            if existing.get("installed") and existing.get("models_ready"):
                 return self.status()
             if existing.get("installed"):
                 await emit({"type": "voice.qwen.install.progress", "stage": "models", "summary": "Qwen 依赖已存在，正在重新准备语音模型"})
@@ -416,7 +557,6 @@ class VoiceRuntime:
                     await asyncio.to_thread(self._prepare_models_sync, Settings.from_env())
                 except Exception as exc:
                     model_error = str(exc)[:500]
-                save_user_settings({"voice_engine": "qwen"})
                 result = self.status()
                 result["qwen_setup"] = "installed_but_models_pending" if model_error else "ready"
                 if model_error:
@@ -471,46 +611,52 @@ class VoiceRuntime:
                 },
             )
             self._activate_optional_packages()
-            await emit({"type": "voice.qwen.install.progress", "stage": "models", "summary": "依赖安装完成，正在下载并加载 Qwen 语音模型"})
+            await emit({"type": "voice.qwen.install.progress", "stage": "models", "summary": "依赖安装完成，正在下载 Qwen 预设与克隆模型"})
             model_error = ""
             try:
                 await asyncio.to_thread(self._prepare_models_sync, Settings.from_env())
             except Exception as exc:
                 model_error = str(exc)[:500]
-            save_user_settings({"voice_engine": "qwen"})
             result = self.status()
             result["qwen_setup"] = "installed_but_models_pending" if model_error else "ready"
             if model_error:
                 result["qwen"]["last_error"] = model_error
-                result["qwen"]["model_message"] = "Qwen 依赖已安装，但模型加载未完成；可稍后重试模型准备。"
+                result["qwen"]["model_message"] = "Qwen 依赖已安装，但模型下载未完成；可稍后重试模型准备。"
                 await emit({"type": "voice.qwen.models_failed", "summary": model_error})
             else:
                 await emit({"type": "voice.qwen.ready", "summary": "Qwen 高品质语音已安装并完成适配"})
             return result
 
-    async def prepare_light_models(self, confirmation: str, emit: VoiceEventSink) -> dict[str, Any]:
-        if confirmation != "download_light_voice_models":
-            raise ValueError("下载轻量语音包前需要确认会占用约 360MB 磁盘空间。")
+    async def prepare_kokoro_models(self, confirmation: str, emit: VoiceEventSink) -> dict[str, Any]:
+        if confirmation != "download_kokoro_voice_models":
+            raise ValueError("下载 Kokoro 前需要确认约 500MB 下载量，解压还需额外磁盘空间。")
         if not _package_available("sherpa_onnx"):
-            raise RuntimeError("当前引擎未包含 sherpa-onnx 轻量运行库，请使用包含轻量语音组件的安装包。")
-        if self._light_model_lock is None:
-            self._light_model_lock = asyncio.Lock()
-        async with self._light_model_lock:
-            await emit({"type": "voice.light.installing", "stage": "tts", "summary": "正在下载轻量中文朗读模型（约 120MB）"})
-            await asyncio.to_thread(self._download_light_model, SHERPA_TTS_MODEL_URL, self.sherpa_tts_dir)
-            await emit({"type": "voice.light.installing", "stage": "asr", "summary": "正在下载普通话识别模型（约 230MB）"})
-            await asyncio.to_thread(self._download_light_model, SHERPA_ASR_MODEL_URL, self.sherpa_asr_dir)
-            save_user_settings({"voice_engine": "sherpa"})
+            raise RuntimeError("当前安装包未包含 Kokoro 所需的 sherpa-onnx 运行库，请使用包含本地语音组件的安装包。")
+        if self._kokoro_model_lock is None:
+            self._kokoro_model_lock = asyncio.Lock()
+        async with self._kokoro_model_lock:
+            await emit({"type": "voice.kokoro.installing", "stage": "tts", "summary": "正在下载 Kokoro 多语种中文朗读模型（约 270MB）"})
+            await asyncio.to_thread(
+                self._download_voice_model, KOKORO_TTS_MODEL_URL, self.kokoro_tts_dir,
+                ("tokens.txt", "voices.bin", "lexicon-zh.txt", "espeak-ng-data/phontab",
+                 "phone-zh.fst", "date-zh.fst", "number-zh.fst"),
+            )
+            await emit({"type": "voice.kokoro.installing", "stage": "asr", "summary": "正在下载普通话识别模型（约 230MB）"})
+            await asyncio.to_thread(self._download_voice_model, SHERPA_ASR_MODEL_URL, self.sherpa_asr_dir)
+            save_user_settings({"voice_engine": "kokoro"})
             result = self.status()
-            await emit({"type": "voice.light.ready", "summary": "轻量本地普通话语音已准备完成"})
+            await emit({"type": "voice.kokoro.ready", "summary": "Kokoro 本地普通话语音已准备完成"})
             return result
 
     @staticmethod
-    def _download_light_model(url: str, destination: Path) -> None:
+    def _download_voice_model(url: str, destination: Path, required: tuple[str, ...] = ("tokens.txt",)) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if any(destination.glob("*.onnx")):
+        if destination.resolve() != destination.absolute():
+            raise RuntimeError("模型目标目录被重定向，无法安全更新，请检查本地语音目录。")
+        if any(destination.glob("*.onnx")) and all((destination / name).is_file() for name in required):
             return
         archive_path = destination.parent / f".{destination.name}.download"
+        extraction = destination.parent / f".{destination.name}.extract-{uuid.uuid4().hex}"
         try:
             with urllib.request.urlopen(url, timeout=60) as response, archive_path.open("wb") as output:
                 while True:
@@ -518,11 +664,12 @@ class VoiceRuntime:
                     if not chunk:
                         break
                     output.write(chunk)
-            extraction = destination.parent / f".{destination.name}.extract-{uuid.uuid4().hex}"
             extraction.mkdir(parents=True, exist_ok=False)
             _safe_extract_tar(archive_path, extraction)
             roots = [item for item in extraction.iterdir() if item.is_dir()]
             source = roots[0] if len(roots) == 1 else extraction
+            if not any(source.glob("*.onnx")) or not all((source / name).is_file() for name in required):
+                raise RuntimeError("下载的模型缺少必要文件，请重试下载。")
             if destination.exists():
                 shutil.rmtree(destination, ignore_errors=True)
             source.replace(destination)
@@ -530,16 +677,18 @@ class VoiceRuntime:
         finally:
             if archive_path.exists():
                 archive_path.unlink()
+            if extraction.exists():
+                shutil.rmtree(extraction)
 
     async def prepare_models(self, workspace_root: str | Path | None, confirmation: str, emit: VoiceEventSink) -> dict[str, Any]:
         if confirmation != "download_local_voice_models":
             raise ValueError("准备本地语音模型前需要确认磁盘、等待时间与显存影响。")
         self._activate_optional_packages()
         settings = Settings.from_env(workspace_root)
-        missing = [name for name in ("funasr", "qwen_tts", "torch", "soundfile") if not _package_available(name)]
+        missing = [name for name in ("qwen_tts", "torch", "soundfile") if not _package_available(name)]
         if missing:
             raise RuntimeError(f"Qwen 语音依赖尚未安装：{', '.join(missing)}。请在设置中点击‘安装 Qwen 并适配’。")
-        await emit({"type": "voice.models.preparing", "summary": "正在准备普通话识别、预设声音和克隆声音模型"})
+        await emit({"type": "voice.models.preparing", "summary": "正在下载 Qwen 预设声音和克隆模型；下载期间不加载显卡"})
         if self._inference_lock is None:
             self._inference_lock = asyncio.Lock()
         async with self._inference_lock:
@@ -567,12 +716,16 @@ class VoiceRuntime:
             raise ValueError("参考语音应清晰且大小在 8KB 到 100MB 之间。")
         quality = self._inspect_audio(source)
         duration = float(quality.get("duration_seconds") or 0)
-        if duration and not 3 <= duration <= 120:
+        if not duration:
+            raise ValueError("无法确认参考录音时长，请使用内置录音或可读取的 WAV 文件。")
+        if not 3 <= duration <= 120:
             raise ValueError("克隆参考语音建议为 3 到 120 秒；当前时长不适合建立稳定声音档案。")
         name = str(params.get("name") or "我的声音").strip()[:40]
         reference_text = str(params.get("reference_text") or "").strip()
         if not reference_text:
             reference_text = await self.transcribe(source, allow_disabled=True)
+        if len(re.sub(r"\s+", "", reference_text)) > 400:
+            raise ValueError("声音克隆参考朗读稿最多 400 字；请使用 Writer 生成的朗读稿或截短后重试。")
         profile_id = f"clone-{uuid.uuid4().hex}"
         folder = self.profiles_dir / profile_id
         folder.mkdir(parents=True, exist_ok=False)
@@ -692,19 +845,12 @@ class VoiceRuntime:
             raise ValueError("没有找到可识别的语音文件。")
         self._activate_optional_packages()
         sherpa = self._sherpa_status()
-        qwen = self._qwen_status()
-        if settings.voice_engine in {"sherpa", "auto"} and sherpa["asr_ready"]:
-            backend = "sherpa"
-        elif qwen["installed"]:
-            backend = "qwen"
-        else:
-            raise RuntimeError("尚未安装轻量语音输入组件；请在设置中下载轻量语音包，或安装可选 Qwen。")
+        if not sherpa["asr_ready"]:
+            raise RuntimeError("尚未安装本地普通话识别组件；请在设置中下载 Kokoro 语音组件。")
         if self._inference_lock is None:
             self._inference_lock = asyncio.Lock()
         async with self._inference_lock:
-            if backend == "sherpa":
-                return await asyncio.to_thread(self._transcribe_sherpa_sync, source, settings)
-            return await asyncio.to_thread(self._transcribe_sync, source, settings)
+            return await asyncio.to_thread(self._transcribe_sherpa_sync, source, settings)
 
     async def speak(self, text: str, profile_id: str | None = None) -> dict[str, Any]:
         settings = Settings.from_env()
@@ -919,40 +1065,16 @@ class VoiceRuntime:
                 return profile
         raise ValueError(f"声音角色不存在：{profile_id}")
 
-    def _transcribe_sync(self, source: Path, settings: Settings) -> str:
-        self.qwen_model_cache_dir.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("HF_HOME", str(self.qwen_model_cache_dir))
-        from funasr import AutoModel
-
-        device = self._resolve_device(settings)
-        cache_key = f"{settings.voice_asr_model}:{device}"
-        model = self._asr_models.get(cache_key)
-        if model is None:
-            model = AutoModel(model=settings.voice_asr_model, vad_model="fsmn-vad", device=device)
-            self._asr_models[cache_key] = model
-        result = model.generate(input=str(source), language="zh")
-        if isinstance(result, list):
-            text = "".join(str(item.get("text") or "") for item in result if isinstance(item, dict))
-        elif isinstance(result, dict):
-            text = str(result.get("text") or "")
-        else:
-            text = str(result or "")
-        # 双保险：funasr 输出偶尔也带 <|zh|>、<|NEUTRAL|> 之类的内联标记。
-        text = re.sub(r"<\|[^|]*\|>", "", text).strip()
-        if not text:
-            raise RuntimeError("没有识别到清晰的普通话内容，请更换安静环境下的录音。")
-        return text
-
     def _transcribe_sherpa_sync(self, source: Path, settings: Settings) -> str:
         if not _package_available("sherpa_onnx") or not _package_available("soundfile"):
             raise RuntimeError("sherpa-onnx 或 soundfile 尚未安装。")
         model_path = self._sherpa_asr_model_path()
         if model_path is None:
-            raise RuntimeError("轻量普通话识别模型尚未下载，请在设置中点击‘下载轻量语音包’。")
+            raise RuntimeError("普通话识别模型尚未下载，请在设置中点击‘下载 Kokoro’。")
         import sherpa_onnx
         import soundfile as sf
 
-        cache_key = f"sherpa:{model_path}:{settings.voice_debug}"
+        cache_key = f"sherpa:{model_path}:{settings.voice_compute_device}:{settings.voice_debug}"
         recognizer = self._sherpa_asr_models.get(cache_key)
         if recognizer is None:
             provider = "cuda" if settings.voice_compute_device == "cuda" else "cpu"
@@ -1034,105 +1156,140 @@ class VoiceRuntime:
         except Exception:
             return {"duration_seconds": None, "channels": None, "sample_rate": None, "warnings": ["当前环境无法读取音频参数，将在首次克隆试听时确认质量。"]}
 
-    def _prepare_models_sync(self, settings: Settings) -> None:
-        self._activate_optional_packages()
-        self.qwen_model_cache_dir.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("HF_HOME", str(self.qwen_model_cache_dir))
-        import torch
-        from funasr import AutoModel
-        from qwen_tts import Qwen3TTSModel
+    def _qwen_model_path(self, model_name: str) -> Path | None:
+        value = _read_json(self.qwen_models_path).get(model_name)
+        if not isinstance(value, str):
+            return None
+        folder = Path(value)
+        if not folder.is_dir() or not (folder / "config.json").is_file():
+            return None
+        return folder
 
-        device = self._resolve_device(settings, torch)
-        asr_key = f"{settings.voice_asr_model}:{device}"
-        if asr_key not in self._asr_models:
-            self._asr_models[asr_key] = AutoModel(
-                model=settings.voice_asr_model,
-                vad_model="fsmn-vad",
-                device=device,
-            )
-        dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
-        for model_name in (settings.voice_tts_model, settings.voice_clone_model):
-            cache_key = f"{model_name}:{device}"
-            if cache_key not in self._tts_models:
-                self._tts_models[cache_key] = Qwen3TTSModel.from_pretrained(
-                    model_name,
-                    device_map=device,
-                    dtype=dtype,
+    def _prepare_models_sync(self, settings: Settings) -> None:
+        """Only an explicit install/prepare action may download Qwen weights."""
+        self._activate_optional_packages()
+        from huggingface_hub import snapshot_download
+
+        # Download both preset and clone models to disk without reserving GPU memory.
+        # The same confirmed preparation action can resume an interrupted download.
+        paths = _read_json(self.qwen_models_path)
+        for model_name in dict.fromkeys((settings.voice_tts_model, settings.voice_clone_model)):
+            local = Path(model_name).expanduser()
+            if local.is_dir():
+                folder = str(local.resolve())
+            else:
+                folder = snapshot_download(
+                    repo_id=model_name,
+                    cache_dir=str(self.qwen_model_cache_dir / "hub"),
                 )
+            paths[model_name] = folder
+            _atomic_json(self.qwen_models_path, paths)
 
     def _synthesize_sync(self, text: str, profile: dict[str, Any], output: Path, settings: Settings) -> None:
         self._activate_optional_packages()
-        sherpa = self._sherpa_status()
+        kokoro = self._kokoro_status()
         qwen = self._qwen_status()
         use_clone = profile.get("kind") == "clone"
-        if settings.voice_engine == "qwen":
+        if use_clone or settings.voice_engine == "qwen":
             backend = "qwen"
-        elif settings.voice_engine == "sherpa":
-            backend = "sherpa"
-        elif sherpa["tts_ready"] and not use_clone:
-            backend = "sherpa"
-        elif qwen["installed"]:
-            backend = "qwen"
-        elif sherpa["tts_ready"]:
-            backend = "sherpa"
+        elif kokoro["tts_ready"]:
+            backend = "kokoro"
         else:
-            raise RuntimeError("尚未安装可用的本地语音输出组件，请在设置中下载轻量语音包或安装 Qwen。")
-        if backend == "sherpa":
-            if use_clone:
-                raise RuntimeError("轻量 sherpa-onnx 模式不支持声音克隆；请安装 Qwen 高品质组件后再使用该声音。")
-            self._synthesize_sherpa_sync(text, profile, output, settings)
+            raise RuntimeError("尚未安装可用的本地语音输出组件，请在设置中下载 Kokoro 或安装 Qwen。")
+        if backend == "kokoro":
+            if self._tts_models:
+                self._tts_models.clear()
+                gc.collect()
+                if "torch" in sys.modules and sys.modules["torch"].cuda.is_available():
+                    sys.modules["torch"].cuda.empty_cache()
+            self._synthesize_kokoro_sync(text, profile, output, settings)
             return
         if not qwen["installed"]:
-            raise RuntimeError("尚未安装 Qwen3-TTS 本地语音输出组件。")
+            raise RuntimeError("声音克隆只使用 Qwen3-TTS；请先在设置中安装 Qwen 高品质组件。")
         self._synthesize_qwen_sync(text, profile, output, settings)
 
-    def _synthesize_sherpa_sync(self, text: str, profile: dict[str, Any], output: Path, settings: Settings) -> None:
+    def _synthesize_kokoro_sync(self, text: str, profile: dict[str, Any], output: Path, settings: Settings) -> None:
         if not _package_available("sherpa_onnx") or not _package_available("soundfile"):
             raise RuntimeError("sherpa-onnx 或 soundfile 尚未安装。")
-        model_path = self._sherpa_tts_model_path()
-        lexicon = self.sherpa_tts_dir / "lexicon.txt"
-        tokens = self.sherpa_tts_dir / "tokens.txt"
-        if model_path is None or not lexicon.is_file() or not tokens.is_file():
-            raise RuntimeError("轻量中文朗读模型尚未下载，请在设置中点击‘下载轻量语音包’。")
+        model_path = self._kokoro_tts_model_path()
+        voices = self.kokoro_tts_dir / "voices.bin"
+        tokens = self.kokoro_tts_dir / "tokens.txt"
+        data_dir = self.kokoro_tts_dir / "espeak-ng-data"
+        lexicons = [
+            self.kokoro_tts_dir / name
+            for name in ("lexicon-us-en.txt", "lexicon-zh.txt")
+            if (self.kokoro_tts_dir / name).is_file()
+        ]
+        if model_path is None or not voices.is_file() or not tokens.is_file() or not data_dir.is_dir() or not lexicons:
+            raise RuntimeError("Kokoro 模型尚未下载完整，请在设置中点击‘下载 Kokoro’后重试。")
         import sherpa_onnx
         import soundfile as sf
 
-        cache_key = f"sherpa:{model_path}:{settings.voice_debug}"
-        tts = self._sherpa_tts_models.get(cache_key)
+        cache_key = f"kokoro:{model_path}:{settings.voice_compute_device}:{settings.voice_debug}"
+        tts = self._kokoro_tts_models.get(cache_key)
         if tts is None:
-            rule_fsts = ",".join(
-                str(self.sherpa_tts_dir / name)
-                for name in ("phone.fst", "date.fst", "number.fst")
-                if (self.sherpa_tts_dir / name).is_file()
-            )
             config = sherpa_onnx.OfflineTtsConfig(
                 model=sherpa_onnx.OfflineTtsModelConfig(
-                    vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                    kokoro=sherpa_onnx.OfflineTtsKokoroModelConfig(
                         model=str(model_path),
-                        lexicon=str(lexicon),
+                        voices=str(voices),
                         tokens=str(tokens),
+                        lexicon=",".join(str(item) for item in lexicons),
+                        data_dir=str(data_dir),
                     ),
                     provider="cuda" if settings.voice_compute_device == "cuda" else "cpu",
                     debug=settings.voice_debug,
                     num_threads=2,
                 ),
-                rule_fsts=rule_fsts,
+                rule_fsts=",".join(str(self.kokoro_tts_dir / name) for name in ("phone-zh.fst", "date-zh.fst", "number-zh.fst")),
             )
             if not config.validate():
-                raise RuntimeError("轻量中文朗读模型配置无效。")
+                raise RuntimeError("Kokoro 中文朗读模型配置无效。")
             tts = sherpa_onnx.OfflineTts(config)
-            self._sherpa_tts_models[cache_key] = tts
-        generation = sherpa_onnx.GenerationConfig()
-        generation.sid = max(0, min(4, int(profile.get("speaker_id", 0))))
-        generation.speed = _clamp_float(profile.get("speed", settings.voice_speed), 0.75, 1.35)
-        audio = tts.generate(text, generation)
-        samples = getattr(audio, "samples", None)
-        sample_rate = int(getattr(audio, "sample_rate", 22_050) or 22_050)
-        if samples is None or len(samples) == 0:
-            raise RuntimeError("轻量语音模型没有生成有效音频。")
+            self._kokoro_tts_models[cache_key] = tts
         import numpy as np
 
-        samples_array = np.asarray(samples, dtype=np.float32)
+        units = _mandarin_speech_units(text)
+        if not units:
+            raise RuntimeError("没有可朗读的有效文字。")
+        generation = sherpa_onnx.GenerationConfig()
+        generation.sid = max(3, min(102, int(profile.get("kokoro_speaker_id", 3))))
+        base_speed = _clamp_float(profile.get("speed", settings.voice_speed), 0.75, 1.35)
+        natural_speed = _clamp_float(
+            base_speed * float(profile.get("kokoro_speed_multiplier", 1.0)),
+            0.75,
+            1.35,
+        )
+        pause_scale = _clamp_float(settings.voice_pause_scale, 0.6, 1.8)
+        sample_rate = 0
+        rendered: list[Any] = []
+        for phrase, pause in units:
+            phrase_speed = natural_speed
+            if phrase.endswith(("？", "?", "……", "…")):
+                phrase_speed *= 0.96
+            elif phrase.endswith(("！", "!")):
+                phrase_speed *= 1.02
+            elif len(phrase) > 55:
+                phrase_speed *= 0.98
+            generation.speed = _clamp_float(phrase_speed, 0.75, 1.35)
+            audio = tts.generate(phrase, generation)
+            samples = getattr(audio, "samples", None)
+            current_rate = int(getattr(audio, "sample_rate", 16_000) or 16_000)
+            if samples is None or len(samples) == 0:
+                raise RuntimeError("Kokoro 语音模型没有生成有效音频。")
+            if sample_rate and current_rate != sample_rate:
+                raise RuntimeError("Kokoro 在同一次朗读中返回了不同采样率。")
+            sample_rate = current_rate
+            phrase_samples = np.asarray(samples, dtype=np.float32)
+            fade_samples = min(len(phrase_samples) // 2, max(1, int(current_rate * 0.008)))
+            if fade_samples > 1:
+                phrase_samples[:fade_samples] *= np.linspace(0.15, 1.0, fade_samples, dtype=np.float32)
+                phrase_samples[-fade_samples:] *= np.linspace(1.0, 0.15, fade_samples, dtype=np.float32)
+            rendered.append(phrase_samples)
+            silence_samples = int(current_rate * pause * pause_scale)
+            if silence_samples:
+                rendered.append(np.zeros(silence_samples, dtype=np.float32))
+        samples_array = np.concatenate(rendered)
         samples_array = np.clip(samples_array * _clamp_float(profile.get("volume", settings.voice_volume), 0.25, 1.5), -1.0, 1.0)
         target_rate = int(settings.voice_sample_rate)
         if target_rate != sample_rate and samples_array.size > 1:
@@ -1156,25 +1313,36 @@ class VoiceRuntime:
         device = self._resolve_device(settings, torch)
         is_clone = profile.get("kind") == "clone"
         model_name = settings.voice_clone_model if is_clone else settings.voice_tts_model
+        model_path = self._qwen_model_path(model_name)
+        if model_path is None:
+            raise RuntimeError("Qwen 模型未准备完成；请在设置中确认安装或重新准备模型。朗读不会自动下载。")
         cache_key = f"{model_name}:{device}"
         model = self._tts_models.get(cache_key)
         if model is None:
+            self._tts_models.clear()
+            self._kokoro_tts_models.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
-            model = Qwen3TTSModel.from_pretrained(model_name, device_map=device, dtype=dtype)
+            model = Qwen3TTSModel.from_pretrained(str(model_path), device_map=device, dtype=dtype, local_files_only=True)
             self._tts_models[cache_key] = model
         if is_clone:
             wavs, sample_rate = model.generate_voice_clone(
-                text=text,
+                text=text.strip(),
                 language="Chinese",
                 ref_audio=str(profile["reference_audio"]),
                 ref_text=str(profile["reference_text"]),
             )
         else:
             wavs, sample_rate = model.generate_custom_voice(
-                text=text,
+                text=text.strip(),
                 language="Chinese",
                 speaker=str(profile["speaker"]),
-                instruct=str(profile.get("instruction") or "自然普通话。"),
+                instruct=(
+                    str(profile.get("instruction") or "自然普通话。")
+                    + " 按中文标点自然换气，逗号短停，句末完整停顿，避免逐字播报。"
+                ),
             )
         audio = np.asarray(wavs[0], dtype=np.float32)
         speed = _clamp_float(profile.get("speed", settings.voice_speed), 0.75, 1.35)

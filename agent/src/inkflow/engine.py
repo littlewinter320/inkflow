@@ -27,6 +27,7 @@ from .prompts import (
     SELECTION_REVISER_SYSTEM,
     WRITER_IDEATE_SYSTEM,
     WRITER_SYSTEM,
+    VOICE_CLONE_SCRIPT_WRITER_SYSTEM,
 )
 from .provider import JsonModelProvider
 from .render import render_memory_conflict, render_plan, render_review, render_state
@@ -45,6 +46,7 @@ from .schemas import (
     BookBrief,
     ContextPacket,
     ContextSection,
+    ContextUseAudit,
     CreativeBrainstorm,
     DraftOutput,
     EvidenceRepairBatch,
@@ -62,10 +64,19 @@ from .schemas import (
     VolumeArcPlan,
     VolumeCompass,
     VolumePlan,
+    VoiceCloneReadingScript,
 )
 from .studio import StudioService
 from .trace import TraceRecorder
 from .utils import atomic_write_text, content_hash, estimate_tokens, json_dumps, utc_now
+
+
+def _hook_planning_instruction(value: str) -> str:
+    return {
+        "most_chapters": "大多数章节卡都应给出与本章因果相连的 hook_question；普通章允许低强度期待，禁止为了悬念硬造反转。",
+        "key_chapters": "重点章节卡必须给出明确 hook_question；普通章可以用未完成行动、关系变化或信息差保持期待。",
+        "natural_afterglow": "章节卡优先自然余味；剧情需要时再设置强钩子，但每章仍应说明读者继续阅读的期待来自哪里。",
+    }.get(value, "大多数章节卡应给出自然的前向期待。")
 
 
 class InkFlowEngine:
@@ -73,13 +84,164 @@ class InkFlowEngine:
         self.provider = provider
         self.settings = settings or Settings.from_env()
 
-    def _context_builder(self, project: InkFlowProject) -> ContextBuilder:
+    async def generate_voice_clone_script(self, root: str | Path) -> dict[str, Any]:
+        """Writer-only auxiliary material: one packet, no novel or audio content."""
+        project = InkFlowProject(root)
+        content = (
+            "生成通用普通话声音克隆朗读稿，严格控制在 180～400 字。"
+            "用连贯自然的短场景覆盖常用发音、平翘舌、前后鼻音、声调、长短句与语气。"
+            "使用汉字写日期、数量和金额，避免数字缩写导致录音原文不一致。"
+            "不使用本书人物、剧情或用户私人信息，不读取参考音频。"
+        )
+        packet = ContextPacket(
+            project_id=project.project_id,
+            chapter_no=0,
+            task="生成声音克隆参考朗读稿",
+            sections=[ContextSection(key="voice", title="朗读材料要求", content=content, source_ids=["user:current"], hard=True)],
+            estimated_tokens=estimate_tokens(content),
+        )
+        result = await self.provider.generate_json(
+            system_prompt=VOICE_CLONE_SCRIPT_WRITER_SYSTEM,
+            user_prompt=packet.to_markdown(),
+            output_model=VoiceCloneReadingScript,
+            effort="low",
+            max_tokens=1500,
+            thinking=False,
+            agent_role="writer",
+        )
+        return {**result.data.model_dump(mode="json"), "model": result.model}
+
+    def _context_builder(self, project: InkFlowProject, role: str = "writer") -> ContextBuilder:
+        soft_limit, hard_limit = self.settings.context_budget_for(role)
         return ContextBuilder(
             project,
-            self.settings.context_soft_tokens,
-            hard_token_limit=self.settings.context_hard_tokens,
+            soft_limit,
+            hard_token_limit=hard_limit,
             embedding_model=self.settings.retrieval_embedding_model,
             reranker_model=self.settings.retrieval_reranker_model,
+            hook_strategy=self.settings.hook_strategy,
+            review_experience_detail=self.settings.review_experience_detail,
+        )
+
+    @staticmethod
+    def _writer_skills(packet: ContextPacket, *built_in: str) -> list[str]:
+        selected: list[str] = []
+        section = next((item for item in packet.sections if item.key == "I"), None)
+        if section is not None:
+            try:
+                guides = json.loads(section.content)
+            except json.JSONDecodeError:
+                guides = []
+            if isinstance(guides, list):
+                selected.extend(
+                    str(item.get("技能") or item.get("技能编号") or "").strip()
+                    for item in guides
+                    if isinstance(item, dict)
+                )
+        return list(dict.fromkeys(item for item in [*selected, *built_in] if item))
+
+    @staticmethod
+    def _save_writer_context_manifest(
+        project: InkFlowProject,
+        *,
+        chapter_no: int,
+        chapter_version: int,
+        run_id: str,
+        packet: ContextPacket,
+        active_skills: list[str],
+    ) -> dict[str, Any]:
+        for artifact in project.db.list_agent_artifacts(
+            chapter_no=chapter_no, artifact_type="writer_context_manifest", limit=20
+        ):
+            if artifact.get("status") == "current":
+                project.db.set_agent_artifact_status(str(artifact["artifact_id"]), "superseded")
+        return project.db.save_agent_artifact(
+            artifact_type="writer_context_manifest",
+            run_id=run_id,
+            role="writer",
+            data={
+                "context_packet_id": content_hash(packet.to_markdown()),
+                "task": packet.task,
+                "estimated_tokens": packet.estimated_tokens,
+                "writing_guides": active_skills,
+                "sections": [
+                    {
+                        "key": section.key,
+                        "title": section.title,
+                        "authority": "hard" if section.hard else "soft",
+                        "source_ids": section.source_ids,
+                    }
+                    for section in packet.sections
+                ],
+            },
+            chapter_no=chapter_no,
+            chapter_version=chapter_version,
+            dimension="context_sources",
+            status="current",
+        )
+
+    @staticmethod
+    def _save_hook_note(
+        project: InkFlowProject,
+        *,
+        chapter_no: int,
+        chapter_version: int,
+        run_id: str,
+        draft: DraftOutput,
+        card: dict[str, Any],
+    ) -> dict[str, Any]:
+        note = draft.hook_note.model_dump(mode="json") if draft.hook_note else {}
+        note = {
+            "hook_type": note.get("hook_type") or card.get("hook_type") or "",
+            "strength": note.get("strength") or card.get("hook_strength") or "medium",
+            "actual_anchor": note.get("actual_anchor") or card.get("hook_anchor") or "",
+            "reader_expectation": note.get("reader_expectation") or card.get("hook_question") or "",
+            "why_keep": note.get("why_keep") or "承接本章结果，并为下一步行动保留阅读期待。",
+            "intentionally_withheld": note.get("intentionally_withheld") or card.get("withholding_boundary") or "",
+            "must_be_clear": note.get("must_be_clear") or card.get("irreversible_delta") or "",
+            "planned_followup": note.get("planned_followup") or card.get("payoff_window") or "",
+        }
+        for artifact in project.db.list_agent_artifacts(
+            chapter_no=chapter_no, artifact_type="writer_hook_note", limit=20
+        ):
+            if artifact.get("status") == "current":
+                project.db.set_agent_artifact_status(str(artifact["artifact_id"]), "superseded")
+        return project.db.save_agent_artifact(
+            artifact_type="writer_hook_note",
+            run_id=run_id,
+            role="writer",
+            data=note,
+            chapter_no=chapter_no,
+            chapter_version=chapter_version,
+            dimension="reader_hook",
+            status="current",
+        )
+
+    @staticmethod
+    def _save_scene_blueprint(
+        project: InkFlowProject,
+        *,
+        chapter_no: int,
+        chapter_version: int,
+        run_id: str,
+        draft: DraftOutput,
+    ) -> dict[str, Any] | None:
+        if not draft.scene_blueprint:
+            return None
+        for artifact in project.db.list_agent_artifacts(
+            chapter_no=chapter_no, artifact_type="writer_scene_blueprint", limit=20
+        ):
+            if artifact.get("status") == "current":
+                project.db.set_agent_artifact_status(str(artifact["artifact_id"]), "superseded")
+        return project.db.save_agent_artifact(
+            artifact_type="writer_scene_blueprint",
+            run_id=run_id,
+            role="writer",
+            data={"scenes": [item.model_dump(mode="json") for item in draft.scene_blueprint]},
+            chapter_no=chapter_no,
+            chapter_version=chapter_version,
+            dimension="scene_blueprint",
+            status="current",
         )
 
     async def brainstorm(self, root: str | Path, prompt: str, packet: ContextPacket) -> dict[str, Any]:
@@ -166,6 +328,7 @@ class InkFlowEngine:
                     content=(
                         "只输出 PlanBundle JSON。每张章节卡目标字数接近 target_chapter_words；"
                         "第一卷篇章摘要应覆盖该卷，但只为第一篇章生成详细章节卡。"
+                        + _hook_planning_instruction(self.settings.hook_strategy)
                     ),
                     hard=True,
                 ),
@@ -553,6 +716,7 @@ class InkFlowEngine:
                         "同卷时只输出 ArcPlan JSON；若打开下一卷则输出 VolumeArcPlan JSON。"
                         "只细化一个篇章，章节卡必须连续并逐章包含目标、阻力、决定、后果、"
                         "不可逆变化和有轮换的章末钩子。"
+                        + _hook_planning_instruction(self.settings.hook_strategy)
                     ),
                     hard=True,
                 ),
@@ -739,7 +903,7 @@ class InkFlowEngine:
                 f"本章创意镜头软建议：{creative_lens}。只有在不违背正史、章节卡和人物动机时采用；"
                 "它用于改变信息呈现方式，不得凭空增加事件。"
             )
-            packet = self._context_builder(project).build(
+            packet = self._context_builder(project, "writer").build(
                 chapter_no, task, mode="draft", provisional_chapters=provisional_chapters
             )
             packet_path = trace.run_dir / "context-packet.md"
@@ -754,12 +918,12 @@ class InkFlowEngine:
                     "creative_lens": creative_lens,
                 },
             )
-            active_skills = ["章节卡履约", "场景动作落地", "自然中文正文"]
+            active_skills = self._writer_skills(packet, "自然中文正文")
             trace.record(
                 "writer.skills",
                 "completed",
-                "写作角色已装载三项轻量技能；创意镜头和用户文风优先",
-                metadata={"skills": active_skills, "extra_model_calls": 0},
+                "写作角色已装载 Context Packet 实际选中的写作引导",
+                metadata={"skills": active_skills, "skill_contract_version": "1", "packet_section": "I", "extra_model_calls": 0},
             )
             result = await self.provider.generate_json(
                 system_prompt=WRITER_SYSTEM,
@@ -776,6 +940,29 @@ class InkFlowEngine:
             relative = Path("chapters") / f"chapter_{chapter_no:05d}.draft.md"
             atomic_write_text(project.root / relative, chapter_text)
             version = project.db.upsert_draft(chapter_no, chapter_title, relative.as_posix(), chapter_text)
+            hook_artifact = self._save_hook_note(
+                project,
+                chapter_no=chapter_no,
+                chapter_version=version,
+                run_id=trace.run_id,
+                draft=draft,
+                card=card,
+            )
+            blueprint_artifact = self._save_scene_blueprint(
+                project,
+                chapter_no=chapter_no,
+                chapter_version=version,
+                run_id=trace.run_id,
+                draft=draft,
+            )
+            context_manifest = self._save_writer_context_manifest(
+                project,
+                chapter_no=chapter_no,
+                chapter_version=version,
+                run_id=trace.run_id,
+                packet=packet,
+                active_skills=active_skills,
+            )
             project.db.resolve_pending_collaboration(chapter_no=chapter_no, recipient_role="writer")
             project.db.append_collaboration_message(
                 thread_id=f"chapter-{chapter_no:05d}-v{version}",
@@ -787,7 +974,17 @@ class InkFlowEngine:
                 chapter_version=version,
                 context_packet_id=content_hash(packet.to_markdown()),
                 claim=f"第 {chapter_no} 章草稿 v{version} 已完成，等待独立审查。",
-                evidence_refs=[relative.as_posix(), f"plan:chapter:{chapter_no:05d}"],
+                evidence_refs=[
+                    relative.as_posix(),
+                    f"plan:chapter:{chapter_no:05d}",
+                    f"artifact:{hook_artifact['artifact_id']}",
+                    f"artifact:{context_manifest['artifact_id']}",
+                    *(
+                        [f"artifact:{blueprint_artifact['artifact_id']}"]
+                        if blueprint_artifact
+                        else []
+                    ),
+                ],
                 requested_response="按当前版本和 Context Packet 给出带证据审查；不直接修改正文。",
             )
             trace.record(
@@ -804,6 +1001,9 @@ class InkFlowEngine:
                 "title": chapter_title,
                 "draft_path": str(project.root / relative),
                 "decision_summary": draft.decision_summary,
+                "hook_note": hook_artifact["data"],
+                "scene_blueprint": blueprint_artifact["data"] if blueprint_artifact else None,
+                "context_manifest": context_manifest["data"],
                 "skills_used": active_skills,
                 "trace_id": trace.run_id,
                 "next_action": "审查章节",
@@ -881,17 +1081,44 @@ class InkFlowEngine:
                     "next_action": "按审查意见修改章节",
                     "model_skipped": True,
                 }
-            packet = self._context_builder(project).build(
+            packet = self._context_builder(project, "reviewer").build(
                 chapter_no,
                 f"审查第 {chapter_no} 章草稿",
                 mode="review",
                 provisional_chapters=provisional_chapters,
                 protected_input=content,
             )
+            hook_note = next(
+                (
+                    item["data"]
+                    for item in project.db.list_agent_artifacts(
+                        chapter_no=chapter_no, artifact_type="writer_hook_note", limit=20
+                    )
+                    if int(item.get("chapter_version") or 0) == int(chapter["version"])
+                ),
+                None,
+            )
+            scene_blueprint = next(
+                (
+                    item["data"]
+                    for item in project.db.list_agent_artifacts(
+                        chapter_no=chapter_no, artifact_type="writer_scene_blueprint", limit=20
+                    )
+                    if int(item.get("chapter_version") or 0) == int(chapter["version"])
+                ),
+                None,
+            )
             user_prompt = (
                 packet.to_markdown()
                 + "\n\n# 待审正文\n\n"
                 + content
+                + "\n\n# Writer 版本说明（版本绑定的协作资料，不是正文或正史）\n\n"
+                + json_dumps(
+                    {
+                        "hook_note": hook_note or {"说明": "当前版本没有单独钩子说明，请直接依据正文判断。"},
+                        "scene_blueprint": scene_blueprint,
+                    }
+                )
                 + "\n\n# 代码层指标\n\n"
                 + json_dumps(metrics)
             )
@@ -905,6 +1132,15 @@ class InkFlowEngine:
                 agent_role="reviewer",
             )
             model_report = result.data
+            available_source_ids = {
+                source_id for section in packet.sections for source_id in section.source_ids
+            }
+            context_use_audit = ContextUseAudit(
+                used_source_ids=[item for item in model_report.context_use_audit.used_source_ids if item in available_source_ids],
+                missing_required_source_ids=[item for item in model_report.context_use_audit.missing_required_source_ids if item in available_source_ids],
+                conflicting_source_ids=[item for item in model_report.context_use_audit.conflicting_source_ids if item in available_source_ids],
+                summary=model_report.context_use_audit.summary,
+            )
             verified, verdict = await self._verify_review_output(
                 project,
                 model_report,
@@ -924,6 +1160,8 @@ class InkFlowEngine:
                 findings=findings,
                 scorecard=_build_review_scorecard(findings),
                 source_hash=content_hash(content),
+                hook_assessment=model_report.hook_assessment,
+                context_use_audit=context_use_audit,
             )
             trace.record_model("review.model", result, f"综合审查结论：{report.verdict}")
             relative = Path("reviews") / f"chapter_{chapter_no:05d}.review.md"
@@ -948,6 +1186,10 @@ class InkFlowEngine:
                 "findings": [item.model_dump(mode="json") for item in report.findings],
                 "score_total": _score_total(report.scorecard),
                 "scorecard": [item.model_dump(mode="json") for item in report.scorecard],
+                "hook_assessment": (
+                    report.hook_assessment.model_dump(mode="json") if report.hook_assessment else None
+                ),
+                "context_use_audit": report.context_use_audit.model_dump(mode="json"),
                 "review_path": str(project.root / relative),
                 "trace_id": trace.run_id,
                 "next_action": "接受章节" if report.verdict == "pass" else "按审查意见修改章节",
@@ -1170,12 +1412,14 @@ class InkFlowEngine:
                 f"构建唯一 Context Packet，估算 {packet.estimated_tokens} tokens",
                 metadata={"sections": [section.key for section in packet.sections], "warnings": packet.warnings},
             )
-            active_skills = ["证据定点修订", "回归连续性扫描", "自然中文正文"]
+            active_skills = self._writer_skills(
+                packet, "证据定点修订", "回归连续性扫描", "自然中文正文"
+            )
             trace.record(
                 "writer.skills",
                 "completed",
                 "写作角色已装载修订技能；只修有依据的问题并保留有效声线",
-                metadata={"skills": active_skills, "extra_model_calls": 0},
+                metadata={"skills": active_skills, "skill_contract_version": "1", "packet_section": "I", "extra_model_calls": 0},
             )
             user_prompt = (
                 packet.to_markdown()
@@ -1206,6 +1450,53 @@ class InkFlowEngine:
                 Path(chapter["path"]).as_posix(),
                 chapter_text,
             )
+            hook_artifact = self._save_hook_note(
+                project,
+                chapter_no=chapter_no,
+                chapter_version=version,
+                run_id=trace.run_id,
+                draft=draft,
+                card=card,
+            )
+            blueprint_artifact = self._save_scene_blueprint(
+                project,
+                chapter_no=chapter_no,
+                chapter_version=version,
+                run_id=trace.run_id,
+                draft=draft,
+            )
+            context_manifest = self._save_writer_context_manifest(
+                project,
+                chapter_no=chapter_no,
+                chapter_version=version,
+                run_id=trace.run_id,
+                packet=packet,
+                active_skills=active_skills,
+            )
+            project.db.resolve_pending_collaboration(chapter_no=chapter_no, recipient_role="writer")
+            project.db.append_collaboration_message(
+                thread_id=f"chapter-{chapter_no:05d}-v{version}",
+                run_id=trace.run_id,
+                sender_role="writer",
+                recipient_role="reviewer",
+                message_type="handoff",
+                chapter_no=chapter_no,
+                chapter_version=version,
+                context_packet_id=content_hash(packet.to_markdown()),
+                claim=f"第 {chapter_no} 章修订稿 v{version} 已完成，旧版审查不再具有放行效力。",
+                evidence_refs=[
+                    Path(chapter["path"]).as_posix(),
+                    f"review:chapter:{chapter_no:05d}:v{previous_version}",
+                    f"artifact:{hook_artifact['artifact_id']}",
+                    f"artifact:{context_manifest['artifact_id']}",
+                    *(
+                        [f"artifact:{blueprint_artifact['artifact_id']}"]
+                        if blueprint_artifact
+                        else []
+                    ),
+                ],
+                requested_response="只审查当前修订版本，并重新核对钩子意图、事实锚点和延迟揭示边界。",
+            )
             project.db.record_learning_event(
                 "revised",
                 {"previous_version": previous_version, "new_version": version, "source": "reviewer_or_user"},
@@ -1227,6 +1518,9 @@ class InkFlowEngine:
                 "title": chapter_title,
                 "draft_path": str(draft_path),
                 "decision_summary": draft.decision_summary,
+                "hook_note": hook_artifact["data"],
+                "scene_blueprint": blueprint_artifact["data"] if blueprint_artifact else None,
+                "context_manifest": context_manifest["data"],
                 "skills_used": active_skills,
                 "trace_id": trace.run_id,
                 "next_action": "重新审查当前版本",
@@ -1569,6 +1863,24 @@ class InkFlowEngine:
             f"当前来源状态：{source_status}。请从第 {chapter_no} 章{source_description}中提取 MemoryPatch JSON。\n\n"
             f"# {state_description}\n{json_dumps(current_state)}\n\n# 当前正文\n{content}"
         )
+        memory_soft_limit, memory_hard_limit = self.settings.context_budget_for("memory_keeper")
+        memory_input_tokens = estimate_tokens(user_prompt)
+        if memory_input_tokens > memory_hard_limit:
+            raise ValidationGateError(
+                "Memory Keeper 的已接受正文与正史证据超过自定义最大上下文；"
+                "为避免静默丢失正史，没有自动截断。请提高 Memory Keeper 最大上下文预算。"
+            )
+        if memory_input_tokens > memory_soft_limit:
+            trace.record(
+                "memory.context",
+                "warning",
+                "Memory Keeper 输入超过常用预算，但仍在最大容量内；完整正史证据已保留",
+                metadata={
+                    "estimated_tokens": memory_input_tokens,
+                    "soft_limit_tokens": memory_soft_limit,
+                    "hard_limit_tokens": memory_hard_limit,
+                },
+            )
         result = await self.provider.generate_json(
             system_prompt=MEMORY_SYSTEM,
             user_prompt=user_prompt,
@@ -2314,7 +2626,7 @@ class InkFlowEngine:
                 end_chapter_no,
                 batch_id=batch_id,
             )
-            packet = self._context_builder(project).build_arc_audit(
+            packet = self._context_builder(project, "reviewer").build_arc_audit(
                 start_chapter_no,
                 end_chapter_no,
                 provisional_chapters=provisional,

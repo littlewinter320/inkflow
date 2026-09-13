@@ -83,8 +83,8 @@ jobs:
             $_.Name -eq "InkFlow-Setup-$version.exe.blockmap" -or
             $_.Name -eq "latest.yml"
           } | ForEach-Object { $_.FullName })
-          if (-not ($assets | Where-Object { $_ -like "*latest.yml" }) -or -not ($assets | Where-Object { $_ -like "*.exe" })) {
-            throw "The desktop build did not produce the installer and latest.yml required by electron-updater."
+          if (-not ($assets | Where-Object { $_ -like "*latest.yml" }) -or -not ($assets | Where-Object { $_ -like "*.exe" }) -or -not ($assets | Where-Object { $_ -like "*.exe.blockmap" })) {
+            throw "The desktop build must produce the installer, latest.yml and .exe.blockmap for differential updates."
           }
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {

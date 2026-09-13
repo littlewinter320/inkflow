@@ -31,7 +31,8 @@ _GUIDES = (
         triggers=("钩子", "伏笔", "回收", "兑现", "承诺", "foreshadow", "payoff", "hook"),
         instruction=(
             "本章至少推进或兑现一项既有承诺，再由本章新后果制造一个具体信息差。"
-            "钩子要让读者知道自己在等什么，并让人物已经朝答案行动；不要另起与正文无关的突发事件。"
+            "钩子要落在正文已经发生的决定、代价、物件或关系变化上，让读者知道自己在等什么，并让人物已经朝答案行动；"
+            "按章节卡区分可暂缓回答的秘密与本章必须说清的事实，不要另起与正文无关的突发事件。"
         ),
         basis="明确且可估计的信息缺口更容易引发求知；悬念规划需要追踪事件、读者预期与可能结果。",
     ),
@@ -93,19 +94,24 @@ def select_craft_guides(
         for index, guide in enumerate(_GUIDES)
     ]
     scored.sort(key=lambda item: (-item[0], item[1]))
-    selected = [guide for score, _, guide in scored if score > 0][: max(1, min(limit, 3))]
+    slot_count = max(1, min(limit, 3))
+    selected = [guide for score, _, guide in scored if score > 0][:slot_count]
     psychology = next(guide for guide in _GUIDES if guide.key == "social-emotion")
     explicit_psychology = any(trigger in task.casefold() for trigger in psychology.triggers)
     if explicit_psychology and psychology not in selected:
-        selected = [*selected[: max(0, min(limit, 3) - 1)], psychology]
+        selected = [*selected[: max(0, slot_count - 1)], psychology]
     if not selected:
-        selected = [_GUIDES[0], _GUIDES[1]][: max(1, min(limit, 2))]
+        selected = [_GUIDES[0], _GUIDES[1]][: max(1, min(slot_count, 2))]
+    hook_guide = next(guide for guide in _GUIDES if guide.key == "hook-thread-lifecycle")
+    if str(card.get("hook_question") or "").strip() and hook_guide not in selected:
+        selected = [hook_guide, *[guide for guide in selected if guide != hook_guide]][:slot_count]
     return [
         {
             "技能": guide.name,
             "本章如何使用": guide.instruction,
             "依据摘要": guide.basis,
             "技能编号": guide.key,
+            "技能版本": "1",
         }
         for guide in selected
     ]

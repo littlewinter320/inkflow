@@ -904,10 +904,61 @@ class StudioService:
     def chapter_workspace(self, chapter_no: int) -> dict[str, Any]:
         card = self.project.db.get_chapter_card(chapter_no)
         record = self.project.db.get_chapter(chapter_no)
+        review_record = self.project.db.latest_review_record(chapter_no)
+        artifacts = self.project.db.list_agent_artifacts(chapter_no=chapter_no, limit=30)
+        current_version = int(record["version"]) if record else None
+        current_hook = next(
+            (
+                item
+                for item in artifacts
+                if item.get("artifact_type") == "writer_hook_note"
+                and int(item.get("chapter_version") or 0) == int(current_version or 0)
+            ),
+            None,
+        )
+        current_blueprint = next(
+            (
+                item
+                for item in artifacts
+                if item.get("artifact_type") == "writer_scene_blueprint"
+                and int(item.get("chapter_version") or 0) == int(current_version or 0)
+            ),
+            None,
+        )
+        current_context_manifest = next(
+            (
+                item
+                for item in artifacts
+                if item.get("artifact_type") == "writer_context_manifest"
+                and int(item.get("chapter_version") or 0) == int(current_version or 0)
+            ),
+            None,
+        )
+        review = None
+        if review_record:
+            review = {
+                "chapter_version": review_record["chapter_version"],
+                "path": review_record["path"],
+                "report": review_record["report"].model_dump(mode="json"),
+                "matches_current_version": review_record["chapter_version"] == current_version,
+            }
         return {
             "chapter_no": chapter_no,
             "card": card,
             "record": record,
+            "review": review,
+            "hook_note": current_hook["data"] if current_hook else None,
+            "scene_blueprint": current_blueprint["data"] if current_blueprint else None,
+            "context_manifest": current_context_manifest["data"] if current_context_manifest else None,
+            "context_pins": self.db.list_context_pins(chapter_no),
+            "can_accept": bool(
+                record
+                and record.get("status") == "draft"
+                and review
+                and review["matches_current_version"]
+                and review["report"].get("verdict") == "pass"
+            ),
+            "active_preferences": self.project.db.list_preferences(),
             "scene_notes": self.db.scene_notes(chapter_no),
             "inherited_facts": self.project.db.current_facts(),
             "open_threads": self.project.db.open_threads(),

@@ -70,8 +70,15 @@ type EngineEvent = {
   method?: string;
   action?: string;
   timestamp?: string;
+  task_ticket?: Record<string, unknown>;
+  dispatch_plan?: {
+    workflow?: string;
+    steps?: Array<Record<string, unknown>>;
+    stop_conditions?: string[];
+  };
 };
 type Message = { id: string; role: "user" | "assistant" | "system"; text: string; details?: string; reasoning?: string[]; animate?: boolean; createdAt?: string };
+type StagedIntervention = { id: string; message: string; queuedAt: string };
 type ConversationHistoryEntry = { id: string; user: string; assistant: string; action_note: string; recorded_at: string };
 type SuggestedPromptItem = { label: string; prompt: string };
 
@@ -123,6 +130,7 @@ type UpdateInfo = { status?: string; currentVersion?: string; availableVersion?:
 type AgentRole = "coordinator" | "writer" | "reviewer" | "memory_keeper";
 type AgentGeneration = { temperature: number; top_p: number; top_k: number | null };
 type AgentGenerationProfiles = Record<AgentRole, AgentGeneration>;
+type AgentContextBudgets = Record<AgentRole, { soft: number; hard: number }>;
 type ContextStatus = {
   status: "idle" | "safe" | "watch" | "near_limit";
   estimated_tokens: number;
@@ -139,9 +147,12 @@ type ContextStatus = {
 };
 type CanonMigration = { required: boolean; confirmation_token: string; accepted_chapter_count: number; impact: string; backup_path?: string; unresolved_chapters?: number[]; message?: string };
 type CollaborationMessage = { message_id: string; sender_role: string; recipient_role: string; message_type: string; claim: string; status: string; chapter_no?: number; chapter_version?: number; created_at: string };
+type TraceReference = { label: string; absolute_path: string; relative_path: string; exists: boolean };
+type TraceStep = { timestamp: string; stage: string; status: string; summary: string; details?: string; metadata?: Record<string, unknown>; references?: TraceReference[] };
+type TraceRun = { run_id: string; operation: string; status: string; summary: string; started_at: string; finished_at: string; events: TraceStep[]; trace_reference?: TraceReference };
 type BatchSummary = { batch_id: string; status: string; start_chapter_no?: number; end_chapter_no?: number; chapters: Array<{ chapter_no?: number; version?: number; review_verdict?: string; memory_status?: string }> };
 type LearningEvent = { event_id: string; event_type: string; chapter_no?: number; created_at: string; payload: Record<string, unknown> };
-type CollaborationOverview = { messages: CollaborationMessage[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; usage?: { calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; estimated_cost: number; currency: string; pricing_configured: boolean } };
+type CollaborationOverview = { messages: CollaborationMessage[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; trace_runs?: TraceRun[]; usage?: { calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; estimated_cost: number; currency: string; pricing_configured: boolean } };
 type PrefillResult = { insertion: string; document_hash: string; cursor_offset: number; confidence: string };
 type WorkspacePreset = "balanced" | "writing" | "planning" | "review";
 type WorkspaceResizeTarget = "navigation" | "assistant" | "inspector";
@@ -272,6 +283,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [projectLoading, setProjectLoading] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [stagedIntervention, setStagedIntervention] = useState<StagedIntervention | null>(null);
   const [mascotMood, setMascotMood] = useState<MascotMood>("idle");
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>(loadRecentProjects);
   const [notice, setNotice] = useState("");
@@ -771,8 +783,40 @@ function App() {
   const sendChat = async (event?: FormEvent, overrideMessage?: string) => {
     event?.preventDefault();
     const message = (overrideMessage ?? chatInput).trim();
-    if (!message || !projectRoot || busy) return;
+    if (!message || !projectRoot) return;
+    if (busy) {
+      if (!stagedIntervention || stagedIntervention.message !== message) {
+        setStagedIntervention({
+          id: crypto.randomUUID(),
+          message,
+          queuedAt: new Date().toISOString(),
+        });
+        setMascotMood("waiting");
+        setNotice("引导提示已暂存。请再次点击“确认引导”才会在当前模型步骤结束后的安全节点交给 Coordinator；继续修改文字会取消本次确认。");
+        return;
+      }
+      const intervention = stagedIntervention;
+      setStagedIntervention(null);
+      setChatInput("");
+      setPromptOptimization(null);
+      setPromptUndo(null);
+      setError("");
+      setMessages((items) => [...items, { id: intervention.id, role: "user", text: message, createdAt: intervention.queuedAt }]);
+      setMascotMood("waiting");
+      if (activeRunId) {
+        setNotice("引导已确认。当前模型步骤结束后，Coordinator 会用它校正后续判断；不会展示原始思维链。 ");
+        void window.inkflow.request<{ accepted: boolean; reason?: string }>("run.steer", { run_id: activeRunId, message }).then((result) => {
+          if (!result.accepted) setNotice(result.reason === "unsupported_run" ? "这项固定工作流已启动，不能在中途改写其参数；如需改变方向，请停止后按“发送”让 Coordinator 重新安排。" : "当前任务已经结束，这条引导没有送入旧任务；请按“发送”开启下一轮。");
+        }).catch((cause) => {
+          setError(errorMessage(cause));
+        });
+      } else {
+        setNotice("当前没有可引导的运行任务；这条内容尚未发送。请在任务开始后再确认引导。 ");
+      }
+      return;
+    }
     setChatInput("");
+    setStagedIntervention(null);
     setPromptOptimization(null);
     setPromptUndo(null);
     setError("");
@@ -783,7 +827,10 @@ function App() {
     setActiveRunId(runId);
     let assistantReply = "";
     try {
-      const result = await request<unknown>("conversation.send", { message, run_id: runId });
+      const result = await request<unknown>("conversation.send", {
+        message,
+        run_id: runId,
+      });
       const visible = visibleResult(result);
       assistantReply = visible.summary;
       const questionSource = result && typeof result === "object" ? (result as Record<string, unknown>).questions : null;
@@ -899,11 +946,16 @@ function App() {
       setMascotMood("waiting");
       return;
     }
-    if (action === "accept" && !window.confirm("验收会让记忆角色将本章提交为正史。确认继续吗？")) {
+    const acceptanceMode = String(provider?.acceptance_confirmation_mode || "per_chapter");
+    if (action === "accept" && acceptanceMode === "per_chapter" && !window.confirm("验收会让 Memory Keeper 将本章提交为正史。确认继续吗？")) {
       setMascotMood("waiting");
       return;
     }
-    if (action === "batch_accept" && !window.confirm("接收批次会按连续章节顺序把已审核内容及其临时记忆提交正史。确认继续吗？")) {
+    if (action === "batch_accept" && acceptanceMode !== "auto_after_review" && !window.confirm("本批次只提交当前版本已通过 Reviewer 的章节，并按顺序写入正史。确认继续吗？")) {
+      setMascotMood("waiting");
+      return;
+    }
+    if (action === "batch_draft" && acceptanceMode === "batch_once" && !window.confirm(`将生成第 ${String(extra.start_chapter_no || "?")}～${String(extra.end_chapter_no || "?")} 章；只有连续通过 Reviewer 的当前版本才会在本批结束后进入正史。确认本批一次授权吗？`)) {
       setMascotMood("waiting");
       return;
     }
@@ -917,6 +969,7 @@ function App() {
         action,
         run_id: runId,
         ...(chapterNo ? { chapter_no: chapterNo } : {}),
+        authorization_source: action === "batch_accept" || (action === "batch_draft" && acceptanceMode === "batch_once") ? "batch_preapproval" : action === "accept" ? "per_chapter_click" : acceptanceMode === "auto_after_review" && ["review", "batch_draft"].includes(action) ? "settings_auto_accept" : "current_request",
         ...extra,
       });
       const visible = visibleResult(result);
@@ -925,6 +978,20 @@ function App() {
         { id: crypto.randomUUID(), role: "assistant", text: visible.summary, details: visible.details, reasoning: visible.reasoning, animate: true },
       ]);
       await refresh();
+      const resultRecord = result && typeof result === "object" ? result as Record<string, unknown> : {};
+      const targetPath = String(resultRecord.review_path || resultRecord.draft_path || "");
+      if (targetPath) {
+        const normalizedRoot = projectRoot.replace(/\\/g, "/").replace(/\/$/, "");
+        const normalizedTarget = targetPath.replace(/\\/g, "/");
+        const relativePath = normalizedTarget.toLowerCase().startsWith(`${normalizedRoot.toLowerCase()}/`)
+          ? normalizedTarget.slice(normalizedRoot.length + 1)
+          : normalizedTarget;
+        const loaded = await request<DocumentData>("document.read", { relative_path: relativePath });
+        setDocument(loaded); setText(loaded.content); setSavedText(loaded.content); setCompareContent(action === "revise" ? text : null);
+        setActiveTab(relativePath.startsWith("reviews/") ? "review" : "editor");
+        const openedChapter = currentChapter(relativePath);
+        if (openedChapter) setChapterWorkspace(await request<Record<string, unknown>>("chapter.workspace", { chapter_no: openedChapter }));
+      }
       setMascotMood("success");
     } catch (cause) {
       const messageText = errorMessage(cause);
@@ -1012,7 +1079,7 @@ function App() {
             <button onClick={openFolder}>打开项目</button>
           </div>
           <div className="welcome-meta">
-            <span>版本 {String(appInfo?.version || "0.5.3")}</span>
+            <span>版本 {String(appInfo?.version || "0.6.0")}</span>
             <span>{provider?.api_key_configured ? "模型已配置" : "尚未配置模型 Key"}</span>
             <button className="text-button" onClick={() => setShowSettings(true)}>模型设置</button>
             <button className="text-button" onClick={() => setShowUpdate(true)}>检查更新</button>
@@ -1028,7 +1095,7 @@ function App() {
             </section>
           )}
         </div>
-        {error && <Toast kind="error" text={error} onClose={() => { setError(""); setMascotMood("idle"); }} />}
+        {error && <Toast kind="error" text={error} onClose={() => { setError(""); setMascotMood("idle"); }} action={{ label: "打开设置", onClick: () => setShowSettings(true) }} />}
         {showCreate && <CreateProject onClose={() => setShowCreate(false)} onCreated={openProject} />}
         {showSettings && <SettingsDialog projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} layout={workspaceLayout} preferences={uiPreferences} onLayoutChange={updateWorkspaceLayout} onLayoutPreset={applyWorkspacePreset} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
         {showUpdate && <UpdateDialog info={updateInfo} onClose={() => setShowUpdate(false)} />}
@@ -1133,12 +1200,16 @@ function App() {
                 </div>
               </article>
             ))}
-            {busy && activeRunId && <article className="message assistant pending" aria-live="polite"><span className="avatar">墨</span><div><p>{[...events].reverse().find(item => item.run_id === activeRunId && item.summary)?.summary || "已收到，先理解你的目标，再把回答或需要确认的问题发在这里。"}</p><small>完成后直接显示答复；也可随时停止。</small></div></article>}
+            {busy && activeRunId && <article className="message assistant pending" aria-live="polite"><span className="avatar">墨</span><div><p>{[...events].reverse().find(item => item.run_id === activeRunId && item.summary)?.summary || "已收到，先理解你的目标，再把回答或需要确认的问题发在这里。"}</p><details className="live-guidance"><summary>查看当前判断依据</summary><p>Coordinator 正在核对目标、已有设定、章节与版本、正史边界和本次授权；这里只展示可复核的阶段摘要，不展示模型原始思维链。</p><small>当前阶段：{[...events].reverse().find(item => item.run_id === activeRunId && item.summary)?.summary || "正在建立任务上下文"}</small></details><small>你可在下方写入引导：首次“发送引导”只暂存，第二次“确认引导”才会在安全节点用于修正后续处理。</small></div></article>}
           </div>
           <form className="composer" onSubmit={sendChat}>
             <textarea
               value={chatInput}
-              onChange={(event) => setChatInput(event.target.value)}
+              onChange={(event) => {
+                const value = event.target.value;
+                setChatInput(value);
+                if (stagedIntervention && value.trim() !== stagedIntervention.message) setStagedIntervention(null);
+              }}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
                   event.preventDefault();
@@ -1147,6 +1218,9 @@ function App() {
               }}
               placeholder="例如：先给我看第 8～12 章的章节卡，再批量写草稿并逐章审查；不要验收。"
             />
+            {stagedIntervention && <div className="intervention-preview" role="status">
+              <strong>引导待确认</strong><span>再次点击“确认引导”才会发送；修改文字会取消确认。</span>
+            </div>}
             {promptOptimization && <div className="prompt-optimization-preview">
               <div><strong>提示词已优化</strong><span>{promptOptimization.change_summary.join(" · ")}</span></div>
               <details><summary>对比原文与保留约束</summary><p><b>原文：</b>{promptOptimization.original_prompt}</p>{promptOptimization.preserved_constraints.length > 0 && <p><b>保留：</b>{promptOptimization.preserved_constraints.join("；")}</p>}</details>
@@ -1158,7 +1232,7 @@ function App() {
                 {busy && <button className="stop-action" type="button" onClick={() => void cancelActiveRun()}>停止任务</button>}
                 {promptUndo !== null && <button type="button" onClick={undoPromptOptimization}>撤回优化</button>}
                 <button className="optimize-action" type="button" disabled={busy || promptOptimizing || !chatInput.trim()} onClick={() => void optimizeChatPrompt()}>{promptOptimizing ? "优化中…" : "优化提示词"}</button>
-                <button className="primary" type="submit" disabled={busy || !chatInput.trim()}>发送</button>
+                <button className="primary" type="submit" disabled={!chatInput.trim()}>{busy ? (stagedIntervention ? "确认引导" : "发送引导") : "发送"}</button>
               </div>
             </div>
           </form>
@@ -1177,6 +1251,7 @@ function App() {
           {activeTab === "project" && (
             <ProjectCenter
               dashboard={dashboard}
+              workspace={chapterWorkspace}
               request={request}
               onPrompt={(value) => { setChatInput(value); setMascotMood("waiting"); }}
               onRefresh={() => refresh()}
@@ -1224,15 +1299,15 @@ function App() {
             />
           )}
           {activeTab === "chapter" && <ChapterPanel workspace={chapterWorkspace} request={request} onPrompt={(value) => setChatInput(value)} />}
-          {activeTab === "review" && <ReviewPanel document={document} tree={tree} request={request} onOpen={openDocument} />}
-          {activeTab === "memory" && <MemoryPanel dashboard={dashboard} request={request} onRefresh={() => refresh()} />}
+          {activeTab === "review" && <ReviewPanel document={document} tree={tree} workspace={chapterWorkspace} request={request} onOpen={openDocument} onPrompt={setChatInput} />}
+          {activeTab === "memory" && <MemoryPanel dashboard={dashboard} workspace={chapterWorkspace} request={request} onRefresh={() => refresh()} />}
           {activeTab === "references" && <ReferencesPanel request={request} />}
           {activeTab === "listen" && <VoiceCenter refreshKey={voiceRevision} projectRoot={projectRoot} source={voiceSource} characterNames={(dashboard?.bible_entries || []).filter((item) => String(item.kind || "") === "character").map((item) => String(item.name || "")).filter(Boolean)} request={request} onNotice={setNotice} onError={setError} onPlay={(path) => playAudioPath(path)} />}
-          {activeTab === "process" && <ProcessPanel events={events} collaboration={collaboration} context={contextStatus} provider={provider} request={request} />}
+          {activeTab === "process" && <ProcessPanel events={events} collaboration={collaboration} context={contextStatus} provider={provider} workspace={chapterWorkspace} request={request} />}
         </section>
       </main>
 
-      {(notice || error) && <Toast kind={error ? "error" : "info"} text={error || notice} onClose={() => { setError(""); setNotice(""); setMascotMood("idle"); }} />}
+      {(notice || error) && <Toast kind={error ? "error" : "info"} text={error || notice} onClose={() => { setError(""); setNotice(""); setMascotMood("idle"); }} action={error ? (/API Key|密钥|模型接口|服务商|模型配置需要处理/.test(error) ? { label: "打开设置", onClick: () => setShowSettings(true) } : /重新审查/.test(error) ? { label: "打开审查", onClick: () => setActiveTab("review") } : /上下文容量|上下文占用/.test(error) ? { label: "查看上下文", onClick: () => setActiveTab("process") } : { label: "查看协作台", onClick: () => setActiveTab("process") }) : undefined} />}
       {showCreate && <CreateProject onClose={() => setShowCreate(false)} onCreated={openProject} />}
       {showSettings && <SettingsDialog projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} layout={workspaceLayout} preferences={uiPreferences} onLayoutChange={updateWorkspaceLayout} onLayoutPreset={applyWorkspacePreset} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
       {showUpdate && <UpdateDialog info={updateInfo} onClose={() => setShowUpdate(false)} />}
@@ -1459,37 +1534,62 @@ function ChapterPanel({ workspace, request, onPrompt }: { workspace: Record<stri
   const [candidateWorking, setCandidateWorking] = useState(false);
   if (!workspace) return <EmptyPanel title="章节工位" text="打开一章后，这里会集中显示章节卡、场景节拍、人物状态和待回收线索。" />;
   const card = (workspace.card || {}) as Record<string, unknown>;
+  const hookNote = (workspace.hook_note || {}) as Record<string, unknown>;
+  const sceneBlueprint = (((workspace.scene_blueprint || {}) as Record<string, unknown>).scenes || []) as Array<Record<string, unknown>>;
+  const contextManifest = (workspace.context_manifest || {}) as Record<string, unknown>;
+  const writingGuides = (contextManifest.writing_guides || []) as unknown[];
+  const contextSections = (contextManifest.sections || []) as Array<Record<string, unknown>>;
+  const contextPins = (workspace.context_pins || []) as Array<Record<string, unknown>>;
+  const preferenceContext = JSON.stringify(card).toLocaleLowerCase();
+  const activePreferences = ((workspace.active_preferences || []) as Array<Record<string, unknown>>).filter((item) => {
+    const scope = String(item.scope || "project");
+    const [, target = ""] = scope.split(":", 2);
+    return scope === "project" || !target || preferenceContext.includes(target.toLocaleLowerCase());
+  });
   const threads = (workspace.open_threads || []) as Array<Record<string, unknown>>;
   return <div className="scroll-panel chapter-panel">
     <div className="section-heading"><p className="eyebrow">第 {String(workspace.chapter_no)} 章</p><h2>{String(card.title_working || "尚无章节卡")}</h2></div>
+    <ChapterStatusStrip workspace={workspace} />
     <div className="card-grid">
       <InfoCard label="章节功能" value={card.function} />
       <InfoCard label="人物目标" value={card.goal} />
       <InfoCard label="阻力" value={card.obstacle} />
       <InfoCard label="不可逆变化" value={card.irreversible_delta} />
       <InfoCard label="章末钩子" value={card.hook_question} accent />
+      <InfoCard label="钩子强度" value={card.hook_strength || "medium"} />
+      <InfoCard label="正文锚点" value={hookNote.actual_anchor || card.hook_anchor || "由 Writer 在草稿中落实"} />
+      <InfoCard label="读者期待" value={hookNote.reader_expectation || card.hook_question} accent />
+      <InfoCard label="留白边界" value={hookNote.intentionally_withheld || card.withholding_boundary || "答案可延后，必要因果须清楚"} />
+      <InfoCard label="预计回应" value={hookNote.planned_followup || card.payoff_window || "下一章或当前篇章内"} />
       <InfoCard label="时空" value={card.time_location} />
     </div>
+    <section className="stack-section"><h3>本章工作声线</h3><p className="form-hint">这些是写作偏好，不进入正史；当前指令和已验收正史始终优先。</p>{activePreferences.length === 0 && <p className="empty-mini">尚未记录作品级偏好，可在记忆页用“文风”条目补充认可片段、角色声线和禁用表达。</p>}{activePreferences.slice(0, 8).map((item) => <article className="thread-card" key={String(item.preference_id)}><strong>{String(item.scope || "project")} · {String(item.strength || "weak")}</strong><p>{String(item.text || "")}</p></article>)}</section>
+    <section className="stack-section"><h3>本版本实际 Context</h3>{!contextManifest.context_packet_id && <p className="empty-mini">这一版本还没有可追踪的 Context 清单；下次由 Writer 生成或修订后会自动记录。</p>}{Boolean(contextManifest.context_packet_id) && <><p className="form-hint">Packet {String(contextManifest.context_packet_id).slice(0, 12)} · 约 {Number(contextManifest.estimated_tokens || 0).toLocaleString()} tokens。这里只显示来源和公开写作引导，不展示模型思维链。</p><article className="thread-card"><strong>实际写作引导</strong><p>{writingGuides.length ? writingGuides.map(String).join("、") : "本章未选择额外写作引导"}</p></article>{contextSections.filter((item) => ((item.source_ids || []) as unknown[]).length > 0).map((item) => <article className="thread-card" key={String(item.key)}><strong>{String(item.key)} · {String(item.title)} · {String(item.authority) === "hard" ? "固定依据" : "可压缩资料"}</strong><p>{((item.source_ids || []) as unknown[]).slice(0, 8).map(String).join("、")}</p></article>)}</>}{contextPins.length > 0 && <article className="thread-card"><strong>用户锁定资料</strong><p>{contextPins.map((item) => String(item.source_id)).join("、")}</p></article>}</section>
     <section className="stack-section"><h3>场景节拍</h3>{((card.scenes || []) as unknown[]).map((scene, index) => <div className="beat" key={index}><span>{index + 1}</span><p>{String(scene)}</p></div>)}</section>
+    {sceneBlueprint.length > 0 && <section className="stack-section"><h3>Writer 公开场景蓝图</h3><p className="form-hint">这是精修版的可检查创作决定，不是正文，也不会进入正史。</p>{sceneBlueprint.map((scene, index) => <article className="thread-card" key={index}><strong>{String(scene.scene || `场景 ${index + 1}`)}</strong><p>{String(scene.entry_state || "")} → {String(scene.new_pressure || "")} → {String(scene.key_choice || "")} → {String(scene.exit_change || "")}</p><small>{String(scene.reading_promise || "")}</small></article>)}</section>}
     <section className="stack-section"><h3>仍在推进的线索</h3>{threads.slice(0, 8).map((thread) => <article className="thread-card" key={String(thread.thread_id)}><strong>{String(thread.title || thread.thread_id)}</strong><p>{String(thread.description || "")}</p><small>{String(thread.status)}</small></article>)}</section>
     <button className="wide-action" onClick={() => onPrompt(`请检查第 ${String(workspace.chapter_no)} 章的章节卡、场景节拍和人物知识边界，先告诉我风险，不要直接写正文。`)}>把本章约束带入对话</button>
+    <button className="wide-action" onClick={() => onPrompt(`请对第 ${String(workspace.chapter_no)} 章使用精修流程：先给出公开的场景蓝图，再由 Writer 定点精修，之后让 Reviewer 重新审查当前新版本；不要自动验收。`)}>准备重要章节精修</button>
     <section className="stack-section"><h3>Writer 候选方向</h3><p className="form-hint">多个 Writer 运行只提交方案；选中后仍由固定主笔统一写正文。</p><button disabled={candidateWorking} onClick={async () => { setCandidateWorking(true); try { const value = await request<{ candidates: Array<Record<string, unknown>> }>("chapter.writer_candidates", { chapter_no: Number(workspace.chapter_no), count: 3 }); setCandidates(value.candidates); } finally { setCandidateWorking(false); } }}>生成三个方向</button>{candidates.map((candidate) => { const data = candidate.data as Record<string, unknown>; return <article className="thread-card" key={String(candidate.artifact_id)}><strong>{String(data.title)}</strong><p>{String(data.scene_goal)}</p><small>{String(data.turning_point)}</small><button onClick={async () => { await request("chapter.writer_candidate.select", { artifact_id: candidate.artifact_id }); setCandidates((items) => items.map((item) => ({ ...item, status: item.artifact_id === candidate.artifact_id ? "selected" : "not_selected" }))); }}>{candidate.status === "selected" ? "已选" : "选为主笔方向"}</button></article>; })}</section>
   </div>;
 }
 
-function ReviewPanel({ document, tree, request, onOpen }: { document: DocumentData | null; tree: ProjectTree | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; onOpen: (item: TreeItem) => void }) {
+function ReviewPanel({ document, tree, workspace, request, onOpen, onPrompt }: { document: DocumentData | null; tree: ProjectTree | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; onOpen: (item: TreeItem) => void; onPrompt: (value: string) => void }) {
   const reviews = tree?.groups.find((group) => group.id === "reviews")?.items || [];
   const [panelResult, setPanelResult] = useState<Record<string, unknown> | null>(null);
   const chapterMatch = document?.relative_path.match(/chapter_(\d+)\.draft\.md$/);
+  const panelFindings = (panelResult?.merged_findings || []) as Array<Record<string, unknown>>;
   return <div className="scroll-panel review-panel">
     <div className="section-heading"><p className="eyebrow">审查</p><h2>证据化审查</h2><p>每个扣分项都应指向正文、章节卡或正史依据；旧审查不能批准新版本。</p></div>
+    {workspace && <ChapterStatusStrip workspace={workspace} />}
     {document?.relative_path.startsWith("reviews/") && <article className="markdown-preview"><pre>{document.content}</pre></article>}
-    {chapterMatch && <section className="stack-section"><h3>多维预审</h3><p className="form-hint">连续性、人物、叙事和表达分别审查，再按证据去重；最终仍由正式 Reviewer 门禁放行。</p><button onClick={async () => setPanelResult(await request<Record<string, unknown>>("chapter.review_panel", { chapter_no: Number(chapterMatch[1]) }))}>运行多维预审</button>{panelResult && <pre className="compact-json">{JSON.stringify(panelResult.merged_findings, null, 2)}</pre>}</section>}
+    {chapterMatch && <section className="stack-section"><h3>多维预审</h3><p className="form-hint">连续性、人物、叙事和表达分别审查，再按证据去重；最终仍由正式 Reviewer 门禁放行。</p><button onClick={async () => setPanelResult(await request<Record<string, unknown>>("chapter.review_panel", { chapter_no: Number(chapterMatch[1]) }))}>运行多维预审</button>{panelResult && <div>{panelFindings.length === 0 && <p className="empty-mini">没有发现可引用的问题。</p>}{panelFindings.map((finding, index) => <article className="thread-card" key={index}><strong>[{String(finding.severity || "info")}] {String(finding.category || "阅读体验")}</strong><p>原文：{String(finding.evidence || "未提供")}</p><p>影响：{String(finding.explanation || "未单独说明")}</p><small>修订方向：{String(finding.repair_instruction || "由作者决定是否调整")}</small></article>)}</div>}</section>}
+    {chapterMatch && <button className="wide-action" onClick={() => onPrompt(`请根据第 ${chapterMatch[1]} 章当前版本的 Reviewer 证据进入精修模式：先输出可审计的场景蓝图，再由 Writer 定点修订并让 Reviewer 重审新版本；不要验收。`)}>把审查意见交给 Writer 精修</button>}
     <section className="stack-section"><h3>审查记录</h3>{reviews.length === 0 && <p className="empty-mini">还没有审查报告。</p>}{reviews.map((item) => <button className="review-link" key={item.id} onClick={() => void onOpen(item)}><span>✓</span><strong>{item.label}</strong><small>打开报告</small></button>)}</section>
   </div>;
 }
 
-function MemoryPanel({ dashboard, request, onRefresh }: { dashboard: Dashboard | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; onRefresh: () => Promise<void> }) {
+function MemoryPanel({ dashboard, workspace, request, onRefresh }: { dashboard: Dashboard | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; onRefresh: () => Promise<void> }) {
   const [showAdd, setShowAdd] = useState(false);
   const [kind, setKind] = useState("character");
   const [name, setName] = useState("");
@@ -1497,22 +1597,44 @@ function MemoryPanel({ dashboard, request, onRefresh }: { dashboard: Dashboard |
   const [previewChapter, setPreviewChapter] = useState(1);
   const [memoryPreview, setMemoryPreview] = useState<Record<string, unknown> | null>(null);
   const [memoryWorking, setMemoryWorking] = useState(false);
+  const [voicePreferences, setVoicePreferences] = useState<Array<Record<string, unknown>>>([]);
+  const [voiceScope, setVoiceScope] = useState("project");
+  const [voiceTarget, setVoiceTarget] = useState("");
+  const [voiceStrength, setVoiceStrength] = useState("weak");
+  const [voiceText, setVoiceText] = useState("");
+  const loadVoicePreferences = useCallback(async () => {
+    const value = await request<{ preferences: Array<Record<string, unknown>> }>("preference.list", { active_only: false });
+    setVoicePreferences(value.preferences || []);
+  }, [request]);
+  useEffect(() => { void loadVoicePreferences(); }, [loadVoicePreferences]);
   const save = async () => {
     if (!name.trim()) return;
     await request("bible.upsert", { kind, name, aliases: [], data: { notes } });
     setName(""); setNotes(""); setShowAdd(false); await onRefresh();
   };
+  const saveVoicePreference = async () => {
+    if (!voiceText.trim()) return;
+    const scope = voiceScope === "project" || !voiceTarget.trim() ? voiceScope : `${voiceScope}:${voiceTarget.trim()}`;
+    await request("preference.upsert", { text: voiceText.trim(), strength: voiceStrength, scope });
+    setVoiceText("");
+    setVoiceTarget("");
+    await loadVoicePreferences();
+    await onRefresh();
+  };
+  const previewData = ((memoryPreview?.preview as Record<string, unknown> | undefined)?.data || {}) as Record<string, unknown>;
   return <div className="scroll-panel memory-panel">
     <div className="section-heading"><p className="eyebrow">正史</p><h2>正史与故事圣经</h2><button onClick={() => setShowAdd(!showAdd)}>＋ 手动圣经条目</button></div>
+    {workspace && <ChapterStatusStrip workspace={workspace} />}
     {showAdd && <div className="inline-form"><select value={kind} onChange={(event) => setKind(event.target.value)}><option value="character">人物</option><option value="location">地点</option><option value="organization">组织</option><option value="item">物品</option><option value="lore">世界观</option><option value="style">文风</option></select><input value={name} onChange={(event) => setName(event.target.value)} placeholder="名称" /><textarea value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="稳定设定、声线、禁忌或说明" /><button className="primary" onClick={() => void save()}>保存</button></div>}
-    <section className="stack-section canon-preview"><h3>正史变更预览</h3><p className="form-hint">只针对你已经接受且 Reviewer 已放行的当前草稿。先看事实与伏笔补丁，再决定是否提交 SQLite。</p><div className="settings-inline-actions"><input type="number" min={1} value={previewChapter} onChange={(event) => setPreviewChapter(Number(event.target.value))} /><button disabled={memoryWorking} onClick={async () => { setMemoryWorking(true); try { const value = await request<Record<string, unknown>>("memory.preview", { chapter_no: previewChapter, user_accepted: true }); setMemoryPreview(value); } finally { setMemoryWorking(false); } }}>生成预览</button></div>{memoryPreview && <article className="memory-card"><strong>第 {previewChapter} 章 · 尚未提交</strong><pre>{JSON.stringify((memoryPreview.preview as Record<string, unknown>)?.data || memoryPreview, null, 2)}</pre><button className="primary" disabled={memoryWorking} onClick={async () => { const preview = memoryPreview.preview as Record<string, unknown>; setMemoryWorking(true); try { await request("memory.commit_preview", { chapter_no: previewChapter, artifact_id: preview.artifact_id }); setMemoryPreview(null); await onRefresh(); } finally { setMemoryWorking(false); } }}>确认提交正史</button></article>}</section>
+    <section className="stack-section"><h3>写作偏好与强制记忆</h3><p className="form-hint">“普通偏好”会按人物、场景和篇章相关度取用；“强制记忆”每次都交给 Writer，并由 Reviewer 核对。它们用于写作方式和长期要求，不会冒充小说正史。</p><div className="inline-form"><select value={voiceScope} onChange={(event) => setVoiceScope(event.target.value)}><option value="project">全书</option><option value="character">人物</option><option value="scene">场景</option><option value="arc">篇章</option></select>{voiceScope !== "project" && <input value={voiceTarget} onChange={(event) => setVoiceTarget(event.target.value)} placeholder={voiceScope === "character" ? "人物名" : voiceScope === "arc" ? "篇章名或编号" : "场景类型"} />}<select value={voiceStrength} onChange={(event) => setVoiceStrength(event.target.value)}><option value="weak">普通偏好：相关时使用</option><option value="hard">强制记忆：始终使用</option></select><textarea value={voiceText} onChange={(event) => setVoiceText(event.target.value)} placeholder="例如：女主紧张时会缩短句子，但不会直说害怕；认可片段……适用于女主视角。" /><button className="primary" onClick={() => void saveVoicePreference()}>保存</button></div><p className="form-hint">强制记忆过多时，墨流只会去除完全重复的副本，不会偷偷删改规则；容量接近上限时会在协作台提醒你暂停过期项或合并同义项。</p>{voicePreferences.map((item) => <article className="memory-card" key={String(item.preference_id)}><span>{String(item.scope)} · {String(item.strength) === "hard" ? "强制记忆" : "普通偏好"}</span><strong>{String(item.status) === "active" ? "正在使用" : "已暂停"}</strong><p>{String(item.text)}</p><div className="settings-inline-actions"><button onClick={async () => { await request("preference.set_status", { preference_id: item.preference_id, status: item.status === "active" ? "paused" : "active" }); await loadVoicePreferences(); }}>{item.status === "active" ? "暂停使用" : "恢复使用"}</button><button onClick={async () => { if (!window.confirm("删除这条写作记忆吗？删除后，后续章节不会再使用它。")) return; await request("preference.delete", { preference_id: item.preference_id }); await loadVoicePreferences(); await onRefresh(); }}>删除</button></div></article>)}</section>
+    <section className="stack-section canon-preview"><h3>正史变更预览</h3><p className="form-hint">只针对你已经接受且 Reviewer 已放行的当前草稿。先看事实与伏笔补丁，再决定是否提交 SQLite。</p><div className="settings-inline-actions"><input type="number" min={1} value={previewChapter} onChange={(event) => setPreviewChapter(Number(event.target.value))} /><button disabled={memoryWorking} onClick={async () => { setMemoryWorking(true); try { const value = await request<Record<string, unknown>>("memory.preview", { chapter_no: previewChapter, user_accepted: true }); setMemoryPreview(value); } finally { setMemoryWorking(false); } }}>生成预览</button></div>{memoryPreview && <article className="memory-card"><strong>第 {previewChapter} 章 · 尚未提交</strong><p>新增或更新事实 {Array.isArray(previewData.facts) ? previewData.facts.length : 0} 条，线索变化 {Array.isArray(previewData.threads) ? previewData.threads.length : 0} 条，冲突 {Array.isArray(previewData.unresolved_conflicts) ? previewData.unresolved_conflicts.length : 0} 条。</p><details><summary>查看完整补丁</summary><pre>{JSON.stringify(previewData, null, 2)}</pre></details><button className="primary" disabled={memoryWorking} onClick={async () => { const preview = memoryPreview.preview as Record<string, unknown>; setMemoryWorking(true); try { await request("memory.commit_preview", { chapter_no: previewChapter, artifact_id: preview.artifact_id }); setMemoryPreview(null); await onRefresh(); } finally { setMemoryWorking(false); } }}>确认提交正史</button></article>}</section>
     <section className="stack-section"><h3>人工故事圣经 <small>{dashboard?.bible_entries.length || 0}</small></h3>{dashboard?.bible_entries.map((entry) => <article className="memory-card" key={String(entry.entry_id)}><span>{kindLabel(String(entry.kind))}</span><strong>{String(entry.name)}</strong><p>{String(((entry.data || {}) as Record<string, unknown>).notes || "")}</p></article>)}</section>
     <section className="stack-section"><h3>当前正史事实 <small>{dashboard?.facts.length || 0}</small></h3>{dashboard?.facts.slice(0, 30).map((fact) => <article className="fact-row" key={String(fact.fact_id)}><strong>{String(fact.subject)} · {String(fact.predicate)}</strong><p>{stringifyShort(fact.value)}</p><small>来源第 {String(fact.source_chapter)} 章</small></article>)}</section>
     <section className="stack-section"><h3>开放线索 <small>{dashboard?.threads.length || 0}</small></h3>{dashboard?.threads.map((thread) => <article className="thread-card" key={String(thread.thread_id)}><strong>{String(thread.title)}</strong><p>{String(thread.description)}</p><small>{String(thread.status)} · 预计第 {String(thread.due_chapter || "—")} 章</small></article>)}</section>
   </div>;
 }
 
-function ProcessPanel({ events, collaboration, context, provider, request }: { events: EngineEvent[]; collaboration: CollaborationOverview | null; context: ContextStatus | null; provider: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> }) {
+function ProcessPanel({ events, collaboration, context, provider, workspace, request }: { events: EngineEvent[]; collaboration: CollaborationOverview | null; context: ContextStatus | null; provider: Record<string, unknown> | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> }) {
   const [threadUpdates, setThreadUpdates] = useState<Record<string, Record<string, unknown>>>({});
   const runs = processRuns(events);
   const tasks = collaboration?.tasks || [];
@@ -1523,7 +1645,7 @@ function ProcessPanel({ events, collaboration, context, provider, request }: { e
   const usage = collaboration?.usage;
   const retrieval = context?.retrieval_diagnostics;
   const openThreads = (collaboration?.threads || []).filter((thread) => ["open", "waiting", "escalated"].includes(String(thread.status))).length;
-  return <div className="scroll-panel process-panel"><div className="section-heading"><p className="eyebrow">协作台</p><h2>工作流与运行状态</h2><p>任务、Agent 讨论、上下文、检索、学习和费用信息集中查看；正文和版本仍留在各自工作区。</p></div>
+  return <div className="scroll-panel process-panel"><div className="section-heading"><p className="eyebrow">协作台</p><h2>工作流与运行状态</h2><p>任务、Agent 讨论、上下文、检索、学习和费用信息集中查看；正文和版本仍留在各自工作区。</p></div>{workspace && <ChapterStatusStrip workspace={workspace} />}
     <div className="operations-grid">
       <article><header><strong>工作流</strong><span>{runs.length} 项</span></header><p>{runs.length ? "当前安排与每一步进度都记录在下方。" : "发送需求后显示任务安排。"}</p></article>
       <article><header><strong>并发任务</strong><span>{activeTasks} 进行中</span></header><p>{failedTasks ? `${failedTasks} 项需要处理；可在项目页重试或停止。` : "依赖关系由 Coordinator 与 Novel Engine 控制。"}</p></article>
@@ -1536,12 +1658,16 @@ function ProcessPanel({ events, collaboration, context, provider, request }: { e
       <article><header><strong>费用</strong><span>{usage?.calls ? `${usage.calls} 次 · ${usage.total_tokens.toLocaleString()} tokens` : "尚无调用"}</span></header><p>{usage?.pricing_configured ? `按已填单价估算 ${usage.currency} ${usage.estimated_cost.toFixed(4)}` : "已统计 Token；填写服务商单价后显示金额估算。"} 当前模型：{String(provider?.model || "未配置")}。</p></article>
     </div>
     {context && <div className="run-list"><h3>Context Packet 质量报告</h3><article className="run-card"><header><strong>预算分配</strong><span>输出预留 {Number((context as unknown as Record<string, unknown>).output_reserve_tokens || 0).toLocaleString()} tokens</span></header><div className="context-budget-list">{(context.budget_allocation || []).map((item) => <p key={item.key}><strong>{item.key} · {item.title}</strong><span>{item.estimated_tokens.toLocaleString()} tokens · {item.hard ? "固定保留" : "可压缩"} · {item.source_count} 来源</span></p>)}</div></article>{Boolean(retrieval?.discarded?.length) && <details className="run-card"><summary>查看检索舍弃记录（{retrieval?.discarded?.length}）</summary><pre className="compact-json">{JSON.stringify(retrieval?.discarded, null, 2)}</pre></details>}</div>}
+    <div className="run-list"><h3>真实调用与引用</h3>{!(collaboration?.trace_runs || []).length && <p className="empty-mini">运行写作、审查或记忆任务后，这里会显示每一步参考了什么、使用了哪个模型、产生了哪些文件。</p>}{(collaboration?.trace_runs || []).slice(0, 10).map((traceRun) => <details className="run-card" key={traceRun.run_id}><summary><strong>{operationLabel(traceRun.operation)}</strong><span>{traceRun.status === "completed" ? "已完成" : traceRun.status === "failed" ? "未完成" : traceRun.status}</span></summary><p>{traceRun.summary}</p><div className="settings-inline-actions">{traceRun.trace_reference?.exists && <button type="button" onClick={() => void window.inkflow.openPath(traceRun.trace_reference!.absolute_path)}>打开完整运行记录</button>}</div><ol>{traceRun.events.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; return <li key={`${step.timestamp}-${index}`}><div><strong>{step.stage}</strong> · {step.summary}</div><small>{formatTime(step.timestamp)} · {step.status}{metadata.model ? ` · 模型 ${String(metadata.model)}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small>{step.details && <p>{step.details}</p>}{(step.references || []).length > 0 && <div className="settings-inline-actions">{(step.references || []).map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void window.inkflow.openPath(reference.absolute_path)}>打开 {reference.relative_path}</button>)}</div>}{Object.keys(metadata).length > 0 && <details><summary>查看本步全部记录</summary><pre className="compact-json">{JSON.stringify(metadata, null, 2)}</pre></details>}</li>; })}</ol></details>)}</div>
     <div className="run-list"><h3>定向讨论</h3>{(collaboration?.threads || []).slice(0, 8).map((thread) => { const current = threadUpdates[String(thread.thread_id)] || thread; const active = ["open", "waiting"].includes(String(current.status)); return <article className="run-card" key={String(thread.thread_id)}><header><strong>{String(thread.topic)}</strong><span>{String(current.status)} · 第 {String(current.current_round || 1)}/{String(current.max_rounds || 2)} 轮</span></header><p>{String(current.resolution || "等待目标 Agent 回答")}</p>{active && <button onClick={async () => { const value = await request<{ thread: Record<string, unknown> }>("collaboration.reply", { thread_id: thread.thread_id }); setThreadUpdates((items) => ({ ...items, [String(thread.thread_id)]: value.thread })); }}>让目标 Agent 回答</button>}{String(current.status) === "escalated" && <small>两轮后仍有分歧，已暂停分支并交给 Coordinator 向你提出最小问题。</small>}</article>; })}</div>
     <div className="run-list"><h3>任务计划</h3>{runs.length === 0 && <p className="empty-mini">发送需求后，这里显示本次任务的安排。</p>}{runs.slice(0, 8).map(run => {
-    const plan = run.method === "conversation.send" ? ["理解需求与已有设定", "回答问题，或执行确认后的写作任务", "在对话中交付结果"] : run.method === "project.ideate" ? ["读取开书偏好", "构思故事方向与开篇", "展示方案，等待你选择"] : run.method === "provider.test" ? ["发送连接检查", "等待模型回答", "显示连接结果"] : ["读取任务范围与相关章节", "执行本次任务", "交付结果供你查看"];
+    const planned = [...run.steps].reverse().find((step) => step.dispatch_plan?.steps?.length);
+    const ticket = planned?.task_ticket || {};
+    const dispatchSteps = planned?.dispatch_plan?.steps || [];
+    const plan = dispatchSteps.length > 0 ? dispatchSteps.map((step) => `${agentRoleLabel(String(step.role || "engine"))} · ${operationLabel(String(step.operation || ""))}${step.gate ? `（${String(step.gate)}）` : ""}`) : run.method === "project.ideate" ? ["读取开书偏好", "构思故事方向与开篇", "展示方案，等待你选择"] : run.method === "provider.test" ? ["发送连接检查", "等待模型回答", "显示连接结果"] : ["读取任务范围与相关章节", "执行本次任务", "交付结果供你查看"];
     const started = run.steps.some(step => ["workflow.started", "writer.started", "provider.testing"].includes(step.type || ""));
-    const current = run.status === "done" ? 3 : started ? 1 : 0;
-    return <article className={`run-card ${run.status}`} key={run.id}><header><strong>{methodLabel(run.method)}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : "进行中"}</span></header><ol>{plan.map((step, index) => <li key={step}><span>{index < current ? "✓" : index === current && run.status === "running" ? "进行中 ·" : "待完成 ·"} {step}</span></li>)}</ol><p>{run.summary}</p><small>{run.method === "project.ideate" ? "结果位置：新建小说窗口" : run.method === "provider.test" ? "结果位置：模型设置窗口" : "结果位置：中间对话区；生成文件可从左侧小说结构打开"}</small></article>;
+    const current = run.status === "done" ? plan.length : started ? Math.min(1, plan.length) : 0;
+    return <article className={`run-card ${run.status}`} key={run.id}><header><strong>{String(ticket.objective || methodLabel(run.method))}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : "进行中"}</span></header>{Boolean(ticket.chapter_no) && <p>章节：第 {String(ticket.chapter_no)} 章{ticket.chapter_version ? ` · v${String(ticket.chapter_version)}` : ""}；验收模式：{acceptanceModeLabel(String(ticket.acceptance_confirmation_mode || "per_chapter"))}；授权来源：{authorizationLabel(String(ticket.authorization_source || "none"))}</p>}<ol>{plan.map((step, index) => <li key={`${index}-${step}`}><span>{index < current ? "✓" : index === current && run.status === "running" ? "进行中 ·" : "待完成 ·"} {step}</span></li>)}</ol><p>{run.summary}</p>{planned?.dispatch_plan?.stop_conditions?.length ? <details><summary>停止条件</summary><ul>{planned.dispatch_plan.stop_conditions.map((item) => <li key={item}>{item}</li>)}</ul></details> : null}<small>{run.method === "project.ideate" ? "结果位置：新建小说窗口" : run.method === "provider.test" ? "结果位置：模型设置窗口" : "结果位置：中间对话区；生成文件可从左侧小说结构打开"}</small></article>;
   })}</div></div>;
 }
 
@@ -1714,6 +1840,17 @@ function agentGenerationFromProvider(value: unknown): AgentGenerationProfiles {
   return Object.fromEntries((Object.keys(DEFAULT_AGENT_GENERATION) as AgentRole[]).map((role) => [role, { ...DEFAULT_AGENT_GENERATION[role], ...(source[role] || {}) }])) as AgentGenerationProfiles;
 }
 
+function agentContextBudgetsFromProvider(value: unknown): AgentContextBudgets {
+  const defaults: AgentContextBudgets = {
+    coordinator: { soft: 96000, hard: 160000 },
+    writer: { soft: 192000, hard: 208000 },
+    reviewer: { soft: 160000, hard: 176000 },
+    memory_keeper: { soft: 96000, hard: 128000 },
+  };
+  const source = value && typeof value === "object" ? value as Partial<AgentContextBudgets> : {};
+  return Object.fromEntries((Object.keys(defaults) as AgentRole[]).map((role) => [role, { ...defaults[role], ...(source[role] || {}) }])) as AgentContextBudgets;
+}
+
 function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, layout, preferences, onLayoutChange, onLayoutPreset, onPreferencesChange, onClose, onSaved, onVoiceSaved }: {
   projectRoot: string;
   provider: Record<string, unknown> | null;
@@ -1728,11 +1865,11 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   onSaved: (value: Record<string, unknown>) => void;
   onVoiceSaved: (settings: VoiceSettings, status: VoiceStatus) => void;
 }) {
-  const [form, setForm] = useState({ provider_kind: String(provider?.provider_kind || "deepseek"), api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), dialogue_history_mode: String(provider?.dialogue_history_mode || "auto"), dialogue_history_interval: Number(provider?.dialogue_history_interval || 1), dialogue_history_limit: Number(provider?.dialogue_history_limit || 100), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), max_output_tokens: Number(provider?.max_output_tokens || 16000), input_price_per_million: Number(provider?.input_price_per_million || 0), output_price_per_million: Number(provider?.output_price_per_million || 0), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), agent_generation: agentGenerationFromProvider(provider?.agent_generation) });
+  const [form, setForm] = useState({ provider_kind: String(provider?.provider_kind || "deepseek"), api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), hook_strategy: String(provider?.hook_strategy || "most_chapters"), acceptance_confirmation_mode: String(provider?.acceptance_confirmation_mode || "per_chapter"), dialogue_history_mode: String(provider?.dialogue_history_mode || "auto"), dialogue_history_interval: Number(provider?.dialogue_history_interval || 1), dialogue_history_limit: Number(provider?.dialogue_history_limit || 100), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), context_budget_mode: String(provider?.context_budget_mode || "unified"), agent_context_budgets: agentContextBudgetsFromProvider(provider?.agent_context_budgets), max_output_tokens: Number(provider?.max_output_tokens || 16000), input_price_per_million: Number(provider?.input_price_per_million || 0), output_price_per_million: Number(provider?.output_price_per_million || 0), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_experience_detail: String(provider?.review_experience_detail || "standard"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), agent_generation: agentGenerationFromProvider(provider?.agent_generation) });
   const [voiceForm, setVoiceForm] = useState<VoiceSettings>(voiceSettings || {
     voice_enabled: false, voice_input_enabled: true, voice_output_enabled: true, voice_auto_read: false, voice_auto_send: false,
-    voice_default_profile: "narrator_female", voice_speed: 1, voice_volume: 1, voice_input_device: "", voice_output_device: "",
-    voice_compute_device: "auto", voice_engine: "auto", voice_asr_model: "paraformer-zh-streaming", voice_tts_model: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", voice_clone_model: "Qwen/Qwen3-TTS-12Hz-0.6B-Base", voice_light_asr_model: "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09", voice_light_tts_model: "sherpa-onnx-vits-zh-ll",
+    voice_default_profile: "narrator_female", voice_speed: 1, voice_volume: 1, voice_pause_scale: 1, voice_input_device: "", voice_output_device: "",
+    voice_compute_device: "auto", voice_engine: "kokoro", voice_asr_model: "paraformer-zh-streaming", voice_tts_model: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", voice_clone_model: "Qwen/Qwen3-TTS-12Hz-1.7B-Base", voice_light_asr_model: "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09", voice_light_tts_model: "kokoro-int8-multi-lang-v1_1",
     voice_sample_rate: 24000, voice_segment_chars: 360, voice_cache_limit_mb: 1024, voice_debug: false,
   });
   const [error, setError] = useState("");
@@ -1755,6 +1892,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   }, [projectRoot]);
   useEffect(() => { if (voiceSettings) setVoiceForm(voiceSettings); }, [voiceSettings]);
   const updateAgentGeneration = (role: AgentRole, patch: Partial<AgentGeneration>) => setForm((value) => ({ ...value, agent_generation: { ...value.agent_generation, [role]: { ...value.agent_generation[role], ...patch } } }));
+  const updateAgentContextBudget = (role: AgentRole, patch: Partial<{ soft: number; hard: number }>) => setForm((value) => ({ ...value, agent_context_budgets: { ...value.agent_context_budgets, [role]: { ...value.agent_context_budgets[role], ...patch } } }));
   const persist = async () => {
     setWorking(true); setError(""); setResult("");
     try {
@@ -1800,7 +1938,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   };
   const activePreset = SETTINGS_PRESETS.find((preset) => preset.reasoning_effort === form.reasoning_effort && preset.inquiry_frequency === form.inquiry_frequency && preset.context_soft_tokens === form.context_soft_tokens && preset.context_hard_tokens === form.context_hard_tokens)?.id;
   const inferredProvider = form.provider_kind;
-  const settingKeywords: Record<SettingsSection, string> = { appearance: "主题 黑白 系统 配色 颜色 密度", layout: "布局 面板 宽度 左右", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", learning: "学习 反馈 训练 LoRA DPO 导出", advanced: "高级 temperature top p top k PowerShell" };
+  const settingKeywords: Record<SettingsSection, string> = { appearance: "主题 黑白 系统 配色 颜色 密度", layout: "布局 面板 宽度 左右", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写 验收 确认 自动", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", learning: "学习 反馈 训练 LoRA DPO 导出", advanced: "高级 temperature top p top k PowerShell" };
   const visibleSections = SETTINGS_SECTIONS.filter((item) => `${item.label}${item.note}${settingKeywords[item.id]}`.toLowerCase().includes(search.trim().toLowerCase()));
   const chooseProvider = (id: string) => {
     const choice = PROVIDER_OPTIONS.find((item) => item.id === id);
@@ -1826,16 +1964,16 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
       setError(cause instanceof Error ? cause.message : "无法读取 Windows 音频设备。");
     }
   };
-  const installLightVoice = async () => {
-    const confirmed = window.confirm("轻量语音包包含普通话朗读与识别模型，预计下载约 360MB，仅保存在本机。确认下载吗？");
+  const installKokoro = async () => {
+    const confirmed = window.confirm("Kokoro 中文朗读与普通话识别组件预计下载约 500MB，解压和安装需额外空间，仅保存在本机。确认下载吗？");
     if (!confirmed) return;
     setLightVoiceInstalling(true); setError("");
     try {
-      const status = await window.inkflow.request<VoiceStatus>("voice.light.install", { confirmation: "download_light_voice_models" });
-      const adapted = { ...voiceForm, voice_engine: "sherpa" as const };
+      const status = await window.inkflow.request<VoiceStatus>("voice.kokoro.install", { confirmation: "download_kokoro_voice_models" });
+      const adapted = { ...voiceForm, voice_engine: "kokoro" as const };
       setVoiceForm(adapted);
       onVoiceSaved(adapted, status);
-      setResult("轻量普通话语音已经安装并适配。关闭设置前可继续调整声音参数。");
+      setResult("Kokoro 已安装并设为默认朗读引擎。关闭设置前可继续调整声音参数。");
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -1845,15 +1983,15 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   const installQwen = async () => {
     const qwen = voiceStatus?.qwen;
     const dependencySize = qwen?.estimated_dependency_download_mb || 7000;
-    const modelSize = qwen?.estimated_model_download_mb || 7000;
-    const confirmed = window.confirm(`Qwen 高品质组件为可选下载：依赖约 ${Math.round(dependencySize / 100) / 10}GB，模型最多还需约 ${Math.round(modelSize / 100) / 10}GB；会占用较多磁盘和显存，安装期间可继续使用其他功能。确认安装并自动适配吗？`);
+    const modelSize = qwen?.estimated_model_download_mb || 9200;
+    const confirmed = window.confirm(`Qwen 高品质组件为可选下载：依赖约 ${Math.round(dependencySize / 100) / 10}GB，预设与克隆模型合计约 ${Math.round(modelSize / 100) / 10}GB；实际依赖大小随环境变化，请预留至少 20GB 空间。下载可能较久，使用时可能占用显卡；默认朗读仍是 Kokoro。确认安装吗？`);
     if (!confirmed) return;
     setQwenInstalling(true); setError("");
     try {
       const status = await window.inkflow.request<VoiceStatus>("voice.qwen.install", { confirmation: "install_optional_qwen" });
-      onVoiceSaved({ ...voiceForm, voice_engine: "qwen" }, status);
-      setVoiceForm((value) => ({ ...value, voice_engine: "qwen" }));
-      setResult(status.qwen?.model_loaded ? "Qwen 高品质语音已经安装、下载模型并完成适配。" : "Qwen 依赖已经安装；模型仍可在本地模型区域继续准备。");
+      onVoiceSaved(voiceForm, status);
+
+      setResult(status.qwen?.models_ready ? "Qwen 预设与克隆模型已经下载。可以主动选择 Qwen，默认声音仍使用 Kokoro。" : "Qwen 依赖已安装，模型尚未完整下载，请点击重新准备。");
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -1883,6 +2021,8 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
         {section === "creation" && <SettingsPane title="创作" note="预设会同时调整上下文、询问策略、审查模式和四个角色的生成参数。">
           <div className="preset-grid">{SETTINGS_PRESETS.map((preset) => <button type="button" key={preset.id} className={activePreset === preset.id ? "active" : ""} onClick={() => applyCreationPreset(preset)}><strong>{activePreset === preset.id ? "✓ " : ""}{preset.name}</strong><span>{preset.note}</span><small>{preset.context_soft_tokens / 10000} 万常用上下文</small></button>)}</div>
           <div className="settings-fields two"><label>思考强度<select value={form.reasoning_effort} onChange={(event) => setForm({ ...form, reasoning_effort: event.target.value })}><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最高</option></select></label><label>主动询问<select value={form.inquiry_frequency} onChange={(event) => setForm({ ...form, inquiry_frequency: event.target.value })}><option value="low">只问必需信息</option><option value="medium">把握较低时询问</option><option value="high">重要创作分岔也询问</option><option value="ultra">有明显未知项就询问</option></select></label></div>
+          <SettingGroup title="章节结尾策略" note="控制规划和 Writer 的默认力度；章节卡、正史与当前指令仍然优先。"><label>钩子密度<select value={form.hook_strategy} onChange={(event) => setForm({ ...form, hook_strategy: event.target.value })}><option value="most_chapters">大多数章节保留前向期待（默认）</option><option value="key_chapters">重点章节使用明确钩子</option><option value="natural_afterglow">自然余味优先</option></select></label><p className="form-hint">普通剧情可以用未完成行动、关系变化、信息差或情绪余波，不会被强行改成反转或危险悬念。</p></SettingGroup>
+          <SettingGroup title="验收确认策略" note="只改变何时取得你的授权；Reviewer 当前版本通过、正文哈希和 Memory Keeper 事务门禁始终保留。"><label>确认方式<select value={form.acceptance_confirmation_mode} onChange={(event) => setForm({ ...form, acceptance_confirmation_mode: event.target.value })}><option value="per_chapter">逐章确认（默认）</option><option value="batch_once">批次提交前确认一次</option><option value="auto_after_review">Reviewer 通过后自动验收</option></select></label><p className="form-hint">“自动验收”只在你主动发起审查且当前版本通过时生效；只生成草稿不会提交正史。切换设置只影响之后的操作。</p></SettingGroup>
           <SettingGroup title="预填续写" note="启用后，编辑停顿会调用当前 Writer 模型，因此可能产生费用。"><label className="setting-check"><input type="checkbox" checked={preferences.prefillEnabled} onChange={(event) => onPreferencesChange({ ...preferences, prefillEnabled: event.target.checked })} />允许在编辑器中手动开启灰字预填候选</label><div className="settings-fields two"><label>等待时间 <small>{preferences.prefillDelayMs} 毫秒</small><input type="range" min="300" max="3000" step="100" value={preferences.prefillDelayMs} onChange={(event) => onPreferencesChange({ ...preferences, prefillDelayMs: Number(event.target.value) })} /></label><label>候选长度<select value={preferences.prefillLength} onChange={(event) => onPreferencesChange({ ...preferences, prefillLength: event.target.value as PrefillLength })}><option value="short">短句</option><option value="medium">一小段</option><option value="long">长段落</option></select></label></div></SettingGroup>
           <SettingGroup title="智能提示词" note="输入框上方的快捷按钮会按最近对话和项目阶段实时预测你下一步想说的话。"><label className="setting-check"><input type="checkbox" checked={preferences.suggestedPromptsEnabled} onChange={(event) => onPreferencesChange({ ...preferences, suggestedPromptsEnabled: event.target.checked })} />显示预测的下一步提示词 <small>每轮对话后会调用一次模型预测，可能产生少量费用；关闭后隐藏整行快捷按钮</small></label></SettingGroup>
           <SettingGroup title="对话历史" note="记录只写入项目里的 DIALOGUE.md，不保存原始思维链、API Key 或模型内部推理。"><div className="settings-fields two"><label>保存方式<select value={form.dialogue_history_mode} onChange={(event) => setForm({ ...form, dialogue_history_mode: event.target.value })}><option value="auto">主动保存（自动写入）</option><option value="manual">被动保存（只在对话历史里手动保存）</option><option value="both">两者都有</option></select></label><label>最多保留 <small>条记录</small><input type="number" min={5} max={1000} value={form.dialogue_history_limit} onChange={(event) => setForm({ ...form, dialogue_history_limit: Number(event.target.value) })} /></label></div><div className="settings-fields"><label>自动保存间隔 <small>每 N 轮写入一次</small><input type="number" min={1} max={50} value={form.dialogue_history_interval} disabled={form.dialogue_history_mode === "manual"} onChange={(event) => setForm({ ...form, dialogue_history_interval: Number(event.target.value) })} /></label></div><p className="form-hint">主动保存会在满 N 轮时写入一次；“两者都有”同时开放对话历史里的手动保存。超出保留上限时只删除最旧的记录，不会改动正史。</p></SettingGroup>
@@ -1890,19 +2030,22 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
         {section === "voice" && <SettingsPane title="本地语音" note="只有一种普通话模式；语音运行时不是新的 Agent，也不会接触小说正史。">
           <div className={`provider-status ${voiceStatus?.ready_for_input && voiceStatus?.ready_for_output ? "ready" : "missing"}`}><strong>{voiceStatus?.message || "正在读取本地语音状态"}</strong><span>{voiceStatus?.backend ? `当前引擎：${voiceStatus.backend}` : "保存设置不会自动下载模型；依赖与模型由安装环节单独处理。"}</span></div>
           <SettingGroup title="总开关"><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_enabled} onChange={(event) => setVoiceForm({ ...voiceForm, voice_enabled: event.target.checked })} />启用本地普通话语音</label><div className="settings-fields two"><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_input_enabled} onChange={(event) => setVoiceForm({ ...voiceForm, voice_input_enabled: event.target.checked })} />语音下达命令与聊天</label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_output_enabled} onChange={(event) => setVoiceForm({ ...voiceForm, voice_output_enabled: event.target.checked })} />对话与正文朗读</label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_auto_send} onChange={(event) => setVoiceForm({ ...voiceForm, voice_auto_send: event.target.checked })} />识别后直接发送 <small>关闭时只填入输入框</small></label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_auto_read} onChange={(event) => setVoiceForm({ ...voiceForm, voice_auto_read: event.target.checked })} />自动朗读 AI 回答</label></div></SettingGroup>
-          <SettingGroup title="默认声音与听感"><div className="settings-fields two"><label>默认声音<select value={voiceForm.voice_default_profile} onChange={(event) => setVoiceForm({ ...voiceForm, voice_default_profile: event.target.value })}><option value="narrator_female">女声旁白</option><option value="female_bright">明快女声</option><option value="female_warm">温柔女声</option><option value="narrator_male">男声旁白</option><option value="male_calm">沉静男声</option><option value="male_firm">坚定男声</option></select></label><label>计算设备<select value={voiceForm.voice_compute_device} onChange={(event) => setVoiceForm({ ...voiceForm, voice_compute_device: event.target.value as VoiceSettings["voice_compute_device"] })}><option value="auto">自动（优先 NVIDIA 显卡）</option><option value="cpu">只用 CPU（较慢）</option><option value="cuda">NVIDIA CUDA</option></select></label><label>语速 <output>{voiceForm.voice_speed.toFixed(2)}</output><input type="range" min="0.75" max="1.35" step="0.05" value={voiceForm.voice_speed} onChange={(event) => setVoiceForm({ ...voiceForm, voice_speed: Number(event.target.value) })} /></label><label>音量 <output>{voiceForm.voice_volume.toFixed(2)}</output><input type="range" min="0.25" max="1.5" step="0.05" value={voiceForm.voice_volume} onChange={(event) => setVoiceForm({ ...voiceForm, voice_volume: Number(event.target.value) })} /></label></div></SettingGroup>
+          <SettingGroup title="默认声音与听感"><div className="settings-fields two"><label>默认声音<select value={voiceForm.voice_default_profile} onChange={(event) => setVoiceForm({ ...voiceForm, voice_default_profile: event.target.value })}><option value="narrator_female">女声旁白</option><option value="female_bright">明快女声</option><option value="female_warm">温柔女声</option><option value="narrator_male">男声旁白</option><option value="male_calm">沉静男声</option><option value="male_firm">坚定男声</option></select></label><label>计算设备<select value={voiceForm.voice_compute_device} onChange={(event) => setVoiceForm({ ...voiceForm, voice_compute_device: event.target.value as VoiceSettings["voice_compute_device"] })}><option value="auto">自动（Kokoro 用 CPU，Qwen 优先显卡）</option><option value="cpu">只用 CPU（较慢）</option><option value="cuda">NVIDIA CUDA</option></select></label><label>语速 <output>{voiceForm.voice_speed.toFixed(2)}</output><input type="range" min="0.75" max="1.35" step="0.05" value={voiceForm.voice_speed} onChange={(event) => setVoiceForm({ ...voiceForm, voice_speed: Number(event.target.value) })} /></label><label>音量 <output>{voiceForm.voice_volume.toFixed(2)}</output><input type="range" min="0.25" max="1.5" step="0.05" value={voiceForm.voice_volume} onChange={(event) => setVoiceForm({ ...voiceForm, voice_volume: Number(event.target.value) })} /></label><label>自然停顿 <output>{voiceForm.voice_pause_scale.toFixed(2)}</output><input type="range" min="0.6" max="1.8" step="0.1" value={voiceForm.voice_pause_scale} onChange={(event) => setVoiceForm({ ...voiceForm, voice_pause_scale: Number(event.target.value) })} /><small>按逗号、句号、问号、换段自动留白；1.0 为自然节奏</small></label></div></SettingGroup>
           <SettingGroup title="设备偏好" note="不选择时使用 Windows 默认设备。"><div className="settings-inline-actions"><button type="button" onClick={() => void refreshVoiceDevices()}>读取可用设备</button><span>首次读取会触发系统麦克风权限提示。</span></div><div className="settings-fields two"><label>麦克风<select value={voiceForm.voice_input_device} onChange={(event) => setVoiceForm({ ...voiceForm, voice_input_device: event.target.value })}><option value="">Windows 默认麦克风</option>{voiceDevices.filter((item) => item.kind === "audioinput").map((item, index) => <option value={item.deviceId} key={item.deviceId}>{item.label || `麦克风 ${index + 1}`}</option>)}</select></label><label>播放设备<select value={voiceForm.voice_output_device} onChange={(event) => setVoiceForm({ ...voiceForm, voice_output_device: event.target.value })}><option value="">Windows 默认扬声器</option>{voiceDevices.filter((item) => item.kind === "audiooutput").map((item, index) => <option value={item.deviceId} key={item.deviceId}>{item.label || `扬声器 ${index + 1}`}</option>)}</select></label></div></SettingGroup>
-          <SettingGroup title="轻量普通话组件" note="默认推荐；约 360MB，使用 sherpa-onnx + ONNX，适合普通 CPU。"><div className="settings-inline-actions"><button type="button" disabled={lightVoiceInstalling || Boolean(voiceStatus?.sherpa?.tts_ready && voiceStatus?.sherpa?.asr_ready)} onClick={() => void installLightVoice()}>{lightVoiceInstalling ? "正在下载轻量组件…" : voiceStatus?.sherpa?.tts_ready && voiceStatus?.sherpa?.asr_ready ? "轻量组件已就绪" : "下载并适配轻量组件"}</button><span>{voiceStatus?.sherpa?.model_size_mb ? `已占用 ${voiceStatus.sherpa.model_size_mb.toFixed(1)}MB` : "只在你点击后下载，不会随保存设置自动执行。"}</span></div></SettingGroup>
-          <SettingGroup title="Qwen 高品质组件（可选）" note="用于更自然的声音和用户授权克隆；依赖与模型可能占用数 GB。"><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_engine === "qwen"} disabled={!voiceStatus?.qwen?.installed} onChange={(event) => setVoiceForm({ ...voiceForm, voice_engine: event.target.checked ? "qwen" : "auto" })} />使用 Qwen 高品质模式</label><div className="settings-inline-actions"><button type="button" disabled={qwenInstalling || Boolean(voiceStatus?.qwen?.installed && voiceStatus?.qwen?.model_loaded)} onClick={() => void installQwen()}>{qwenInstalling ? "正在安装并适配 Qwen…" : voiceStatus?.qwen?.installed ? voiceStatus.qwen.model_loaded ? "Qwen 已就绪" : "重新准备 Qwen 模型" : "安装 Qwen 并一键适配"}</button><span>{voiceStatus?.qwen?.installed ? `组件 ${voiceStatus.qwen.package_size_mb.toFixed(1)}MB · 模型 ${voiceStatus.qwen.model_size_mb.toFixed(1)}MB` : `预计依赖约 ${(voiceStatus?.qwen?.estimated_dependency_download_mb || 7000) / 1000}GB，模型另计`}</span></div>{voiceStatus?.qwen?.last_error && <p className="form-error">{voiceStatus.qwen.last_error}</p>}{!voiceStatus?.qwen?.python_available && !voiceStatus?.qwen?.installed && <p className="form-hint">当前安装包没有找到 Python。安装 Qwen 需要本机有 Python 3.12/3.13，或设置 INKFLOW_PYTHON 指向 python.exe。</p>}</SettingGroup>
-          <SettingGroup title="声音调试与资源" note="这些参数只影响本机音频生成，不修改正文或正史。"><div className="settings-fields two"><label>输出采样率<select value={voiceForm.voice_sample_rate} onChange={(event) => setVoiceForm({ ...voiceForm, voice_sample_rate: Number(event.target.value) })}><option value={16000}>16 kHz（省空间）</option><option value={22050}>22.05 kHz（轻量模型原生）</option><option value={24000}>24 kHz（推荐）</option><option value={44100}>44.1 kHz（更大文件）</option><option value={48000}>48 kHz（更大文件）</option></select></label><label>每段最多字数 <small>{voiceForm.voice_segment_chars} 字</small><input type="range" min="120" max="800" step="20" value={voiceForm.voice_segment_chars} onChange={(event) => setVoiceForm({ ...voiceForm, voice_segment_chars: Number(event.target.value) })} /></label><label>短音频缓存 <small>{voiceForm.voice_cache_limit_mb} MB</small><input type="range" min="128" max="4096" step="128" value={voiceForm.voice_cache_limit_mb} onChange={(event) => setVoiceForm({ ...voiceForm, voice_cache_limit_mb: Number(event.target.value) })} /></label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_debug} onChange={(event) => setVoiceForm({ ...voiceForm, voice_debug: event.target.checked })} />开启语音调试日志 <small>只记录运行状态，不记录录音内容</small></label></div><p className="form-hint">分段越短越容易暂停和恢复，但文件数量会增加；缓存达到上限时会自动清理最早的短音频。</p></SettingGroup>
-          <details className="voice-technical"><summary>组件与模型信息</summary><p>当前引擎：{voiceForm.voice_engine}</p><p>轻量输入：sherpa-onnx · {voiceForm.voice_light_asr_model}</p><p>轻量朗读：sherpa-onnx · {voiceForm.voice_light_tts_model}</p><p>Qwen 预设：{voiceForm.voice_tts_model}</p><p>声音克隆：Qwen3-TTS · {voiceForm.voice_clone_model}</p><p>本地目录：{voiceStatus?.data_root || "尚未读取"}</p></details>
+          <p className="form-hint">升级后会自动移除旧 VITS 和 Qwen 0.6B 模型缓存，录音、声音档案和听读结果保留。首次使用请下载 Kokoro。</p>
+          {voiceStatus?.migration?.errors?.length ? <p className="form-error">旧语音资源清理未完成：{voiceStatus.migration.errors.join("；")} 下次启动会重试。</p> : null}
+          <SettingGroup title="Kokoro 标准组件（默认）" note="日常朗读默认使用 Kokoro 中文版；连同普通话识别预计下载约 500MB，适合 CPU。"><div className="settings-inline-actions"><button type="button" disabled={lightVoiceInstalling || Boolean(voiceStatus?.kokoro?.tts_ready && voiceStatus?.asr?.asr_ready)} onClick={() => void installKokoro()}>{lightVoiceInstalling ? "正在下载 Kokoro…" : voiceStatus?.kokoro?.tts_ready && voiceStatus?.asr?.asr_ready ? "Kokoro 已就绪" : "下载 Kokoro"}</button><span>{voiceStatus?.kokoro?.model_size_mb ? `已占用 ${voiceStatus.kokoro.model_size_mb.toFixed(1)}MB` : "只在你点击后下载，不会随保存设置自动执行。"}</span></div></SettingGroup>
+          <SettingGroup title="Qwen 高品质组件（可选）" note="Qwen3-TTS 1.7B：预设朗读与授权克隆，两套模型合计约 9.2GB，依赖另计。安装不自动切换默认引擎。"><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_engine === "qwen"} disabled={!voiceStatus?.qwen?.installed} onChange={(event) => setVoiceForm({ ...voiceForm, voice_engine: event.target.checked ? "qwen" : "kokoro" })} />使用 Qwen 高品质模式</label><div className="settings-inline-actions"><button type="button" disabled={qwenInstalling || Boolean(voiceStatus?.qwen?.installed && voiceStatus?.qwen?.models_ready)} onClick={() => void installQwen()}>{qwenInstalling ? "正在安装并适配 Qwen…" : voiceStatus?.qwen?.installed ? voiceStatus.qwen.models_ready ? "Qwen 已就绪" : "重新准备 Qwen 模型" : "安装 Qwen 并一键适配"}</button><span>{voiceStatus?.qwen?.installed ? `组件 ${voiceStatus.qwen.package_size_mb.toFixed(1)}MB · 模型 ${voiceStatus.qwen.model_size_mb.toFixed(1)}MB` : `预计依赖约 ${(voiceStatus?.qwen?.estimated_dependency_download_mb || 7000) / 1000}GB，模型另计`}</span></div>{voiceStatus?.qwen?.last_error && <p className="form-error">{voiceStatus.qwen.last_error}</p>}{!voiceStatus?.qwen?.python_available && !voiceStatus?.qwen?.installed && <p className="form-hint">当前安装包没有找到 Python。安装 Qwen 需要本机有 Python 3.12/3.13，或设置 INKFLOW_PYTHON 指向 python.exe。</p>}</SettingGroup>
+          <SettingGroup title="声音调试与资源" note="这些参数只影响本机音频生成，不修改正文或正史。"><div className="settings-fields two"><label>输出采样率<select value={voiceForm.voice_sample_rate} onChange={(event) => setVoiceForm({ ...voiceForm, voice_sample_rate: Number(event.target.value) })}><option value={16000}>16 kHz（省空间）</option><option value={22050}>22.05 kHz</option><option value={24000}>24 kHz（推荐）</option><option value={44100}>44.1 kHz（更大文件）</option><option value={48000}>48 kHz（更大文件）</option></select></label><label>每段最多字数 <small>{voiceForm.voice_segment_chars} 字</small><input type="range" min="120" max="800" step="20" value={voiceForm.voice_segment_chars} onChange={(event) => setVoiceForm({ ...voiceForm, voice_segment_chars: Number(event.target.value) })} /></label><label>短音频缓存 <small>{voiceForm.voice_cache_limit_mb} MB</small><input type="range" min="128" max="4096" step="128" value={voiceForm.voice_cache_limit_mb} onChange={(event) => setVoiceForm({ ...voiceForm, voice_cache_limit_mb: Number(event.target.value) })} /></label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_debug} onChange={(event) => setVoiceForm({ ...voiceForm, voice_debug: event.target.checked })} />开启语音调试日志 <small>只记录运行状态，不记录录音内容</small></label></div><p className="form-hint">分段越短越容易暂停和恢复，但文件数量会增加；缓存达到上限时会自动清理最早的短音频。</p></SettingGroup>
+          <details className="voice-technical"><summary>组件与模型信息</summary><p>当前引擎：{voiceForm.voice_engine}</p><p>轻量输入：sherpa-onnx · {voiceForm.voice_light_asr_model}</p><p>默认朗读：Kokoro · {voiceForm.voice_light_tts_model}</p><p>Qwen 预设：{voiceForm.voice_tts_model}</p><p>声音克隆：Qwen3-TTS · {voiceForm.voice_clone_model}</p><p>本地目录：{voiceStatus?.data_root || "尚未读取"}</p></details>
         </SettingsPane>}
-        {section === "context" && <SettingsPane title="上下文与检索" note="按任务分配预算；硬事实固定保留，普通资料按相关度压缩。">
-          <div className="settings-fields two"><label>常用上下文<input type="number" min={16000} max={512000} value={form.context_soft_tokens} onChange={(event) => setForm({ ...form, context_soft_tokens: Number(event.target.value) })} /></label><label>最大上下文<input type="number" min={16000} max={1000000} value={form.context_hard_tokens} onChange={(event) => setForm({ ...form, context_hard_tokens: Number(event.target.value) })} /></label></div>
+        {section === "context" && <SettingsPane title="上下文与检索" note="可让四个 Agent 共用一套预算，也可按职责分别设置；硬事实固定保留，普通资料按相关度压缩。">
+          <div className="settings-fields"><label>预算方式<select value={form.context_budget_mode} onChange={(event) => setForm({ ...form, context_budget_mode: event.target.value })}><option value="unified">统一：四个 Agent 共用</option><option value="custom">自定义：每个 Agent 单独设置</option></select></label></div>
+          {form.context_budget_mode === "unified" ? <div className="settings-fields two"><label>统一常用上下文<input type="number" min={16000} max={512000} value={form.context_soft_tokens} onChange={(event) => setForm({ ...form, context_soft_tokens: Number(event.target.value) })} /></label><label>统一最大上下文<input type="number" min={16000} max={1000000} value={form.context_hard_tokens} onChange={(event) => setForm({ ...form, context_hard_tokens: Number(event.target.value) })} /></label></div> : <section className="agent-tuning">{AGENT_TUNING_META.map((meta) => { const budget = form.agent_context_budgets[meta.id]; return <article key={meta.id}><header><div><strong>{meta.label}</strong><small>{meta.note}</small></div></header><div className="agent-tuning-grid"><label>常用上下文<input type="number" min={16000} max={512000} value={budget.soft} onChange={(event) => updateAgentContextBudget(meta.id, { soft: Number(event.target.value) })} /></label><label>最大上下文<input type="number" min={16000} max={1000000} value={budget.hard} onChange={(event) => updateAgentContextBudget(meta.id, { hard: Number(event.target.value) })} /></label></div></article>; })}</section>}
           <SettingGroup title="混合记忆检索" note="精确查询和本地 BM25 始终可用；召回数量按任务、人物、伏笔与剩余预算动态计算。"><div className="settings-fields two"><label>语义召回模型 <small>可选</small><input value={form.retrieval_embedding_model} onChange={(event) => setForm({ ...form, retrieval_embedding_model: event.target.value })} placeholder="BAAI/bge-m3" /></label><label>精排模型 <small>可选</small><input value={form.retrieval_reranker_model} onChange={(event) => setForm({ ...form, retrieval_reranker_model: event.target.value })} placeholder="BAAI/bge-reranker-v2-m3" /></label></div><p className="form-hint">留空不会下载模型。生成参数里的 Top K 默认也留空，只有接口支持且你明确设置时才发送。</p></SettingGroup>
         </SettingsPane>}
         {section === "review" && <SettingsPane title="审查" note="Reviewer 只给证据化报告，不直接改正文。">
-          <div className="settings-fields"><label>核验模式<select value={form.review_verification_mode} onChange={(event) => setForm({ ...form, review_verification_mode: event.target.value })}><option value="evidence">基础：本地证据门禁</option><option value="assisted">增强：纠错并逐条核验</option><option value="strict">严格：争议时调用裁判</option></select></label><label>本地中文 NLI <small>留空关闭</small><input value={form.review_local_nli_model} onChange={(event) => setForm({ ...form, review_local_nli_model: event.target.value })} placeholder="本机模型路径或名称" /></label><label>争议裁判模型 <small>留空关闭</small><input value={form.review_judge_model} onChange={(event) => setForm({ ...form, review_judge_model: event.target.value })} placeholder="当前兼容接口中的模型 ID" /></label></div>
+          <div className="settings-fields"><label>核验模式<select value={form.review_verification_mode} onChange={(event) => setForm({ ...form, review_verification_mode: event.target.value })}><option value="evidence">基础：本地证据门禁</option><option value="assisted">增强：纠错并逐条核验</option><option value="strict">严格：争议时调用裁判</option></select></label><label>阅读体验建议<select value={form.review_experience_detail} onChange={(event) => setForm({ ...form, review_experience_detail: event.target.value })}><option value="concise">精简：只提最重要一项</option><option value="standard">标准：优先 1～3 项</option><option value="detailed">详细：完整说明但不扩大硬门禁</option></select></label><label>本地中文 NLI <small>留空关闭</small><input value={form.review_local_nli_model} onChange={(event) => setForm({ ...form, review_local_nli_model: event.target.value })} placeholder="本机模型路径或名称" /></label><label>争议裁判模型 <small>留空关闭</small><input value={form.review_judge_model} onChange={(event) => setForm({ ...form, review_judge_model: event.target.value })} placeholder="当前兼容接口中的模型 ID" /></label></div><p className="form-hint">钩子的未知项、延后回应和开放问题本身不算表达不清；Reviewer 仍会阻止与正史冲突、缺少锚点或无法理解的结尾。</p>
         </SettingsPane>}
         {section === "learning" && <SettingsPane title="本地学习" note="当前只在项目内记录可复核的反馈信号，不会把小说正文上传为公共训练数据。">
           <SettingGroup title="反馈记录" note={projectRoot ? "当前项目" : "打开项目后可设置"}><label className="setting-check"><input type="checkbox" disabled={!projectRoot} checked={learningSettings.enabled} onChange={(event) => setLearningSettings({ ...learningSettings, enabled: event.target.checked })} />记录接受、拒绝、撤回、重写、偏好和检索反馈</label></SettingGroup>
@@ -2018,7 +2161,7 @@ function UpdateDialog({ info, onClose }: { info: UpdateInfo; onClose: () => void
     } finally { setWorking(false); }
   };
   const sourceLabel = local.source === "embedded" ? "发布包内置更新源" : local.source === "github" ? "GitHub Releases" : local.source === "environment" ? "自定义公开更新源" : "尚未配置";
-  return <Modal title="软件更新" subtitle="新版会自动下载，并在关闭或重启墨流时安装；小说正文、正史数据库和本地项目不会被删除。" onClose={onClose}><section className={`update-card ${local.status || "ready"}`}><div><small>当前版本</small><strong>{local.currentVersion || "0.5.3"}</strong></div><div><small>可用版本</small><strong>{local.availableVersion || "—"}</strong></div><div><small>更新来源</small><strong>{sourceLabel}</strong></div>{typeof local.progress === "number" && <div className="update-progress"><span style={{ width: `${Math.max(0, Math.min(local.progress, 100))}%` }} /></div>}<p>{local.message || "墨流会自动检查新版本，也可以在这里立即检查。"}</p></section>{local.status === "not_configured" && <p className="form-hint">私密仓库的下载需要账号令牌，不适合写进大众软件。仓库或独立发布仓库公开后，只需在构建时配置发布源即可启用在线更新。</p>}<div className="dialog-actions"><button onClick={onClose}>关闭</button>{!new Set(["available", "downloading", "downloaded"]).has(String(local.status)) && <button className="primary" disabled={working || local.status === "not_configured" || local.status === "checking"} onClick={() => void action("check")}>{local.status === "checking" ? "正在检查…" : "检查新版本"}</button>}{local.status === "available" && <button className="primary" disabled>正在准备自动下载…</button>}{local.status === "downloading" && <button className="primary" disabled>正在下载 {Math.round(Number(local.progress || 0))}%</button>}{local.status === "downloaded" && <button className="primary" disabled={working} onClick={() => void action("install")}>重启并安装</button>}</div></Modal>;
+  return <Modal title="软件更新" subtitle="新版会自动下载，并在关闭或重启墨流时安装；小说正文、正史数据库和本地项目不会被删除。" onClose={onClose}><section className={`update-card ${local.status || "ready"}`}><div><small>当前版本</small><strong>{local.currentVersion || "0.6.0"}</strong></div><div><small>可用版本</small><strong>{local.availableVersion || "—"}</strong></div><div><small>更新来源</small><strong>{sourceLabel}</strong></div>{typeof local.progress === "number" && <div className="update-progress"><span style={{ width: `${Math.max(0, Math.min(local.progress, 100))}%` }} /></div>}<p>{local.message || "墨流会自动检查新版本，也可以在这里立即检查。"}</p></section>{local.status === "not_configured" && <p className="form-hint">私密仓库的下载需要账号令牌，不适合写进大众软件。仓库或独立发布仓库公开后，只需在构建时配置发布源即可启用在线更新。</p>}<div className="dialog-actions"><button onClick={onClose}>关闭</button>{!new Set(["available", "downloading", "downloaded"]).has(String(local.status)) && <button className="primary" disabled={working || local.status === "not_configured" || local.status === "checking"} onClick={() => void action("check")}>{local.status === "checking" ? "正在检查…" : "检查新版本"}</button>}{local.status === "available" && <button className="primary" disabled>正在准备自动下载…</button>}{local.status === "downloading" && <button className="primary" disabled>正在下载 {Math.round(Number(local.progress || 0))}%</button>}{local.status === "downloaded" && <button className="primary" disabled={working} onClick={() => void action("install")}>重启并安装</button>}</div></Modal>;
 }
 
 function SelectionDialog({ selection, busy, onClose, onSubmit }: { selection: SelectionDraft; busy: boolean; onClose: () => void; onSubmit: (mode: "comment" | "revise", comment: string) => void }) {
@@ -2094,7 +2237,13 @@ function RevealText({ text, animate }: { text: string; animate: boolean }) {
 }
 
 function Modal({ title, subtitle, onClose, children, className = "" }: { title: string; subtitle: string; onClose: () => void; children: ReactNode; className?: string }) { return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className={`modal ${className}`} role="dialog" aria-modal="true" aria-label={title}><button className="modal-close" aria-label="关闭" onClick={onClose}>×</button><p className="eyebrow">INKFLOW</p><h2>{title}</h2><p className="modal-subtitle">{subtitle}</p>{children}</section></div>; }
-function Toast({ kind, text, onClose }: { kind: "error" | "info"; text: string; onClose: () => void }) { return <div className={`toast ${kind}`}><span>{kind === "error" ? "!" : "i"}</span><p>{text}</p><button onClick={onClose}>×</button></div>; }
+function ChapterStatusStrip({ workspace }: { workspace: Record<string, unknown> }) {
+  const record = (workspace.record || {}) as Record<string, unknown>;
+  const review = (workspace.review || {}) as Record<string, unknown>;
+  const report = (review.report || {}) as Record<string, unknown>;
+  return <section className="stack-section"><h3>当前章节状态</h3><div className="card-grid"><InfoCard label="章节" value={`第 ${String(workspace.chapter_no || "?")} 章`} /><InfoCard label="正文版本" value={record.version ? `v${String(record.version)} · ${String(record.status || "未知")}` : "尚未生成草稿"} /><InfoCard label="Reviewer" value={report.verdict ? `${String(report.verdict)}${review.matches_current_version ? " · 当前版本" : " · 已过期"}` : "尚未审查"} /><InfoCard label="能否验收" value={workspace.can_accept ? "可以：当前版本已通过" : "暂不可：请查看版本或审查状态"} accent /></div></section>;
+}
+function Toast({ kind, text, onClose, action }: { kind: "error" | "info"; text: string; onClose: () => void; action?: { label: string; onClick: () => void } }) { return <div className={`toast ${kind}`}><span>{kind === "error" ? "!" : "i"}</span><p>{text}</p>{action && <button onClick={action.onClick}>{action.label}</button>}<button onClick={onClose}>×</button></div>; }
 function EmptyPanel({ title, text }: { title: string; text: string }) { return <div className="empty-panel"><div>◇</div><h2>{title}</h2><p>{text}</p></div>; }
 function InfoCard({ label, value, accent = false }: { label: string; value: unknown; accent?: boolean }) { return <article className={`info-card ${accent ? "accent" : ""}`}><small>{label}</small><p>{String(value || "尚未设置")}</p></article>; }
 
@@ -2140,7 +2289,15 @@ function isSensitivePresentationKey(key: string): boolean {
     || normalized === "thoughts"
     || normalized === "thinking";
 }
-function errorMessage(cause: unknown): string { return cause instanceof Error ? cause.message : String(cause); }
+function errorMessage(cause: unknown): string {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  if (/影响：/.test(message) && /下一步：/.test(message)) return message;
+  if (/API Key|密钥|模型接口|服务商/.test(message)) return `${message}\n影响：当前模型任务未完成，小说文件和正史未改变。下一步：打开设置检查服务商、模型名称和密钥。`;
+  if (/版本|哈希|正文已变化|重新审查/.test(message)) return `${message}\n影响：系统已停止使用旧审查或旧正文继续提交。已保存：当前草稿版本仍在。下一步：打开当前章重新审查，再决定是否验收。`;
+  if (/章节卡|尚未生成.*规划|缺少.*规划/.test(message)) return `${message}\n影响：Writer 没有可靠的章节约束，因此没有继续写作。下一步：先生成或补齐当前篇章规划。`;
+  if (/超时|网络|连接/.test(message)) return `${message}\n影响：本次远程调用没有正常返回；已经落盘的本地版本不会被删除。下一步：在协作台查看任务状态，再选择重试。`;
+  return `${message}\n影响：本次操作已停止；已有正文和正史保持当前状态。下一步：在协作台查看最后阶段，并按提示重试或调整输入。`;
+}
 async function withDeadline<T>(request: Promise<T>, ms: number, message: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try { return await Promise.race([request, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })]); }
@@ -2148,7 +2305,11 @@ async function withDeadline<T>(request: Promise<T>, ms: number, message: string)
 }
 function currentChapter(path?: string): number | null { const match = path?.match(/chapter_(\d+)/); return match ? Number(match[1]) : null; }
 function tabLabel(tab: Tab): string { return ({ project: "项目", editor: "正文", chapter: "章工位", review: "审查", memory: "记忆", references: "参考", listen: "听读", process: "协作台" })[tab]; }
-function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "run.cancelled": "任务已停止", "workflow.started": "工作流启动", "workflow.completed": "工作流完成", "controller.routing": "理解与路由", "writer.started": "写作角色构思", "writer.completed": "写作角色完成", "provider.testing": "模型连接" } as Record<string, string>)[value || ""] || value || "过程"; }
+function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "run.cancelled": "任务已停止", "run.steered": "已接收人工引导", "workflow.started": "工作流启动", "workflow.planned": "真实任务单", "workflow.completed": "工作流完成", "controller.routing": "理解与路由", "writer.started": "写作角色构思", "writer.completed": "写作角色完成", "provider.testing": "模型连接" } as Record<string, string>)[value || ""] || value || "过程"; }
+function agentRoleLabel(value: string): string { return ({ writer: "Writer", reviewer: "Reviewer", memory_keeper: "Memory Keeper", engine: "Novel Engine" } as Record<string, string>)[value] || value; }
+function operationLabel(value: string): string { return ({ "plan.generate": "生成四级规划", "chapter.write": "生成章节草稿", "chapter.review": "审查当前版本", "chapter.revise": "修订为新版本", "chapter.accept": "提交已通过版本的正史补丁", "batch.draft_loop": "逐章写作、审查与临时连续性", "batch.accept_loop": "按顺序提交通过章节", "arc.audit": "复审篇章承诺" } as Record<string, string>)[value] || value; }
+function authorizationLabel(value: string): string { return ({ none: "未取得", current_request: "当前明确操作", per_chapter_click: "逐章点击", batch_preapproval: "批次一次确认", settings_auto_accept: "设置中的自动验收" } as Record<string, string>)[value] || value; }
+function acceptanceModeLabel(value: string): string { return ({ per_chapter: "逐章确认", batch_once: "批次确认一次", auto_after_review: "审查通过后自动验收" } as Record<string, string>)[value] || value; }
 function credentialLabel(value: string): string { return ({ windows_credential_manager: "Windows 凭据库", "environment:INKFLOW_API_KEY": "系统环境变量", "environment:DEEPSEEK_API_KEY": "DeepSeek 环境变量" } as Record<string, string>)[value] || "本机安全存储"; }
 function methodLabel(value?: string): string { return ({ "conversation.send": "自然对话", "document.revise_selection": "局部修订", "workflow.run": "小说工作流", "project.ideate": "从零构思", "provider.test": "模型连接测试", "reference.search": "搜索公开写作资料", "reference.fetch": "抓取参考资料", "reference.analyze": "分析参考资料" } as Record<string, string>)[value || ""] || "墨流任务"; }
 function processRuns(events: EngineEvent[]) {

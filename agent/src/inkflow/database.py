@@ -1110,6 +1110,37 @@ class ProjectDatabase:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def set_preference_status(self, preference_id: str, status: str) -> dict[str, Any]:
+        if status not in {"active", "paused"}:
+            raise ValueError("偏好状态只能是 active 或 paused")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE user_preferences SET status=?, updated_at=? WHERE preference_id=?",
+                (status, utc_now(), preference_id),
+            )
+            connection.commit()
+        if not cursor.rowcount:
+            raise ValueError("作品声音偏好不存在")
+        return next(
+            item for item in self.list_preferences(active_only=False) if item["preference_id"] == preference_id
+        )
+
+    def delete_preference(self, preference_id: str) -> dict[str, Any]:
+        existing = next(
+            (
+                item
+                for item in self.list_preferences(active_only=False)
+                if item["preference_id"] == preference_id
+            ),
+            None,
+        )
+        if existing is None:
+            raise ValueError("作品声音偏好不存在")
+        with self.connect() as connection:
+            connection.execute("DELETE FROM user_preferences WHERE preference_id=?", (preference_id,))
+            connection.commit()
+        return {**existing, "status": "deleted", "updated_at": utc_now()}
+
     def record_learning_event(
         self,
         event_type: str,

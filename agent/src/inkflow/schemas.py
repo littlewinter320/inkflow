@@ -54,6 +54,13 @@ class PromptOptimization(StrictModel):
     preserved_constraints: list[str] = Field(default_factory=list, max_length=12)
 
 
+class VoiceCloneReadingScript(StrictModel):
+    """Writer 生成的本地克隆参考朗读稿；不属于小说正文或正史。"""
+
+    reading_text: str = Field(min_length=180, max_length=400)
+    coverage_summary: list[str] = Field(min_length=3, max_length=6)
+
+
 class CreativeBrainstorm(StrictModel):
     """Writer 创意分身的输出：无依据可查时的纯创意提案，不写正文、不入正史。"""
 
@@ -173,6 +180,10 @@ class ChapterCard(StrictModel):
     payoff: list[str] = Field(default_factory=list)
     hook_type: HOOK_TYPES
     hook_question: str
+    hook_strength: Literal["light", "medium", "strong"] = "medium"
+    hook_anchor: str = ""
+    withholding_boundary: str = ""
+    payoff_window: str = "下一章或当前篇章内"
     target_words: int = Field(ge=500, le=20_000)
     dependencies: list[str] = Field(default_factory=list)
 
@@ -298,6 +309,40 @@ class VolumeArcPlan(StrictModel):
         return self
 
 
+class HookNote(StrictModel):
+    """Writer 对当前正文版本的公开钩子交付说明，不属于小说正文或正史。"""
+
+    hook_type: str = ""
+    strength: Literal["light", "medium", "strong"] = "medium"
+    actual_anchor: str = ""
+    reader_expectation: str = ""
+    why_keep: str = ""
+    intentionally_withheld: str = ""
+    must_be_clear: str = ""
+    planned_followup: str = ""
+
+
+class HookAssessment(StrictModel):
+    """Reviewer 对版本钩子的阅读体验判断；不替代正史安全门禁。"""
+
+    clarity: Literal["clear", "intentional_ambiguity", "confusing", "absent"] = "absent"
+    actual_anchor: str = ""
+    reader_expectation: str = ""
+    repetition_risk: str = ""
+    payoff_risk: str = ""
+    suggestion: str = ""
+
+
+class SceneBlueprintItem(StrictModel):
+    scene: str
+    entry_state: str
+    character_goal: str
+    new_pressure: str
+    key_choice: str
+    exit_change: str
+    reading_promise: str = ""
+
+
 class DraftOutput(StrictModel):
     title: str
     content: str = Field(min_length=100)
@@ -308,6 +353,8 @@ class DraftOutput(StrictModel):
     )
     new_fact_candidates: list[str] = Field(default_factory=list)
     thread_changes: list[str] = Field(default_factory=list)
+    hook_note: HookNote | None = None
+    scene_blueprint: list[SceneBlueprintItem] = Field(default_factory=list, max_length=8)
 
 
 class SelectionRevisionOutput(StrictModel):
@@ -366,6 +413,15 @@ class ReviewScoreDimension(StrictModel):
     deductions: list[ReviewFinding] = Field(default_factory=list)
 
 
+class ContextUseAudit(StrictModel):
+    """Reviewer 对 Writer 是否正确使用上下文的公开核对结果。"""
+
+    used_source_ids: list[str] = Field(default_factory=list)
+    missing_required_source_ids: list[str] = Field(default_factory=list)
+    conflicting_source_ids: list[str] = Field(default_factory=list)
+    summary: str = ""
+
+
 class ReviewReport(StrictModel):
     verdict: Literal["pass", "patch", "replan", "unknown"]
     confidence: float = Field(ge=0, le=1)
@@ -374,6 +430,8 @@ class ReviewReport(StrictModel):
     findings: list[ReviewFinding] = Field(default_factory=list)
     scorecard: list[ReviewScoreDimension] = Field(default_factory=list)
     source_hash: str = ""
+    hook_assessment: HookAssessment | None = None
+    context_use_audit: ContextUseAudit = Field(default_factory=ContextUseAudit)
 
 
 class ReviewFindingBatch(StrictModel):
@@ -572,6 +630,12 @@ class TaskTicket(StrictModel):
     max_model_calls: int = Field(ge=0, le=100)
     max_tokens: int = Field(ge=0, le=1_000_000)
     max_discussion_rounds: int = Field(default=2, ge=0, le=4)
+    authorization_source: Literal[
+        "none", "current_request", "per_chapter_click", "batch_preapproval", "settings_auto_accept"
+    ] = "none"
+    acceptance_confirmation_mode: Literal[
+        "per_chapter", "batch_once", "auto_after_review"
+    ] = "per_chapter"
 
 
 class DispatchStep(StrictModel):
@@ -602,6 +666,7 @@ TerminalAction = Literal[
     "arc_audit",
     "continue_run",
     "batch_draft",
+    "batch_draft_accept",
     "batch_repair",
     "batch_accept",
     "checkpoint_list",
@@ -610,6 +675,7 @@ TerminalAction = Literal[
     "rollback_restore",
     "write_draft",
     "write_review",
+    "write_review_accept",
     "review",
     "revise_draft",
     "revise_review",
@@ -617,6 +683,7 @@ TerminalAction = Literal[
     "revise_review_accept",
     "accept",
     "help",
+    "voice_clone_script",
     "exit",
 ]
 
@@ -629,6 +696,12 @@ class TerminalIntent(StrictModel):
     alternative_action: TerminalAction | None = None
     confidence: Literal["high", "medium", "low"] = "medium"
     authorization: Literal["none", "proposed", "approved"] = "none"
+    authorization_source: Literal[
+        "none", "current_request", "per_chapter_click", "batch_preapproval", "settings_auto_accept"
+    ] = "none"
+    acceptance_confirmation_mode: Literal[
+        "per_chapter", "batch_once", "auto_after_review"
+    ] = "per_chapter"
     missing_fields: list[str] = Field(default_factory=list, max_length=8)
     clarification_question: str = Field(default="", max_length=500)
     clarification_questions: list["ClarificationQuestion"] = Field(default_factory=list, max_length=3)

@@ -31,17 +31,22 @@ PERSISTED_SETTING_NAMES = {
     "reasoning_effort",
     "context_soft_tokens",
     "context_hard_tokens",
+    "context_budget_mode",
+    "agent_context_budgets",
     "max_output_tokens",
     "request_timeout_seconds",
     "planning_timeout_seconds",
     "trace_level",
     "show_provider_reasoning",
     "inquiry_frequency",
+    "hook_strategy",
+    "acceptance_confirmation_mode",
     "dialogue_history_mode",
     "dialogue_history_interval",
     "dialogue_history_limit",
     "agent_generation",
     "review_verification_mode",
+    "review_experience_detail",
     "review_local_nli_model",
     "review_judge_model",
     "retrieval_embedding_model",
@@ -55,6 +60,7 @@ PERSISTED_SETTING_NAMES = {
     "voice_default_profile",
     "voice_speed",
     "voice_volume",
+    "voice_pause_scale",
     "voice_input_device",
     "voice_output_device",
     "voice_compute_device",
@@ -77,6 +83,13 @@ DEFAULT_AGENT_GENERATION: dict[str, dict[str, float | int | None]] = {
     "writer": {"temperature": 0.85, "top_p": 0.95, "top_k": None},
     "reviewer": {"temperature": 0.2, "top_p": 0.8, "top_k": None},
     "memory_keeper": {"temperature": 0.1, "top_p": 0.7, "top_k": None},
+}
+
+DEFAULT_AGENT_CONTEXT_BUDGETS: dict[str, dict[str, int]] = {
+    "coordinator": {"soft": 96_000, "hard": 160_000},
+    "writer": {"soft": 192_000, "hard": 208_000},
+    "reviewer": {"soft": 160_000, "hard": 176_000},
+    "memory_keeper": {"soft": 96_000, "hard": 128_000},
 }
 
 
@@ -147,12 +160,18 @@ class Settings:
     reasoning_effort: str = "high"
     context_soft_tokens: int = 256_000
     context_hard_tokens: int = 512_000
+    context_budget_mode: str = "unified"
+    agent_context_budgets: dict[str, dict[str, int]] = field(
+        default_factory=lambda: {name: dict(values) for name, values in DEFAULT_AGENT_CONTEXT_BUDGETS.items()}
+    )
     max_output_tokens: int = 16_000
     request_timeout_seconds: float = 180.0
     planning_timeout_seconds: float = 600.0
     trace_level: str = "full"
     show_provider_reasoning: bool = True
     inquiry_frequency: str = "medium"
+    hook_strategy: str = "most_chapters"
+    acceptance_confirmation_mode: str = "per_chapter"
     dialogue_history_mode: str = "auto"
     dialogue_history_interval: int = 1
     dialogue_history_limit: int = 100
@@ -160,6 +179,7 @@ class Settings:
         default_factory=lambda: {name: dict(values) for name, values in DEFAULT_AGENT_GENERATION.items()}
     )
     review_verification_mode: str = "evidence"
+    review_experience_detail: str = "standard"
     review_local_nli_model: str = ""
     review_judge_model: str = ""
     retrieval_embedding_model: str = ""
@@ -173,15 +193,16 @@ class Settings:
     voice_default_profile: str = "narrator_female"
     voice_speed: float = 1.0
     voice_volume: float = 1.0
+    voice_pause_scale: float = 1.0
     voice_input_device: str = ""
     voice_output_device: str = ""
     voice_compute_device: str = "auto"
-    voice_engine: str = "auto"
+    voice_engine: str = "kokoro"
     voice_asr_model: str = "paraformer-zh-streaming"
-    voice_tts_model: str = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
-    voice_clone_model: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    voice_tts_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    voice_clone_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
     voice_light_asr_model: str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09"
-    voice_light_tts_model: str = "sherpa-onnx-vits-zh-ll"
+    voice_light_tts_model: str = "kokoro-int8-multi-lang-v1_1"
     voice_sample_rate: int = 24000
     voice_segment_chars: int = 360
     voice_cache_limit_mb: int = 1024
@@ -190,12 +211,30 @@ class Settings:
     output_price_per_million: float = 0.0
     workspace_root: Path | None = None
 
+    def context_budget_for(self, role: str) -> tuple[int, int]:
+        """返回一次 Agent 调用可用的上下文预算；统一模式保持旧行为。"""
+
+        if self.context_budget_mode != "custom":
+            return self.context_soft_tokens, self.context_hard_tokens
+        selected = self.agent_context_budgets.get(role) or self.agent_context_budgets["writer"]
+        return int(selected["soft"]), int(selected["hard"])
+
     @classmethod
     def from_mapping(
         cls,
         value: dict[str, Any],
         workspace_root: str | Path | None = None,
     ) -> "Settings":
+        value = dict(value)
+        # Normalize legacy model IDs even when they come from workspace settings
+        # or environment variables, rather than only the global settings file.
+        for key, previous, current in (
+            ("voice_tts_model", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"),
+            ("voice_clone_model", "Qwen/Qwen3-TTS-12Hz-0.6B-Base", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
+            ("voice_light_tts_model", "sherpa-onnx-vits-zh-ll", "kokoro-int8-multi-lang-v1_1"),
+        ):
+            if str(value.get(key, "")).strip() == previous:
+                value[key] = current
         defaults = cls()
         provider_kind = str(value.get("provider_kind", defaults.provider_kind)).strip().lower()
         if provider_kind not in PROVIDER_KINDS:
@@ -218,6 +257,24 @@ class Settings:
         output = _positive_int(value.get("max_output_tokens", defaults.max_output_tokens), "单次输出上限")
         if soft > hard:
             raise ConfigurationError("软上下文预算不能大于硬上下文上限。")
+        context_budget_mode = _choice(
+            value.get("context_budget_mode", defaults.context_budget_mode),
+            "上下文预算模式",
+            {"unified", "custom"},
+        )
+        raw_agent_budgets = value.get("agent_context_budgets", defaults.agent_context_budgets)
+        if not isinstance(raw_agent_budgets, dict):
+            raise ConfigurationError("各 Agent 上下文预算必须是对象。")
+        agent_context_budgets: dict[str, dict[str, int]] = {}
+        for role, fallback in DEFAULT_AGENT_CONTEXT_BUDGETS.items():
+            raw = raw_agent_budgets.get(role, fallback)
+            if not isinstance(raw, dict):
+                raise ConfigurationError(f"{role} 的上下文预算格式无效。")
+            role_soft = _positive_int(raw.get("soft", fallback["soft"]), f"{role} 常用上下文预算")
+            role_hard = _positive_int(raw.get("hard", fallback["hard"]), f"{role} 最大上下文预算")
+            if role_soft > role_hard:
+                raise ConfigurationError(f"{role} 的常用上下文不能大于最大上下文。")
+            agent_context_budgets[role] = {"soft": role_soft, "hard": role_hard}
         if output > 16_000:
             raise ConfigurationError("墨流的单次模型输出上限固定为 16K tokens。")
         timeout = _positive_float(
@@ -229,6 +286,16 @@ class Settings:
         inquiry_frequency = str(value.get("inquiry_frequency", defaults.inquiry_frequency)).lower()
         if inquiry_frequency not in {"low", "medium", "high", "ultra"}:
             raise ConfigurationError("主动询问频率只能是 low、medium、high 或 ultra。")
+        hook_strategy = _choice(
+            value.get("hook_strategy", defaults.hook_strategy),
+            "章节结尾策略",
+            {"most_chapters", "key_chapters", "natural_afterglow"},
+        )
+        acceptance_confirmation_mode = _choice(
+            value.get("acceptance_confirmation_mode", defaults.acceptance_confirmation_mode),
+            "验收确认策略",
+            {"per_chapter", "batch_once", "auto_after_review"},
+        )
         dialogue_history_mode = _choice(
             value.get("dialogue_history_mode", defaults.dialogue_history_mode),
             "对话历史保存方式",
@@ -252,6 +319,11 @@ class Settings:
         ).lower()
         if review_verification_mode not in {"evidence", "assisted", "strict"}:
             raise ConfigurationError("审核核验模式只能是 evidence、assisted 或 strict。")
+        review_experience_detail = _choice(
+            value.get("review_experience_detail", defaults.review_experience_detail),
+            "阅读体验建议详细度",
+            {"concise", "standard", "detailed"},
+        )
         return cls(
             provider_kind=provider_kind,
             base_url=base_url,
@@ -259,6 +331,8 @@ class Settings:
             reasoning_effort=effort,
             context_soft_tokens=soft,
             context_hard_tokens=hard,
+            context_budget_mode=context_budget_mode,
+            agent_context_budgets=agent_context_budgets,
             max_output_tokens=output,
             request_timeout_seconds=timeout,
             planning_timeout_seconds=planning_timeout,
@@ -267,11 +341,14 @@ class Settings:
                 value.get("show_provider_reasoning", defaults.show_provider_reasoning)
             ),
             inquiry_frequency=inquiry_frequency,
+            hook_strategy=hook_strategy,
+            acceptance_confirmation_mode=acceptance_confirmation_mode,
             dialogue_history_mode=dialogue_history_mode,
             dialogue_history_interval=dialogue_history_interval,
             dialogue_history_limit=dialogue_history_limit,
             agent_generation=agent_generation,
             review_verification_mode=review_verification_mode,
+            review_experience_detail=review_experience_detail,
             review_local_nli_model=str(
                 value.get("review_local_nli_model", defaults.review_local_nli_model)
             ).strip(),
@@ -292,6 +369,12 @@ class Settings:
             or defaults.voice_default_profile,
             voice_speed=_bounded_float(value.get("voice_speed", defaults.voice_speed), "语音速度", 0.75, 1.35),
             voice_volume=_bounded_float(value.get("voice_volume", defaults.voice_volume), "语音音量", 0.25, 1.5),
+            voice_pause_scale=_bounded_float(
+                value.get("voice_pause_scale", defaults.voice_pause_scale),
+                "语音停顿强度",
+                0.6,
+                1.8,
+            ),
             voice_input_device=str(value.get("voice_input_device", defaults.voice_input_device)).strip(),
             voice_output_device=str(value.get("voice_output_device", defaults.voice_output_device)).strip(),
             voice_compute_device=_choice(
@@ -299,10 +382,14 @@ class Settings:
                 "语音计算设备",
                 {"auto", "cpu", "cuda"},
             ),
+            # 旧版本的 auto / sherpa 都迁移到当前默认的 Kokoro，避免已有设置
+            # 因为引擎名称更新而无法启动。
             voice_engine=_choice(
-                value.get("voice_engine", defaults.voice_engine),
+                "kokoro"
+                if str(value.get("voice_engine", defaults.voice_engine)).strip().lower() in {"", "auto", "sherpa"}
+                else value.get("voice_engine", defaults.voice_engine),
                 "语音引擎",
-                {"auto", "sherpa", "qwen"},
+                {"kokoro", "qwen"},
             ),
             voice_asr_model=str(value.get("voice_asr_model", defaults.voice_asr_model)).strip()
             or defaults.voice_asr_model,
@@ -357,7 +444,10 @@ class Settings:
             "trace_level": "INKFLOW_TRACE_LEVEL",
             "show_provider_reasoning": "INKFLOW_SHOW_REASONING",
             "inquiry_frequency": "INKFLOW_INQUIRY_FREQUENCY",
+            "hook_strategy": "INKFLOW_HOOK_STRATEGY",
+            "acceptance_confirmation_mode": "INKFLOW_ACCEPTANCE_CONFIRMATION_MODE",
             "review_verification_mode": "INKFLOW_REVIEW_VERIFICATION_MODE",
+            "review_experience_detail": "INKFLOW_REVIEW_EXPERIENCE_DETAIL",
             "review_local_nli_model": "INKFLOW_REVIEW_LOCAL_NLI_MODEL",
             "review_judge_model": "INKFLOW_REVIEW_JUDGE_MODEL",
             "retrieval_embedding_model": "INKFLOW_RETRIEVAL_EMBEDDING_MODEL",

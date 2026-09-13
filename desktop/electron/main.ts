@@ -58,6 +58,9 @@ class UpdateManager {
       });
     }
     if (!this.updater) return;
+    // Reuse unchanged blocks from the cached installer. electron-updater falls
+    // back to a full download when the old installer or blockmap is unavailable.
+    this.updater.disableDifferentialDownload = false;
     this.updater.autoDownload = true;
     this.updater.autoInstallOnAppQuit = true;
     this.updater.on("checking-for-update", () => this.setState({ status: "checking", message: "正在检查新版本…" }));
@@ -208,8 +211,22 @@ class EngineBridge {
     if (!pending) return;
     this.pending.delete(id);
     if (value.error) {
-      const error = value.error as { message?: string; code?: string };
-      pending.reject(new Error(error.message || error.code || "墨流引擎请求失败。"));
+      const error = value.error as {
+        title?: string;
+        message?: string;
+        code?: string;
+        impact?: string;
+        preserved?: string;
+        actions?: Array<{ label?: string }>;
+      };
+      const lines = [
+        error.title && error.title !== error.message ? error.title : "",
+        error.message || error.code || "墨流引擎请求失败。",
+        error.impact ? `影响：${error.impact}` : "",
+        error.preserved ? `已保留：${error.preserved}` : "",
+        error.actions?.length ? `下一步：${error.actions.map((item) => item.label).filter(Boolean).join("；")}` : "",
+      ].filter(Boolean);
+      pending.reject(new Error(lines.join("\n")));
     } else {
       pending.resolve(value.result);
     }

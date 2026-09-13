@@ -14,6 +14,103 @@ from .studio import StudioDatabase
 from .utils import atomic_write_text, estimate_tokens, json_dumps, utc_now
 
 
+_COMPRESSED_NOTE = "（已按完整条目压缩；完整资料仍保存在本地）"
+
+
+def _shorten_soft_text(value: str, limit: int, *, keep_tail: bool = False) -> str:
+    if len(value) <= limit:
+        return value
+    room = max(0, limit - len(_COMPRESSED_NOTE) - 1)
+    if keep_tail:
+        suffix = value[-room:]
+        boundaries = [position for position in (suffix.find("\n\n"), suffix.find("。"), suffix.find("！"), suffix.find("？"), suffix.find("\n")) if position >= 0]
+        if boundaries:
+            suffix = suffix[min(boundaries) + 1 :].lstrip()
+        return _COMPRESSED_NOTE + "\n" + suffix
+    prefix = value[:room]
+    boundaries = [prefix.rfind(mark) for mark in ("\n\n", "。", "！", "？", "\n")]
+    boundary = max(boundaries)
+    if boundary >= max(80, room // 3):
+        prefix = prefix[: boundary + (0 if prefix[boundary: boundary + 2] == "\n\n" else 1)]
+    return prefix.rstrip() + "\n" + _COMPRESSED_NOTE
+
+
+def _fit_json_value(value: Any, limit: int) -> Any:
+    """在字符预算内保留完整 JSON 项，避免把半个对象交给模型。"""
+
+    if isinstance(value, list):
+        kept: list[Any] = []
+        for item in value:
+            candidate = [*kept, item]
+            if len(json.dumps(candidate, ensure_ascii=False, indent=2)) <= limit:
+                kept = candidate
+                continue
+            if not kept and isinstance(item, (list, dict, str)):
+                compact = _fit_json_value(item, max(80, limit - 8))
+                if len(json.dumps([compact], ensure_ascii=False, indent=2)) <= limit:
+                    kept = [compact]
+            break
+        return kept
+    if isinstance(value, dict):
+        kept: dict[str, Any] = {}
+        for key, item in value.items():
+            candidate = {**kept, key: item}
+            if len(json.dumps(candidate, ensure_ascii=False, indent=2)) <= limit:
+                kept[key] = item
+                continue
+            remaining = max(80, limit - len(json.dumps(kept, ensure_ascii=False, indent=2)) - len(str(key)) - 16)
+            if isinstance(item, (list, dict)):
+                compact = _fit_json_value(item, remaining)
+                candidate = {**kept, key: compact}
+                if len(json.dumps(candidate, ensure_ascii=False, indent=2)) <= limit:
+                    kept[key] = compact
+            elif isinstance(item, str) and remaining >= 80:
+                compact = _shorten_soft_text(item, remaining)
+                candidate = {**kept, key: compact}
+                if len(json.dumps(candidate, ensure_ascii=False, indent=2)) <= limit:
+                    kept[key] = compact
+        return kept
+    if isinstance(value, str):
+        return _shorten_soft_text(value, limit)
+    return value
+
+
+def _fit_soft_content(content: str, limit: int, *, keep_tail: bool = False) -> str:
+    try:
+        value = json.loads(content)
+    except json.JSONDecodeError:
+        return _shorten_soft_text(content, limit, keep_tail=keep_tail)
+    compact = _fit_json_value(value, limit)
+    rendered = json.dumps(compact, ensure_ascii=False, indent=2)
+    if len(rendered) <= limit:
+        return rendered
+    empty = [] if isinstance(value, list) else {}
+    return json.dumps(empty, ensure_ascii=False, indent=2)
+
+
+def _voice_preferences_for_context(
+    preferences: list[dict[str, Any]], task: str, card: dict[str, Any], limit: int = 12
+) -> list[dict[str, Any]]:
+    haystack = (task + "\n" + json.dumps(card, ensure_ascii=False)).casefold()
+    ranked: list[tuple[int, int, dict[str, Any]]] = []
+    for index, item in enumerate(preferences):
+        if item.get("strength") != "weak":
+            continue
+        scope = str(item.get("scope") or "project")
+        scope_kind, _, target = scope.partition(":")
+        if scope_kind == "project":
+            score = 2
+        elif target and target.casefold() in haystack:
+            score = 4
+        elif not target:
+            score = 1
+        else:
+            continue
+        ranked.append((score, -index, item))
+    ranked.sort(key=lambda row: (-row[0], -row[1]))
+    return [item for _, _, item in ranked[:limit]]
+
+
 class ContextBuilder:
     """把内部多源数据压成模型唯一可见的 Context Packet。"""
 
@@ -25,6 +122,8 @@ class ContextBuilder:
         hard_token_limit: int | None = None,
         embedding_model: str = "",
         reranker_model: str = "",
+        hook_strategy: str = "most_chapters",
+        review_experience_detail: str = "standard",
     ):
         self.project = project
         self.soft_token_limit = soft_token_limit
@@ -37,6 +136,8 @@ class ContextBuilder:
             embedding_model=embedding_model,
             reranker_model=reranker_model,
         )
+        self.hook_strategy = hook_strategy
+        self.review_experience_detail = review_experience_detail
 
     def build(
         self,
@@ -70,6 +171,9 @@ class ContextBuilder:
         facts = database.current_facts()
         threads = database.open_threads()
         preferences = database.list_preferences()
+        forced_preferences = [item for item in preferences if item["strength"] == "hard"]
+        forced_texts = list(dict.fromkeys(str(item["text"]).strip() for item in forced_preferences if str(item["text"]).strip()))
+        voice_preferences = _voice_preferences_for_context(preferences, task, card)
         learning_guidance = database.learning_guidance()
         studio_context = self._studio_context(chapter_no, task, card)
         pinned_sources = {str(item["source_id"]) for item in studio_context["pins"]}
@@ -78,7 +182,8 @@ class ContextBuilder:
             "review": 1,
             "revise": 1,
         }[mode]
-        recent = database.recent_accepted_chapters(chapter_no, limit=effective_recent_limit)
+        recent_for_patterns = database.recent_accepted_chapters(chapter_no, limit=max(6, effective_recent_limit))
+        recent = recent_for_patterns[-effective_recent_limit:] if effective_recent_limit else []
         recent_parts: list[str] = []
         recent_ids: list[str] = []
         provisional_memory: list[dict[str, Any]] = []
@@ -88,6 +193,21 @@ class ContextBuilder:
             content = path.read_text(encoding="utf-8") if path.exists() else "（章节文件缺失）"
             recent_parts.append(f"### 第 {item['chapter_no']} 章\n\n{content}")
             recent_ids.append(f"chapter:{item['chapter_no']:05d}")
+        ending_pattern_inputs = [*recent_for_patterns]
+        ending_pattern_ids = [f"chapter:{item['chapter_no']:05d}" for item in recent_for_patterns]
+        for item in (provisional_chapters or [])[-4:]:
+            provisional_no = int(item["chapter_no"])
+            ending_pattern_inputs.append(
+                {
+                    "chapter_no": provisional_no,
+                    "content": str(item["content"]),
+                    "source_kind": "批次临时草稿",
+                }
+            )
+            ending_pattern_ids.append(
+                f"batch:{item.get('batch_id', 'current')}:chapter:{provisional_no:05d}"
+            )
+        ending_patterns = _recent_ending_patterns(self.project.root, ending_pattern_inputs)
         for item in (provisional_chapters or [])[-2:]:
             provisional_no = int(item["chapter_no"])
             provisional_content = str(item["content"])
@@ -228,6 +348,19 @@ class ContextBuilder:
                 source_ids=recent_ids,
             ),
             ContextSection(
+                key="E1",
+                title="近期章节结尾模式摘要",
+                content=json.dumps(
+                    {
+                        "最近模式": ending_patterns,
+                        "用途": "只用于避免连续章节采用相同收束方式；不得据此改写章节卡、正史或因果。",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                source_ids=ending_pattern_ids,
+            ),
+            ContextSection(
                 key="F",
                 title="分层混合检索结果",
                 content=json.dumps(
@@ -253,6 +386,11 @@ class ContextBuilder:
                 key="H",
                 title="参考作品特征卡",
                 content=json.dumps(reference_cards, ensure_ascii=False, indent=2) if reference_cards else "本章未加载参考作品。",
+                source_ids=[
+                    f"reference:{item['reference_id']}"
+                    for item in reference_cards
+                    if item.get("reference_id")
+                ],
             ),
             ContextSection(
                 key="I",
@@ -262,7 +400,7 @@ class ContextBuilder:
             ),
             ContextSection(
                 key="J",
-                title="用户偏好与文风契约",
+                title="用户强制记忆与作品方向",
                 content=json.dumps(
                     {
                         "题材": brief.genre,
@@ -270,13 +408,33 @@ class ContextBuilder:
                         "目标字数": brief.target_chapter_words,
                         "核心卖点": brief.core_selling_point,
                         "本书硬规则": brief.user_rules,
-                        "长期硬规则": [item["text"] for item in preferences if item["strength"] == "hard"],
-                        "弱偏好": [item["text"] for item in preferences if item["strength"] == "weak"],
+                        "强制记忆": forced_texts,
+                        "使用要求": "Writer 必须逐条遵守；发现互相冲突时不得自行猜测，由 Reviewer 标出冲突并交给用户处理。",
                     },
                     ensure_ascii=False,
                     indent=2,
                 ),
+                source_ids=[str(item["preference_id"]) for item in forced_preferences],
                 hard=True,
+            ),
+            ContextSection(
+                key="J2",
+                title="作品声音契约（非正史）",
+                content=json.dumps(
+                    {
+                        "本章可用偏好": [
+                            {"范围": item["scope"], "要求": item["text"]}
+                            for item in voice_preferences
+                        ],
+                        "使用边界": "当前用户指令和已验收正史优先；只采用与本章视角、人物或场景相符的偏好。",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                source_ids=[
+                    str(item["preference_id"])
+                    for item in voice_preferences
+                ],
             ),
             ContextSection(
                 key="J1",
@@ -287,7 +445,12 @@ class ContextBuilder:
             ContextSection(
                 key="K",
                 title="输出契约",
-                content=_output_contract(mode, card),
+                content=_output_contract(
+                    mode,
+                    card,
+                    hook_strategy=self.hook_strategy,
+                    review_experience_detail=self.review_experience_detail,
+                ),
                 hard=True,
             ),
         ]
@@ -307,6 +470,11 @@ class ContextBuilder:
             if overlapping_manual
             else []
         )
+        if len(forced_texts) > 24 or sum(len(item) for item in forced_texts) > 12_000:
+            warnings.append(
+                "强制记忆数量或体积偏大：已安全去除完全重复项，但没有删改任何原始记录；"
+                "Writer 仍会读取全部内容，Reviewer 会核对冲突。建议在记忆页暂停过期项或合并同义规则。"
+            )
         packet = ContextPacket(
             project_id=self.project.project_id,
             chapter_no=chapter_no,
@@ -529,6 +697,11 @@ class ContextBuilder:
                 key="H",
                 title="参考作品特征卡",
                 content=json.dumps(reference_cards, ensure_ascii=False, indent=2) if reference_cards else "本次未加载参考作品。",
+                source_ids=[
+                    f"reference:{item['reference_id']}"
+                    for item in reference_cards
+                    if item.get("reference_id")
+                ],
             ),
             ContextSection(
                 key="I",
@@ -570,8 +743,8 @@ class ContextBuilder:
         """只压缩低权威软资料；顺序固定且优先保留高相关候选和最近正文。"""
 
         actions: list[str] = []
-        targets = {"H": 4_000, "I": 4_000, "J1": 2_000, "F": 10_000, "E": 24_000, "D1": 8_000}
-        for key in ("H", "I", "J1", "F", "E", "D1"):
+        targets = {"H": 4_000, "I": 4_000, "J1": 2_000, "J2": 4_000, "E1": 4_000, "F": 10_000, "E": 24_000, "D1": 8_000}
+        for key in ("H", "J1", "I", "J2", "E1", "F", "E", "D1"):
             if estimate_tokens(
                 "\n".join([*[item.content for item in packet.sections], protected_input])
             ) <= int(self.soft_token_limit * 0.82):
@@ -598,7 +771,7 @@ class ContextBuilder:
                     pass
             limit = targets[key]
             if len(section.content) > limit:
-                section.content = section.content[-limit:] + "\n（按优先级保留的相关尾部；完整资料仍在本地）"
+                section.content = _fit_soft_content(section.content, limit, keep_tail=key == "E")
             if section.content != original:
                 actions.append(section.title)
         return actions
@@ -793,11 +966,78 @@ def _audit_card_for_model(card: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _output_contract(mode: str, card: dict[str, Any]) -> str:
+def _recent_ending_patterns(project_root: Path, chapters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """提取可解释的结尾形态，不保存或复述章节原文。"""
+
+    patterns: list[dict[str, Any]] = []
+    for item in chapters:
+        if "content" in item:
+            content = str(item["content"]).strip()
+        else:
+            path = project_root / str(item["path"])
+            if not path.is_file():
+                continue
+            content = path.read_text(encoding="utf-8").strip()
+        tail = content[-800:]
+        final_paragraph = next((part.strip() for part in reversed(re.split(r"\n\s*\n", tail)) if part.strip()), tail)
+        signals: list[str] = []
+        if re.search(r"[？?]", final_paragraph):
+            signals.append("悬问")
+        if re.search(r"[“\"].{0,80}[”\"]\s*[。！？!?]?$", final_paragraph, re.S):
+            signals.append("对话截停")
+        if re.search(r"忽然|突然|竟然|发现|看见|听见|原来|真相|秘密", tail):
+            signals.append("新信息揭示")
+        if re.search(r"决定|必须|不能再|选择|答应|拒绝|转身|出发", tail):
+            signals.append("决定或行动")
+        if re.search(r"危险|警报|血|死|杀|追|逼近|崩塌|爆炸|失踪", tail):
+            signals.append("迫近危险")
+        if not signals:
+            signals.append("余波收束")
+        patterns.append(
+            {
+                "章节": int(item["chapter_no"]),
+                "来源": str(item.get("source_kind") or "已接受章节"),
+                "结尾形态": signals[:3],
+                "末段长度": len(final_paragraph),
+            }
+        )
+    return patterns
+
+
+def _hook_strategy_instruction(value: str) -> str:
+    return {
+        "most_chapters": "大多数章节都应形成自然的前向期待；普通章可使用低强度余波、决定或信息差，禁止机械反转。",
+        "key_chapters": "重点章使用明确钩子；普通章只要保持未完成的行动、关系或信息即可，不强求强悬念。",
+        "natural_afterglow": "优先自然余味；只有章节卡或剧情本身需要时才加强悬念，但结尾仍要留下可继续阅读的期待。",
+    }.get(value, "大多数章节都应形成自然的前向期待。")
+
+
+def _review_detail_instruction(value: str) -> str:
+    return {
+        "concise": "阅读体验建议保持精简，最多指出 1 个最有价值的非阻断改进点。",
+        "standard": "阅读体验建议保持适量，优先指出最影响吸引力的 1 至 3 个非阻断改进点。",
+        "detailed": "可较详细说明阅读体验，但仍须区分硬门禁与可选建议，不得用建议阻止通过。",
+    }.get(value, "阅读体验建议保持适量，并与硬门禁分开。")
+
+
+def _output_contract(
+    mode: str,
+    card: dict[str, Any],
+    *,
+    hook_strategy: str = "most_chapters",
+    review_experience_detail: str = "standard",
+) -> str:
     if mode == "review":
-        return "只输出审查报告结构。没有可直接证明的硬问题时必须通过；不续写、不重写正文。"
+        return (
+            "只输出审查报告结构，并单独填写 hook_assessment；有意留白与表达混乱必须区分。"
+            "钩子的未知项、延后回应和开放问题本身不算表达不清；只有锚点缺失、与正史冲突或正文无法理解时才按证据报告。"
+            "没有可直接证明的硬问题时必须通过；不续写、不重写正文。"
+            + _review_detail_instruction(review_experience_detail)
+        )
     return (
         "只输出章节草稿结构。正文约 "
         f"{card['target_words']} 字，完成目标—阻力—决定—后果与不可逆变化即可；"
-        "表达、场景调度与修辞可自由发挥，不附工作说明。"
+        "表达、场景调度与修辞可自由发挥；正文外填写 hook_note，说明实际锚点、留白边界和预计回应，"
+        "不得把说明混入小说正文。"
+        + _hook_strategy_instruction(hook_strategy)
     )

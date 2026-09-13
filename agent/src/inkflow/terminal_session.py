@@ -6,12 +6,12 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from .config import Settings
 from .coordinator import Coordinator
 from .engine import InkFlowEngine
-from .errors import InkFlowError
+from .errors import InkFlowError, ValidationGateError
 from .project import InkFlowProject
 from .prompts import MOBAO_PERSONA
 from .project_lock import project_write_lock_sync
@@ -47,6 +47,7 @@ TERMINAL_ROUTER_SYSTEM = """
 - plan_next_arc：只有当前篇章全部进入正史后，才让 Writer 基于实际结果细化紧邻的下一篇章。operation_instruction 非空表示用户要调整未来规划；只要整句语义明确要求现在执行，authorization=approved 且 plan_change_confirmed=true，不限定必须出现“确认/同意”两个词。
 - continue_run：按 Writer→Reviewer→必要时定点修订→重审→Memory Keeper 的门禁循环续写。必须提取“已接受正文目标字符数”或“结束章节号”之一；结束章节号写入 end_chapter_no，例如“连续完成第8到10章”应设为 10。不可同时填写两种终点。
 - batch_draft：生成一段临时批次草稿。chapter_no 是起始章，end_chapter_no 是结束章；每章写完后立即由 Reviewer 审查，若有 patch 最多由独立 Writer 调用修订两轮。不得调用 Memory Keeper 或进入正史。
+- batch_draft_accept：仅由已保存的“批次确认一次/自动验收”策略升级而来；先完整执行 batch_draft，只有整个连续批次都处于 ready_for_acceptance 时才调用 batch_accept。用户说“只要草稿/不要验收”时绝不能使用。
 - batch_repair：按明确的因果方向修订一个已有临时批次中的一段章节。先让 Writer 修订每一章，再让 Reviewer 审查当前版本；若新审查仍有硬问题，最多再做 max_revision_rounds 轮修订。修订结果和审查分数必须回写同一批次清单；不得调用 Memory Keeper 或进入正史。batch_id 可逐字复制用户提供的编号；未提供时宿主只在唯一可修复批次存在时补齐。chapter_no/end_chapter_no 未提供时，宿主只在已确定批次时采用该批次的完整范围。
 - batch_accept：用户明确接收一个已完成批次。batch_id 必须逐字复制用户输入；只能把通过审查、连续衔接的批次章节依次交给 Memory Keeper。
 - checkpoint_list：列出可用检查点/回退点。
@@ -54,6 +55,7 @@ TERMINAL_ROUTER_SYSTEM = """
 - rollback_preview：只预览回退影响并返回确认码，不改变项目。优先提取 checkpoint_id；若用户说“回到第 N 章生成前”，chapter_no 应设为 N-1，表示回到上一章已接受后的边界。
 - rollback_restore：使用用户明确给出的 checkpoint_id/章节边界和 confirmation_token 执行分支式恢复；缺任一关键参数都不得猜测。
 - write_review：让 Writer 写指定章节，然后让 Reviewer 审查；绝不接受。
+- write_review_accept：仅由已保存的自动验收策略升级而来；Writer 写作后由 Reviewer 审查，只有当前版本 `pass` 才调用 Memory Keeper。用户要求先看草稿或不要验收时绝不能使用。
 - revise_review：让 Writer 依同版本审查修订指定章节，然后让 Reviewer 重审；绝不接受。
 - review_accept：先让 Reviewer 审查；仅当 verdict=pass 时才让 Memory Keeper 接受，且 force 永远为 false。
 - revise_review_accept：修订→重审→仅 pass 时接受，途中任一门禁失败必须停止。
@@ -102,6 +104,7 @@ _BEFORE_CHAPTER_PATTERN = re.compile(r"(?:生成|写|开始写)?\s*第\s*(\d+)\s
 _CHAPTER_ACTIONS = {
     "write_draft",
     "write_review",
+    "write_review_accept",
     "review",
     "revise_draft",
     "revise_review",
@@ -122,6 +125,8 @@ _CANON_MUTATION_ACTIONS = {
     "plan_next_arc",
     "continue_run",
     "batch_accept",
+    "batch_draft_accept",
+    "write_review_accept",
     "review_accept",
     "revise_review_accept",
     "accept",
@@ -145,7 +150,13 @@ class TerminalSession:
     def __init__(self, engine: InkFlowEngine):
         self.engine = engine
 
-    async def handle(self, root: str | Path, message: str) -> dict[str, Any]:
+    async def handle(
+        self,
+        root: str | Path,
+        message: str,
+        *,
+        consume_steering: Callable[[], Awaitable[list[str]]] | None = None,
+    ) -> dict[str, Any]:
         project = InkFlowProject(root)
         text = message.strip()
         if not text:
@@ -191,8 +202,29 @@ class TerminalSession:
                 thinking=False,
                 agent_role="coordinator",
             )
+            steering_messages = await consume_steering() if consume_steering else []
+            if steering_messages:
+                text = self._apply_steering(text, steering_messages)
+                packet = self._build_packet(project, text)
+                atomic_write_text(packet_path, packet.to_markdown())
+                trace.record(
+                    "session.steer",
+                    "completed",
+                    "已在安全节点接收用户引导，并重新判断后续处理。",
+                    metadata={"guidance_count": len(steering_messages)},
+                )
+                route_result = await self.engine.provider.generate_json(
+                    system_prompt=TERMINAL_ROUTER_SYSTEM,
+                    user_prompt=packet.to_markdown(),
+                    output_model=TerminalIntent,
+                    effort="low",
+                    max_tokens=900,
+                    thinking=False,
+                    agent_role="coordinator",
+                )
             raw_intent = route_result.data
             intent, routing_response = self._resolve_intent(project, text, raw_intent)
+            intent = self._apply_acceptance_policy(text, intent)
             ticket, dispatch_plan = Coordinator(project).compile(intent)
             trace.record(
                 "session.route",
@@ -329,6 +361,26 @@ class TerminalSession:
             }
         return None
 
+    @staticmethod
+    def _apply_steering(original_message: str, steering_messages: list[str]) -> str:
+        """Append confirmed user guidance only at a model-call boundary.
+
+        Providers used by InkFlow do not accept new input in the middle of one
+        request.  Re-routing at this boundary gives the Coordinator the same
+        practical steering semantics without exposing private model reasoning or
+        letting a late message bypass the Novel Engine's authorization gates.
+        """
+        guidance = "\n\n".join(f"- {item.strip()}" for item in steering_messages if item.strip())
+        if not guidance:
+            return original_message
+        return (
+            f"{original_message}\n\n"
+            "# 用户的运行中引导\n"
+            "以下内容是用户在本轮运行中确认的方向修正。它约束后续判断和动作；"
+            "不得恢复已经不适用的未完成步骤，也不得因此绕过验收、正史或其他权限门禁。\n"
+            f"{guidance}"
+        )
+
     def _resolve_intent(
         self,
         project: InkFlowProject,
@@ -350,7 +402,7 @@ class TerminalSession:
         if action in _CHAPTER_ACTIONS and explicit_start is not None:
             updates["chapter_no"] = explicit_start
             missing.discard("chapter_no")
-        if action in {"plan_preview", "arc_audit", "batch_draft", "batch_repair"} and explicit_start is not None:
+        if action in {"plan_preview", "arc_audit", "batch_draft", "batch_draft_accept", "batch_repair"} and explicit_start is not None:
             updates["chapter_no"] = explicit_start
             updates["end_chapter_no"] = explicit_end or explicit_start
             missing.difference_update({"chapter_no", "end_chapter_no", "chapter_range"})
@@ -462,6 +514,31 @@ class TerminalSession:
 
         return resolved, None
 
+    def _apply_acceptance_policy(self, message: str, intent: TerminalIntent) -> TerminalIntent:
+        """把用户保存的自动验收授权应用到含 Reviewer 的固定工作流。"""
+
+        mode = self.engine.settings.acceptance_confirmation_mode
+        intent = intent.model_copy(update={"acceptance_confirmation_mode": mode})
+        if re.search(r"只(?:要|做|生成)?(?:草稿|审查)|不要(?:验收|接收|入正史)|先(?:给我)?看", message):
+            return intent
+        if mode == "batch_once" and intent.action == "batch_draft" and intent.authorization == "approved":
+            return intent.model_copy(
+                update={"action": "batch_draft_accept", "authorization_source": "batch_preapproval"}
+            )
+        if mode != "auto_after_review":
+            return intent
+        upgraded = {
+            "review": "review_accept",
+            "write_review": "write_review_accept",
+            "revise_review": "revise_review_accept",
+            "batch_draft": "batch_draft_accept",
+        }.get(intent.action)
+        if not upgraded or intent.authorization != "approved":
+            return intent
+        return intent.model_copy(
+            update={"action": upgraded, "authorization_source": "settings_auto_accept"}
+        )
+
     @staticmethod
     def _explicit_chapter_range(message: str) -> tuple[int | None, int | None]:
         # A natural request can quote an audit scope before naming its real
@@ -536,7 +613,7 @@ class TerminalSession:
         missing: set[str] = set()
         if intent.action in _CHAPTER_ACTIONS and intent.chapter_no is None:
             missing.add("chapter_no")
-        if intent.action in {"plan_preview", "arc_audit", "batch_draft", "batch_repair"}:
+        if intent.action in {"plan_preview", "arc_audit", "batch_draft", "batch_draft_accept", "batch_repair"}:
             if intent.chapter_no is None or intent.end_chapter_no is None:
                 missing.add("chapter_range")
         if intent.action in {"batch_accept", "batch_repair"} and not intent.batch_id:
@@ -556,7 +633,7 @@ class TerminalSession:
         fields: set[str] = set()
         if action in _CHAPTER_ACTIONS:
             fields.add("chapter_no")
-        if action in {"plan_preview", "arc_audit", "batch_draft", "batch_repair"}:
+        if action in {"plan_preview", "arc_audit", "batch_draft", "batch_draft_accept", "batch_repair"}:
             fields.update({"chapter_no", "end_chapter_no", "chapter_range"})
         if action in {"batch_accept", "batch_repair"}:
             fields.add("batch_id")
@@ -765,13 +842,26 @@ class TerminalSession:
                 hard=True,
             ),
         ]
-        return ContextPacket(
+        packet = ContextPacket(
             project_id=project.project_id,
             chapter_no=1,
             task="理解用户的自然语言讨论、确认或执行请求，并路由到既有墨流工作流",
             sections=sections,
             estimated_tokens=estimate_tokens("\n".join(item.content for item in sections)),
         )
+        soft_limit, hard_limit = self.engine.settings.context_budget_for("coordinator")
+        if packet.estimated_tokens > soft_limit:
+            for key in ("F1", "F"):
+                section = next((item for item in packet.sections if item.key == key), None)
+                if section and len(section.content) > 1_000:
+                    section.content = section.content[-max(1_000, len(section.content) // 2):]
+                    packet.warnings.append(f"Coordinator 上下文接近预算，已缩短 {section.title}；项目硬状态未动。")
+                    packet.estimated_tokens = estimate_tokens("\n".join(item.content for item in sections))
+                    if packet.estimated_tokens <= soft_limit:
+                        break
+        if packet.estimated_tokens > hard_limit:
+            raise ValidationGateError("Coordinator 的硬上下文超过自定义上限，请提高该 Agent 的最大上下文预算。")
+        return packet
 
     @staticmethod
     def _dialogue_path(project: InkFlowProject) -> Path:
@@ -983,6 +1073,8 @@ class TerminalSession:
             }
         if intent.action == "status":
             return {"result": self.engine.status(root)}
+        if intent.action == "voice_clone_script":
+            return {"result": await self.engine.generate_voice_clone_script(root)}
         if intent.action == "plan":
             return {"steps": [{"step": "writer.plan", "result": await self.engine.generate_plan(root)}]}
         if intent.action == "plan_preview":
@@ -1035,18 +1127,24 @@ class TerminalSession:
                     batch_id=intent.batch_id,
                 )
             }
-        if intent.action == "batch_draft":
+        if intent.action in {"batch_draft", "batch_draft_accept"}:
             if intent.chapter_no is None or intent.end_chapter_no is None:
                 return {"gate": "批量草稿必须明确起止章节，例如“生成第 9 到第 10 章的批量草稿”。"}
-            return {
-                "result": await self.engine.draft_batch(
-                    root,
-                    intent.chapter_no,
-                    intent.end_chapter_no,
-                    instruction=intent.operation_instruction,
-                    max_revision_rounds=intent.max_revision_rounds,
-                )
-            }
+            drafted = await self.engine.draft_batch(
+                root,
+                intent.chapter_no,
+                intent.end_chapter_no,
+                instruction=intent.operation_instruction,
+                max_revision_rounds=intent.max_revision_rounds,
+            )
+            if intent.action == "batch_draft_accept" and drafted.get("status") == "ready_for_acceptance":
+                accepted = await self.engine.accept_batch(root, str(drafted["batch_id"]))
+                return {
+                    "result": accepted,
+                    "batch_draft": drafted,
+                    "authorization_source": intent.authorization_source,
+                }
+            return {"result": drafted}
         if intent.action == "batch_repair":
             if not intent.batch_id or intent.chapter_no is None or intent.end_chapter_no is None:
                 return {"gate": "修复临时批次需要可确定的批次和章节范围；请说明批次编号或第 N 到第 M 章。"}
@@ -1116,14 +1214,18 @@ class TerminalSession:
                 "next_action": "草稿已生成；你可以先阅读章节文件，确认后再说“审查第 N 章”或“按意见修改第 N 章”。",
             }
 
-        if intent.action == "write_review":
+        if intent.action in {"write_review", "write_review_accept"}:
             written = await self._run_step(
                 "writer.write", self.engine.write_chapter(root, chapter_no, instruction)
             )
             steps.append(written)
-            if "gate" not in written:
-                steps.append(await self._run_step("reviewer.review", self.engine.review_chapter(root, chapter_no)))
-            return {"steps": steps}
+            if "gate" in written:
+                return {"steps": steps}
+            reviewed = await self._run_step("reviewer.review", self.engine.review_chapter(root, chapter_no))
+            steps.append(reviewed)
+            if "gate" in reviewed or intent.action == "write_review":
+                return {"steps": steps}
+            return await self._conditionally_accept(root, chapter_no, steps, reviewed)
 
         if intent.action == "revise_draft":
             steps.append(await self._run_step("writer.revise", self.engine.revise_chapter(root, chapter_no, instruction)))

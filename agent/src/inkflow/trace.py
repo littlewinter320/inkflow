@@ -10,6 +10,96 @@ from .provider import ProviderResult
 from .utils import atomic_write_text, json_dumps, utc_now
 
 
+def recent_trace_runs(project_root: str | Path, limit: int = 12) -> list[dict[str, Any]]:
+    """读取最近的可公开运行记录，供客户端展示调用过程和可打开文件。"""
+
+    root = Path(project_root).resolve()
+    runs_root = root / ".inkflow" / "runs"
+    if not runs_root.is_dir():
+        return []
+    run_dirs = sorted(
+        (item for item in runs_root.iterdir() if item.is_dir()),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )[: max(1, min(limit, 50))]
+    output: list[dict[str, Any]] = []
+    for run_dir in run_dirs:
+        events_path = run_dir / "events.jsonl"
+        if not events_path.is_file():
+            continue
+        events: list[dict[str, Any]] = []
+        try:
+            raw_events = events_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for raw in raw_events:
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+            references = _trace_file_references(root, metadata)
+            event["metadata"] = metadata
+            event["references"] = references
+            events.append(event)
+        if not events:
+            continue
+        trace_path = run_dir / "trace.md"
+        trace_reference = _file_reference(root, trace_path, "完整运行记录")
+        output.append(
+            {
+                "run_id": run_dir.name,
+                "operation": _operation_from_run_id(run_dir.name),
+                "status": str(events[-1].get("status") or "unknown"),
+                "summary": str(events[-1].get("summary") or ""),
+                "started_at": str(events[0].get("timestamp") or ""),
+                "finished_at": str(events[-1].get("timestamp") or ""),
+                "events": events,
+                "trace_reference": trace_reference,
+            }
+        )
+    return output
+
+
+def _operation_from_run_id(run_id: str) -> str:
+    parts = run_id.split("-")
+    return "-".join(parts[1:-1]) if len(parts) > 2 else run_id
+
+
+def _trace_file_references(root: Path, value: Any, label: str = "") -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(item, str) and (key == "path" or key.endswith("_path")):
+                reference = _file_reference(root, Path(item), key.replace("_", " "))
+                if reference:
+                    found.append(reference)
+            elif isinstance(item, (dict, list)):
+                found.extend(_trace_file_references(root, item, key))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(_trace_file_references(root, item, label))
+    unique: dict[str, dict[str, Any]] = {}
+    for item in found:
+        unique[str(item["absolute_path"]).casefold()] = item
+    return list(unique.values())
+
+
+def _file_reference(root: Path, path: Path, label: str) -> dict[str, Any] | None:
+    candidate = path if path.is_absolute() else root / path
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return {
+        "label": label or resolved.name,
+        "absolute_path": str(resolved),
+        "relative_path": resolved.relative_to(root).as_posix(),
+        "exists": resolved.is_file(),
+    }
+
+
 @dataclass(slots=True)
 class TraceEvent:
     timestamp: str

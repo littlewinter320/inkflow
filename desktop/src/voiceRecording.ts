@@ -10,7 +10,7 @@ export class LocalWavRecorder {
     private readonly silentGain: GainNode,
   ) {}
 
-  static async start(deviceId = ""): Promise<LocalWavRecorder> {
+  static async start(deviceId = "", maxSeconds = 0): Promise<LocalWavRecorder> {
     const audio = deviceId ? { deviceId: { exact: deviceId } } : true;
     const stream = await navigator.mediaDevices.getUserMedia({ audio });
     const context = new AudioContext();
@@ -20,7 +20,10 @@ export class LocalWavRecorder {
     silentGain.gain.value = 0;
     const recorder = new LocalWavRecorder(stream, context, source, processor, silentGain);
     processor.onaudioprocess = (event) => {
-      const copy = new Float32Array(event.inputBuffer.getChannelData(0));
+      const input = event.inputBuffer.getChannelData(0);
+      const remaining = maxSeconds > 0 ? Math.max(0, Math.floor(context.sampleRate * maxSeconds) - recorder.length) : input.length;
+      const copy = new Float32Array(input.subarray(0, remaining));
+      if (!copy.length) return;
       recorder.chunks.push(copy);
       recorder.length += copy.length;
     };
