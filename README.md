@@ -114,63 +114,96 @@ Writer 每次写作会保存上下文清单，记录 Context Packet 各分区、
 - 云模型调用仍取决于用户配置的服务商；本地语音模型仍由用户主动下载。Qwen3-TTS 1.7B 两套模型需要明显更多磁盘和运行资源。
 - 本轮已完成桌面端 TypeScript 类型检查，以及语音克隆 MVP 边界检查：Writer 朗读稿保持 180～400 字，录音器独立限制 120 秒。没有为验证而下载或安装任何语音模型。
 
-## 墨流适合做什么
+## 产品模块（先看功能，不看执行顺序）
 
-墨流面向的是需要长期保持人物、时间线、伏笔和章节目标一致的中文小说创作。它既可以作为“从灵感开始”的创作助手，也可以接手一部已经有设定、正文和大纲的作品，帮助作者把素材整理成可继续写作的项目。
+墨流面向需要长期保持人物、时间线、伏笔和章节目标一致的中文小说。下面按“你能使用的模块”介绍产品；模块之间有协作关系，但不会因为打开一个模块就自动触发完整生产流程。
 
-| 你现在的状态 | 可以怎样使用墨流 | 主要结果 |
-| --- | --- | --- |
-| 只有一个模糊点子 | 先和 Coordinator 讨论，再让 Writer 提出一个或三个创意方向 | 可编辑的选题、卖点、人物关系和开篇钩子 |
-| 已经知道题材和主角 | 新建项目并生成书罗盘、卷计划、篇章计划和章节卡 | 一套逐步展开的写作蓝图 |
-| 正在连载 | 让 Writer 写下一章草稿，或只请求局部续写、扩写、改对白 | 新的草稿版本，不会覆盖已接受正文 |
-| 感觉前后不一致 | 让 Reviewer 针对人物、时间、设定、因果或伏笔做证据化审查 | 可定位的问题和修改建议 |
-| 想长期维护世界观 | 在 Story Bible、场景笔记和偏好中补充材料 | 后续写作可检索的工作资料；不会自动升级为正史 |
-| 想听小说或用语音对话 | 开启本地普通话转写、短消息朗读或后台听读 | 本机音频与播放清单，不影响写作和正史 |
+| 模块 | 负责什么 | 适合什么时候用 | 产生的结果 |
+| --- | --- | --- | --- |
+| **墨宝对话与 Coordinator** | 听懂日常中文，识别目标，整理任务单，选择固定工作方式，解释暂停和下一步 | 你不知道该从哪里开始，或只想讨论一个想法 | 任务单、调度计划、公开判断摘要和待确认问题 |
+| **Writer 规划与写作** | 生成书罗盘、卷计划、篇章计划、章节卡、创意方向、正文草稿和定点修订 | 从灵感建项、推进连载、修改局部内容 | 可编辑规划、草稿新版本、钩子说明和场景蓝图 |
+| **Reviewer 证据化审查** | 按当前正文版本检查人物、时间、设定、因果、伏笔、章节功能和表达重复 | 需要知道一章是否成立，或准备进入正史前 | 带正文引文和来源 ID 的审查报告、通过或修订意见 |
+| **Memory Keeper 正史维护** | 只从用户已接受的正文提取事实、伏笔、人物状态和时间线变化 | 用户接受章节并准备更新世界状态时 | 可预览的正史补丁、SQLite 事务和 Markdown 投影更新 |
+| **章节编辑与版本** | 阅读和编辑 Markdown，保存草稿版本、批注、Diff、预填续写和恢复点 | 想亲自改稿、比较多个版本或回到较早状态时 | 新版本文件、批注、差异视图和可恢复检查点 |
+| **Context Packet 与检索** | 从正史、规划、章节卡、偏好、协作消息和资料中筛选本次任务需要的内容 | 项目变长、资料变多，担心模型漏掉关键事实时 | 有预算、权限和来源 ID 的唯一上下文包与上下文清单 |
+| **批量写作与临时记忆** | 按章节顺序写作、审查、修订，使用仅对当前批次有效的连续性记忆 | 需要连续生成多章，但还不想立即写入正史时 | 批次清单、临时记忆补丁和待一次验收的章节前缀 |
+| **听读与声音** | Kokoro 默认朗读、SenseVoice 普通话输入、Qwen3-TTS 高品质朗读和授权声音克隆 | 听对话、听章节或建立自己的声音档案时 | 本地音频、播放队列、声音档案和独立朗读稿 |
+| **设置、过程与错误引导** | 调整模型、上下文、钩子密度、验收策略、审查详细度，显示参考来源和可执行的错误处理 | 想控制成本、速度、确认频率或排查问题时 | 角色级配置、任务过程卡、文件入口和下一步操作 |
 
-它不把“生成得很长”当作完成，也不承诺代替作者作出所有故事决定。故事方向、接受哪一个版本、是否修改既有正史、是否使用自己的声音，始终由用户决定。
+这些模块有清楚的状态边界：草稿是草稿，审查报告是审查报告，工作资料是工作资料，只有通过门禁并被用户接受的正文才会影响正史。用户可以只讨论、只规划、只写草稿或只审查；系统不会把每一次对话都强行变成完整生产流程。
 
-### 一次普通创作会看到什么
+### 你可以从哪里开始
 
-以“帮我写第 3 章草稿，先不要审查”为例，用户看到的是：Coordinator 先确认目标和章节；Writer 使用第 3 章章节卡、已有正史和相关资料写出新草稿；编辑器显示可阅读、可修改的版本；过程面板保留这次任务的公开摘要和所用资料范围。因为用户只要求草稿，系统不会把它当成已通过审查，更不会写入正史。
+- 只有一个模糊点子：打开墨宝对话，让 Coordinator 帮你整理，再让 Writer 给出一个或三个可编辑方向。
+- 已经有设定和正文：导入项目后直接请求某一章的草稿、续写、扩写或对白修改。
+- 觉得前后不一致：指定章节和问题，让 Reviewer 只审当前版本并给出证据。
+- 想批量推进：设置批量范围和验收策略，先让章节停留在临时批次，确认后再提交正史。
+- 想听内容：在编辑器或对话气泡使用短消息朗读；长篇内容交给后台听读队列。
 
-如果用户接着说“审查这章”，Reviewer 才会针对当前版本给出有引文的问题；如果用户说“按意见修改”，Writer 才基于该报告生成下一版。这样的分层让作者可以随时停在草稿、讨论或审查阶段，而不是被自动化流程推着走。
+## 系统架构（模块关系，与运行流程分开）
 
-## 先看懂：一次请求怎样变成结果
+下面的图说明墨流由哪些层组成以及各层之间的依赖关系。它不是时间顺序图；真正的请求执行顺序见后面的“完整生产流程”。
 
 ```mermaid
-flowchart LR
-    U[用户自然语言] --> D[Electron 桌面端]
-    U --> V[VS Code 扩展]
-    U --> C[CLI]
-    U --> M[MCP 客户端]
+flowchart TB
+    subgraph Entry[入口层]
+        Desktop[Windows 桌面端]
+        Extension[VS Code 扩展]
+        CLI[CLI]
+        MCP[MCP 客户端]
+    end
 
-    D --> IPC[Preload IPC / JSONL]
-    V --> E[本地 InkFlow Engine]
-    C --> E
-    M --> E
-    IPC --> E
+    subgraph Orchestration[编排层]
+        Engine[InkFlow Engine]
+        Coordinator[Coordinator<br/>产品理解与任务调度]
+        Novel[Novel Engine<br/>确定性工作流与权限门禁]
+    end
 
-    E --> CO[Coordinator<br/>理解、拆解、派工]
-    CO --> G[Novel Engine<br/>固定工作流与权限门禁]
-    G --> CB[Context Builder<br/>编译唯一 Context Packet]
-    CB --> RAG[Hybrid RAG<br/>精确查询 + BM25 + 可选语义召回]
-    RAG <--> DB[(项目 SQLite)]
+    subgraph Production[小说生产层]
+        Writer[Writer<br/>规划 / 写作 / 修订]
+        Reviewer[Reviewer<br/>证据化审查]
+        Keeper[Memory Keeper<br/>接受后维护正史]
+    end
 
-    G --> W[Writer<br/>规划 / 草稿 / 修订]
-    G --> RV[Reviewer<br/>证据化审查]
-    G --> MK[Memory Keeper<br/>接受后提取正史补丁]
-    W --> DB
-    RV --> DB
-    MK --> DB
+    subgraph Knowledge[上下文与知识层]
+        Context[Context Builder<br/>唯一 Context Packet]
+        Retrieval[Hybrid RAG<br/>精确查询 / BM25 / 可选语义召回]
+        Provider[Provider Adapter<br/>结构化 JSON 调用]
+    end
 
-    G --> PA[Provider Adapter<br/>结构化 JSON 调用]
-    PA --> API[(DeepSeek / OpenAI / Anthropic<br/>Gemini / OpenRouter / Ollama / 自定义)]
-    E -.事件、进度、错误.-> D
-    E -.事件、进度、错误.-> V
-    E --> VR[Voice Runtime<br/>本地普通话输入与朗读]
+    subgraph Storage[项目数据层]
+        Canon[(inkflow.db<br/>正史与门禁)]
+        Studio[(studio.db<br/>版本、批注、任务)]
+        Files[Markdown 投影、Trace、检查点、缓存]
+    end
+
+    subgraph Local[本地确定性服务]
+        Voice[Voice Runtime<br/>Kokoro / SenseVoice / 可选 Qwen]
+        Update[更新服务<br/>完整包与差分 blockmap]
+    end
+
+    Desktop & Extension & CLI & MCP --> Engine
+    Engine --> Coordinator --> Novel
+    Novel --> Writer & Reviewer & Keeper
+    Novel --> Context
+    Context --> Retrieval
+    Retrieval <--> Canon
+    Context --> Provider
+    Provider --> Model[(已配置的模型服务)]
+    Writer & Reviewer & Keeper --> Studio
+    Keeper --> Canon
+    Canon --> Files
+    Studio --> Files
+    Engine -.进度、来源、错误.-> Desktop & Extension
+    Engine --> Voice
+    Desktop --> Update
 ```
 
-简单说，用户不会直接命令 Writer 去改数据库，也不会让 Reviewer 直接覆盖正文。每一步都先形成结构化结果，再由引擎判断下一步是否允许执行。
+架构中有四个正式 AI Agent：Coordinator、Writer、Reviewer、Memory Keeper。Novel Engine、Context Builder、Hybrid RAG、Provider Adapter、Voice Runtime 和更新服务是确定性组件，不计算为新的 Agent。宿主界面只负责承载会话、文件和操作，不能代替任何 Agent 越权。
+
+数据层也有明确分工：`inkflow.db` 是正史和门禁的稳定来源，`studio.db` 管理版本、批注、任务和工作资料，Markdown 是用户直接阅读和编辑的投影，Trace、索引、缓存和检查点用于复查或恢复。模型只收到 Context Builder 编译后的一个 Context Packet；它不能直接读取整个项目，也不能直接写入数据库。
+
+接口层可以替换入口和模型服务，但不能绕过 Novel Engine。桌面端、VS Code 扩展、CLI 和 MCP 最终都调用同一个本地引擎；本地语音通过独立资源锁运行，不参与写作、审查和正史提交。
 
 ## 四个正式 AI Agent
 
