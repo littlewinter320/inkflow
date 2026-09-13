@@ -12,6 +12,13 @@ from .utils import content_hash
 
 
 _MODEL_CACHE: dict[str, Any] = {}
+# Keep a small process-local vector cache in front of SQLite. ContextBuilder is
+# intentionally short lived, so without this layer repeated Writer/Reviewer
+# calls re-read and JSON-decode the same embeddings even when the source hash
+# is unchanged. The cache only stores derived vectors; the database remains
+# the durable source of truth and a changed source hash always misses safely.
+_VECTOR_CACHE: dict[tuple[str, str, str], list[float]] = {}
+_VECTOR_CACHE_LIMIT = 512
 
 
 def _terms(text: str) -> list[str]:
@@ -35,6 +42,8 @@ class HybridRetriever:
         self.embedding_model = embedding_model.strip()
         self.reranker_model = reranker_model.strip()
         self.last_diagnostics: dict[str, Any] = {}
+        self._embedding_cache_hits = 0
+        self._embedding_cache_misses = 0
 
     def retrieve(
         self,
@@ -46,6 +55,8 @@ class HybridRetriever:
         top_k: int | None = None,
     ) -> list[dict[str, Any]]:
         candidates = self._candidates(role=role, chapter_no=chapter_no, chapter_version=chapter_version)
+        self._embedding_cache_hits = 0
+        self._embedding_cache_misses = 0
         if not candidates:
             self.last_diagnostics = {"query": query, "candidate_count": 0, "selected": [], "discarded": []}
             return []
@@ -98,6 +109,9 @@ class HybridRetriever:
                 for item in candidates if item["source_id"] not in selected_ids
             ][:80],
         }
+        if self.embedding_model:
+            self.last_diagnostics["embedding_cache_hits"] = self._embedding_cache_hits
+            self.last_diagnostics["embedding_cache_misses"] = self._embedding_cache_misses
         return result
 
     @staticmethod
@@ -210,19 +224,31 @@ class HybridRetriever:
 
     def _semantic_ranking(self, query: str, candidates: list[dict[str, Any]]) -> list[tuple[str, float]]:
         model = _cached_sentence_model(self.embedding_model)
-        query_vector = model.encode([query], normalize_embeddings=True)[0]
+        query_key = ("__query__", self.embedding_model, content_hash(query))
+        query_vector = _VECTOR_CACHE.get(query_key)
+        if query_vector is None:
+            encoded_query = model.encode([query], normalize_embeddings=True)[0]
+            query_vector = encoded_query.tolist() if hasattr(encoded_query, "tolist") else list(encoded_query)
+            _remember_vector(query_key, query_vector)
         vectors = []
         missing_items = []
         missing_texts = []
         for item in candidates:
             text = item["title"] + "\n" + item["body"]
             source_hash = content_hash(text)
-            cached = self.project.db.get_cached_embedding(item["source_id"], self.embedding_model, source_hash)
+            cache_key = (item["source_id"], self.embedding_model, source_hash)
+            cached = _VECTOR_CACHE.get(cache_key)
             if cached is None:
+                cached = self.project.db.get_cached_embedding(item["source_id"], self.embedding_model, source_hash)
+                if cached is not None:
+                    _remember_vector(cache_key, cached)
+            if cached is None:
+                self._embedding_cache_misses += 1
                 vectors.append(None)
                 missing_items.append((len(vectors) - 1, item, source_hash))
                 missing_texts.append(text)
             else:
+                self._embedding_cache_hits += 1
                 vectors.append(cached)
         if missing_texts:
             encoded = model.encode(missing_texts, normalize_embeddings=True)
@@ -230,6 +256,7 @@ class HybridRetriever:
                 values = vector.tolist() if hasattr(vector, "tolist") else list(vector)
                 vectors[index] = values
                 self.project.db.cache_embedding(item["source_id"], self.embedding_model, source_hash, values)
+                _remember_vector((item["source_id"], self.embedding_model, source_hash), values)
         return sorted(
             [(item["source_id"], float(sum(float(a) * float(b) for a, b in zip(query_vector, vector, strict=True)))) for item, vector in zip(candidates, vectors, strict=True)],
             key=lambda value: (-value[1], value[0]),
@@ -279,3 +306,14 @@ def _cached_cross_encoder(model_name: str):
             raise RuntimeError("启用 BGE reranker 前，请安装 `pip install -e .[rag]`。") from exc
         _MODEL_CACHE[key] = CrossEncoder(model_name, trust_remote_code=True)
     return _MODEL_CACHE[key]
+
+
+def _remember_vector(key: tuple[str, str, str], vector: list[float]) -> None:
+    """Store derived vectors with a bounded FIFO policy."""
+
+    if key in _VECTOR_CACHE:
+        _VECTOR_CACHE[key] = vector
+        return
+    if len(_VECTOR_CACHE) >= _VECTOR_CACHE_LIMIT:
+        _VECTOR_CACHE.pop(next(iter(_VECTOR_CACHE)))
+    _VECTOR_CACHE[key] = vector

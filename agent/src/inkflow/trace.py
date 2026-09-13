@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -160,6 +161,55 @@ class TraceRecorder:
                 metadata={"reasoning_characters": len(result.reasoning_content)},
             )
 
+    def record_model_started(
+        self,
+        stage: str,
+        *,
+        model: str,
+        agent_role: str,
+        max_tokens: int,
+        timeout_seconds: float | None = None,
+        thinking: bool | None = None,
+    ) -> None:
+        """Record a public model-call boundary before waiting for the provider.
+
+        A long JSON request used to leave the trace at ``context.build``.  This
+        event makes the wait observable without persisting private reasoning or
+        prompt contents.
+        """
+
+        metadata: dict[str, Any] = {
+            "model": model,
+            "agent_role": agent_role,
+            "max_tokens": int(max_tokens),
+        }
+        if timeout_seconds is not None:
+            metadata["timeout_seconds"] = float(timeout_seconds)
+        if thinking is not None:
+            metadata["thinking"] = bool(thinking)
+        self.record(stage, "started", "已提交模型请求，等待结构化结果", metadata=metadata)
+
+    def record_model_failed(
+        self,
+        stage: str,
+        exc: BaseException,
+        *,
+        model: str | None = None,
+        agent_role: str | None = None,
+    ) -> None:
+        metadata: dict[str, Any] = {}
+        if model:
+            metadata["model"] = model
+        if agent_role:
+            metadata["agent_role"] = agent_role
+        self.record(
+            stage,
+            "failed",
+            "模型请求未完成；未写入新的正文或正史",
+            _redact_error(str(exc)),
+            metadata=metadata,
+        )
+
     def finish(self, status: str = "completed", summary: str = "运行完成") -> None:
         self.record("run", status, summary)
 
@@ -189,3 +239,12 @@ class TraceRecorder:
                 lines.extend(["", "```json", json_dumps(event.metadata), "```"])
             lines.extend(["", "</details>", ""])
         atomic_write_text(self.trace_path, "\n".join(lines).rstrip() + "\n")
+
+
+def _redact_error(value: str) -> str:
+    """Keep provider diagnostics useful while removing credential-like text."""
+
+    text = value[:2_000]
+    text = re.sub(r"(?i)(bearer\s+|api[_ -]?key\s*[:=]\s*)[^\s,;]+", r"\1[已隐藏]", text)
+    text = re.sub(r"(?i)sk-[A-Za-z0-9_-]{8,}", "[已隐藏密钥]", text)
+    return text or "未知错误"

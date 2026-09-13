@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Natural-language terminal entry point with strictly bounded workflow routing."""
 
+import asyncio
 import json
 import re
 from datetime import datetime, timezone
@@ -156,6 +157,7 @@ class TerminalSession:
         message: str,
         *,
         consume_steering: Callable[[], Awaitable[list[str]]] | None = None,
+        emit: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         project = InkFlowProject(root)
         text = message.strip()
@@ -193,6 +195,16 @@ class TerminalSession:
                 "已构建唯一终端会话 Context Packet",
                 metadata={"estimated_tokens": packet.estimated_tokens, "sections": [item.key for item in packet.sections]},
             )
+            if emit:
+                await emit({"type": "coordinator.model.started", "stage": "controller.routing", "role": "coordinator", "model": self.engine.settings.model, "summary": "Coordinator 正在理解请求并选择安全工作流"})
+            trace.record_model_started(
+                "controller.routing",
+                model=self.engine.settings.model,
+                agent_role="coordinator",
+                max_tokens=900,
+                timeout_seconds=self.engine.settings.request_timeout_seconds,
+                thinking=False,
+            )
             route_result = await self.engine.provider.generate_json(
                 system_prompt=TERMINAL_ROUTER_SYSTEM,
                 user_prompt=packet.to_markdown(),
@@ -212,6 +224,16 @@ class TerminalSession:
                     "completed",
                     "已在安全节点接收用户引导，并重新判断后续处理。",
                     metadata={"guidance_count": len(steering_messages)},
+                )
+                if emit:
+                    await emit({"type": "coordinator.model.started", "stage": "controller.routing.steer", "role": "coordinator", "model": self.engine.settings.model, "summary": "Coordinator 正在读取新增指导并重新选择工作流"})
+                trace.record_model_started(
+                    "controller.routing.steer",
+                    model=self.engine.settings.model,
+                    agent_role="coordinator",
+                    max_tokens=900,
+                    timeout_seconds=self.engine.settings.request_timeout_seconds,
+                    thinking=False,
                 )
                 route_result = await self.engine.provider.generate_json(
                     system_prompt=TERMINAL_ROUTER_SYSTEM,
@@ -329,6 +351,10 @@ class TerminalSession:
                 },
                 **response,
             }
+        except asyncio.CancelledError:
+            trace.record("session", "cancelled", "当前请求被停止；没有提交新的正文或正史")
+            trace.finish(status="cancelled", summary="终端任务已停止，已有项目内容保留")
+            raise
         except InkFlowError as exc:
             trace.record("session", "failed", "终端工作流被配置或门禁阻止", str(exc))
             trace.finish(status="failed", summary="终端自然语言请求未改变正史")
@@ -1076,7 +1102,17 @@ class TerminalSession:
         if intent.action == "voice_clone_script":
             return {"result": await self.engine.generate_voice_clone_script(root)}
         if intent.action == "plan":
-            return {"steps": [{"step": "writer.plan", "result": await self.engine.generate_plan(root)}]}
+            return {
+                "steps": [
+                    {
+                        "step": "writer.plan",
+                        "result": await self.engine.generate_plan(
+                            root,
+                            instruction=intent.operation_instruction,
+                        ),
+                    }
+                ]
+            }
         if intent.action == "plan_preview":
             if intent.chapter_no is None or intent.end_chapter_no is None:
                 return {"gate": "批次规划预览需要明确起止章节，例如“查看第 7～11 章规划”。"}

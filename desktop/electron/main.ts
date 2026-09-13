@@ -22,6 +22,13 @@ type UpdateState = {
   source: "none" | "embedded" | "github" | "environment";
 };
 
+function redactEngineDiagnostics(value: string): string {
+  return value
+    .replace(/(bearer\s+|api[_ -]?key\s*[:=]\s*)[^\s,;]+/gi, "$1[已隐藏]")
+    .replace(/sk-[A-Za-z0-9_-]{8,}/g, "[已隐藏密钥]")
+    .slice(-1_200);
+}
+
 class UpdateManager {
   private updater: AppUpdater | null = null;
   private state: UpdateState;
@@ -62,7 +69,10 @@ class UpdateManager {
     // back to a full download when the old installer or blockmap is unavailable.
     this.updater.disableDifferentialDownload = false;
     this.updater.autoDownload = true;
-    this.updater.autoInstallOnAppQuit = true;
+    // Installing an update must be an explicit user action. Automatic
+    // install-on-quit can restart the desktop while a Writer request is still
+    // waiting on the local engine.
+    this.updater.autoInstallOnAppQuit = false;
     this.updater.on("checking-for-update", () => this.setState({ status: "checking", message: "正在检查新版本…" }));
     this.updater.on("update-available", (info: { version: string }) => this.setState({ status: "available", availableVersion: info.version, message: `发现新版本 ${info.version}，正在自动下载。` }));
     this.updater.on("update-not-available", () => this.setState({ status: "current", availableVersion: undefined, message: "当前已经是最新版本。" }));
@@ -128,14 +138,20 @@ class EngineBridge {
     this.process = child;
     const lines = readline.createInterface({ input: child.stdout });
     lines.on("line", (line) => this.receive(line));
-    child.stderr.on("data", () => {
+    let stderrTail = "";
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderrTail = redactEngineDiagnostics(`${stderrTail}${chunk.toString("utf8")}`);
       this.send("engine:status", {
         level: "warning",
         message: "本地写作引擎报告了诊断信息；如任务失败，可查看过程面板。",
+        details: stderrTail,
       });
     });
     child.once("error", (cause) => this.failChild(child, new Error(`无法启动墨流本地引擎：${cause.message}`)));
-    child.once("exit", (code) => this.failChild(child, new Error(`墨流本地引擎已退出（代码 ${code ?? "unknown"}）。请重试刚才的操作。`)));
+    child.once("exit", (code, signal) => {
+      const suffix = stderrTail ? `\n诊断摘要：${stderrTail}` : "";
+      this.failChild(child, new Error(`墨流本地引擎已退出（代码 ${code ?? "unknown"}${signal ? `，信号 ${signal}` : ""}）。请重试刚才的操作。${suffix}`));
+    });
   }
 
   async request(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
@@ -181,6 +197,11 @@ class EngineBridge {
     const child = this.process;
     this.process = null;
     this.compatibilityCheck = null;
+    for (const [id, item] of this.pending.entries()) {
+      if (item.child !== child) continue;
+      item.reject(new Error("墨流桌面已关闭，本次引擎任务被中断；已写入的文件会保留。"));
+      this.pending.delete(id);
+    }
     child?.kill();
   }
 

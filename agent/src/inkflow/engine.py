@@ -254,6 +254,14 @@ class InkFlowEngine:
             context = packet.to_markdown()
             if len(context) > 6_000:
                 context = context[-6_000:]
+            trace.record_model_started(
+                "writer.brainstorm",
+                model=self.settings.model,
+                agent_role="writer",
+                max_tokens=2_400,
+                timeout_seconds=min(self.settings.request_timeout_seconds, 120.0),
+                thinking=False,
+            )
             result = await self.provider.generate_json(
                 system_prompt=WRITER_IDEATE_SYSTEM,
                 user_prompt=(
@@ -279,6 +287,10 @@ class InkFlowEngine:
                 "next_action": "选中哪个方向告诉我；确认后再进入正式规划流程。",
                 "trace_id": trace.run_id,
             }
+        except asyncio.CancelledError:
+            trace.record("brainstorm", "cancelled", "创意请求被停止；没有写入正文或正史")
+            trace.finish(status="cancelled", summary="灵感请求已停止，已有项目内容保留")
+            raise
         except Exception as exc:
             trace.record("brainstorm", "failed", "创意提案生成失败", str(exc))
             trace.finish(status="failed", summary="灵感分身未产出提案")
@@ -299,7 +311,7 @@ class InkFlowEngine:
         }
 
     @project_mutation_locked
-    async def generate_plan(self, root: str | Path) -> dict[str, Any]:
+    async def generate_plan(self, root: str | Path, *, instruction: str = "") -> dict[str, Any]:
         project = InkFlowProject(root)
         trace = TraceRecorder(project.root, "plan", self.settings.trace_level)
         try:
@@ -309,12 +321,27 @@ class InkFlowEngine:
                 "生成初始四级规划：全书所有卷给卷级罗盘，完整规划第一卷的篇章摘要，"
                 "只细化第一篇章的全部连续章节卡。"
             )
+            if instruction.strip():
+                task += f"\n\n用户在本次任务中已经确认的方向：{instruction.strip()}"
             sections = [
                 ContextSection(
                     key="A",
                     title="当前规划任务",
                     content=task,
                     hard=True,
+                ),
+                *(
+                    [
+                        ContextSection(
+                            key="U",
+                            title="本次任务的已确认补充方向",
+                            content=instruction.strip(),
+                            source_ids=["user:current"],
+                            hard=True,
+                        )
+                    ]
+                    if instruction.strip()
+                    else []
                 ),
                 ContextSection(
                     key="B",
@@ -346,12 +373,28 @@ class InkFlowEngine:
                 "completed",
                 f"构建唯一规划 Context Packet，估算 {packet.estimated_tokens} tokens",
             )
+            trace.record_model_started(
+                "plan.model",
+                model=self.settings.model,
+                agent_role="writer",
+                max_tokens=16_000,
+                timeout_seconds=self.settings.planning_timeout_seconds,
+                thinking=False,
+            )
             result = await self.provider.generate_json(
                 system_prompt=PLANNER_SYSTEM,
                 user_prompt=packet.to_markdown(),
                 output_model=PlanBundle,
-                effort="max",
+                # A full PlanBundle is a large structured response.  DeepSeek
+                # Flash can spend the whole output budget on hidden reasoning
+                # before emitting JSON, which made the desktop look frozen and
+                # led users to cancel a healthy request.  The schema and the
+                # deterministic gates still validate the plan; keep this one
+                # call in direct JSON mode so it returns a usable plan promptly.
+                effort="high",
                 max_tokens=16_000,
+                timeout_seconds=self.settings.planning_timeout_seconds,
+                thinking=False,
                 agent_role="writer",
             )
             bundle = result.data
@@ -383,6 +426,10 @@ class InkFlowEngine:
                 "checkpoint": checkpoint,
                 "trace_id": trace.run_id,
             }
+        except asyncio.CancelledError:
+            trace.record("plan", "cancelled", "规划请求被停止；尚未提交新的规划")
+            trace.finish(status="cancelled", summary="四级规划已停止，原有规划保持不变")
+            raise
         except Exception as exc:
             trace.record("plan", "failed", "规划失败", str(exc))
             trace.finish(status="failed", summary="四级规划未提交")
@@ -517,6 +564,14 @@ class InkFlowEngine:
                 f"构建公开判断单 Context Packet，估算 {packet.estimated_tokens} tokens",
                 metadata={"next_start": next_start, "next_end": target_summary.chapter_end},
             )
+            trace.record_model_started(
+                "plan.brief.model",
+                model=self.settings.model,
+                agent_role="writer",
+                max_tokens=6_000,
+                timeout_seconds=self.settings.request_timeout_seconds,
+                thinking=True,
+            )
             result = await self.provider.generate_json(
                 system_prompt=PLANNER_SYSTEM,
                 user_prompt=packet.to_markdown(),
@@ -568,6 +623,10 @@ class InkFlowEngine:
                 "trace_id": trace.run_id,
                 "next_action": "阅读判断单后，可用自然语言说“按刚才的判断单展开第二篇章节卡”。",
             }
+        except asyncio.CancelledError:
+            trace.record("plan.brief", "cancelled", "规划判断请求被停止；尚未改变正式规划")
+            trace.finish(status="cancelled", summary="规划判断已停止，原有规划保持不变")
+            raise
         except Exception as exc:
             trace.record("plan.brief", "failed", "公开判断单未生成", str(exc))
             trace.finish(status="failed", summary="公开判断单未改变规划或正史")
@@ -925,6 +984,14 @@ class InkFlowEngine:
                 "写作角色已装载 Context Packet 实际选中的写作引导",
                 metadata={"skills": active_skills, "skill_contract_version": "1", "packet_section": "I", "extra_model_calls": 0},
             )
+            trace.record_model_started(
+                "writer.model",
+                model=self.settings.model,
+                agent_role="writer",
+                max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
+                timeout_seconds=self.settings.request_timeout_seconds,
+                thinking=True,
+            )
             result = await self.provider.generate_json(
                 system_prompt=WRITER_SYSTEM,
                 user_prompt=packet.to_markdown(),
@@ -1008,6 +1075,10 @@ class InkFlowEngine:
                 "trace_id": trace.run_id,
                 "next_action": "审查章节",
             }
+        except asyncio.CancelledError:
+            trace.record("write", "cancelled", "Writer 请求被停止；当前章节未写入新的草稿版本")
+            trace.finish(status="cancelled", summary="章节草稿生成已停止，已有版本保留")
+            raise
         except Exception as exc:
             trace.record("write", "failed", "章节生成失败", str(exc))
             trace.finish(status="failed", summary="草稿未完成")
@@ -1122,6 +1193,14 @@ class InkFlowEngine:
                 + "\n\n# 代码层指标\n\n"
                 + json_dumps(metrics)
             )
+            trace.record_model_started(
+                "review.model",
+                model=self.settings.model,
+                agent_role="reviewer",
+                max_tokens=16_000,
+                timeout_seconds=120,
+                thinking=True,
+            )
             result = await self.provider.generate_json(
                 system_prompt=REVIEWER_SYSTEM,
                 user_prompt=user_prompt,
@@ -1194,6 +1273,10 @@ class InkFlowEngine:
                 "trace_id": trace.run_id,
                 "next_action": "接受章节" if report.verdict == "pass" else "按审查意见修改章节",
             }
+        except asyncio.CancelledError:
+            trace.record("review", "cancelled", "Reviewer 请求被停止；当前版本没有被放行")
+            trace.finish(status="cancelled", summary="章节审查已停止，正文和审查版本保持不变")
+            raise
         except Exception as exc:
             trace.record("review", "failed", "章节审查失败", str(exc))
             trace.finish(status="failed", summary="审查未完成，章节不会放行")
@@ -1430,6 +1513,14 @@ class InkFlowEngine:
                 + "\n\n# 修订要求\n\n"
                 + (instruction or "逐项处理有证据的问题，保留审查确认有效的内容。")
             )
+            trace.record_model_started(
+                "writer.revise",
+                model=self.settings.model,
+                agent_role="writer",
+                max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
+                timeout_seconds=self.settings.request_timeout_seconds,
+                thinking=True,
+            )
             result = await self.provider.generate_json(
                 system_prompt=REVISER_SYSTEM,
                 user_prompt=user_prompt,
@@ -1525,6 +1616,10 @@ class InkFlowEngine:
                 "trace_id": trace.run_id,
                 "next_action": "重新审查当前版本",
             }
+        except asyncio.CancelledError:
+            trace.record("revise", "cancelled", "Writer 修订请求被停止；旧草稿版本保留")
+            trace.finish(status="cancelled", summary="章节修订已停止，未覆盖当前草稿")
+            raise
         except Exception as exc:
             trace.record("revise", "failed", "章节修订失败", str(exc))
             trace.finish(status="failed", summary="草稿未修改")
@@ -1881,6 +1976,14 @@ class InkFlowEngine:
                     "hard_limit_tokens": memory_hard_limit,
                 },
             )
+        trace.record_model_started(
+            "memory.model",
+            model=self.settings.model,
+            agent_role="memory_keeper",
+            max_tokens=10_000,
+            timeout_seconds=self.settings.request_timeout_seconds,
+            thinking=False,
+        )
         result = await self.provider.generate_json(
             system_prompt=MEMORY_SYSTEM,
             user_prompt=user_prompt,
@@ -1933,6 +2036,14 @@ class InkFlowEngine:
                     ]
                 )
                 + "\n\n请为每个 fact_id 只选择一个 candidate_id，或在没有直接支持时 drop。"
+            )
+            trace.record_model_started(
+                "memory.evidence_select",
+                model=self.settings.model,
+                agent_role="memory_keeper",
+                max_tokens=min(2_000, max(800, len(unsupported) * 180)),
+                timeout_seconds=self.settings.request_timeout_seconds,
+                thinking=False,
             )
             repaired = await self.provider.generate_json(
                 system_prompt=MEMORY_EVIDENCE_SYSTEM,
@@ -1992,6 +2103,14 @@ class InkFlowEngine:
                 + "SQLite 正史尚未提交。请仅依据上一状态与正文逐字证据，重新输出完整 MemoryPatch。"
                 + "能由明确原文消解的误报冲突应删除；真正存在两个无法同时成立的版本时必须保留，"
                 + "不得猜测、补写或替用户选择。每条 fact evidence 仍须是正文连续原文。"
+            )
+            trace.record_model_started(
+                "memory.conflict_resolution",
+                model=self.settings.model,
+                agent_role="memory_keeper",
+                max_tokens=12_000,
+                timeout_seconds=self.settings.request_timeout_seconds,
+                thinking=False,
             )
             conflict_result = await self.provider.generate_json(
                 system_prompt=MEMORY_SYSTEM,
@@ -2242,6 +2361,13 @@ class InkFlowEngine:
             result = self._batch_result(project, manifest)
             trace.finish(summary="批量草稿已完成，等待用户集中验收")
             return {**result, "trace_id": trace.run_id}
+        except asyncio.CancelledError:
+            manifest["status"] = "interrupted"
+            manifest["stop_reason"] = "用户停止了批次任务；已经写入的临时草稿保留"
+            self._save_batch_manifest(project, manifest)
+            trace.record("batch", "cancelled", "批次草稿请求被停止，已经写入的临时草稿保留")
+            trace.finish(status="cancelled", summary="批次草稿已停止，未提交正史")
+            raise
         except Exception as exc:
             manifest["status"] = "failed"
             manifest["stop_reason"] = str(exc)

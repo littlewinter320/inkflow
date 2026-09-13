@@ -915,7 +915,12 @@ class InkFlowAppService:
             await emit({"type": "controller.routing", "summary": "正在理解目标与执行边界"})
             session = TerminalSession(self._engine(project.root))
             await emit({"type": "workflow.started", "summary": "已交给墨流确定性工作流"})
-            result = await session.handle(project.root, message, consume_steering=consume_steering)
+            result = await session.handle(
+                project.root,
+                message,
+                consume_steering=consume_steering,
+                emit=emit,
+            )
             session_result = result.get("session") if isinstance(result, dict) else None
             if isinstance(session_result, dict) and session_result.get("task_ticket"):
                 await emit(
@@ -1056,8 +1061,29 @@ class InkFlowAppService:
             }
         )
         if action == "plan":
-            result = await engine.generate_plan(project.root)
+            await emit(
+                {
+                    "type": "writer.started",
+                    "stage": "plan.model",
+                    "role": "writer",
+                    "model": settings.model,
+                    "summary": "Writer 正在生成四级规划；完成后才会写入 PLAN.md",
+                }
+            )
+            result = await engine.generate_plan(
+                project.root,
+                instruction=str(params.get("instruction") or ""),
+            )
         elif action == "write":
+            await emit(
+                {
+                    "type": "writer.started",
+                    "stage": "writer.model",
+                    "role": "writer",
+                    "model": settings.model,
+                    "summary": "Writer 正在生成当前章节草稿；结果会先进入临时版本",
+                }
+            )
             instruction = str(params.get("instruction") or "")
             selected = project.db.get_metadata(f"writer_selection:{int(params['chapter_no'])}", None)
             if isinstance(selected, dict) and selected.get("data"):
@@ -1066,6 +1092,15 @@ class InkFlowAppService:
                 project.root, int(params["chapter_no"]), instruction
             )
         elif action == "review":
+            await emit(
+                {
+                    "type": "reviewer.started",
+                    "stage": "review.model",
+                    "role": "reviewer",
+                    "model": settings.model,
+                    "summary": "Reviewer 正在审查当前草稿版本；不会直接修改正文",
+                }
+            )
             result = await engine.review_chapter(project.root, int(params["chapter_no"]))
             if settings.acceptance_confirmation_mode == "auto_after_review" and result.get("verdict") == "pass":
                 acceptance = await engine.accept_chapter(project.root, int(params["chapter_no"]), force=False)
@@ -1076,12 +1111,30 @@ class InkFlowAppService:
                     "next_action": "本章已按设置自动验收并提交正史",
                 }
         elif action == "revise":
+            await emit(
+                {
+                    "type": "writer.started",
+                    "stage": "writer.revise",
+                    "role": "writer",
+                    "model": settings.model,
+                    "summary": "Writer 正在读取 Reviewer 证据并生成新版本；旧草稿仍会保留在版本记录中",
+                }
+            )
             result = await engine.revise_chapter(
                 project.root, int(params["chapter_no"]), str(params.get("instruction") or "")
             )
         elif action == "accept":
             result = await engine.accept_chapter(project.root, int(params["chapter_no"]), force=False)
         elif action == "batch_draft":
+            await emit(
+                {
+                    "type": "workflow.stage",
+                    "stage": "batch-draft",
+                    "role": "writer",
+                    "model": settings.model,
+                    "summary": "批次开始：逐章调用 Writer、Reviewer 和临时记忆；不会提交正史",
+                }
+            )
             result = await engine.draft_batch(
                 project.root,
                 int(params["start_chapter_no"]),
@@ -1290,6 +1343,8 @@ class InkFlowAppService:
 def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, Any]:
     prompt_tokens = 0
     completion_tokens = 0
+    prompt_cache_hit_tokens = 0
+    prompt_cache_miss_tokens = 0
     calls = 0
     for event_path in (project.internal / "runs").glob("*/events.jsonl"):
         try:
@@ -1306,6 +1361,14 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
             calls += 1
             prompt_tokens += int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
             completion_tokens += int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+            prompt_details = usage.get("prompt_tokens_details") or {}
+            cache_hit = int(
+                usage.get("prompt_cache_hit_tokens", prompt_details.get("cached_tokens", 0)) or 0
+            ) if isinstance(prompt_details, dict) else int(usage.get("prompt_cache_hit_tokens", 0) or 0)
+            cache_miss_value = usage.get("prompt_cache_miss_tokens")
+            cache_miss = int(cache_miss_value or 0) if cache_miss_value is not None else max(0, int(usage.get("prompt_tokens", 0) or 0) - cache_hit)
+            prompt_cache_hit_tokens += cache_hit
+            prompt_cache_miss_tokens += cache_miss
     estimated_cost = (
         prompt_tokens * settings.input_price_per_million
         + completion_tokens * settings.output_price_per_million
@@ -1315,6 +1378,11 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
+        "prompt_cache_hit_tokens": prompt_cache_hit_tokens,
+        "prompt_cache_miss_tokens": prompt_cache_miss_tokens,
+        "prompt_cache_hit_rate": round(
+            prompt_cache_hit_tokens / max(1, prompt_cache_hit_tokens + prompt_cache_miss_tokens), 4
+        ) if prompt_cache_hit_tokens + prompt_cache_miss_tokens else None,
         "estimated_cost": round(estimated_cost, 6),
         "currency": "CNY",
         "pricing_configured": settings.input_price_per_million > 0 or settings.output_price_per_million > 0,
@@ -1329,6 +1397,7 @@ class JsonLineServer:
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self.task_methods: dict[str, str] = {}
         self.steering_messages: dict[str, list[str]] = {}
+        self.cancel_requested: set[str] = set()
 
     async def serve(self) -> None:
         while True:
@@ -1348,6 +1417,7 @@ class JsonLineServer:
                 task = self.tasks.get(run_id)
                 cancelled = bool(task and not task.done())
                 if task and not task.done():
+                    self.cancel_requested.add(run_id)
                     task.cancel()
                 await self.write({"jsonrpc": "2.0", "id": request_id, "result": {"cancelled": cancelled}})
                 continue
@@ -1388,6 +1458,7 @@ class JsonLineServer:
                 self.tasks.pop(key, None)
                 self.task_methods.pop(key, None)
                 self.steering_messages.pop(key, None)
+                self.cancel_requested.discard(key)
             task.add_done_callback(cleanup)
         if self.tasks:
             await asyncio.gather(*self.tasks.values(), return_exceptions=True)
@@ -1427,16 +1498,34 @@ class JsonLineServer:
             await self.write({"jsonrpc": "2.0", "id": request_id, "result": result})
             await emit({"type": "run.completed", "method": method, "summary": "任务已完成"})
         except asyncio.CancelledError:
+            requested = run_id in self.cancel_requested
             if task_db is not None:
-                task_db.finish_task(run_id, status="cancelled", summary="用户已取消任务。")
+                task_db.finish_task(
+                    run_id,
+                    status="cancelled",
+                    summary="用户请求停止了任务；已有文件保留" if requested else "任务在引擎退出时被中断",
+                )
             await self.write(
                 {
                     "jsonrpc": "2.0",
                     "id": request_id,
-                    "error": {"code": "cancelled", "message": "任务已取消。"},
+                    "error": {
+                        "code": "cancelled",
+                        "message": "当前任务已停止",
+                        "details": "已有写入的草稿和版本会保留，尚未完成的步骤需要重新执行。",
+                        "preserved": "已有正文、草稿版本和正史未被回退",
+                    },
                 }
             )
-            await emit({"type": "run.cancelled", "method": method, "summary": "任务已取消"})
+            await emit(
+                {
+                    "type": "run.cancelled",
+                    "method": method,
+                    "summary": "当前任务已停止；已有内容保留",
+                    "details": "如果没有点击停止，通常表示桌面引擎退出；可在协作台查看最近 Trace。",
+                    "cancel_requested": requested,
+                }
+            )
         except Exception as exc:
             if task_db is not None:
                 task_db.finish_task(run_id, status="failed", error_message=str(exc))

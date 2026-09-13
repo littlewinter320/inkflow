@@ -392,8 +392,29 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .timeline p { margin: 5px 0; color: var(--muted); font-size: 11px; }
 .timeline small { color: var(--faint); font-size: 9px; }
 .run-list { display: flex; flex-direction: column; gap: 12px; }
+.process-hint { margin: 5px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.live-runs { margin-top: 18px; }
+.live-run > summary { cursor: pointer; list-style: none; }
+.live-run > summary::-webkit-details-marker { display: none; }
+.live-timeline { margin-top: 12px !important; }
+.live-step { display: block !important; padding: 10px 11px !important; border-left: 2px solid var(--line) !important; }
+.live-step.started { border-left-color: var(--amber) !important; }
+.live-step.completed { border-left-color: var(--accent-dim) !important; }
+.live-step.failed { border-left-color: var(--red) !important; }
+.live-step-main { display: flex; gap: 9px; align-items: flex-start; }
+.live-step-marker { display: inline-flex; width: 18px; height: 18px; align-items: center; justify-content: center; flex: 0 0 18px; border: 1px solid var(--line); border-radius: 50%; color: var(--accent-dim); font-size: 11px; }
+.live-step.started .live-step-marker { color: var(--amber); }
+.live-step.failed .live-step-marker { color: var(--red); }
+.live-step-main p { margin: 4px 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.live-step-main small, .live-step-meta, .live-run-footnote { color: var(--faint); font-size: 9px; line-height: 1.5; }
+.live-step-details { margin: 8px 0 0 27px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.live-step-meta { display: block; margin: 5px 0 0 27px; }
+.live-run-footnote { display: block; margin-top: 10px; }
 .operations-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .operations-grid article { min-height: 112px; padding: 13px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.cache-grid { margin-top: 8px; }
+.cache-summary { min-height: 0 !important; }
+.cache-summary p { -webkit-line-clamp: 4 !important; }
 .operations-grid header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .operations-grid strong { color: var(--text); font-size: 11px; }
 .operations-grid span { color: var(--accent-dim); font-size: 8px; }

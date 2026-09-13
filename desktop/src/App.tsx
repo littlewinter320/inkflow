@@ -66,7 +66,14 @@ type Dashboard = {
 type EngineEvent = {
   run_id?: string;
   type?: string;
+  stage?: string;
+  status?: string;
+  role?: string;
+  model?: string;
   summary?: string;
+  details?: string;
+  metadata?: Record<string, unknown>;
+  references?: TraceReference[];
   method?: string;
   action?: string;
   timestamp?: string;
@@ -156,7 +163,7 @@ type TraceStep = { timestamp: string; stage: string; status: string; summary: st
 type TraceRun = { run_id: string; operation: string; status: string; summary: string; started_at: string; finished_at: string; events: TraceStep[]; trace_reference?: TraceReference };
 type BatchSummary = { batch_id: string; status: string; start_chapter_no?: number; end_chapter_no?: number; chapters: Array<{ chapter_no?: number; version?: number; review_verdict?: string; memory_status?: string }> };
 type LearningEvent = { event_id: string; event_type: string; chapter_no?: number; created_at: string; payload: Record<string, unknown> };
-type CollaborationOverview = { messages: CollaborationMessage[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; trace_runs?: TraceRun[]; usage?: { calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; estimated_cost: number; currency: string; pricing_configured: boolean } };
+type CollaborationOverview = { messages: CollaborationMessage[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; trace_runs?: TraceRun[]; usage?: { calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; prompt_cache_hit_rate?: number | null; estimated_cost: number; currency: string; pricing_configured: boolean } };
 type PrefillResult = { insertion: string; document_hash: string; cursor_offset: number; confidence: string };
 type WorkspacePreset = "balanced" | "writing" | "planning" | "review";
 type WorkspaceResizeTarget = "navigation" | "assistant" | "inspector";
@@ -1179,7 +1186,7 @@ function App() {
             <button onClick={openFolder}>打开项目</button>
           </div>
           <div className="welcome-meta">
-            <span>版本 {String(appInfo?.version || "0.6.2")}</span>
+            <span>版本 {String(appInfo?.version || "0.6.3")}</span>
             <span>{provider?.api_key_configured ? "模型已配置" : "尚未配置模型 Key"}</span>
             <button className="text-button" onClick={() => setShowSettings(true)}>模型设置</button>
             <button className="text-button" onClick={() => setShowUpdate(true)}>检查更新</button>
@@ -1735,6 +1742,22 @@ function MemoryPanel({ dashboard, workspace, request, onRefresh }: { dashboard: 
   </div>;
 }
 
+function CacheSummary({ usage }: { usage?: CollaborationOverview["usage"] }) {
+  const hit = Number(usage?.prompt_cache_hit_tokens || 0);
+  const miss = Number(usage?.prompt_cache_miss_tokens || 0);
+  const total = hit + miss;
+  if (!total) return null;
+  const rate = Math.round((hit / total) * 100);
+  return <article className="cache-summary"><header><strong>模型上下文缓存</strong><span>{rate}% 命中</span></header><p>已复用 {hit.toLocaleString()} tokens；未命中 {miss.toLocaleString()} tokens。墨流会保持稳定的系统规则和上下文顺序，动态内容仍按章节更新，避免为了命中缓存而牺牲新章节质量。</p></article>;
+}
+
+type LiveRun = { id: string; steps: EngineEvent[]; method?: string; status: string; summary: string };
+
+function LiveRunTimeline({ runs }: { runs: LiveRun[] }) {
+  if (!runs.length) return null;
+  return <div className="run-list live-runs"><h3>实时运行过程</h3><p className="process-hint">这里展示公开的步骤、角色、模型、等待参数和文件引用；不会展示模型原始思考内容。</p>{runs.slice(0, 8).map((run) => <details className={`run-card live-run ${run.status}`} open={run.status === "running"} key={`live-${run.id}`}><summary><strong>{String(run.method ? methodLabel(run.method) : "墨流任务")}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : "进行中"}</span></summary><p>{run.summary}</p><ol className="live-timeline">{run.steps.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; const stepStatus = step.status || "info"; const role = String(step.role || metadata.agent_role || ""); const model = String(step.model || metadata.model || ""); const refs = step.references || []; const publicMetadata = Object.fromEntries(Object.entries(metadata).filter(([key]) => !isSensitivePresentationKey(key))); return <li className={`live-step ${stepStatus}`} key={`${step.timestamp || index}-${index}`}><div className="live-step-main"><span className="live-step-marker">{stepStatus === "completed" ? "✓" : stepStatus === "failed" ? "!" : stepStatus === "started" ? "…" : "·"}</span><div><strong>{eventLabel(step.type || step.stage)}</strong><p>{step.summary || step.stage || "过程"}</p><small>{step.timestamp ? formatTime(step.timestamp) : "刚刚"}{role ? ` · ${agentRoleLabel(role)}` : ""}{model ? ` · ${model}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small></div></div>{step.details && <p className="live-step-details">{step.details}</p>}{(metadata.timeout_seconds || metadata.max_tokens || typeof metadata.thinking === "boolean") && <small className="live-step-meta">请求参数：{metadata.timeout_seconds ? `超时 ${String(metadata.timeout_seconds)} 秒` : ""}{metadata.max_tokens ? ` · 输出上限 ${Number(metadata.max_tokens).toLocaleString()} tokens` : ""}{typeof metadata.thinking === "boolean" ? ` · 深度推理 ${metadata.thinking ? "开启" : "关闭"}` : ""}</small>}{refs.length > 0 && <div className="settings-inline-actions">{refs.map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void window.inkflow.openPath(reference.absolute_path)}>打开 {reference.relative_path}</button>)}</div>}{Object.keys(publicMetadata).length > 0 && <details><summary>查看本步公开记录</summary><pre className="compact-json">{JSON.stringify(publicMetadata, null, 2)}</pre></details>}</li>; })}</ol><small className="live-run-footnote">可复核文件由运行记录自动发现；点击文件按钮可在本地打开。</small></details>)}</div>;
+}
+
 function ProcessPanel({ events, collaboration, context, provider, workspace, request }: { events: EngineEvent[]; collaboration: CollaborationOverview | null; context: ContextStatus | null; provider: Record<string, unknown> | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> }) {
   const [threadUpdates, setThreadUpdates] = useState<Record<string, Record<string, unknown>>>({});
   const runs = processRuns(events);
@@ -1747,6 +1770,8 @@ function ProcessPanel({ events, collaboration, context, provider, workspace, req
   const retrieval = context?.retrieval_diagnostics;
   const openThreads = (collaboration?.threads || []).filter((thread) => ["open", "waiting", "escalated"].includes(String(thread.status))).length;
   return <div className="scroll-panel process-panel"><div className="section-heading"><p className="eyebrow">协作台</p><h2>工作流与运行状态</h2><p>任务、Agent 讨论、上下文、检索、学习和费用信息集中查看；正文和版本仍留在各自工作区。</p></div>{workspace && <ChapterStatusStrip workspace={workspace} />}
+    <LiveRunTimeline runs={runs} />
+    <div className="operations-grid cache-grid"><CacheSummary usage={usage} /></div>
     <div className="operations-grid">
       <article><header><strong>工作流</strong><span>{runs.length} 项</span></header><p>{runs.length ? "当前安排与每一步进度都记录在下方。" : "发送需求后显示任务安排。"}</p></article>
       <article><header><strong>并发任务</strong><span>{activeTasks} 进行中</span></header><p>{failedTasks ? `${failedTasks} 项需要处理；可在项目页重试或停止。` : "依赖关系由 Coordinator 与 Novel Engine 控制。"}</p></article>
@@ -2505,7 +2530,7 @@ async function withDeadline<T>(request: Promise<T>, ms: number, message: string)
 }
 function currentChapter(path?: string): number | null { const match = path?.match(/chapter_(\d+)/); return match ? Number(match[1]) : null; }
 function tabLabel(tab: Tab): string { return ({ project: "项目", editor: "正文", chapter: "章工位", review: "审查", memory: "记忆", references: "参考", listen: "听读", process: "协作台" })[tab]; }
-function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "run.cancelled": "任务已停止", "run.steered": "已接收人工引导", "workflow.started": "工作流启动", "workflow.planned": "真实任务单", "workflow.completed": "工作流完成", "controller.routing": "理解与路由", "writer.started": "写作角色构思", "writer.completed": "写作角色完成", "provider.testing": "模型连接" } as Record<string, string>)[value || ""] || value || "过程"; }
+function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "run.cancelled": "任务已停止", "run.steered": "已接收人工引导", "workflow.started": "工作流启动", "workflow.planned": "真实任务单", "workflow.completed": "工作流完成", "controller.routing": "理解与路由", "coordinator.model.started": "Coordinator 请求模型", "writer.started": "Writer 请求模型", "writer.completed": "Writer 完成", "reviewer.started": "Reviewer 开始审查", "workflow.stage": "工作流阶段", "provider.testing": "模型连接" } as Record<string, string>)[value || ""] || value || "过程"; }
 function agentRoleLabel(value: string): string { return ({ writer: "Writer", reviewer: "Reviewer", memory_keeper: "Memory Keeper", engine: "Novel Engine" } as Record<string, string>)[value] || value; }
 function operationLabel(value: string): string { return ({ "plan.generate": "生成四级规划", "chapter.write": "生成章节草稿", "chapter.review": "审查当前版本", "chapter.revise": "修订为新版本", "chapter.accept": "提交已通过版本的正史补丁", "batch.draft_loop": "逐章写作、审查与临时连续性", "batch.accept_loop": "按顺序提交通过章节", "arc.audit": "复审篇章承诺" } as Record<string, string>)[value] || value; }
 function authorizationLabel(value: string): string { return ({ none: "未取得", current_request: "当前明确操作", per_chapter_click: "逐章点击", batch_preapproval: "批次一次确认", settings_auto_accept: "设置中的自动验收" } as Record<string, string>)[value] || value; }
@@ -2530,7 +2555,7 @@ function processRuns(events: EngineEvent[]) {
     const visibleSteps = steps.filter((item) => !["run.started", "run.completed"].includes(item.type || ""));
     const action = steps.find((item) => item.action)?.action;
     return { id, steps: visibleSteps, method, action, status: failed ? "failed" : cancelled ? "cancelled" : done ? "done" : "running", summary, finishedAt: failed || cancelled || done ? [...steps].reverse().find((item) => item.timestamp)?.timestamp : undefined };
-  }).filter((run) => !["checkpoint_list", "rollback_preview"].includes(run.action || "") && (visibleMethods.has(run.method || "") || run.steps.some((item) => ["controller.routing", "workflow.started", "writer.started"].includes(item.type || "")))).reverse();
+  }).filter((run) => !["checkpoint_list", "rollback_preview"].includes(run.action || "") && (visibleMethods.has(run.method || "") || run.steps.some((item) => ["controller.routing", "coordinator.model.started", "workflow.started", "workflow.stage", "writer.started", "reviewer.started"].includes(item.type || "")))).reverse();
 }
 function statusLabel(value: string): string { return ({ open: "待处理", resolved: "已处理", dismissed: "已忽略", orphaned: "原文已变化" } as Record<string, string>)[value] || value; }
 function kindLabel(value: string): string { return ({ character: "人物", location: "地点", organization: "组织", item: "物品", lore: "世界观", style: "文风" } as Record<string, string>)[value] || value; }
