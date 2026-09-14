@@ -432,6 +432,7 @@ class ReviewReport(StrictModel):
     findings: list[ReviewFinding] = Field(default_factory=list)
     scorecard: list[ReviewScoreDimension] = Field(default_factory=list)
     source_hash: str = ""
+    context_fingerprint: str = ""
     hook_assessment: HookAssessment | None = None
     context_use_audit: ContextUseAudit = Field(default_factory=ContextUseAudit)
 
@@ -585,6 +586,49 @@ class ContextPacket(StrictModel):
         if self.warnings:
             output.extend(["## Warnings", "", *[f"- {item}" for item in self.warnings], ""])
         return "\n".join(output).rstrip() + "\n"
+
+    def to_model_prompt(self) -> str:
+        """Serialize stable material before task-specific material for provider caching."""
+
+        def priority(section: ContextSection) -> tuple[int, str]:
+            if section.key == "A0":
+                return (0, section.key)
+            if section.key == "J" and "输出契约" not in section.title:
+                return (1, section.key)
+            if "输出契约" in section.title:
+                return (2, section.key)
+            if section.key == "A":
+                return (4, section.key)
+            return (3, section.key)
+
+        output = ["# 墨流编译上下文", ""]
+        for section in sorted(self.sections, key=priority):
+            output.extend([f"## {section.key}. {section.title}", "", section.content or "（无）", ""])
+            if section.source_ids:
+                output.extend([f"来源：{', '.join(sorted(section.source_ids))}", ""])
+        output.extend([
+            "## 本次执行信息",
+            "",
+            f"章节：{self.chapter_no}",
+            f"估算输入：{self.estimated_tokens} tokens",
+        ])
+        if self.warnings:
+            output.extend(["", "警告：", *[f"- {item}" for item in self.warnings]])
+        return "\n".join(output).rstrip() + "\n"
+
+    def gate_material(self) -> str:
+        """Return only acceptance-critical context for stale-review detection."""
+
+        return "\n".join(
+            [
+                f"task={self.task}",
+                *[
+                    f"{section.key}\n{section.content}\n{','.join(sorted(section.source_ids))}"
+                    for section in sorted(self.sections, key=lambda item: item.key)
+                    if section.hard
+                ],
+            ]
+        )
 
 
 class PrefillSuggestion(StrictModel):

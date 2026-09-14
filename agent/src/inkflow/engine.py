@@ -102,7 +102,7 @@ class InkFlowEngine:
         )
         result = await self.provider.generate_json(
             system_prompt=VOICE_CLONE_SCRIPT_WRITER_SYSTEM,
-            user_prompt=packet.to_markdown(),
+            user_prompt=packet.to_model_prompt(),
             output_model=VoiceCloneReadingScript,
             effort="low",
             max_tokens=1500,
@@ -160,7 +160,7 @@ class InkFlowEngine:
             run_id=run_id,
             role="writer",
             data={
-                "context_packet_id": content_hash(packet.to_markdown()),
+                "context_packet_id": content_hash(packet.to_model_prompt()),
                 "task": packet.task,
                 "estimated_tokens": packet.estimated_tokens,
                 "writing_guides": active_skills,
@@ -256,7 +256,7 @@ class InkFlowEngine:
         trace = TraceRecorder(project.root, "writer-brainstorm", self.settings.trace_level)
         try:
             # 灵感分身只把最近对话当作背景参考，不做证据核验，也不引用正史结论。
-            context = packet.to_markdown()
+            context = packet.to_model_prompt()
             if len(context) > 6_000:
                 context = context[-6_000:]
             trace.record_model_started(
@@ -388,7 +388,7 @@ class InkFlowEngine:
             )
             result = await self.provider.generate_json(
                 system_prompt=PLANNER_SYSTEM,
-                user_prompt=packet.to_markdown(),
+                user_prompt=packet.to_model_prompt(),
                 output_model=PlanBundle,
                 # A full PlanBundle is a large structured response.  DeepSeek
                 # Flash can spend the whole output budget on hidden reasoning
@@ -579,7 +579,7 @@ class InkFlowEngine:
             )
             result = await self.provider.generate_json(
                 system_prompt=PLANNER_SYSTEM,
-                user_prompt=packet.to_markdown(),
+                user_prompt=packet.to_model_prompt(),
                 output_model=ArcPlanningBrief,
                 effort="high",
                 max_tokens=6_000,
@@ -803,7 +803,7 @@ class InkFlowEngine:
             if same_volume:
                 result = await self.provider.generate_json(
                     system_prompt=PLANNER_SYSTEM,
-                    user_prompt=packet.to_markdown(),
+                    user_prompt=packet.to_model_prompt(),
                     output_model=ArcPlan,
                     # A rolling window only needs one arc and a handful of
                     # chapter cards.  Flash timed out on max/28k before
@@ -840,7 +840,7 @@ class InkFlowEngine:
             else:
                 result = await self.provider.generate_json(
                     system_prompt=PLANNER_SYSTEM,
-                    user_prompt=packet.to_markdown(),
+                    user_prompt=packet.to_model_prompt(),
                     output_model=VolumeArcPlan,
                     effort="max",
                     max_tokens=16_000,
@@ -999,18 +999,15 @@ class InkFlowEngine:
                 agent_role="writer",
                 max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
                 timeout_seconds=self.settings.request_timeout_seconds,
-                # 长篇正文不需要把隐藏推理预算和正文输出一起拉长。关闭
-                # provider 的 thinking 可显著降低等待与被宿主超时中断的概率；
-                # 公开的 Context Packet、章节卡和后续 Reviewer 仍保留质量门禁。
-                thinking=False,
+                thinking=True,
             )
             result = await self.provider.generate_json(
                 system_prompt=WRITER_SYSTEM,
-                user_prompt=packet.to_markdown(),
+                user_prompt=packet.to_model_prompt(),
                 output_model=DraftOutput,
-                effort="high",
+                effort=self.settings.reasoning_effort,
                 max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
-                thinking=False,
+                thinking=True,
                 agent_role="writer",
             )
             draft = result.data
@@ -1024,7 +1021,7 @@ class InkFlowEngine:
                 clean_content,
                 chapter_no=chapter_no,
                 card=card,
-                base_prompt=packet.to_markdown(),
+                base_prompt=packet.to_model_prompt(),
                 system_prompt=WRITER_SYSTEM,
                 trace=trace,
                 stage="writer.length_repair",
@@ -1066,7 +1063,7 @@ class InkFlowEngine:
                 message_type="handoff",
                 chapter_no=chapter_no,
                 chapter_version=version,
-                context_packet_id=content_hash(packet.to_markdown()),
+                context_packet_id=content_hash(packet.to_model_prompt()),
                 claim=f"第 {chapter_no} 章草稿 v{version} 已完成，等待独立审查。",
                 evidence_refs=[
                     relative.as_posix(),
@@ -1288,7 +1285,7 @@ class InkFlowEngine:
                 None,
             )
             user_prompt = (
-                packet.to_markdown()
+                packet.to_model_prompt()
                 + "\n\n# 待审正文\n\n"
                 + content
                 + "\n\n# Writer 版本说明（版本绑定的协作资料，不是正文或正史）\n\n"
@@ -1305,22 +1302,18 @@ class InkFlowEngine:
                 "review.model",
                 model=self.settings.model,
                 agent_role="reviewer",
-                # 审查报告是结构化证据摘要；2600 tokens 足够承载发现、
-                # 评分和钩子判断，避免无隐藏推理时仍等待大预算。
                 max_tokens=2_600,
                 timeout_seconds=120,
-                # Reviewer 的公开职责是证据判断；隐藏推理不会写入
-                # Trace，关闭它可避免长时间等待，确定性审查和证据核验仍保留。
-                thinking=False,
+                thinking=True,
             )
             result = await self.provider.generate_json(
                 system_prompt=REVIEWER_SYSTEM,
                 user_prompt=user_prompt,
                 output_model=ReviewReport,
-                effort="low",
+                effort=self.settings.reasoning_effort,
                 max_tokens=2_600,
                 timeout_seconds=120,
-                thinking=False,
+                thinking=True,
                 agent_role="reviewer",
             )
             model_report = result.data
@@ -1352,6 +1345,7 @@ class InkFlowEngine:
                 findings=findings,
                 scorecard=_build_review_scorecard(findings),
                 source_hash=content_hash(content),
+                context_fingerprint=content_hash(packet.gate_material()),
                 hook_assessment=model_report.hook_assessment,
                 context_use_audit=context_use_audit,
             )
@@ -1365,7 +1359,7 @@ class InkFlowEngine:
                 int(chapter["version"]),
                 report,
                 trace.run_id,
-                content_hash(packet.to_markdown()),
+                content_hash(packet.gate_material()),
             )
             trace.record("review.write", "completed", "审查报告已写入", metadata={"path": relative.as_posix()})
             trace.finish(summary=f"审查完成：{report.verdict}")
@@ -1417,7 +1411,7 @@ class InkFlowEngine:
                     system_prompt=REVIEW_CORRECTION_SYSTEM,
                     user_prompt=(
                         "# 当前 Context Packet\n"
-                        + packet.to_markdown()
+                        + packet.to_model_prompt()
                         + "\n\n# 当前正文\n"
                         + content
                         + "\n\n# 当前全部审查意见（请保留其中合格条目）\n"
@@ -1622,7 +1616,7 @@ class InkFlowEngine:
                 metadata={"skills": active_skills, "skill_contract_version": "1", "packet_section": "I", "extra_model_calls": 0},
             )
             user_prompt = (
-                packet.to_markdown()
+                packet.to_model_prompt()
                 + "\n\n# 当前草稿\n\n"
                 + current_draft
                 + "\n\n# 当前版本 Reviewer 报告\n\n"
@@ -1641,15 +1635,15 @@ class InkFlowEngine:
                 agent_role="writer",
                 max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
                 timeout_seconds=self.settings.request_timeout_seconds,
-                thinking=False,
+                thinking=True,
             )
             result = await self.provider.generate_json(
                 system_prompt=REVISER_SYSTEM,
                 user_prompt=user_prompt,
                 output_model=DraftOutput,
-                effort="high",
+                effort=self.settings.reasoning_effort,
                 max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
-                thinking=False,
+                thinking=True,
                 agent_role="writer",
             )
             draft = result.data
@@ -1710,7 +1704,7 @@ class InkFlowEngine:
                 message_type="handoff",
                 chapter_no=chapter_no,
                 chapter_version=version,
-                context_packet_id=content_hash(packet.to_markdown()),
+                context_packet_id=content_hash(packet.to_model_prompt()),
                 claim=f"第 {chapter_no} 章修订稿 v{version} 已完成，旧版审查不再具有放行效力。",
                 evidence_refs=[
                     Path(chapter["path"]).as_posix(),
@@ -1828,7 +1822,7 @@ class InkFlowEngine:
             )
 
             user_prompt = (
-                packet.to_markdown()
+                packet.to_model_prompt()
                 + "\n\n# 选区前文（只读，不得改写）\n\n"
                 + before
                 + "\n\n# 唯一允许替换的原文\n\n"
@@ -1940,6 +1934,15 @@ class InkFlowEngine:
             content = draft_path.read_text(encoding="utf-8")
             if review.source_hash and review.source_hash != content_hash(content):
                 raise ValidationGateError("正文与审查时的内容不一致，必须重新审查。")
+            if review.context_fingerprint and _provisional_batch_id is None:
+                current_packet = self._context_builder(project, "reviewer").build(
+                    chapter_no,
+                    f"审查第 {chapter_no} 章草稿",
+                    mode="review",
+                    protected_input=content,
+                )
+                if review.context_fingerprint != content_hash(current_packet.gate_material()):
+                    raise ValidationGateError("正史、章节卡或硬规则在审查后发生变化，必须重新审查当前版本。")
             if _prepared_patch is None:
                 patch, conflict_relative, conflict_path = await self._extract_memory_patch(
                     project,
@@ -2929,7 +2932,7 @@ class InkFlowEngine:
             )
             result = await self.provider.generate_json(
                 system_prompt=ARC_AUDIT_SYSTEM,
-                user_prompt=packet.to_markdown(),
+                user_prompt=packet.to_model_prompt(),
                 output_model=ArcAuditReport,
                 effort="low",
                 max_tokens=16_000,

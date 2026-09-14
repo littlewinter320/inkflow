@@ -152,6 +152,17 @@ class TraceRecorder:
             "response_id": result.response_id,
             "usage": result.usage,
         }
+        started = next(
+            (
+                event for event in reversed(self.events)
+                if event.stage == stage and event.status == "started"
+            ),
+            None,
+        )
+        if started and started.metadata.get("agent_role"):
+            metadata["agent_role"] = started.metadata["agent_role"]
+        elif result.agent_role:
+            metadata["agent_role"] = result.agent_role
         self.record(stage, "completed", decision_summary, metadata=json.loads(json_dumps(metadata)))
         if self.trace_level == "full" and result.reasoning_content:
             self.record(

@@ -590,13 +590,13 @@ class InkFlowAppService:
                 content=json.dumps({"before_cursor": before, "after_cursor": after, "maximum_characters": length_limit}, ensure_ascii=False),
                 source_ids=[f"draft:{chapter_no}:{current_hash}"],
             ))
-            packet.estimated_tokens = estimate_tokens(packet.to_markdown())
+            packet.estimated_tokens = estimate_tokens(packet.to_model_prompt())
             result = await create_provider(settings).generate_json(
                 system_prompt=(
                     "你是墨流的 Writer，只生成编辑器光标处可插入的正文候选。保持人物、时态、视角和声线连续；"
                     "不要解释，不要重复光标前后的文字，不要修改文件，不要提交正史。"
                 ),
-                user_prompt=packet.to_markdown(),
+                user_prompt=packet.to_model_prompt(),
                 output_model=PrefillSuggestion,
                 max_tokens=min(1_200, settings.max_output_tokens),
                 thinking=False,
@@ -655,7 +655,7 @@ class InkFlowAppService:
             )
             result = await create_provider(settings).generate_json(
                 system_prompt="你是墨流 Writer 的候选方案阶段。只提出方向，最终正文仍由固定主笔统一完成。",
-                user_prompt=packet.to_markdown() + f"\n\n必须给出 {count} 个方向。",
+                user_prompt=packet.to_model_prompt() + f"\n\n必须给出 {count} 个方向。",
                 output_model=WriterDirectionSet,
                 max_tokens=3_000, thinking=False, agent_role="writer",
             )
@@ -668,7 +668,7 @@ class InkFlowAppService:
                         chapter_no=chapter_no, chapter_version=(chapter.get("chapter") or {}).get("version"),
                         data=direction.model_dump(), status="awaiting_selection",
                     ))
-            return {"candidates": artifacts, "context_packet_id": content_hash(packet.to_markdown()), "model": result.model, "usage": result.usage}
+            return {"candidates": artifacts, "context_packet_id": content_hash(packet.to_model_prompt()), "model": result.model, "usage": result.usage}
         if method == "chapter.writer_candidate.select":
             with project_write_lock_sync(project.root):
                 selected = project.db.select_agent_artifact(str(params["artifact_id"]))
@@ -699,7 +699,7 @@ class InkFlowAppService:
             for dimension in dimensions:
                 result = await create_provider(Settings.from_env(project.root)).generate_json(
                     system_prompt="你是墨流 Reviewer。只审查指定维度，逐条引用当前正文或 Context Packet；不直接修改正文，不以投票代替证据。",
-                    user_prompt=packet.to_markdown() + f"\n\n# 审查维度\n{dimension}\n\n# 当前正文\n{content}",
+                    user_prompt=packet.to_model_prompt() + f"\n\n# 审查维度\n{dimension}\n\n# 当前正文\n{content}",
                     output_model=ReviewReport, max_tokens=5_000, thinking=False, agent_role="reviewer",
                 )
                 verified, verdict = verify_review(result.data, content, packet)
@@ -847,7 +847,7 @@ class InkFlowAppService:
             )
             result = await create_provider(Settings.from_env(project.root)).generate_json(
                 system_prompt=f"你是墨流的 {recipient}。{role_boundaries.get(recipient, '')} 最多两轮定向交流，不得自由群聊。",
-                user_prompt=discussion_packet.to_markdown(),
+                user_prompt=discussion_packet.to_model_prompt(),
                 output_model=CollaborationReply,
                 max_tokens=2_000,
                 thinking=False,
@@ -1364,11 +1364,20 @@ class InkFlowAppService:
 
 
 def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, Any]:
-    prompt_tokens = 0
-    completion_tokens = 0
-    prompt_cache_hit_tokens = 0
-    prompt_cache_miss_tokens = 0
-    calls = 0
+    def empty_bucket() -> dict[str, int]:
+        return {
+            "calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 0,
+            "cache_reported_calls": 0,
+            "cache_unknown_calls": 0,
+            "cache_unknown_prompt_tokens": 0,
+        }
+
+    overall = empty_bucket()
+    by_agent_role: dict[str, dict[str, int]] = {}
     for event_path in (project.internal / "runs").glob("*/events.jsonl"):
         try:
             lines = event_path.read_text(encoding="utf-8").splitlines()
@@ -1376,36 +1385,60 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
             continue
         for line in lines:
             try:
-                usage = dict(json.loads(line).get("metadata", {}).get("usage") or {})
+                metadata = dict(json.loads(line).get("metadata") or {})
+                usage = dict(metadata.get("usage") or {})
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
             if not usage:
                 continue
-            calls += 1
-            prompt_tokens += int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
-            completion_tokens += int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+            raw_role = str(metadata.get("agent_role") or "unknown")
+            role = (
+                "reviewer" if raw_role.startswith("reviewer")
+                else "memory_keeper" if raw_role.startswith("memory")
+                else raw_role if raw_role in {"coordinator", "writer"}
+                else "unknown"
+            )
+            bucket = by_agent_role.setdefault(role, empty_bucket())
+            prompt = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+            completion = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
             prompt_details = usage.get("prompt_tokens_details") or {}
+            hit_reported = "prompt_cache_hit_tokens" in usage or (
+                isinstance(prompt_details, dict) and "cached_tokens" in prompt_details
+            )
+            miss_reported = "prompt_cache_miss_tokens" in usage
             cache_hit = int(
                 usage.get("prompt_cache_hit_tokens", prompt_details.get("cached_tokens", 0)) or 0
             ) if isinstance(prompt_details, dict) else int(usage.get("prompt_cache_hit_tokens", 0) or 0)
-            cache_miss_value = usage.get("prompt_cache_miss_tokens")
-            cache_miss = int(cache_miss_value or 0) if cache_miss_value is not None else max(0, int(usage.get("prompt_tokens", 0) or 0) - cache_hit)
-            prompt_cache_hit_tokens += cache_hit
-            prompt_cache_miss_tokens += cache_miss
+            cache_miss = int(usage.get("prompt_cache_miss_tokens", 0) or 0) if miss_reported else max(0, prompt - cache_hit)
+            for target in (overall, bucket):
+                target["calls"] += 1
+                target["prompt_tokens"] += prompt
+                target["completion_tokens"] += completion
+                if hit_reported or miss_reported:
+                    target["cache_reported_calls"] += 1
+                    target["prompt_cache_hit_tokens"] += cache_hit
+                    target["prompt_cache_miss_tokens"] += cache_miss
+                else:
+                    target["cache_unknown_calls"] += 1
+                    target["cache_unknown_prompt_tokens"] += prompt
+
+    def public_bucket(bucket: dict[str, int]) -> dict[str, Any]:
+        cache_total = bucket["prompt_cache_hit_tokens"] + bucket["prompt_cache_miss_tokens"]
+        return {
+            **bucket,
+            "total_tokens": bucket["prompt_tokens"] + bucket["completion_tokens"],
+            "prompt_cache_hit_rate": round(bucket["prompt_cache_hit_tokens"] / cache_total, 4)
+            if cache_total else None,
+        }
+
+    usage = public_bucket(overall)
     estimated_cost = (
-        prompt_tokens * settings.input_price_per_million
-        + completion_tokens * settings.output_price_per_million
+        overall["prompt_tokens"] * settings.input_price_per_million
+        + overall["completion_tokens"] * settings.output_price_per_million
     ) / 1_000_000
     return {
-        "calls": calls,
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-        "prompt_cache_hit_tokens": prompt_cache_hit_tokens,
-        "prompt_cache_miss_tokens": prompt_cache_miss_tokens,
-        "prompt_cache_hit_rate": round(
-            prompt_cache_hit_tokens / max(1, prompt_cache_hit_tokens + prompt_cache_miss_tokens), 4
-        ) if prompt_cache_hit_tokens + prompt_cache_miss_tokens else None,
+        **usage,
+        "by_agent_role": {role: public_bucket(bucket) for role, bucket in by_agent_role.items()},
         "estimated_cost": round(estimated_cost, 6),
         "currency": "CNY",
         "pricing_configured": settings.input_price_per_million > 0 or settings.output_price_per_million > 0,

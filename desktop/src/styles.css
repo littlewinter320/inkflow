@@ -499,6 +499,10 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .cache-grid { margin-top: 8px; }
 .cache-summary { min-height: 0 !important; }
 .cache-summary p { -webkit-line-clamp: 4 !important; }
+.cache-role-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 14px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.cache-role-list div { display: flex; justify-content: space-between; gap: 8px; }
+.cache-role-list strong { font-size: 9px; font-weight: 500; }
+.cache-role-list span { font-size: 9px; }
 .operations-grid header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .operations-grid strong { color: var(--text); font-size: 11px; }
 .operations-grid span { color: var(--accent-dim); font-size: 8px; }

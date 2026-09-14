@@ -207,7 +207,7 @@ class TerminalSession:
             )
             route_result = await self.engine.provider.generate_json(
                 system_prompt=TERMINAL_ROUTER_SYSTEM,
-                user_prompt=packet.to_markdown(),
+                user_prompt=packet.to_model_prompt(),
                 output_model=TerminalIntent,
                 effort="low",
                 max_tokens=900,
@@ -237,7 +237,7 @@ class TerminalSession:
                 )
                 route_result = await self.engine.provider.generate_json(
                     system_prompt=TERMINAL_ROUTER_SYSTEM,
-                    user_prompt=packet.to_markdown(),
+                    user_prompt=packet.to_model_prompt(),
                     output_model=TerminalIntent,
                     effort="low",
                     max_tokens=900,
@@ -278,7 +278,7 @@ class TerminalSession:
                             message_type="task_assignment",
                             chapter_no=ticket.chapter_no,
                             chapter_version=ticket.chapter_version,
-                            context_packet_id=content_hash(packet.to_markdown()),
+                            context_packet_id=content_hash(packet.to_model_prompt()),
                             claim=ticket.objective,
                             evidence_refs=ticket.input_sources,
                             requested_response=step.required_output,
@@ -325,7 +325,7 @@ class TerminalSession:
                             message_type="risk",
                             chapter_no=ticket.chapter_no,
                             chapter_version=ticket.chapter_version,
-                            context_packet_id=content_hash(packet.to_markdown()),
+                            context_packet_id=content_hash(packet.to_model_prompt()),
                             claim=str(response.get("gate") or "任务仍需要用户补充信息。"),
                             evidence_refs=ticket.input_sources,
                             requested_response="请补充阻塞信息或确认新的处理方向。",
@@ -1338,8 +1338,7 @@ class TerminalSession:
 
         return {"gate": f"不支持的路由结果：{intent.action}"}
 
-    @staticmethod
-    def _reuse_current_pass_review(project: InkFlowProject, chapter_no: int) -> dict[str, Any] | None:
+    def _reuse_current_pass_review(self, project: InkFlowProject, chapter_no: int) -> dict[str, Any] | None:
         """Return a safe handoff when the current draft already has a pass report."""
 
         chapter = project.db.get_chapter(chapter_no)
@@ -1357,6 +1356,17 @@ class TerminalSession:
             return None
         source_hash = getattr(report, "source_hash", "")
         if source_hash and source_hash != content_hash(content):
+            return None
+        context_fingerprint = getattr(report, "context_fingerprint", "")
+        if not context_fingerprint:
+            return None
+        packet = self.engine._context_builder(project, "reviewer").build(
+            chapter_no,
+            f"审查第 {chapter_no} 章草稿",
+            mode="review",
+            protected_input=content,
+        )
+        if context_fingerprint != content_hash(packet.gate_material()):
             return None
         return {
             "step": "reviewer.review",

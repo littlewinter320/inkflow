@@ -168,7 +168,8 @@ type TraceStep = { timestamp: string; stage: string; status: string; summary: st
 type TraceRun = { run_id: string; operation: string; status: string; summary: string; started_at: string; finished_at: string; events: TraceStep[]; trace_reference?: TraceReference };
 type BatchSummary = { batch_id: string; status: string; start_chapter_no?: number; end_chapter_no?: number; chapters: Array<{ chapter_no?: number; version?: number; review_verdict?: string; memory_status?: string }> };
 type LearningEvent = { event_id: string; event_type: string; chapter_no?: number; created_at: string; payload: Record<string, unknown> };
-type CollaborationOverview = { messages: CollaborationMessage[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; trace_runs?: TraceRun[]; usage?: { calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; prompt_cache_hit_rate?: number | null; estimated_cost: number; currency: string; pricing_configured: boolean } };
+type UsageSummary = { calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; prompt_cache_hit_rate?: number | null; cache_reported_calls?: number; cache_unknown_calls?: number; cache_unknown_prompt_tokens?: number };
+type CollaborationOverview = { messages: CollaborationMessage[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; trace_runs?: TraceRun[]; usage?: UsageSummary & { by_agent_role?: Record<string, UsageSummary>; estimated_cost: number; currency: string; pricing_configured: boolean } };
 type PrefillResult = { insertion: string; document_hash: string; cursor_offset: number; confidence: string };
 type WorkspacePreset = "balanced" | "writing" | "planning" | "review";
 type WorkspaceResizeTarget = "navigation" | "assistant" | "inspector";
@@ -1821,9 +1822,13 @@ function CacheSummary({ usage }: { usage?: CollaborationOverview["usage"] }) {
   const hit = Number(usage?.prompt_cache_hit_tokens || 0);
   const miss = Number(usage?.prompt_cache_miss_tokens || 0);
   const total = hit + miss;
-  if (!total) return null;
-  const rate = Math.round((hit / total) * 100);
-  return <article className="cache-summary"><header><strong>模型上下文缓存</strong><span>{rate}% 命中</span></header><p>已复用 {hit.toLocaleString()} tokens；未命中 {miss.toLocaleString()} tokens。墨流会保持稳定的系统规则和上下文顺序，动态内容仍按章节更新，避免为了命中缓存而牺牲新章节质量。</p></article>;
+  if (!usage?.calls) return null;
+  const rate = total ? Math.round((hit / total) * 100) : null;
+  const labels: Record<string, string> = { coordinator: "Coordinator", writer: "Writer", reviewer: "Reviewer", memory_keeper: "Memory Keeper", unknown: "历史记录" };
+  const roleUsage = usage.by_agent_role || {};
+  const roleKeys = ["coordinator", "writer", "reviewer", "memory_keeper", ...(roleUsage.unknown?.calls ? ["unknown"] : [])];
+  const roles = roleKeys.map((role) => [role, roleUsage[role] || { calls: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }] as const);
+  return <article className="cache-summary"><header><strong>模型上下文缓存</strong><span>{rate === null ? "服务商未报告" : `${rate}% / 目标 80%`}</span></header><p>{rate === null ? `已记录 ${usage.calls} 次调用，但当前服务商或旧记录没有返回缓存字段。` : `已复用 ${hit.toLocaleString()} tokens；未命中 ${miss.toLocaleString()} tokens。`} 缓存只复用相同前缀，不会压缩正史、章节卡或当前任务。</p><div className="cache-role-list">{roles.map(([role, value]) => { const roleHit = Number(value.prompt_cache_hit_tokens || 0); const roleMiss = Number(value.prompt_cache_miss_tokens || 0); const roleTotal = roleHit + roleMiss; const roleRate = roleTotal ? Math.round((roleHit / roleTotal) * 100) : null; return <div key={role}><strong>{labels[role] || role}</strong><span>{value.calls ? roleRate === null ? `未知 · ${value.calls} 次` : `${roleRate}% · ${value.calls} 次` : "暂无调用"}</span></div>; })}</div></article>;
 }
 
 type LiveRun = { id: string; steps: EngineEvent[]; method?: string; status: string; summary: string };

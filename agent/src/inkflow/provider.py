@@ -23,6 +23,7 @@ class ProviderResult(Generic[T]):
     response_id: str | None
     reasoning_content: str | None
     usage: dict[str, Any]
+    agent_role: str = ""
 
 
 class JsonModelProvider(Protocol):
@@ -208,6 +209,7 @@ class DeepSeekProvider:
                     response_id=body.get("id"),
                     reasoning_content=message.get("reasoning_content"),
                     usage=dict(body.get("usage") or {}),
+                    agent_role=agent_role,
                 )
             except (
                 httpx.HTTPError,
@@ -334,6 +336,7 @@ class AnthropicProvider:
                 response_id=body.get("id"),
                 reasoning_content=None,
                 usage=usage,
+                agent_role=agent_role,
             )
         except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError, ValidationError, ProviderError) as exc:
             if isinstance(exc, ProviderError):
@@ -490,4 +493,5 @@ class ScriptedProvider:
             response_id=f"scripted-{len(self.calls)}",
             reasoning_content="离线脚本响应：仅验证工作流，不代表真实模型推理。",
             usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            agent_role=agent_role,
         )

@@ -254,6 +254,30 @@ class ContextBuilder:
             chapter_no=chapter_no,
             chapter_version=int(chapter["version"]) if chapter else None,
         )
+        state_facts = [
+            item for item in facts
+            if item["predicate"].startswith(("state.", "knows.", "believes."))
+        ]
+        general_facts = [
+            item for item in facts
+            if not item["predicate"].startswith(("state.", "knows.", "believes."))
+        ]
+        already_loaded = {
+            *[str(item["fact_id"]) for item in facts],
+            *[str(item["thread_id"]) for item in threads],
+            *[str(item["preference_id"]) for item in preferences],
+        }
+        duplicate_retrieval_ids = sorted(
+            str(item["source_id"]) for item in retrieval_hits
+            if str(item["source_id"]) in already_loaded
+        )
+        retrieval_hits = [
+            item for item in retrieval_hits
+            if str(item["source_id"]) not in already_loaded
+        ]
+        if duplicate_retrieval_ids:
+            self.retriever.last_diagnostics["selected"] = retrieval_hits
+            self.retriever.last_diagnostics["deduplicated_source_ids"] = duplicate_retrieval_ids
 
         reference_cards = self._load_reference_cards(limit=6)
         craft_guides = select_craft_guides(task=task, genre=brief.genre, card=card, limit=2)
@@ -273,10 +297,10 @@ class ContextBuilder:
             ContextSection(
                 key="B",
                 title="不可违反的硬正史",
-                content=json.dumps([_fact_for_model(item) for item in facts], ensure_ascii=False, indent=2)
-                if facts
+                content=json.dumps([_fact_for_model(item) for item in general_facts], ensure_ascii=False, indent=2)
+                if general_facts
                 else "当前尚无已提交事实。",
-                source_ids=[str(item["fact_id"]) for item in facts],
+                source_ids=[str(item["fact_id"]) for item in general_facts],
                 hard=True,
             ),
             ContextSection(
@@ -292,16 +316,14 @@ class ContextBuilder:
                 content=json.dumps(
                     [
                         _state_for_model(item)
-                        for item in facts
-                        if item["predicate"].startswith(("state.", "knows.", "believes."))
+                        for item in state_facts
                     ],
                     ensure_ascii=False,
                     indent=2,
                 ),
                 source_ids=[
                     str(item["fact_id"])
-                    for item in facts
-                    if item["predicate"].startswith(("state.", "knows.", "believes."))
+                    for item in state_facts
                 ],
                 hard=True,
             ),

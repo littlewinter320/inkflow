@@ -78,11 +78,11 @@ def verify_review(report: ReviewReport, content: str, packet: ContextPacket) -> 
                     for ref in finding.canon_refs
                 ):
                     reasons.append("对照原文无法定位到来源")
-        if reasons:
-            # Unsupported hard claims are demoted to info below; they remain
-            # visible for human review but cannot block acceptance on an
-            # unanchored quote.
-            disputed |= False
+        if reasons and hard and not editorial:
+            # One unsupported hard claim must be corrected or explicitly
+            # resolved before the report can pass.  It is still demoted below
+            # so an unanchored quote never edits prose by itself.
+            disputed = True
         findings.append(finding.model_copy(update={
             "severity": "info" if reasons else "minor" if hard and editorial else finding.severity,
             "verification_status": "unsupported" if reasons else "anchored",
