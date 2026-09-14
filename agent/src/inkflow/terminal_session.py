@@ -98,7 +98,10 @@ TERMINAL_ROUTER_SYSTEM = TERMINAL_ROUTER_SYSTEM + "\n\n墨宝口吻（适用于�
 _SENSITIVE_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
 _NO_OPTIONAL_QUESTION_PATTERN = re.compile(r"(?:直接|马上|立刻)(?:开始|执行|写|做)|(?:不用|不要|别|不必)再?问")
 _CHAPTER_RANGE_PATTERN = re.compile(
-    r"第?\s*(\d+)\s*(?:到|至|~|～|—|-)\s*第?\s*(\d+)\s*章"
+    # Accept both "第6章到第10章" and the shorter "第6到第10章".
+    # The chapter marker before the separator is optional because both forms
+    # are common in natural Chinese requests.
+    r"第?\s*(\d+)\s*章?\s*(?:到|至|~|～|—|-)\s*第?\s*(\d+)\s*章"
 )
 _CHAPTER_NUMBER_PATTERN = re.compile(r"第\s*(\d+)\s*章")
 _BEFORE_CHAPTER_PATTERN = re.compile(r"(?:生成|写|开始写)?\s*第\s*(\d+)\s*章\s*(?:之前|以前|前)")

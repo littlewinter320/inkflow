@@ -25,6 +25,7 @@ from .prompts import (
     REVIEWER_SYSTEM,
     REVISER_SYSTEM,
     SELECTION_REVISER_SYSTEM,
+    LENGTH_REPAIR_SYSTEM,
     WRITER_IDEATE_SYSTEM,
     WRITER_SYSTEM,
     VOICE_CLONE_SCRIPT_WRITER_SYSTEM,
@@ -997,7 +998,11 @@ class InkFlowEngine:
                 "writer.model",
                 model=self.settings.model,
                 agent_role="writer",
-                max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
+                # Keep the structured response bounded so a low-effort
+                # chapter request does not spend its budget echoing context.
+                # 6k is enough for a complete DraftOutput at the default
+                # 3k-character chapter target, including light reasoning.
+                max_tokens=min(16_000, max(6_000, int(card["target_words"] * 1.8))),
                 timeout_seconds=self.settings.request_timeout_seconds,
                 thinking=True,
             )
@@ -1006,7 +1011,7 @@ class InkFlowEngine:
                 user_prompt=packet.to_model_prompt(),
                 output_model=DraftOutput,
                 effort=self.settings.reasoning_effort,
-                max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
+                max_tokens=min(16_000, max(6_000, int(card["target_words"] * 1.8))),
                 thinking=True,
                 agent_role="writer",
             )
@@ -1130,6 +1135,17 @@ class InkFlowEngine:
         lower_bound = int(target * (1 - _CHAPTER_LENGTH_TOLERANCE))
         upper_bound = int(target * (1 + _CHAPTER_LENGTH_TOLERANCE))
         current = _content_char_count(clean_content)
+        if current > upper_bound:
+            return await self._repair_long_draft(
+                draft,
+                clean_content,
+                chapter_no=chapter_no,
+                card=card,
+                base_prompt=base_prompt,
+                system_prompt=system_prompt,
+                trace=trace,
+                stage=stage,
+            )
         if current >= lower_bound:
             return draft, clean_content
         card_requirements = json_dumps(
@@ -1186,6 +1202,107 @@ class InkFlowEngine:
             "completed",
             f"篇幅补救后有效字符 {_content_char_count(repaired_content)}（目标范围 {lower_bound}～{upper_bound}）",
             metadata={"before_characters": current, "after_characters": _content_char_count(repaired_content), "target_characters": repair_target, "lower_bound": lower_bound, "upper_bound": upper_bound},
+        )
+        return repaired, repaired_content
+
+    async def _repair_long_draft(
+        self,
+        draft: DraftOutput,
+        clean_content: str,
+        *,
+        chapter_no: int,
+        card: dict[str, Any],
+        base_prompt: str,
+        system_prompt: str,
+        trace: TraceRecorder,
+        stage: str,
+    ) -> tuple[DraftOutput, str]:
+        """Ask Writer once to compress an overlong draft without changing its story.
+
+        Length is a hard chapter-card gate.  Keeping this as a single, bounded
+        Writer call avoids silently truncating prose and preserves the reviewer
+        as the authority on whether the resulting version is acceptable.
+        """
+        target = int(card["target_words"])
+        lower_bound = int(target * (1 - _CHAPTER_LENGTH_TOLERANCE))
+        upper_bound = int(target * (1 + _CHAPTER_LENGTH_TOLERANCE))
+        current = _content_char_count(clean_content)
+        card_requirements = json_dumps(
+            {
+                "chapter_function": card.get("function", ""),
+                "goal": card.get("goal", ""),
+                "obstacle": card.get("obstacle", ""),
+                "decision": card.get("decision", ""),
+                "consequence": card.get("consequence", ""),
+                "irreversible_delta": card.get("irreversible_delta", ""),
+                "required_scenes": card.get("scenes", []),
+                "chapter_end_hook": card.get("hook_anchor") or card.get("hook_question", ""),
+            }
+        )
+        # The original writing/revision request already carried the full
+        # Context Packet.  Repeating it here together with the new prose made
+        # the compression call echo the chapter and occasionally truncate its
+        # JSON.  A bounded length pass only needs the chapter-card contract
+        # and the current draft; removing duplicates cannot introduce canon.
+        over_by = max(0, current - upper_bound)
+        repair_prompt = (
+            "# 篇幅硬修复：只做一次压缩\n"
+            + f"第 {chapter_no} 章当前约 {current} 个有效中文字符，已经超过上限 {upper_bound}；"
+            + f"章节卡目标是 {target}，最终正文必须严格落在 {lower_bound}～{upper_bound}。\n"
+            + f"本次至少删减或合并 {max(over_by + 120, 300)} 个有效字符，内部目标约 2700～3000 字。"
+            + "这是硬门槛：交稿前自行数正文有效字符，若仍超过上限必须继续删减后才返回。"
+            + "只返回完整 DraftOutput JSON，content 字段只放正文，不放字数说明、审查意见或修改说明。\n"
+            + "不要只换词或重排句子，必须实际删除低信息内容：至少删除三到六个重复或空转的完整短段，"
+            + "或合并十个以上只承担停顿/回应的短段。删减顺序：合并重复的环境和感官描写，删除同一信息的重复解释、无结果的来回动作、"
+            + "空泛的情绪总结和多余对话寒暄；保留人物目标与阻力、关键选择、因果触发、必要的声音和感官细节、"
+            + "不可逆后果以及原有章末钩子。不得增加支线、改变正史、改写章节功能，也不能删掉结尾。\n"
+            + "章节卡要求：\n"
+            + card_requirements
+            + "\n当前正文（在此基础上压缩，不要扩写）：\n"
+            + clean_content
+        )
+        trace.record_model_started(
+            stage,
+            model=self.settings.model,
+            agent_role="writer",
+            # Compression is deliberately given a smaller output budget than
+            # creative drafting.  This prevents the repair response from
+            # simply echoing another overlong chapter while leaving enough
+            # room for a complete DraftOutput JSON object.
+            # Keep enough room for a complete DraftOutput JSON object.  A
+            # tighter token cap can truncate the JSON before the prose ends,
+            # which costs more time through provider retries than it saves.
+            max_tokens=min(16_000, max(5_200, int(target * 1.7))),
+            timeout_seconds=self.settings.request_timeout_seconds,
+            thinking=False,
+        )
+        result = await self.provider.generate_json(
+            system_prompt=LENGTH_REPAIR_SYSTEM,
+            user_prompt=repair_prompt,
+            output_model=DraftOutput,
+            effort="low",
+            max_tokens=min(16_000, max(5_200, int(target * 1.7))),
+            thinking=False,
+            agent_role="writer",
+        )
+        repaired = result.data
+        trace.record_model(stage, result, "Writer completed one bounded compression for an overlong draft")
+        repaired_content = _deduplicate_exact_paragraphs(
+            _strip_model_chapter_heading(repaired.content, chapter_no)
+        )
+        trace.record(
+            "writer.length_repair",
+            "completed",
+            f"Length repair produced {_content_char_count(repaired_content)} effective characters "
+            f"(target range {lower_bound}-{upper_bound})",
+            metadata={
+                "before_characters": current,
+                "after_characters": _content_char_count(repaired_content),
+                "target_characters": target,
+                "lower_bound": lower_bound,
+                "upper_bound": upper_bound,
+                "direction": "compress",
+            },
         )
         return repaired, repaired_content
 
@@ -1633,7 +1750,10 @@ class InkFlowEngine:
                 "writer.revise",
                 model=self.settings.model,
                 agent_role="writer",
-                max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
+                # Revisions should be shorter than creative drafting: the
+                # existing prose is supplied in the prompt and only a
+                # complete replacement plus its decision summary is needed.
+                max_tokens=min(16_000, max(6_000, int(card["target_words"] * 1.8))),
                 timeout_seconds=self.settings.request_timeout_seconds,
                 thinking=True,
             )
@@ -1642,7 +1762,7 @@ class InkFlowEngine:
                 user_prompt=user_prompt,
                 output_model=DraftOutput,
                 effort=self.settings.reasoning_effort,
-                max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
+                max_tokens=min(16_000, max(6_000, int(card["target_words"] * 1.8))),
                 thinking=True,
                 agent_role="writer",
             )
@@ -1953,12 +2073,29 @@ class InkFlowEngine:
                     force=force,
                 )
             else:
-                patch = _validate_memory_patch_scope(
-                    _prepared_patch,
-                    chapter_no,
-                    known_facts=project.db.current_facts(),
+                # The provisional patch was already scope-validated when the
+                # batch was staged.  Re-running that normalizer against the
+                # now-expanded canonical facts can rename an otherwise valid
+                # fact id; re-aligning evidence can also change only its
+                # punctuation.  Normalize both copies for comparison first,
+                # then commit the prepared patch without inventing a new
+                # identity at acceptance time.
+                staged_patch = project.db.get_provisional_memory_patch(
+                    _provisional_batch_id, chapter_no
                 )
-                patch, aligned_ids = _align_patch_evidence(patch, content)
+                if staged_patch is None:
+                    raise ValidationGateError(
+                        f"第 {chapter_no} 章没有可提升的批次临时记忆"
+                    )
+                prepared_normalized, aligned_ids = _align_patch_evidence(_prepared_patch, content)
+                staged_normalized, _ = _align_patch_evidence(staged_patch["patch"], content)
+                if prepared_normalized.model_dump(mode="json") != staged_normalized.model_dump(mode="json"):
+                    raise ValidationGateError(f"第 {chapter_no} 章待提升补丁与临时记忆不一致")
+                # Commit the exact staged representation after the normalized
+                # equality check.  The database deliberately compares the
+                # persisted patch byte-for-byte; using the aligned copy here
+                # would reintroduce a harmless punctuation-only mismatch.
+                patch = staged_patch["patch"]
                 unsupported = [
                     fact.fact_id for fact in patch.facts if not _evidence_in_content(fact.evidence, content)
                 ]
