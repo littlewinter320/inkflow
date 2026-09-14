@@ -519,6 +519,46 @@ function App() {
     }
   }, []);
 
+  const forgetRecentProject = (root: string) => {
+    setRecentProjects((items) => removeRecentProject(items, root));
+  };
+
+  const trashRecentProject = async (project: RecentProject) => {
+    const confirmed = window.confirm(`确定将“${project.title}”移入系统回收站吗？\n\n项目文件夹、章节正文、正史数据库和运行记录都会一起移动；需要时可以从系统回收站恢复。`);
+    if (!confirmed) return;
+    setError("");
+    setProjectLoading(true);
+    try {
+      await window.inkflow.trashProject(project.root);
+      forgetRecentProject(project.root);
+      if (localStorage.getItem("inkflow.lastProject")?.toLocaleLowerCase() === project.root.toLocaleLowerCase()) localStorage.removeItem("inkflow.lastProject");
+      setNotice(`已将“${project.title}”移入系统回收站。`);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setProjectLoading(false);
+    }
+  };
+
+  const moveRecentProject = async (project: RecentProject) => {
+    const targetParent = await window.inkflow.chooseFolder("选择项目转移到的文件夹");
+    if (!targetParent) return;
+    const confirmed = window.confirm(`将“${project.title}”整体转移到：\n${targetParent}\n\n转移完成后，章节、正史和运行记录都会保留，主页会更新为新位置。`);
+    if (!confirmed) return;
+    setError("");
+    setProjectLoading(true);
+    try {
+      const result = await window.inkflow.moveProject(project.root, targetParent);
+      setRecentProjects((items) => rememberRecentProject(items, result.destination, project.title));
+      if (localStorage.getItem("inkflow.lastProject")?.toLocaleLowerCase() === project.root.toLocaleLowerCase()) localStorage.setItem("inkflow.lastProject", result.destination);
+      setNotice(`项目已转移到 ${result.destination}`);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setProjectLoading(false);
+    }
+  };
+
   useEffect(() => {
     messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, busy]);
@@ -1246,9 +1286,16 @@ function App() {
             <section className="recent-projects">
               <div><strong>最近打开</strong><small>只保存在这台电脑</small></div>
               {recentProjects.map((project) => (
-                <button key={project.root} onClick={() => void openProject(project.root)}>
-                  <span>{project.title}</span><small>{project.root}</small>
-                </button>
+                <div className="recent-project-row" key={project.root}>
+                  <button className="recent-project-open" disabled={projectLoading} onClick={() => void openProject(project.root)}>
+                    <span>{project.title}</span><small>{project.root}</small>
+                  </button>
+                  <div className="recent-project-actions">
+                    <button type="button" disabled={projectLoading} title="转移项目" aria-label={`转移项目：${project.title}`} onClick={() => void moveRecentProject(project)}>转移</button>
+                    <button type="button" disabled={projectLoading} title="只从主页移除记录" aria-label={`移除记录：${project.title}`} onClick={() => forgetRecentProject(project.root)}>移除记录</button>
+                    <button type="button" className="danger" disabled={projectLoading} title="将项目文件夹移入系统回收站" aria-label={`删除项目文件：${project.title}`} onClick={() => void trashRecentProject(project)}>删除文件</button>
+                  </div>
+                </div>
               ))}
             </section>
           )}
@@ -2827,6 +2874,12 @@ function rememberRecentProject(items: RecentProject[], root: string, title: stri
     { root, title, openedAt: new Date().toISOString() },
     ...items.filter((item) => item.root.toLocaleLowerCase() !== root.toLocaleLowerCase()),
   ].slice(0, 5);
+  localStorage.setItem("inkflow.recentProjects.v1", JSON.stringify(next));
+  return next;
+}
+
+function removeRecentProject(items: RecentProject[], root: string): RecentProject[] {
+  const next = items.filter((item) => item.root.toLocaleLowerCase() !== root.toLocaleLowerCase());
   localStorage.setItem("inkflow.recentProjects.v1", JSON.stringify(next));
   return next;
 }

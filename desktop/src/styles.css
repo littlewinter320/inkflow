@@ -55,12 +55,17 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .welcome-actions button { min-width: 130px; padding: 13px 20px; }
 .welcome-meta { display: flex; gap: 18px; align-items: center; margin-top: 35px; color: var(--faint); font-size: 13px; }
 .recent-projects { width: min(620px, 100%); margin-top: 25px; padding-top: 16px; border-top: 1px solid var(--line); }
-.recent-projects > div { display: flex; justify-content: space-between; margin-bottom: 8px; color: var(--muted); font-size: 11px; }
-.recent-projects > div small { color: var(--faint); }
-.recent-projects > button { display: grid; grid-template-columns: minmax(0, 1fr); width: 100%; margin-top: 6px; padding: 9px 11px; background: rgba(19, 19, 16, .72); text-align: left; }
-.recent-projects > button span, .recent-projects > button small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.recent-projects > button span { color: #ddd8cd; font-size: 12px; }
-.recent-projects > button small { margin-top: 3px; color: var(--faint); font-size: 9px; }
+.recent-projects > div:first-child { display: flex; justify-content: space-between; margin-bottom: 8px; color: var(--muted); font-size: 11px; }
+.recent-projects > div:first-child small { color: var(--faint); }
+.recent-project-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; width: 100%; margin-top: 6px; }
+.recent-project-open { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; padding: 9px 11px; border-color: var(--line-soft); background: rgba(19, 19, 16, .72); text-align: left; }
+.recent-project-open span, .recent-project-open small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recent-project-open span { color: #ddd8cd; font-size: 12px; }
+.recent-project-open small { margin-top: 3px; color: var(--faint); font-size: 9px; }
+.recent-project-actions { display: flex; align-items: stretch; gap: 4px; }
+.recent-project-actions button { padding: 6px 8px; color: var(--muted); font-size: 9px; white-space: nowrap; }
+.recent-project-actions button:hover:not(:disabled) { color: var(--text); }
+.recent-project-actions .danger { color: var(--red); }
 
 .app-shell { display: grid; grid-template-rows: 62px minmax(0, 1fr); height: 100%; background: var(--bg); }
 .topbar { display: grid; grid-template-columns: 240px minmax(250px, 1fr) auto; align-items: center; border-bottom: 1px solid var(--line); background: #141411; }
@@ -1044,6 +1049,8 @@ body.layout-resizing, body.layout-resizing * { cursor: col-resize !important; us
 :root[data-theme="light"] .detail-metric { background: var(--panel); }
 :root[data-theme="light"] .workflow-mini-card:hover:not(:disabled),
 :root[data-theme="light"] .process-summary-card:hover:not(:disabled) { background: var(--panel-2); }
+:root[data-theme="light"] .recent-project-open { background: var(--panel); }
+:root[data-theme="light"] .recent-project-open span { color: var(--text); }
 
 :root[data-density="compact"] .topbar { min-height: 52px; }
 :root[data-density="compact"] .app-shell { grid-template-rows: 52px minmax(0, 1fr); }
@@ -1071,6 +1078,8 @@ body.layout-resizing, body.layout-resizing * { cursor: col-resize !important; us
   .workflow-mini-track { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .workflow-mini-track i:nth-child(4), .workflow-mini-track i:nth-child(5) { margin-top: 3px; }
   .detail-metrics { grid-template-columns: 1fr 1fr; }
+  .recent-project-row { grid-template-columns: 1fr; }
+  .recent-project-actions { justify-content: flex-end; }
 }
 
 @media (max-width: 900px) {

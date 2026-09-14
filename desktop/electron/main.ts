@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from "electron";
 import { AppUpdater, NsisUpdater, autoUpdater } from "electron-updater";
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { pathToFileURL } from "node:url";
@@ -27,6 +27,20 @@ function redactEngineDiagnostics(value: string): string {
     .replace(/(bearer\s+|api[_ -]?key\s*[:=]\s*)[^\s,;]+/gi, "$1[已隐藏]")
     .replace(/sk-[A-Za-z0-9_-]{8,}/g, "[已隐藏密钥]")
     .slice(-1_200);
+}
+
+function resolveInkFlowProject(rootValue: string): string {
+  const root = realpathSync(path.resolve(String(rootValue || "")));
+  const stat = lstatSync(root);
+  if (!stat.isDirectory() || !existsSync(path.join(root, ".inkflow", "project.json"))) {
+    throw new Error("这不是可识别的墨流项目文件夹，未执行操作。");
+  }
+  return root;
+}
+
+function pathContains(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 class UpdateManager {
@@ -329,6 +343,28 @@ function createWindow(): void {
       properties: ["openDirectory", "createDirectory"],
     });
     return result.canceled ? null : result.filePaths[0];
+  });
+  ipcMain.handle("project:trash", async (_event, rootValue: string) => {
+    const root = resolveInkFlowProject(rootValue);
+    await shell.trashItem(root);
+    return { root, recoverable: true };
+  });
+  ipcMain.handle("project:move", async (_event, rootValue: string, targetParentValue: string) => {
+    const source = resolveInkFlowProject(rootValue);
+    const targetParent = realpathSync(path.resolve(String(targetParentValue || "")));
+    if (!lstatSync(targetParent).isDirectory()) throw new Error("目标位置不是文件夹，项目没有移动。");
+    if (pathContains(source, targetParent)) throw new Error("不能把项目移动到自己的文件夹内。");
+    const destination = path.join(targetParent, path.basename(source));
+    if (existsSync(destination)) throw new Error(`目标位置已经存在“${path.basename(source)}”文件夹，请先选择其他位置。`);
+    try {
+      renameSync(source, destination);
+    } catch (cause) {
+      const code = cause && typeof cause === "object" && "code" in cause ? String((cause as { code?: unknown }).code || "") : "";
+      if (code !== "EXDEV") throw cause;
+      cpSync(source, destination, { recursive: true, errorOnExist: true, force: false });
+      rmSync(source, { recursive: true, force: true });
+    }
+    return { source, destination };
   });
   ipcMain.handle("dialog:choose-file", async (_event, title: string) => {
     const result = await dialog.showOpenDialog(mainWindow!, {

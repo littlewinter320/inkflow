@@ -4,6 +4,8 @@ contextBridge.exposeInMainWorld("inkflow", {
   request: (method: string, params: Record<string, unknown> = {}) =>
     ipcRenderer.invoke("engine:request", method, params),
   chooseFolder: (title: string) => ipcRenderer.invoke("dialog:choose-folder", title),
+  trashProject: (root: string) => ipcRenderer.invoke("project:trash", root),
+  moveProject: (root: string, targetParent: string) => ipcRenderer.invoke("project:move", root, targetParent),
   chooseFile: (title: string) => ipcRenderer.invoke("dialog:choose-file", title),
   chooseAudio: (title: string) => ipcRenderer.invoke("dialog:choose-audio", title),
   saveVoiceRecording: (bytes: Uint8Array, extension = "webm") =>
