@@ -225,6 +225,30 @@ class InkFlowProject:
         staged_path = Path(transaction["staged_path"])
         final_path = Path(transaction["final_path"])
         if not staged_path.exists():
+            # 桌面宿主可能在数据库提交后先运行恢复器，把同一哈希的
+            # 暂存文件替换到目标位置并清理日志。此时事务已经安全完成，
+            # 让本次 finalize 具备幂等性，避免把成功提交误报成失败。
+            if final_path.is_file():
+                try:
+                    if content_hash(final_path.read_text(encoding="utf-8")) == transaction["content_hash"]:
+                        if journal_path.exists():
+                            journal_path.unlink(missing_ok=True)
+                        return
+                except OSError:
+                    pass
+            # 如果恢复器正好在暂存文件移走、目标文件写入之前运行，
+            # SQLite 已经记录了本次接受的完整正文时，可以从正史正文
+            # 安全重建投影。哈希必须与事务一致，避免把任何其他内容写入目标。
+            try:
+                chapter_no = int(final_path.stem.split("_")[-1])
+                canonical_content = self.db.canonical_chapter_content(chapter_no)
+                if canonical_content is not None and content_hash(canonical_content) == transaction["content_hash"]:
+                    atomic_write_text(final_path, canonical_content)
+                    if journal_path.exists():
+                        journal_path.unlink(missing_ok=True)
+                    return
+            except (OSError, ValueError):
+                pass
             raise ProjectError("正史事务暂存文件不存在，已停止提交以避免覆盖正文。")
         final_path.parent.mkdir(parents=True, exist_ok=True)
         if final_path.exists() and content_hash(final_path.read_text(encoding="utf-8")) == transaction["content_hash"]:

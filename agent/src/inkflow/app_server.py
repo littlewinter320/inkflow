@@ -27,7 +27,7 @@ from .provider import create_provider
 from .references import ReferenceService
 from .schemas import BookBrief, CollaborationReply, ContextPacket, ContextSection, MemoryPatch, NovelIdeaBundle, NovelIdeaCandidate, PrefillSuggestion, PromptOptimization, ProviderProbe, ReviewReport, SuggestedPrompts, SuggestedPrompt, TerminalIntent, WriterDirectionSet
 from .review_verifier import verify_review
-from .studio import StudioService
+from .studio import StudioService, text_statistics
 from .terminal_session import TerminalSession
 from .trace import TraceRecorder, recent_trace_runs
 from .utils import content_hash, estimate_tokens, project_source_revision
@@ -516,6 +516,9 @@ class InkFlowAppService:
                 "status": "idle",
                 "estimated_tokens": 0,
                 "before_compression_tokens": 0,
+                "previous_updated_at": "",
+                "previous_estimated_tokens": None,
+                "change_since_previous_tokens": None,
                 "soft_limit_tokens": settings.context_budget_for("writer")[0],
                 "hard_limit_tokens": settings.context_budget_for("writer")[1],
                 "hard_usage_percent": 0,
@@ -539,6 +542,26 @@ class InkFlowAppService:
             return studio.tree()
         if method == "document.read":
             return studio.read_document(str(params["relative_path"]))
+        if method == "document.read_reference":
+            # 运行记录位于 .inkflow 内部目录，只允许只读预览；前端不会再把
+            # 这类证据交给系统 shell 打开，也不能借此绕过通用文件写入门禁。
+            relative_path = str(params.get("relative_path") or "").replace("\\", "/").lstrip("/")
+            path = project.resolve_user_path(relative_path, allow_internal=True)
+            if not path.is_file():
+                raise ProjectError(f"运行记录不存在：{relative_path}")
+            if path.suffix.lower() not in {".md", ".json", ".jsonl", ".txt", ".log"}:
+                raise ProjectError("只读复核面板不支持预览此类文件。")
+            content = path.read_text(encoding="utf-8", errors="replace")
+            return {
+                "relative_path": relative_path,
+                "content": content,
+                "content_hash": content_hash(content),
+                "statistics": text_statistics(content),
+                "annotations": [],
+                "versions": [],
+                "read_only": True,
+                "reason": "运行记录只读预览；如需修改请回到对应正文、规划或审查入口。",
+            }
         if method == "document.prefill":
             relative_path = str(params.get("relative_path") or "")
             chapter_match = re.search(r"chapter_(\d+)\.draft\.md$", relative_path)

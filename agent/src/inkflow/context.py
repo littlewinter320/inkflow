@@ -787,14 +787,28 @@ class ContextBuilder:
         hard_sections = [item for item in packet.sections if item.hard]
         ratio = packet.estimated_tokens / max(1, self.hard_token_limit)
         status = "safe" if ratio < 0.7 else "watch" if ratio < 0.9 else "near_limit"
+        status_path = self.project.internal / "context-status.json"
+        previous: dict[str, Any] = {}
+        try:
+            raw_previous = json.loads(status_path.read_text(encoding="utf-8"))
+            if isinstance(raw_previous, dict) and raw_previous.get("project_id") in {None, "", self.project.project_id}:
+                previous = raw_previous
+        except (OSError, json.JSONDecodeError):
+            previous = {}
+        previous_updated_at = str(previous.get("updated_at") or "")
+        previous_estimated = int(previous.get("estimated_tokens") or 0) if previous_updated_at else 0
+        updated_at = utc_now()
         payload = {
             "project_id": self.project.project_id,
             "source_revision": project_source_revision(self.project.root, self.project.internal),
-            "updated_at": utc_now(),
+            "updated_at": updated_at,
             "chapter_no": packet.chapter_no,
             "task": packet.task,
             "estimated_tokens": packet.estimated_tokens,
             "before_compression_tokens": before_compression,
+            "previous_updated_at": previous_updated_at,
+            "previous_estimated_tokens": previous_estimated if previous_updated_at else None,
+            "change_since_previous_tokens": (packet.estimated_tokens - previous_estimated) if previous_updated_at else None,
             "soft_limit_tokens": self.soft_token_limit,
             "hard_limit_tokens": self.hard_token_limit,
             "configured_soft_limit_tokens": self.configured_soft_token_limit,
@@ -845,7 +859,7 @@ class ContextBuilder:
             "retrieval_diagnostics": self.retriever.last_diagnostics,
             "warnings": packet.warnings,
         }
-        atomic_write_text(self.project.internal / "context-status.json", json_dumps(payload))
+        atomic_write_text(status_path, json_dumps(payload))
 
 
 def _fact_for_model(item: dict[str, Any]) -> dict[str, Any]:

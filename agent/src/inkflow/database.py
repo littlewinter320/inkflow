@@ -537,7 +537,21 @@ class ProjectDatabase:
     def current_facts(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM facts WHERE status='active' AND valid_to_chapter IS NULL ORDER BY subject, predicate"
+                """
+                SELECT fact.*
+                FROM facts AS fact
+                WHERE fact.status='active' AND fact.valid_to_chapter IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM facts AS newer
+                      WHERE newer.subject=fact.subject
+                        AND newer.predicate=fact.predicate
+                        AND newer.status='active'
+                        AND newer.valid_to_chapter IS NULL
+                        AND newer.source_chapter > fact.source_chapter
+                  )
+                ORDER BY fact.subject, fact.predicate
+                """
             ).fetchall()
         result = []
         for row in rows:
@@ -702,9 +716,10 @@ class ProjectDatabase:
                 connection.execute(
                     """
                     UPDATE facts SET valid_to_chapter=?, status='superseded'
-                    WHERE subject=? AND predicate=? AND status='active' AND valid_to_chapter IS NULL
+                    WHERE subject=? AND predicate=? AND status='active'
+                      AND valid_to_chapter IS NULL AND source_chapter <= ?
                     """,
-                    (chapter_no - 1, fact.subject, fact.predicate),
+                    (chapter_no - 1, fact.subject, fact.predicate, chapter_no),
                 )
                 connection.execute(
                     """
@@ -1039,6 +1054,92 @@ class ProjectDatabase:
             item["evidence_refs"] = json.loads(item.pop("evidence_refs_json"))
             result.append(item)
         return result
+
+    def reconcile_collaboration_queue(self) -> dict[str, int]:
+        """Collapse obsolete Coordinator assignments without deleting evidence.
+
+        A failed/repeated desktop request can leave several pending assignments
+        for the same chapter version.  The Coordinator should see only the
+        newest actionable handoff; resolved rows remain queryable as history.
+        """
+
+        active = self.list_collaboration_messages(active_only=True, limit=500)
+        if not active:
+            return {"resolved": 0, "remaining": 0}
+        with self.connect() as connection:
+            chapter_rows = connection.execute("SELECT * FROM chapters").fetchall()
+        chapters = {int(item["chapter_no"]): dict(item) for item in chapter_rows}
+        current_plan_exists = self.get_current_plan_bundle() is not None
+        keep: set[str] = set()
+        newest: dict[tuple[Any, ...], str] = {}
+        stale_ids: list[str] = []
+        for item in active:
+            message_id = str(item["message_id"])
+            chapter_no = item.get("chapter_no")
+            chapter = chapters.get(int(chapter_no)) if chapter_no is not None else None
+            chapter_version = item.get("chapter_version")
+            if chapter is None:
+                if current_plan_exists and item.get("message_type") == "task_assignment":
+                    stale_ids.append(message_id)
+                    continue
+                key = ("global", item.get("recipient_role"), item.get("message_type"))
+            else:
+                current_version = int(chapter.get("version") or 0)
+                if chapter.get("status") == "accepted":
+                    stale_ids.append(message_id)
+                    continue
+                if chapter_version is not None and int(chapter_version) != current_version:
+                    stale_ids.append(message_id)
+                    continue
+                review = self.latest_review_record(int(chapter_no))
+                if review and int(review["chapter_version"]) == current_version and review["report"].verdict == "pass":
+                    if item.get("recipient_role") == "reviewer" or item.get("message_type") == "task_assignment":
+                        stale_ids.append(message_id)
+                        continue
+                key = (
+                    int(chapter_no),
+                    current_version,
+                    item.get("recipient_role"),
+                    item.get("message_type"),
+                )
+            previous = newest.get(key)
+            if previous:
+                stale_ids.append(previous)
+            newest[key] = message_id
+            keep.add(message_id)
+        if stale_ids:
+            # stale_ids 只记录已经被新一条替代或明确过期的消息；
+            # 当前 key 的最后一条不会进入这个集合。
+            unique = sorted(set(stale_ids))
+            with self.connect() as connection:
+                connection.executemany(
+                    "UPDATE collaboration_messages SET status='resolved', resolved_at=? WHERE message_id=? AND status IN ('pending','responded','escalated')",
+                    [(utc_now(), message_id) for message_id in unique],
+                )
+                connection.execute(
+                    """
+                    UPDATE collaboration_threads
+                    SET status='resolved', updated_at=?
+                    WHERE thread_id IN (
+                        SELECT DISTINCT thread_id FROM collaboration_messages
+                        WHERE status='resolved' AND thread_id IN (
+                            SELECT thread_id FROM collaboration_messages WHERE message_id IN ({placeholders})
+                        )
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM collaboration_messages active
+                        WHERE active.thread_id=collaboration_threads.thread_id
+                          AND active.status IN ('pending','responded','escalated')
+                    )
+                    """.format(placeholders=",".join("?" for _ in unique)),
+                    [utc_now(), *unique],
+                ) if unique else None
+                connection.commit()
+            resolved = len(unique)
+        else:
+            resolved = 0
+        remaining = len(self.list_collaboration_messages(active_only=True, limit=500))
+        return {"resolved": resolved, "remaining": remaining}
 
     def resolve_pending_collaboration(
         self,

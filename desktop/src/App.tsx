@@ -141,8 +141,13 @@ type ContextStatus = {
   status: "idle" | "safe" | "watch" | "near_limit" | "stale";
   estimated_tokens: number;
   before_compression_tokens: number;
+  previous_updated_at?: string;
+  previous_estimated_tokens?: number | null;
+  change_since_previous_tokens?: number | null;
   soft_limit_tokens: number;
   hard_limit_tokens: number;
+  configured_soft_limit_tokens?: number;
+  configured_hard_limit_tokens?: number;
   hard_usage_percent: number;
   compression_applied: boolean;
   hard_sections: Array<{ key: string; title: string; reason?: string; source_ids?: string[] }>;
@@ -311,6 +316,8 @@ function App() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [tree, setTree] = useState<ProjectTree | null>(null);
   const [document, setDocument] = useState<DocumentData | null>(null);
+  const [reviewDocument, setReviewDocument] = useState<DocumentData | null>(null);
+  const [referenceDocument, setReferenceDocument] = useState<DocumentData | null>(null);
   const [text, setText] = useState("");
   const [savedText, setSavedText] = useState("");
   const [activeTab, setActiveTab] = useState<Tab>("editor");
@@ -346,6 +353,7 @@ function App() {
   const [promptOptimization, setPromptOptimization] = useState<PromptOptimizationResult | null>(null);
   const [promptUndo, setPromptUndo] = useState<string | null>(null);
   const [contextStatus, setContextStatus] = useState<ContextStatus | null>(null);
+  const contextSnapshotRef = useRef<{ updatedAt: string; estimatedTokens: number } | null>(null);
   const [collaboration, setCollaboration] = useState<CollaborationOverview | null>(null);
   const [canonMigration, setCanonMigration] = useState<CanonMigration | null>(null);
   const [showMigration, setShowMigration] = useState(false);
@@ -481,6 +489,9 @@ function App() {
       setCanonMigration(opened.canon_migration || null);
       setShowMigration(Boolean(opened.canon_migration?.required));
       setDocument(null);
+      setReviewDocument(null);
+      setReferenceDocument(null);
+      contextSnapshotRef.current = null;
       setText("");
       setActiveTab("project");
       localStorage.setItem("inkflow.lastProject", root);
@@ -567,7 +578,7 @@ function App() {
   }, [projectRoot]);
 
   useEffect(() => {
-    if (!projectRoot) { setContextStatus(null); setCollaboration(null); return; }
+    if (!projectRoot) { setContextStatus(null); setCollaboration(null); contextSnapshotRef.current = null; return; }
     let active = true;
     const poll = async () => {
       try {
@@ -575,7 +586,23 @@ function App() {
           window.inkflow.request<ContextStatus>("context.status", { project_root: projectRoot }),
           window.inkflow.request<CollaborationOverview>("collaboration.overview", { project_root: projectRoot }),
         ]);
-        if (active) { setContextStatus(value); setCollaboration(overview); }
+        if (active) {
+          const updatedAt = String(value.updated_at || "");
+          const estimatedTokens = Math.max(0, Number(value.estimated_tokens || 0));
+          const previous = contextSnapshotRef.current;
+          const changed = Boolean(updatedAt && previous && previous.updatedAt && updatedAt !== previous.updatedAt);
+          const change = changed && previous ? estimatedTokens - previous.estimatedTokens : value.change_since_previous_tokens ?? null;
+          if (updatedAt && (!previous || previous.updatedAt !== updatedAt)) {
+            contextSnapshotRef.current = { updatedAt, estimatedTokens };
+          }
+          setContextStatus({
+            ...value,
+            previous_updated_at: value.previous_updated_at || previous?.updatedAt || "",
+            previous_estimated_tokens: value.previous_estimated_tokens ?? previous?.estimatedTokens ?? null,
+            change_since_previous_tokens: change,
+          });
+          setCollaboration(overview);
+        }
       } catch { /* 状态面板不能打断正文工作流；下一轮继续读取。 */ }
     };
     void poll();
@@ -587,13 +614,18 @@ function App() {
     setError("");
     try {
       const loaded = await request<DocumentData>("document.read", { relative_path: item.relative_path });
-      setDocument(loaded);
-      setText(loaded.content);
-      setSavedText(loaded.content);
+      setReferenceDocument(null);
       setCompareContent(null);
-      if (item.kind === "review") setActiveTab("review");
-      else if (item.kind === "chapter") setActiveTab("editor");
-      else setActiveTab("editor");
+      if (item.kind === "review") {
+        setReviewDocument(loaded);
+        setActiveTab("review");
+      } else {
+        setReviewDocument(null);
+        setDocument(loaded);
+        setText(loaded.content);
+        setSavedText(loaded.content);
+        setActiveTab("editor");
+      }
       if (item.chapter_no) {
         const workspace = await request<Record<string, unknown>>("chapter.workspace", {
           chapter_no: item.chapter_no,
@@ -602,6 +634,24 @@ function App() {
       } else {
         setChapterWorkspace(null);
       }
+    } catch (cause) {
+      setError(errorMessage(cause));
+    }
+  };
+
+  const openReference = async (reference: TraceReference) => {
+    setError("");
+    const relativePath = String(reference.relative_path || "").replace(/\\/g, "/");
+    const item = [...(tree?.items || []), ...(tree?.groups.flatMap((group) => group.items) || [])]
+      .find((entry) => entry.relative_path.replace(/\\/g, "/") === relativePath);
+    if (item) {
+      await openDocument(item);
+      return;
+    }
+    try {
+      const loaded = await request<DocumentData>("document.read_reference", { relative_path: relativePath });
+      setReferenceDocument(loaded);
+      setActiveTab("process");
     } catch (cause) {
       setError(errorMessage(cause));
     }
@@ -1229,6 +1279,7 @@ function App() {
           <strong>{title}</strong>
           <span>{dashboard?.accepted_characters.toLocaleString() || 0} 字正史</span>
           {projectLoading ? <span className="working-dot">正在载入项目</span> : busy && <span className="working-dot">正在工作</span>}
+          {projectRoot && <ContextTopbarBadge value={contextStatus} onOpen={() => setActiveTab("process")} />}
         </div>
         <nav className="top-actions">
           <button onClick={() => setShowCreate(true)}>＋ 新建</button>
@@ -1359,8 +1410,10 @@ function App() {
             <ProjectCenter
               dashboard={dashboard}
               workspace={chapterWorkspace}
+              tree={tree}
               request={request}
               onPrompt={(value) => { setChatInput(value); setMascotMood("waiting"); }}
+              onOpen={openDocument}
               onRefresh={() => refresh()}
               onNotice={setNotice}
               onError={setError}
@@ -1406,11 +1459,11 @@ function App() {
             />
           )}
           {activeTab === "chapter" && <ChapterPanel workspace={chapterWorkspace} request={request} onPrompt={(value) => setChatInput(value)} />}
-          {activeTab === "review" && <ReviewPanel document={document} tree={tree} workspace={chapterWorkspace} request={request} onOpen={openDocument} onPrompt={setChatInput} />}
+          {activeTab === "review" && <ReviewPanel document={document} reviewDocument={reviewDocument} tree={tree} workspace={chapterWorkspace} request={request} onOpen={openDocument} onPrompt={setChatInput} />}
           {activeTab === "memory" && <MemoryPanel dashboard={dashboard} workspace={chapterWorkspace} request={request} onRefresh={() => refresh()} />}
           {activeTab === "references" && <ReferencesPanel request={request} />}
           {activeTab === "listen" && <VoiceCenter refreshKey={voiceRevision} projectRoot={projectRoot} source={voiceSource} characterNames={(dashboard?.bible_entries || []).filter((item) => String(item.kind || "") === "character").map((item) => String(item.name || "")).filter(Boolean)} request={request} onNotice={setNotice} onError={setError} onPlay={(path) => playAudioPath(path)} />}
-          {activeTab === "process" && <ProcessPanel events={events} collaboration={collaboration} context={contextStatus} provider={provider} workspace={chapterWorkspace} request={request} />}
+          {activeTab === "process" && <ProcessPanel events={events} collaboration={collaboration} context={contextStatus} provider={provider} workspace={chapterWorkspace} request={request} referenceDocument={referenceDocument} onOpenReference={openReference} onCloseReference={() => setReferenceDocument(null)} />}
         </section>
       </main>
 
@@ -1460,14 +1513,34 @@ function ContextBudgetPanel({ value, onPin }: { value: ContextStatus | null; onP
   const used = stale ? 0 : Math.max(0, Math.min(100, Number(value?.hard_usage_percent || 0)));
   const label = stale ? "\u9879\u76ee\u8d44\u6599\u5df2\u53d8\u5316\uff0c\u7b49\u5f85\u91cd\u65b0\u7f16\u8bd1" : value?.status === "near_limit" ? "\u63a5\u8fd1\u4e0a\u9650" : value?.status === "watch" ? "\u6ce8\u610f\u5bb9\u91cf" : value?.status === "safe" ? "\u5bb9\u91cf\u5b89\u5168" : "\u7b49\u5f85\u4e0a\u4e0b\u6587";
   const compressed = Boolean(value?.compression_applied);
+  const previousChange = value?.change_since_previous_tokens;
+  const previousLabel = typeof previousChange === "number" ? `${previousChange > 0 ? "+" : ""}${previousChange.toLocaleString()} tokens` : "首次编译";
   return <details className={`context-budget ${value?.status || "idle"}`}>
     <summary><span>上下文容量</span><strong>{stale ? "—" : `${used.toFixed(1)}%`}</strong></summary>
     <div className="context-meter"><i style={{ width: `${used}%` }} /></div>
     <p>{stale ? label : `${label} · ${Number(value?.estimated_tokens || 0).toLocaleString()} / ${Number(value?.hard_limit_tokens || 0).toLocaleString()} tokens`}</p>
+    <small className="context-budget-change">与上次编译：{previousLabel}{compressed ? `；本轮压缩减少 ${Math.max(0, Number(value?.before_compression_tokens || 0) - Number(value?.estimated_tokens || 0)).toLocaleString()} tokens` : "；本轮未触发压缩"}</small>
     <small>{value?.stale_reason || (compressed ? `\u5df2\u4ece ${Number(value?.before_compression_tokens || 0).toLocaleString()} tokens \u5b9a\u5411\u538b\u7f29\uff1b\u786c\u7ea6\u675f\u672a\u52a8\u3002` : "\u6bcf 4 \u79d2\u5237\u65b0\uff0c\u63a5\u8fd1\u8f6f\u9884\u7b97\u65f6\u53ea\u538b\u7f29\u4f4e\u6743\u5a01\u3001\u4f4e\u76f8\u5173\u8d44\u6599\u3002")}</small>
     {value && <ul><li>不可压缩：{value.hard_sections.map((item) => item.title).join("、") || "尚未生成"}</li><li>可压缩：{value.compressible_sections.map((item) => item.title).join("、") || "尚未生成"}</li></ul>}
     {value && <details className="context-explain"><summary>查看保留与压缩理由</summary>{[...value.hard_sections, ...value.compressible_sections].map((item) => <div key={`${item.key}-${item.title}`}><strong>{item.title}</strong><small>{item.reason || "由当前资料优先级决定。"}</small>{["D1", "D2"].includes(item.key) && (item.source_ids || []).slice(0, 6).map((sourceId) => <button key={sourceId} type="button" onClick={() => onPin(sourceId, item.key !== "D2")}>{item.key === "D2" ? `解除 ${sourceId}` : `锁定 ${sourceId}`}</button>)}</div>)}</details>}
   </details>;
+}
+
+function ContextTopbarBadge({ value, onOpen }: { value: ContextStatus | null; onOpen: () => void }) {
+  if (!value || value.status === "idle") return <button type="button" className="context-topbar-badge idle" onClick={onOpen}>Context 等待编译</button>;
+  const hard = Math.max(1, Number(value.hard_limit_tokens || 1));
+  const estimated = Math.max(0, Number(value.estimated_tokens || 0));
+  const percent = Math.max(0, Math.min(100, Number(value.hard_usage_percent || (estimated / hard) * 100)));
+  const change = value.change_since_previous_tokens;
+  const changeLabel = typeof change === "number" ? `${change > 0 ? "+" : ""}${change.toLocaleString()}` : "首次";
+  const statusLabel = value.status === "stale" ? "待重编译" : value.status === "near_limit" ? "接近上限" : value.status === "watch" ? "注意容量" : "容量安全";
+  const compressionDelta = Math.max(0, Number(value.before_compression_tokens || 0) - estimated);
+  const compressionLabel = value.compression_applied ? `\u538b\u7f29 -${compressionDelta.toLocaleString()}` : "\u672c\u8f6e\u672a\u538b\u7f29";
+  return <button type="button" className={`context-topbar-badge ${value.status}`} onClick={onOpen} title="打开协作台查看 Context 容量、编译前后变化和来源">
+    <span>Context {percent.toFixed(1)}%</span>
+    <small>{estimated.toLocaleString()} / {hard.toLocaleString()} · {changeLabel}</small>
+    <em>{statusLabel} {"\u00b7"} {compressionLabel}</em>
+  </button>;
 }
 
 function roleLabel(role: string) {
@@ -1682,17 +1755,19 @@ function ChapterPanel({ workspace, request, onPrompt }: { workspace: Record<stri
   </div>;
 }
 
-function ReviewPanel({ document, tree, workspace, request, onOpen, onPrompt }: { document: DocumentData | null; tree: ProjectTree | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; onOpen: (item: TreeItem) => void; onPrompt: (value: string) => void }) {
+function ReviewPanel({ document, reviewDocument, tree, workspace, request, onOpen, onPrompt }: { document: DocumentData | null; reviewDocument: DocumentData | null; tree: ProjectTree | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; onOpen: (item: TreeItem) => void; onPrompt: (value: string) => void }) {
   const reviews = tree?.groups.find((group) => group.id === "reviews")?.items || [];
   const [panelResult, setPanelResult] = useState<Record<string, unknown> | null>(null);
   const chapterMatch = document?.relative_path.match(/chapter_(\d+)\.draft\.md$/);
+  const reviewChapterMatch = reviewDocument?.relative_path.match(/chapter_(\d+)\.review\.md$/);
+  const chapterNo = Number(chapterMatch?.[1] || reviewChapterMatch?.[1] || 0);
   const panelFindings = (panelResult?.merged_findings || []) as Array<Record<string, unknown>>;
   return <div className="scroll-panel review-panel">
     <div className="section-heading"><p className="eyebrow">审查</p><h2>证据化审查</h2><p>每个扣分项都应指向正文、章节卡或正史依据；旧审查不能批准新版本。</p></div>
     {workspace && <ChapterStatusStrip workspace={workspace} />}
-    {document?.relative_path.startsWith("reviews/") && <article className="markdown-preview"><pre>{document.content}</pre></article>}
-    {chapterMatch && <section className="stack-section"><h3>多维预审</h3><p className="form-hint">连续性、人物、叙事和表达分别审查，再按证据去重；最终仍由正式 Reviewer 门禁放行。</p><button onClick={async () => setPanelResult(await request<Record<string, unknown>>("chapter.review_panel", { chapter_no: Number(chapterMatch[1]) }))}>运行多维预审</button>{panelResult && <div>{panelFindings.length === 0 && <p className="empty-mini">没有发现可引用的问题。</p>}{panelFindings.map((finding, index) => <article className="thread-card" key={index}><strong>[{String(finding.severity || "info")}] {String(finding.category || "阅读体验")}</strong><p>原文：{String(finding.evidence || "未提供")}</p><p>影响：{String(finding.explanation || "未单独说明")}</p><small>修订方向：{String(finding.repair_instruction || "由作者决定是否调整")}</small></article>)}</div>}</section>}
-    {chapterMatch && <button className="wide-action" onClick={() => onPrompt(`请根据第 ${chapterMatch[1]} 章当前版本的 Reviewer 证据进入精修模式：先输出可审计的场景蓝图，再由 Writer 定点修订并让 Reviewer 重审新版本；不要验收。`)}>把审查意见交给 Writer 精修</button>}
+    {reviewDocument && <article className="markdown-preview review-document"><header><strong>{reviewDocument.relative_path}</strong><span>审查报告 · 只读</span></header><pre>{reviewDocument.content}</pre><small>审查报告单独显示；正文仍在编辑器中打开，不会被报告覆盖。</small></article>}
+    {chapterNo > 0 && <section className="stack-section"><h3>多维预审</h3><p className="form-hint">连续性、人物、叙事和表达分别审查，再按证据去重；最终仍由正式 Reviewer 门禁放行。</p><button onClick={async () => setPanelResult(await request<Record<string, unknown>>("chapter.review_panel", { chapter_no: chapterNo }))}>运行多维预审</button>{panelResult && <div>{panelFindings.length === 0 && <p className="empty-mini">没有发现可引用的问题。</p>}{panelFindings.map((finding, index) => <article className="thread-card" key={index}><strong>[{String(finding.severity || "info")}] {String(finding.category || "阅读体验")}</strong><p>原文：{String(finding.evidence || "未提供")}</p><p>影响：{String(finding.explanation || "未单独说明")}</p><small>修订方向：{String(finding.repair_instruction || "由作者决定是否调整")}</small></article>)}</div>}</section>}
+    {chapterNo > 0 && <button className="wide-action" onClick={() => onPrompt(`请根据第 ${chapterNo} 章当前版本的 Reviewer 证据进入精修模式：先输出可审计的场景蓝图，再由 Writer 定点修订并让 Reviewer 重审新版本；不要验收。`)}>把审查意见交给 Writer 精修</button>}
     <section className="stack-section"><h3>审查记录</h3>{reviews.length === 0 && <p className="empty-mini">还没有审查报告。</p>}{reviews.map((item) => <button className="review-link" key={item.id} onClick={() => void onOpen(item)}><span>✓</span><strong>{item.label}</strong><small>打开报告</small></button>)}</section>
   </div>;
 }
@@ -1753,12 +1828,55 @@ function CacheSummary({ usage }: { usage?: CollaborationOverview["usage"] }) {
 
 type LiveRun = { id: string; steps: EngineEvent[]; method?: string; status: string; summary: string };
 
-function LiveRunTimeline({ runs }: { runs: LiveRun[] }) {
+function LiveRunTimeline({ runs, onOpenReference }: { runs: LiveRun[]; onOpenReference: (reference: TraceReference) => void | Promise<void> }) {
   if (!runs.length) return null;
-  return <div className="run-list live-runs"><h3>实时运行过程</h3><p className="process-hint">这里展示公开的步骤、角色、模型、等待参数和文件引用；不会展示模型原始思考内容。</p>{runs.slice(0, 8).map((run) => <details className={`run-card live-run ${run.status}`} open={run.status === "running"} key={`live-${run.id}`}><summary><strong>{String(run.method ? methodLabel(run.method) : "墨流任务")}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : "进行中"}</span></summary><p>{run.summary}</p><ol className="live-timeline">{run.steps.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; const stepStatus = step.status || "info"; const role = String(step.role || metadata.agent_role || ""); const model = String(step.model || metadata.model || ""); const refs = step.references || []; const publicMetadata = Object.fromEntries(Object.entries(metadata).filter(([key]) => !isSensitivePresentationKey(key))); return <li className={`live-step ${stepStatus}`} key={`${step.timestamp || index}-${index}`}><div className="live-step-main"><span className="live-step-marker">{stepStatus === "completed" ? "✓" : stepStatus === "failed" ? "!" : stepStatus === "started" ? "…" : "·"}</span><div><strong>{eventLabel(step.type || step.stage)}</strong><p>{step.summary || step.stage || "过程"}</p><small>{step.timestamp ? formatTime(step.timestamp) : "刚刚"}{role ? ` · ${agentRoleLabel(role)}` : ""}{model ? ` · ${model}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small></div></div>{step.details && <p className="live-step-details">{step.details}</p>}{(metadata.timeout_seconds || metadata.max_tokens || typeof metadata.thinking === "boolean") && <small className="live-step-meta">请求参数：{metadata.timeout_seconds ? `超时 ${String(metadata.timeout_seconds)} 秒` : ""}{metadata.max_tokens ? ` · 输出上限 ${Number(metadata.max_tokens).toLocaleString()} tokens` : ""}{typeof metadata.thinking === "boolean" ? ` · 深度推理 ${metadata.thinking ? "开启" : "关闭"}` : ""}</small>}{refs.length > 0 && <div className="settings-inline-actions">{refs.map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void window.inkflow.openPath(reference.absolute_path)}>打开 {reference.relative_path}</button>)}</div>}{Object.keys(publicMetadata).length > 0 && <details><summary>查看本步公开记录</summary><pre className="compact-json">{JSON.stringify(publicMetadata, null, 2)}</pre></details>}</li>; })}</ol><small className="live-run-footnote">可复核文件由运行记录自动发现；点击文件按钮可在本地打开。</small></details>)}</div>;
+  return <div className="run-list live-runs"><h3>实时运行过程</h3><p className="process-hint">这里展示公开的步骤、角色、模型、等待参数和文件引用；不会展示模型原始思考内容。</p>{runs.slice(0, 8).map((run) => <details className={`run-card live-run ${run.status}`} open={run.status === "running"} key={`live-${run.id}`}><summary><strong>{String(run.method ? methodLabel(run.method) : "墨流任务")}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : "进行中"}</span></summary><p>{run.summary}</p><ol className="live-timeline">{run.steps.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; const stepStatus = step.status || "info"; const role = String(step.role || metadata.agent_role || ""); const model = String(step.model || metadata.model || ""); const refs = step.references || []; const publicMetadata = Object.fromEntries(Object.entries(metadata).filter(([key]) => !isSensitivePresentationKey(key))); return <li className={`live-step ${stepStatus}`} key={`${step.timestamp || index}-${index}`}><div className="live-step-main"><span className="live-step-marker">{stepStatus === "completed" ? "✓" : stepStatus === "failed" ? "!" : stepStatus === "started" ? "…" : "·"}</span><div><strong>{eventLabel(step.type || step.stage)}</strong><p>{step.summary || step.stage || "过程"}</p><small>{step.timestamp ? formatTime(step.timestamp) : "刚刚"}{role ? ` · ${agentRoleLabel(role)}` : ""}{model ? ` · ${model}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small></div></div>{step.details && <p className="live-step-details">{step.details}</p>}{(metadata.timeout_seconds || metadata.max_tokens || typeof metadata.thinking === "boolean") && <small className="live-step-meta">请求参数：{metadata.timeout_seconds ? `超时 ${String(metadata.timeout_seconds)} 秒` : ""}{metadata.max_tokens ? ` · 输出上限 ${Number(metadata.max_tokens).toLocaleString()} tokens` : ""}{typeof metadata.thinking === "boolean" ? ` · 深度推理 ${metadata.thinking ? "开启" : "关闭"}` : ""}</small>}{refs.length > 0 && <div className="settings-inline-actions">{refs.map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {reference.relative_path}</button>)}</div>}{Object.keys(publicMetadata).length > 0 && <details><summary>查看本步公开记录</summary><pre className="compact-json">{JSON.stringify(publicMetadata, null, 2)}</pre></details>}</li>; })}</ol><small className="live-run-footnote">可复核文件由运行记录自动发现；点击文件按钮可在本地打开。</small></details>)}</div>;
 }
 
-function ProcessPanel({ events, collaboration, context, provider, workspace, request }: { events: EngineEvent[]; collaboration: CollaborationOverview | null; context: ContextStatus | null; provider: Record<string, unknown> | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> }) {
+function ReferenceDocumentViewer({ document, onClose }: { document: DocumentData; onClose: () => void }) {
+  return <article className="reference-viewer"><header><div><span className="reference-viewer-icon">↗</span><div><strong>运行记录 · 只读复核</strong><small>{document.relative_path}</small></div></div><button type="button" onClick={onClose}>关闭预览</button></header><pre>{document.content}</pre><footer>{document.reason || "文件来自本地 .inkflow 运行记录，只能在墨流内查看。"}</footer></article>;
+}
+
+function workflowIcon(stage: string) {
+  if (stage.includes("规划") || stage.includes("plan")) return "⌘";
+  if (stage.includes("写作") || stage.includes("writer")) return "✎";
+  if (stage.includes("审查") || stage.includes("review")) return "✓";
+  if (stage.includes("记忆") || stage.includes("memory")) return "◎";
+  return "•";
+}
+
+function WorkflowProgressStrip({ runs }: { runs: LiveRun[] }) {
+  const latest = runs[0];
+  const steps = [
+    { key: "plan", label: "任务规划", match: ["controller.routing", "workflow.started"] },
+    { key: "write", label: "Writer 写作", match: ["writer.started", "writer.completed"] },
+    { key: "review", label: "Reviewer 审查", match: ["reviewer.started", "reviewer.completed"] },
+    { key: "accept", label: "用户验收", match: ["chapter.accepted", "chapter.accept"] },
+    { key: "memory", label: "Memory Keeper", match: ["memory.started", "memory.completed"] },
+  ];
+  const events = latest?.steps || [];
+  const index = steps.findIndex((step) => events.some((event) => step.match.some((value) => String(event.type || "").includes(value))));
+  const completed = latest?.status === "done" ? steps.length : Math.max(0, index);
+  const current = latest?.status === "running" ? Math.max(0, index) : latest?.status === "done" ? steps.length - 1 : -1;
+  return <section className="workflow-progress"><header><div><h3>本次工作流</h3><p>只显示公开阶段和可复核结论，原始思考不会进入界面。</p></div><strong>{latest ? (latest.status === "done" ? "已完成" : latest.status === "failed" ? "需处理" : "进行中") : "等待任务"}</strong></header><ol>{steps.map((step, stepIndex) => { const state = stepIndex < completed ? "done" : stepIndex === current ? "active" : "skip"; return <li className={`progress-stage ${state}`} key={step.key}><span className="progress-stage-icon">{workflowIcon(step.label)}</span><div><strong>{step.label}</strong><small>{state === "done" ? "已完成" : state === "active" ? "正在处理" : "等待条件"}</small></div></li>; })}</ol><p className="workflow-progress-note">每个阶段都绑定任务单、版本和文件证据；未被当前任务使用的 Agent 会保持等待，不会生成无效待处理项。</p></section>;
+}
+
+function ContextCapacityCard({ value }: { value: ContextStatus | null }) {
+  if (!value) return <article className="context-capacity-card idle"><header><div><strong>Context 容量</strong><small>等待第一次编译</small></div><span>—</span></header><p>发送一次规划、写作或审查请求后，这里会显示当前占用和变化。</p></article>;
+  const hard = Math.max(1, Number(value.hard_limit_tokens || 1));
+  const soft = Math.max(1, Number(value.soft_limit_tokens || 1));
+  const estimated = Math.max(0, Number(value.estimated_tokens || 0));
+  const before = Math.max(estimated, Number(value.before_compression_tokens || estimated));
+  const delta = Math.max(0, before - estimated);
+  const previousChange = typeof value.change_since_previous_tokens === "number" ? value.change_since_previous_tokens : null;
+  const configuredSoft = Math.max(1, Number(value.configured_soft_limit_tokens || soft));
+  const configuredHard = Math.max(1, Number(value.configured_hard_limit_tokens || hard));
+  const hardPercent = Math.max(0, Math.min(100, Number(value.hard_usage_percent || (estimated / hard) * 100)));
+  const softPercent = Math.max(0, Math.min(100, (estimated / soft) * 100));
+  return <article className={`context-capacity-card ${value.status}`}><header><div><strong>Context 容量变化</strong><small>当前编译包 · {value.updated_at ? formatTime(value.updated_at) : "刚刚"}</small></div><span>{hardPercent.toFixed(1)}%</span></header><div className="context-capacity-track"><i style={{ width: `${hardPercent}%` }} /></div><div className="context-capacity-stats"><div><small>当前占用</small><strong>{estimated.toLocaleString()}</strong><span>/ {hard.toLocaleString()} tokens</span></div><div><small>软阈值</small><strong>{softPercent.toFixed(1)}%</strong><span>{soft.toLocaleString()} tokens</span></div><div><small>与上次编译</small><strong>{previousChange === null ? "首次" : `${previousChange > 0 ? "+" : ""}${previousChange.toLocaleString()}`}</strong><span>{value.previous_updated_at ? `上次 ${formatTime(value.previous_updated_at)}` : "等待下一轮"}</span></div><div><small>本轮压缩</small><strong>{delta ? `-${delta.toLocaleString()}` : "0"}</strong><span>{value.compression_applied ? "压缩后保留" : "未触发压缩"}</span></div></div><p>{value.compression_applied ? `编译前 ${before.toLocaleString()} → 编译后 ${estimated.toLocaleString()} tokens，减少 ${delta.toLocaleString()} tokens；硬约束资料保持不变。` : `本轮没有触发压缩：${estimated.toLocaleString()} tokens 仍在软阈值内。0 不是缺失，而是本轮无需压缩。当前任务预算为 ${soft.toLocaleString()} / ${hard.toLocaleString()}，设置预算为 ${configuredSoft.toLocaleString()} / ${configuredHard.toLocaleString()}。`}</p></article>;
+}
+
+function ProcessPanel({ events, collaboration, context, provider, workspace, request, referenceDocument, onOpenReference, onCloseReference }: { events: EngineEvent[]; collaboration: CollaborationOverview | null; context: ContextStatus | null; provider: Record<string, unknown> | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; referenceDocument: DocumentData | null; onOpenReference: (reference: TraceReference) => void | Promise<void>; onCloseReference: () => void }) {
   const [threadUpdates, setThreadUpdates] = useState<Record<string, Record<string, unknown>>>({});
   const runs = processRuns(events);
   const tasks = collaboration?.tasks || [];
@@ -1770,7 +1888,10 @@ function ProcessPanel({ events, collaboration, context, provider, workspace, req
   const retrieval = context?.retrieval_diagnostics;
   const openThreads = (collaboration?.threads || []).filter((thread) => ["open", "waiting", "escalated"].includes(String(thread.status))).length;
   return <div className="scroll-panel process-panel"><div className="section-heading"><p className="eyebrow">协作台</p><h2>工作流与运行状态</h2><p>任务、Agent 讨论、上下文、检索、学习和费用信息集中查看；正文和版本仍留在各自工作区。</p></div>{workspace && <ChapterStatusStrip workspace={workspace} />}
-    <LiveRunTimeline runs={runs} />
+     {referenceDocument && <ReferenceDocumentViewer document={referenceDocument} onClose={onCloseReference} />}
+     <WorkflowProgressStrip runs={runs} />
+     <ContextCapacityCard value={context} />
+     <LiveRunTimeline runs={runs} onOpenReference={onOpenReference} />
     <div className="operations-grid cache-grid"><CacheSummary usage={usage} /></div>
     <div className="operations-grid">
       <article><header><strong>工作流</strong><span>{runs.length} 项</span></header><p>{runs.length ? "当前安排与每一步进度都记录在下方。" : "发送需求后显示任务安排。"}</p></article>
@@ -1784,7 +1905,7 @@ function ProcessPanel({ events, collaboration, context, provider, workspace, req
       <article><header><strong>费用</strong><span>{usage?.calls ? `${usage.calls} 次 · ${usage.total_tokens.toLocaleString()} tokens` : "尚无调用"}</span></header><p>{usage?.pricing_configured ? `按已填单价估算 ${usage.currency} ${usage.estimated_cost.toFixed(4)}` : "已统计 Token；填写服务商单价后显示金额估算。"} 当前模型：{String(provider?.model || "未配置")}。</p></article>
     </div>
     {context && <div className="run-list"><h3>Context Packet 质量报告</h3><article className="run-card"><header><strong>预算分配</strong><span>输出预留 {Number((context as unknown as Record<string, unknown>).output_reserve_tokens || 0).toLocaleString()} tokens</span></header><div className="context-budget-list">{(context.budget_allocation || []).map((item) => <p key={item.key}><strong>{item.key} · {item.title}</strong><span>{item.estimated_tokens.toLocaleString()} tokens · {item.hard ? "固定保留" : "可压缩"} · {item.source_count} 来源</span></p>)}</div></article>{Boolean(retrieval?.discarded?.length) && <details className="run-card"><summary>查看检索舍弃记录（{retrieval?.discarded?.length}）</summary><pre className="compact-json">{JSON.stringify(retrieval?.discarded, null, 2)}</pre></details>}</div>}
-    <div className="run-list"><h3>真实调用与引用</h3>{!(collaboration?.trace_runs || []).length && <p className="empty-mini">运行写作、审查或记忆任务后，这里会显示每一步参考了什么、使用了哪个模型、产生了哪些文件。</p>}{(collaboration?.trace_runs || []).slice(0, 10).map((traceRun) => <details className="run-card" key={traceRun.run_id}><summary><strong>{operationLabel(traceRun.operation)}</strong><span>{traceRun.status === "completed" ? "已完成" : traceRun.status === "failed" ? "未完成" : traceRun.status}</span></summary><p>{traceRun.summary}</p><div className="settings-inline-actions">{traceRun.trace_reference?.exists && <button type="button" onClick={() => void window.inkflow.openPath(traceRun.trace_reference!.absolute_path)}>打开完整运行记录</button>}</div><ol>{traceRun.events.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; return <li key={`${step.timestamp}-${index}`}><div><strong>{step.stage}</strong> · {step.summary}</div><small>{formatTime(step.timestamp)} · {step.status}{metadata.model ? ` · 模型 ${String(metadata.model)}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small>{step.details && <p>{step.details}</p>}{(step.references || []).length > 0 && <div className="settings-inline-actions">{(step.references || []).map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void window.inkflow.openPath(reference.absolute_path)}>打开 {reference.relative_path}</button>)}</div>}{Object.keys(metadata).length > 0 && <details><summary>查看本步全部记录</summary><pre className="compact-json">{JSON.stringify(metadata, null, 2)}</pre></details>}</li>; })}</ol></details>)}</div>
+    <div className="run-list"><h3>真实调用与引用</h3>{!(collaboration?.trace_runs || []).length && <p className="empty-mini">运行写作、审查或记忆任务后，这里会显示每一步参考了什么、使用了哪个模型、产生了哪些文件。</p>}{(collaboration?.trace_runs || []).slice(0, 10).map((traceRun) => <details className="run-card" key={traceRun.run_id}><summary><strong>{operationLabel(traceRun.operation)}</strong><span>{traceRun.status === "completed" ? "已完成" : traceRun.status === "failed" ? "未完成" : traceRun.status}</span></summary><p>{traceRun.summary}</p><div className="settings-inline-actions">{traceRun.trace_reference?.exists && <button type="button" onClick={() => void onOpenReference(traceRun.trace_reference!)}>打开完整运行记录</button>}</div><ol>{traceRun.events.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; return <li key={`${step.timestamp}-${index}`}><div><strong>{step.stage}</strong> · {step.summary}</div><small>{formatTime(step.timestamp)} · {step.status}{metadata.model ? ` · 模型 ${String(metadata.model)}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small>{step.details && <p>{step.details}</p>}{(step.references || []).length > 0 && <div className="settings-inline-actions">{(step.references || []).map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {reference.relative_path}</button>)}</div>}{Object.keys(metadata).length > 0 && <details><summary>查看本步全部记录</summary><pre className="compact-json">{JSON.stringify(metadata, null, 2)}</pre></details>}</li>; })}</ol></details>)}</div>
     <div className="run-list"><h3>定向讨论</h3>{(collaboration?.threads || []).slice(0, 8).map((thread) => { const current = threadUpdates[String(thread.thread_id)] || thread; const active = ["open", "waiting"].includes(String(current.status)); return <article className="run-card" key={String(thread.thread_id)}><header><strong>{String(thread.topic)}</strong><span>{String(current.status)} · 第 {String(current.current_round || 1)}/{String(current.max_rounds || 2)} 轮</span></header><p>{String(current.resolution || "等待目标 Agent 回答")}</p>{active && <button onClick={async () => { const value = await request<{ thread: Record<string, unknown> }>("collaboration.reply", { thread_id: thread.thread_id }); setThreadUpdates((items) => ({ ...items, [String(thread.thread_id)]: value.thread })); }}>让目标 Agent 回答</button>}{String(current.status) === "escalated" && <small>两轮后仍有分歧，已暂停分支并交给 Coordinator 向你提出最小问题。</small>}</article>; })}</div>
     <div className="run-list"><h3>任务计划</h3>{runs.length === 0 && <p className="empty-mini">发送需求后，这里显示本次任务的安排。</p>}{runs.slice(0, 8).map(run => {
     const planned = [...run.steps].reverse().find((step) => step.dispatch_plan?.steps?.length);

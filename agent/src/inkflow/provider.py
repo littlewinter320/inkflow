@@ -382,10 +382,50 @@ def _model_from_json_content(content: str, output_model: type[T]) -> T:
 
     last_validation: ValidationError | None = None
     for candidate in candidates:
+        # 兼容 Reviewer 偶尔把一条 finding 直接放在顶层的情况。它仍然
+        # 必须具备 finding 的完整字段；包装后继续走 ReviewReport 的严格
+        # 校验与后续证据门禁，不能因此自动放行。
+        if getattr(output_model, "__name__", "") == "ReviewReport" and isinstance(candidate, dict):
+            finding_fields = {"category", "severity", "evidence", "explanation", "repair_instruction"}
+            if finding_fields.issubset(candidate):
+                allowed_finding_fields = {
+                    "category", "severity", "evidence", "canon_refs", "explanation",
+                    "repair_instruction", "rule_id", "reference_evidence", "verification_note",
+                    "claim", "verification_status", "semantic_status", "verification_confidence",
+                    "proposed_severity",
+                }
+                finding = {key: value for key, value in candidate.items() if key in allowed_finding_fields}
+                wrapped = {
+                    "verdict": "patch" if str(finding.get("severity")) in {"major", "blocking"} else "unknown",
+                    "confidence": float(candidate.get("verification_confidence") or 0.5),
+                    "summary": "模型返回单条审查意见，已按兼容格式归档并继续执行证据核验。",
+                    "strengths": [],
+                    "findings": [finding],
+                    "scorecard": [],
+                    "source_hash": "",
+                    "hook_assessment": None,
+                    "context_use_audit": {},
+                }
+                try:
+                    return output_model.model_validate(wrapped)
+                except ValidationError as exc:
+                    last_validation = exc
         try:
             return output_model.model_validate(candidate)
         except ValidationError as exc:
             last_validation = exc
+            # 模型有时会在合法结构外附带一两个顶层说明字段（例如
+            # verification_note）。这些字段不属于目标 Schema，也不会改变
+            # 任何业务判断；先移除未知顶层键，再重新执行完整的必填/类型校验。
+            # 缺少必填字段或嵌套结构错误仍会继续抛出 ValidationError。
+            if isinstance(candidate, dict):
+                known_fields = set(getattr(output_model, "model_fields", {}) or {})
+                if known_fields and set(candidate) - known_fields:
+                    trimmed = {key: value for key, value in candidate.items() if key in known_fields}
+                    try:
+                        return output_model.model_validate(trimmed)
+                    except ValidationError as trimmed_error:
+                        last_validation = trimmed_error
     assert last_validation is not None
     raise last_validation
 

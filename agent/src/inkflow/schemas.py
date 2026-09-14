@@ -320,6 +320,8 @@ class HookNote(StrictModel):
     intentionally_withheld: str = ""
     must_be_clear: str = ""
     planned_followup: str = ""
+    # 兼容模型偶尔使用的更明确字段名；落盘时统一归并为 planned_followup。
+    planned_followup_window: str = ""
 
 
 class HookAssessment(StrictModel):

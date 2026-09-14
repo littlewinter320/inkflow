@@ -199,7 +199,12 @@ class InkFlowEngine:
             "why_keep": note.get("why_keep") or "承接本章结果，并为下一步行动保留阅读期待。",
             "intentionally_withheld": note.get("intentionally_withheld") or card.get("withholding_boundary") or "",
             "must_be_clear": note.get("must_be_clear") or card.get("irreversible_delta") or "",
-            "planned_followup": note.get("planned_followup") or card.get("payoff_window") or "",
+            "planned_followup": (
+                note.get("planned_followup")
+                or note.get("planned_followup_window")
+                or card.get("payoff_window")
+                or ""
+            ),
         }
         for artifact in project.db.list_agent_artifacts(
             chapter_no=chapter_no, artifact_type="writer_hook_note", limit=20
@@ -959,6 +964,10 @@ class InkFlowEngine:
             creative_lens = _creative_lens(chapter_no)
             task = (
                 f"创作第 {chapter_no} 章。用户补充：{instruction or '无'}\n"
+                f"本章章节卡目标有效字符约 {int(card['target_words'])}，允许范围 "
+                f"{int(int(card['target_words']) * (1 - _CHAPTER_LENGTH_TOLERANCE))}～"
+                f"{int(int(card['target_words']) * (1 + _CHAPTER_LENGTH_TOLERANCE))}；"
+                "交稿前必须把正文写到该范围内，不能用提纲、说明或重复标题代替正文。\n"
                 f"本章创意镜头软建议：{creative_lens}。只有在不违背正史、章节卡和人物动机时采用；"
                 "它用于改变信息呈现方式，不得凭空增加事件。"
             )
@@ -990,7 +999,10 @@ class InkFlowEngine:
                 agent_role="writer",
                 max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
                 timeout_seconds=self.settings.request_timeout_seconds,
-                thinking=True,
+                # 长篇正文不需要把隐藏推理预算和正文输出一起拉长。关闭
+                # provider 的 thinking 可显著降低等待与被宿主超时中断的概率；
+                # 公开的 Context Packet、章节卡和后续 Reviewer 仍保留质量门禁。
+                thinking=False,
             )
             result = await self.provider.generate_json(
                 system_prompt=WRITER_SYSTEM,
@@ -998,12 +1010,27 @@ class InkFlowEngine:
                 output_model=DraftOutput,
                 effort="high",
                 max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
+                thinking=False,
                 agent_role="writer",
             )
             draft = result.data
             trace.record_model("writer.model", result, "完成章节草稿并给出可审计决策摘要")
             chapter_title = _normalise_chapter_title(chapter_no, draft.title)
-            chapter_text = f"# 第 {chapter_no} 章 {chapter_title}\n\n{draft.content.strip()}\n"
+            clean_content = _deduplicate_exact_paragraphs(
+                _strip_model_chapter_heading(draft.content, chapter_no)
+            )
+            draft, clean_content = await self._repair_short_draft(
+                draft,
+                clean_content,
+                chapter_no=chapter_no,
+                card=card,
+                base_prompt=packet.to_markdown(),
+                system_prompt=WRITER_SYSTEM,
+                trace=trace,
+                stage="writer.length_repair",
+            )
+            chapter_title = _normalise_chapter_title(chapter_no, draft.title)
+            chapter_text = f"# 第 {chapter_no} 章 {chapter_title}\n\n{clean_content}\n"
             relative = Path("chapters") / f"chapter_{chapter_no:05d}.draft.md"
             atomic_write_text(project.root / relative, chapter_text)
             version = project.db.upsert_draft(chapter_no, chapter_title, relative.as_posix(), chapter_text)
@@ -1059,7 +1086,7 @@ class InkFlowEngine:
                 "completed",
                 f"写入草稿 v{version}",
                 details="\n".join(f"- {item}" for item in draft.decision_summary),
-                metadata={"path": relative.as_posix(), "characters": _content_char_count(draft.content)},
+                metadata={"path": relative.as_posix(), "characters": _content_char_count(clean_content)},
             )
             trace.finish(summary="章节草稿已生成，等待审查")
             return {
@@ -1083,6 +1110,87 @@ class InkFlowEngine:
             trace.record("write", "failed", "章节生成失败", str(exc))
             trace.finish(status="failed", summary="草稿未完成")
             raise
+
+    async def _repair_short_draft(
+        self,
+        draft: DraftOutput,
+        clean_content: str,
+        *,
+        chapter_no: int,
+        card: dict[str, Any],
+        base_prompt: str,
+        system_prompt: str,
+        trace: TraceRecorder,
+        stage: str,
+    ) -> tuple[DraftOutput, str]:
+        """Ask Writer once for a focused expansion when deterministic length is too short.
+
+        This is a bounded repair call, not a second creative branch. It keeps the
+        chapter card and the existing scene evidence in the prompt, then leaves
+        Reviewer as the final authority if the repaired text is still short.
+        """
+        target = int(card["target_words"])
+        lower_bound = int(target * (1 - _CHAPTER_LENGTH_TOLERANCE))
+        upper_bound = int(target * (1 + _CHAPTER_LENGTH_TOLERANCE))
+        current = _content_char_count(clean_content)
+        if current >= lower_bound:
+            return draft, clean_content
+        card_requirements = json_dumps(
+            {
+                "章节功能": card.get("function", ""),
+                "目标": card.get("goal", ""),
+                "阻力": card.get("obstacle", ""),
+                "决定": card.get("decision", ""),
+                "后果": card.get("consequence", ""),
+                "不可逆变化": card.get("irreversible_delta", ""),
+                "必须落地的场景": card.get("scenes", []),
+                "章末钩子": card.get("hook_anchor") or card.get("hook_question", ""),
+            }
+        )
+        # 让补救目标落在章节卡中心值附近，而不是只补到下限边缘；
+        # 这样模型因标点、换行不计入有效字符时仍留有安全余量。
+        repair_target = target
+        required_addition = max(lower_bound - current, repair_target - current)
+        repair_prompt = (
+            base_prompt
+            + "\n\n# 篇幅补救（只允许一次）\n"
+            + f"当前正文有效字符约 {current}，本章目标 {target}，可接受范围 {lower_bound}～{upper_bound}。"
+            + f"请返回一份完整的第 {chapter_no} 章 DraftOutput，在保留现有有效内容的基础上补写至少 {required_addition} 个有效中文字符，交稿目标约 {repair_target}。"
+            + "补写必须承载章节卡规定的冲突、人物选择、后果和感官动作，不能用提纲、总结、重复句或新增无关事件凑字；正文仍需保留自然钩子。\n"
+            + "章节卡硬要求：\n"
+            + card_requirements
+            + "\n当前正文（只作为需要扩写和校正的素材）：\n"
+            + clean_content
+        )
+        trace.record_model_started(
+            stage,
+            model=self.settings.model,
+            agent_role="writer",
+            max_tokens=min(16_000, max(8_000, int(target * 2.2))),
+            timeout_seconds=self.settings.request_timeout_seconds,
+            thinking=False,
+        )
+        result = await self.provider.generate_json(
+            system_prompt=system_prompt,
+            user_prompt=repair_prompt,
+            output_model=DraftOutput,
+            effort="high",
+            max_tokens=min(16_000, max(8_000, int(target * 2.2))),
+            thinking=False,
+            agent_role="writer",
+        )
+        repaired = result.data
+        trace.record_model(stage, result, "篇幅低于门槛，Writer 已执行一次定向补足")
+        repaired_content = _deduplicate_exact_paragraphs(
+            _strip_model_chapter_heading(repaired.content, chapter_no)
+        )
+        trace.record(
+            "writer.length_repair",
+            "completed",
+            f"篇幅补救后有效字符 {_content_char_count(repaired_content)}（目标范围 {lower_bound}～{upper_bound}）",
+            metadata={"before_characters": current, "after_characters": _content_char_count(repaired_content), "target_characters": repair_target, "lower_bound": lower_bound, "upper_bound": upper_bound},
+        )
+        return repaired, repaired_content
 
     @project_mutation_locked
     async def review_chapter(
@@ -1197,17 +1305,22 @@ class InkFlowEngine:
                 "review.model",
                 model=self.settings.model,
                 agent_role="reviewer",
-                max_tokens=16_000,
+                # 审查报告是结构化证据摘要；2600 tokens 足够承载发现、
+                # 评分和钩子判断，避免无隐藏推理时仍等待大预算。
+                max_tokens=2_600,
                 timeout_seconds=120,
-                thinking=True,
+                # Reviewer 的公开职责是证据判断；隐藏推理不会写入
+                # Trace，关闭它可避免长时间等待，确定性审查和证据核验仍保留。
+                thinking=False,
             )
             result = await self.provider.generate_json(
                 system_prompt=REVIEWER_SYSTEM,
                 user_prompt=user_prompt,
                 output_model=ReviewReport,
                 effort="low",
-                max_tokens=16_000,
+                max_tokens=2_600,
                 timeout_seconds=120,
+                thinking=False,
                 agent_role="reviewer",
             )
             model_report = result.data
@@ -1481,6 +1594,10 @@ class InkFlowEngine:
             current_draft = draft_path.read_text(encoding="utf-8")
             review_text = review_path.read_text(encoding="utf-8")
             task = f"修订第 {chapter_no} 章。用户补充：{instruction or '无'}"
+            current_characters = _content_char_count(current_draft)
+            target_characters = int(card["target_words"])
+            lower_bound = int(target_characters * (1 - _CHAPTER_LENGTH_TOLERANCE))
+            upper_bound = int(target_characters * (1 + _CHAPTER_LENGTH_TOLERANCE))
             packet = self._context_builder(project).build(
                 chapter_no,
                 task,
@@ -1512,6 +1629,11 @@ class InkFlowEngine:
                 + review_text
                 + "\n\n# 修订要求\n\n"
                 + (instruction or "逐项处理有证据的问题，保留审查确认有效的内容。")
+                + "\n\n# 篇幅硬门槛\n\n"
+                + f"当前正文有效字符约 {current_characters}；本章目标 {target_characters}，"
+                + f"本次交稿必须落在 {lower_bound}～{upper_bound} 之间。"
+                + "若当前版本偏短，请补足承载本章冲突、选择和后果的具体场景与感官动作；"
+                + "不得用重复解释、空泛总结、提纲或标题凑数。"
             )
             trace.record_model_started(
                 "writer.revise",
@@ -1519,7 +1641,7 @@ class InkFlowEngine:
                 agent_role="writer",
                 max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
                 timeout_seconds=self.settings.request_timeout_seconds,
-                thinking=True,
+                thinking=False,
             )
             result = await self.provider.generate_json(
                 system_prompt=REVISER_SYSTEM,
@@ -1527,12 +1649,27 @@ class InkFlowEngine:
                 output_model=DraftOutput,
                 effort="high",
                 max_tokens=min(16_000, max(8_000, int(card["target_words"] * 2.2))),
+                thinking=False,
                 agent_role="writer",
             )
             draft = result.data
             trace.record_model("writer.revise", result, "Writer 读取旧稿与审查证据后完成定点修订")
             chapter_title = _normalise_chapter_title(chapter_no, draft.title)
-            chapter_text = f"# 第 {chapter_no} 章 {chapter_title}\n\n{draft.content.strip()}\n"
+            clean_content = _deduplicate_exact_paragraphs(
+                _strip_model_chapter_heading(draft.content, chapter_no)
+            )
+            draft, clean_content = await self._repair_short_draft(
+                draft,
+                clean_content,
+                chapter_no=chapter_no,
+                card=card,
+                base_prompt=user_prompt,
+                system_prompt=REVISER_SYSTEM,
+                trace=trace,
+                stage="writer.revise.length_repair",
+            )
+            chapter_title = _normalise_chapter_title(chapter_no, draft.title)
+            chapter_text = f"# 第 {chapter_no} 章 {chapter_title}\n\n{clean_content}\n"
             atomic_write_text(draft_path, chapter_text)
             previous_version = int(chapter["version"])
             version = project.db.upsert_draft(
@@ -1599,7 +1736,7 @@ class InkFlowEngine:
                 "completed",
                 f"草稿由 v{previous_version} 修订为 v{version}；旧审查自动失效",
                 details="\n".join(f"- {item}" for item in draft.decision_summary),
-                metadata={"path": chapter["path"], "characters": _content_char_count(draft.content)},
+                metadata={"path": chapter["path"], "characters": _content_char_count(clean_content)},
             )
             trace.finish(summary="章节修订完成，等待重新审查")
             return {
@@ -1813,7 +1950,11 @@ class InkFlowEngine:
                     force=force,
                 )
             else:
-                patch = _validate_memory_patch_scope(_prepared_patch, chapter_no)
+                patch = _validate_memory_patch_scope(
+                    _prepared_patch,
+                    chapter_no,
+                    known_facts=project.db.current_facts(),
+                )
                 patch, aligned_ids = _align_patch_evidence(patch, content)
                 unsupported = [
                     fact.fact_id for fact in patch.facts if not _evidence_in_content(fact.evidence, content)
@@ -1943,11 +2084,25 @@ class InkFlowEngine:
             raise ValueError(f"不支持的记忆来源状态：{source_status}")
         conflict_relative = Path("reviews") / f"chapter_{chapter_no:05d}.memory-conflict.md"
         conflict_path = project.root / conflict_relative
+        all_canonical_facts = project.db.current_facts()
+        all_canonical_threads = project.db.open_threads()
+        # Memory Keeper 只应看到当前章节之前已经成立的状态。保留
+        # all_* 供宿主校验 fact_id/时间冲突，但不把未来章节泄漏进模型。
         current_state = {
-            "canonical_facts": project.db.current_facts(),
-            "canonical_threads": project.db.open_threads(),
+            "canonical_facts": [
+                item
+                for item in all_canonical_facts
+                if int(item.get("source_chapter") or 0) < chapter_no
+            ],
+            "canonical_threads": [
+                item
+                for item in all_canonical_threads
+                if int(item.get("planted_chapter") or 0) == 0
+                or int(item.get("planted_chapter") or 0) < chapter_no
+            ],
             "earlier_batch_memory": provisional_patches or [],
         }
+        validation_facts = [*all_canonical_facts]
         if source_status == "provisional":
             source_description = "已经通过 Reviewer、等待用户验收的批次临时正文"
             state_description = "上一正史与同一批次更早章节的临时记忆"
@@ -1980,7 +2135,9 @@ class InkFlowEngine:
             "memory.model",
             model=self.settings.model,
             agent_role="memory_keeper",
-            max_tokens=10_000,
+            # 章节记忆只需要结构化事实和线索；限制输出预算避免在
+            # 正史门禁阶段长时间占用请求，事实证据仍由程序逐条校验。
+            max_tokens=6_000,
             timeout_seconds=self.settings.request_timeout_seconds,
             thinking=False,
         )
@@ -1989,10 +2146,11 @@ class InkFlowEngine:
             user_prompt=user_prompt,
             output_model=MemoryPatch,
             effort="low",
-            max_tokens=10_000,
+            max_tokens=6_000,
+            thinking=False,
             agent_role="memory_keeper",
         )
-        known_facts = list(current_state["canonical_facts"])
+        known_facts = validation_facts
         for staged_patch in current_state["earlier_batch_memory"]:
             if isinstance(staged_patch, dict):
                 known_facts.extend(staged_patch.get("facts") or [])
@@ -2118,6 +2276,7 @@ class InkFlowEngine:
                 output_model=MemoryPatch,
                 effort="low",
                 max_tokens=12_000,
+                thinking=False,
                 agent_role="memory_keeper",
             )
             patch = _validate_memory_patch_scope(
@@ -2775,6 +2934,7 @@ class InkFlowEngine:
                 effort="low",
                 max_tokens=16_000,
                 timeout_seconds=120,
+                thinking=False,
                 agent_role="reviewer",
             )
             report = result.data
@@ -3970,6 +4130,46 @@ def _content_char_count(content: str) -> int:
     return len(re.findall(r"[\u3400-\u9fffA-Za-z0-9]", content))
 
 
+def _strip_model_chapter_heading(content: str, chapter_no: int) -> str:
+    """Remove headings a model may repeat when the engine adds the title itself."""
+
+    lines = content.strip().splitlines()
+    heading = re.compile(
+        rf"^\s*#+\s*(?:第\s*{chapter_no}\s*章|chapter\s*{chapter_no})\b.*$",
+        flags=re.IGNORECASE,
+    )
+    while lines and heading.match(lines[0]):
+        lines.pop(0)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def _deduplicate_exact_paragraphs(content: str) -> str:
+    """Remove only verbatim repeated paragraphs introduced by generation.
+
+    Exact duplicates are a mechanical output fault rather than a creative
+    choice. Keeping the first occurrence preserves the scene and prevents a
+    reviewer from repeatedly blocking an otherwise valid chapter.
+    """
+
+    paragraphs = re.split(r"(\n\s*\n)", content.strip())
+    seen: set[str] = set()
+    output: list[str] = []
+    for item in paragraphs:
+        if not item or re.fullmatch(r"\n\s*\n", item):
+            if output and output[-1] != item:
+                output.append(item)
+            continue
+        normalized = re.sub(r"\s+", "", item)
+        if normalized and normalized in seen:
+            continue
+        if normalized:
+            seen.add(normalized)
+        output.append(item)
+    return "".join(output).strip()
+
+
 def _normalise_chapter_title(chapter_no: int, title: str) -> str:
     """Prevent a model-supplied chapter prefix from being emitted twice."""
 
@@ -4004,27 +4204,64 @@ def _validate_memory_patch_scope(
     """Lock a model-produced delta to the current chapter and stable identities."""
 
     if patch.chapter_no != chapter_no:
-        raise ValidationGateError("记忆补丁章节号与当前章节不一致。")
-    identities: dict[str, tuple[str, str]] = {}
+        raise ValidationGateError("\u8bb0\u5fc6\u8865\u4e01\u7ae0\u8282\u53f7\u4e0e\u5f53\u524d\u7ae0\u8282\u4e0d\u4e00\u81f4\u3002")
+    identities: dict[str, tuple[str, str, int]] = {}
     for item in known_facts or []:
         fact_id = str(item.get("fact_id") or "")
         if fact_id:
-            identities[fact_id] = (str(item.get("subject") or ""), str(item.get("predicate") or ""))
-    seen_relations: set[tuple[str, str]] = set()
+            identities[fact_id] = (
+                str(item.get("subject") or ""),
+                str(item.get("predicate") or ""),
+                int(item.get("source_chapter") or 0),
+            )
+    # Models sometimes reuse an old fact id for a new relation. New relations
+    # are split deterministically so SQLite cannot supersede the wrong fact.
+    relation_counts: dict[tuple[str, str], int] = {}
+    for fact in patch.facts:
+        relation = (fact.subject, fact.predicate)
+        relation_counts[relation] = relation_counts.get(relation, 0) + 1
+    relation_seen: dict[tuple[str, str], int] = {}
+    used_fact_ids: set[str] = set()
+
+    def collision_id(base: str) -> str:
+        """Keep a model-reused id from overwriting a different canon relation."""
+
+        stem = f"{base}__ch{chapter_no}"
+        candidate = stem
+        index = 2
+        while candidate in used_fact_ids or candidate in identities:
+            candidate = f"{stem}_{index}"
+            index += 1
+        return candidate
+
     normalized_facts: list[FactMutation] = []
     for fact in patch.facts:
         relation = (fact.subject, fact.predicate)
-        if relation in seen_relations:
-            raise ValidationGateError(
-                f"记忆补丁重复修改同一关系：{fact.subject}/{fact.predicate}。"
-            )
-        seen_relations.add(relation)
         known_identity = identities.get(fact.fact_id)
-        if known_identity and known_identity != relation:
-            raise ValidationGateError(
-                f"fact_id {fact.fact_id} 已属于其他主体关系，不能覆盖。"
-            )
+        if known_identity and (
+            known_identity[:2] != relation or known_identity[2] > chapter_no
+        ):
+            # Preserve the old canon row and give this chapter its own stable id.
+            fact = fact.model_copy(update={"fact_id": collision_id(fact.fact_id)})
+        if relation_counts[relation] > 1 and not known_identity:
+            index = relation_seen.get(relation, 0) + 1
+            relation_seen[relation] = index
+            value_text = re.sub(r"\s+", "", json_dumps(fact.value, indent=None)).strip('"')
+            label = re.sub(r"[^\u3400-\u9fffA-Za-z0-9]+", "", value_text)[:16] or str(index)
+            predicate = f"{fact.predicate}\u00b7{label}"
+            fact = fact.model_copy(update={"predicate": predicate})
+        if fact.fact_id in used_fact_ids:
+            fact = fact.model_copy(update={"fact_id": collision_id(fact.fact_id)})
+        used_fact_ids.add(fact.fact_id)
         normalized_facts.append(fact.model_copy(update={"valid_from_chapter": chapter_no}))
+    final_relations: set[tuple[str, str]] = set()
+    for fact in normalized_facts:
+        relation = (fact.subject, fact.predicate)
+        if relation in final_relations:
+            raise ValidationGateError(
+                f"\u8bb0\u5fc6\u8865\u4e01\u91cd\u590d\u4fee\u6539\u540c\u4e00\u5173\u7cfb\uff1a{fact.subject}/{fact.predicate}\u3002"
+            )
+        final_relations.add(relation)
     return patch.model_copy(update={"facts": normalized_facts})
 
 
@@ -4298,6 +4535,10 @@ _TEMPLATE_PHRASES = (
     "她并不知道",
 )
 
+# 章节卡给出的是每章自己的有效字符目标。允许小范围的自然波动，
+# 但把超出范围的草稿挡在 Reviewer 门禁之前，避免不同章节被硬套成同一长度。
+_CHAPTER_LENGTH_TOLERANCE = 0.15
+
 
 def _enforce_review_severity(finding: ReviewFinding) -> ReviewFinding:
     """把 Reviewer 已经承认的硬冲突从 minor 提升为不可放行级别。"""
@@ -4367,34 +4608,38 @@ def _deterministic_audit(
     paragraphs = [item for item in re.split(r"\n\s*\n", content) if item.strip()]
     normalized = [re.sub(r"\s+", "", item) for item in paragraphs]
     duplicate_count = len(normalized) - len(set(normalized))
+    chapter_heading_count = len(re.findall(r"(?m)^\s*#+\s*(?:第\s*\d+\s*章|chapter\s*\d+)\b", content, flags=re.IGNORECASE))
     template_hits = {phrase: content.count(phrase) for phrase in _TEMPLATE_PHRASES if phrase in content}
     metrics = {
         "content_characters": char_count,
         "target_words": target_words,
         "paragraph_count": len(paragraphs),
         "duplicate_paragraphs": duplicate_count,
+        "chapter_heading_count": chapter_heading_count,
         "placeholder_count": len(re.findall(r"TODO|TBD|待补|占位", content, flags=re.IGNORECASE)),
         "template_phrase_hits": template_hits,
     }
     findings: list[ReviewFinding] = []
-    if char_count < target_words * 0.6:
+    lower_bound = target_words * (1 - _CHAPTER_LENGTH_TOLERANCE)
+    upper_bound = target_words * (1 + _CHAPTER_LENGTH_TOLERANCE)
+    if char_count < lower_bound:
         findings.append(
             ReviewFinding(
                 category="format",
                 severity="blocking",
-                evidence=f"有效字符约 {char_count}，目标 {target_words}",
-                explanation="正文显著短于章节卡目标，可能是截断或只生成了提纲。",
-                repair_instruction="补足完整场景、决定和后果后重新审查。",
+                evidence=f"有效字符约 {char_count}，目标 {target_words}（下限约 {int(lower_bound)}）",
+                explanation="正文低于章节卡目标的 15% 容差，可能是截断或只生成了提纲。",
+                repair_instruction="按当前章节卡补足完整场景、决定和后果，直到有效字符回到目标上下 15% 内，再重新审查。",
             )
         )
-    if char_count > target_words * 1.6:
+    if char_count > upper_bound:
         findings.append(
             ReviewFinding(
                 category="pacing",
                 severity="major",
-                evidence=f"有效字符约 {char_count}，目标 {target_words}",
-                explanation="篇幅显著超出目标，可能同时塞入了多章功能。",
-                repair_instruction="检查是否应拆章，或删除重复解释和无效过场。",
+                evidence=f"有效字符约 {char_count}，目标 {target_words}（上限约 {int(upper_bound)}）",
+                explanation="正文超过章节卡目标的 15% 容差，可能同时塞入了多章功能或重复解释。",
+                repair_instruction="保留本章功能和钩子，删除重复解释、无效过场或不属于本章的内容，使有效字符回到目标上下 15% 内。",
             )
         )
     if duplicate_count:
@@ -4405,6 +4650,16 @@ def _deterministic_audit(
                 evidence=f"检测到 {duplicate_count} 个完全重复段落",
                 explanation="重复段通常来自生成或拼接故障。",
                 repair_instruction="删除重复段并检查相邻转场。",
+            )
+        )
+    if chapter_heading_count > 1:
+        findings.append(
+            ReviewFinding(
+                category="format",
+                severity="major",
+                evidence=f"当前草稿包含 {chapter_heading_count} 个章节标题行",
+                explanation="引擎会统一写入章节标题，正文再次带标题会造成重复标题和阅读结构错乱。",
+                repair_instruction="删除正文开头重复的章节标题，只保留引擎生成的一行标题后重新审查。",
             )
         )
     if metrics["placeholder_count"]:

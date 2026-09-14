@@ -60,19 +60,32 @@ type ChapterWorkspaceLike = {
   can_accept?: boolean;
 };
 
+type ProjectTreeItemLike = {
+  id: string;
+  label: string;
+  kind: string;
+  relative_path: string;
+  chapter_no?: number;
+  status?: string;
+};
+
 export function ProjectCenter({
   dashboard,
   workspace,
+  tree,
   request,
   onPrompt,
+  onOpen,
   onRefresh,
   onNotice,
   onError,
 }: {
   dashboard: DashboardLike | null;
   workspace: Record<string, unknown> | null;
+  tree: { groups?: Array<{ id: string; items: ProjectTreeItemLike[] }> } | null;
   request: Request;
   onPrompt: (prompt: string) => void;
+  onOpen: (item: ProjectTreeItemLike) => void;
   onRefresh: () => Promise<unknown>;
   onNotice: (message: string) => void;
   onError: (message: string) => void;
@@ -210,6 +223,7 @@ export function ProjectCenter({
   const volume = (currentPlan?.volume || {}) as Record<string, unknown>;
   const arc = (currentPlan?.arc || {}) as Record<string, unknown>;
   const chapterCards = (arc.chapter_cards || []) as Array<Record<string, unknown>>;
+  const chapterFiles = (tree?.groups || []).find((group) => group.id === "chapters")?.items || [];
 
   return (
     <div className="scroll-panel project-center">
@@ -236,6 +250,8 @@ export function ProjectCenter({
         activeFacts={numberValue(dashboard?.status.active_facts)}
         openThreads={numberValue(dashboard?.status.open_threads)}
       />
+
+      {chapterCards.length > 0 && <ChapterNavigator cards={chapterCards} files={chapterFiles} onOpen={onOpen} onPrompt={onPrompt} />}
 
       <section className="project-section plan-overview">
         <div className="project-section-title"><div><h3>四级规划与章节卡</h3><p>这里直接展示当前卷、篇章、章节功能和钩子；完整版本仍保存在“当前规划”文档。</p></div>{chapterCards.length > 0 && <button onClick={() => onPrompt(`请把第 ${String(arc.chapter_start)} 到第 ${String(arc.chapter_end)} 章的章节卡一次性整理给我看，只预览，不改规划。`)}>集中预览本篇</button>}</div>
@@ -386,6 +402,65 @@ function ProjectSnapshot({
           <div className="snapshot-stat"><span>{"\u5f00\u653e\u7ebf\u7d22"}</span><strong>{openThreads}</strong><small>{"\u4ecd\u9700 Writer \u6216\u7528\u6237\u63a8\u8fdb\u7684\u7ebf\u7d22"}</small></div>
           <div className="snapshot-note">{"\u6570\u636e\u6765\u81ea\u9879\u76ee\u6570\u636e\u5e93\u548c\u5f53\u524d\u7bc7\u7ae0\u89c4\u5212\u3002\u56fe\u8868\u4e0d\u4f1a\u521b\u5efa\u865a\u6784\u7684\u5386\u53f2\u8d70\u52bf\u3002"}</div>
         </div>
+      </div>
+    </section>
+  );
+}
+
+function ChapterNavigator({
+  cards,
+  files,
+  onOpen,
+  onPrompt,
+}: {
+  cards: Array<Record<string, unknown>>;
+  files: ProjectTreeItemLike[];
+  onOpen: (item: ProjectTreeItemLike) => void;
+  onPrompt: (prompt: string) => void;
+}) {
+  const accepted = new Set(
+    files
+      .filter((item) => item.status === "accepted" && item.chapter_no)
+      .map((item) => Number(item.chapter_no)),
+  );
+  const drafts = new Map(
+    files
+      .filter((item) => item.relative_path.endsWith(".draft.md") && item.chapter_no)
+      .map((item) => [Number(item.chapter_no), item]),
+  );
+  const canon = new Map(
+    files
+      .filter((item) => !item.relative_path.endsWith(".draft.md") && item.chapter_no)
+      .map((item) => [Number(item.chapter_no), item]),
+  );
+  const acceptedCount = cards.filter((card) => accepted.has(Number(card.chapter_no))).length;
+  const progress = Math.round((acceptedCount / Math.max(1, cards.length)) * 100);
+  return (
+    <section className="project-section chapter-navigator">
+      <div className="project-section-title">
+        <div><h3>章节进度</h3><p>{acceptedCount} / {cards.length} 章已进入正史</p></div>
+        <span>{progress}%</span>
+      </div>
+      <div className="chapter-progress-track" aria-label={`已完成 ${progress}%`}><i style={{ width: `${progress}%` }} /></div>
+      <div className="chapter-navigator-grid">
+        {cards.map((card) => {
+          const chapterNo = Number(card.chapter_no);
+          const draft = drafts.get(chapterNo);
+          const final = canon.get(chapterNo);
+          const status = accepted.has(chapterNo) ? "正史" : draft ? "草稿" : "未开始";
+          return (
+            <article className={`chapter-nav-card ${status === "正史" ? "accepted" : status === "草稿" ? "draft" : "planned"}`} key={chapterNo}>
+              <header><strong>第 {chapterNo} 章</strong><span>{status}</span></header>
+              <p>{String(card.title_working || "未命名章节")}</p>
+              <div className="chapter-nav-actions">
+                {final && <button type="button" onClick={() => onOpen(final)}>打开正文</button>}
+                {draft && <button type="button" onClick={() => onOpen(draft)}>打开草稿</button>}
+                {!final && !draft && <button type="button" onClick={() => onPrompt(`打开第 ${chapterNo} 章章节卡并生成草稿，先不要验收。`)}>开始本章</button>}
+                <button type="button" className="text-button" onClick={() => onPrompt(`打开第 ${chapterNo} 章的章节卡和规划进度，只预览，不写正文。`)}>看章节卡</button>
+              </div>
+            </article>
+          );
+        })}
       </div>
     </section>
   );

@@ -808,6 +808,28 @@ class TerminalSession:
                 "chapter_start": bundle.current_arc.chapter_start,
                 "chapter_end": bundle.current_arc.chapter_end,
             }
+        # Coordinator ???????????????????????
+        # ????????????????????????????
+        # ????????????????? token?
+        queue_reconciliation = project.db.reconcile_collaboration_queue()
+        status["queue_reconciliation"] = queue_reconciliation
+        active_messages = project.db.list_collaboration_messages(active_only=True, limit=8)
+        collaboration_digest = [
+            {
+                "message_id": item.get("message_id"),
+                "thread_id": item.get("thread_id"),
+                "message_type": item.get("message_type"),
+                "chapter_no": item.get("chapter_no"),
+                "chapter_version": item.get("chapter_version"),
+                "sender_role": item.get("sender_role"),
+                "recipient_role": item.get("recipient_role"),
+                "status": item.get("status"),
+                "claim": str(item.get("claim") or "")[:240],
+                "evidence_refs": list(item.get("evidence_refs") or [])[:8],
+                "created_at": item.get("created_at"),
+            }
+            for item in active_messages
+        ]
         policy = {
             "roles": {
                 "Coordinator": "理解需求、维护交流、拆解与派工；不写正文、不审批、不提交正史",
@@ -849,13 +871,14 @@ class TerminalSession:
             ContextSection(
                 key="F",
                 title="最近用户讨论与待确认事项",
-                content=self._recent_dialogue(project) or "这是一次新的会话，尚无待确认事项。",
+                content=self._recent_dialogue(project, limit=3, char_limit=6_000)
+                or "这是一次新的会话，尚无待确认事项。",
             ),
             ContextSection(
                 key="F1",
                 title="结构化 Agent 分歧与待用户回答问题",
-                content=json_dumps(project.db.list_collaboration_messages(active_only=True, limit=20)),
-                source_ids=[item["message_id"] for item in project.db.list_collaboration_messages(active_only=True, limit=20)],
+                content=json_dumps(collaboration_digest),
+                source_ids=[item["message_id"] for item in collaboration_digest if item.get("message_id")],
             ),
             ContextSection(
                 key="E",
@@ -893,7 +916,7 @@ class TerminalSession:
     def _dialogue_path(project: InkFlowProject) -> Path:
         return project.root / "DIALOGUE.md"
 
-    def _recent_dialogue(self, project: InkFlowProject, limit: int = 6) -> str:
+    def _recent_dialogue(self, project: InkFlowProject, limit: int = 6, char_limit: int = 12_000) -> str:
         path = self._dialogue_path(project)
         if not path.is_file():
             return ""
@@ -904,7 +927,7 @@ class TerminalSession:
             entries = [item.strip() for item in content.split("\n\n---\n\n") if item.strip()]
         except OSError:
             return ""
-        return "\n\n---\n\n".join(entries[-limit:])[-12_000:]
+        return "\n\n---\n\n".join(entries[-limit:])[-max(1_000, int(char_limit)):]
 
     @classmethod
     def history(cls, root: str | Path, limit: int = 100) -> list[dict[str, str]]:
@@ -1291,6 +1314,14 @@ class TerminalSession:
             }
 
         if intent.action == "review_accept":
+            # Coordinator 先检查当前草稿是否已经有同版本、同正文哈希的
+            # pass 报告。用户明确是在已有合格版本上接收时，不重复调用
+            # Reviewer；这避免无意义的重复等待，同时仍由 accept_chapter
+            # 再次校验版本、哈希、结论和 Memory Keeper 门禁。
+            reused = self._reuse_current_pass_review(InkFlowProject(root), chapter_no)
+            if reused is not None:
+                steps.append(reused)
+                return await self._conditionally_accept(root, chapter_no, steps, reused)
             reviewed = await self._run_step("reviewer.review", self.engine.review_chapter(root, chapter_no))
             steps.append(reviewed)
             if "gate" in reviewed:
@@ -1306,6 +1337,40 @@ class TerminalSession:
             return {"steps": steps}
 
         return {"gate": f"不支持的路由结果：{intent.action}"}
+
+    @staticmethod
+    def _reuse_current_pass_review(project: InkFlowProject, chapter_no: int) -> dict[str, Any] | None:
+        """Return a safe handoff when the current draft already has a pass report."""
+
+        chapter = project.db.get_chapter(chapter_no)
+        record = project.db.latest_review_record(chapter_no)
+        if not chapter or chapter.get("status") != "draft" or not record:
+            return None
+        report = record.get("report")
+        if report is None or getattr(report, "verdict", "") != "pass":
+            return None
+        if int(record.get("chapter_version", -1)) != int(chapter.get("version", -2)):
+            return None
+        try:
+            content = (project.root / str(chapter["path"])).read_text(encoding="utf-8")
+        except OSError:
+            return None
+        source_hash = getattr(report, "source_hash", "")
+        if source_hash and source_hash != content_hash(content):
+            return None
+        return {
+            "step": "reviewer.review",
+            "result": {
+                "chapter_no": chapter_no,
+                "verdict": "pass",
+                "confidence": getattr(report, "confidence", 1.0),
+                "summary": "Coordinator 复用当前版本已存在的 pass 审查；正文哈希和版本一致，未重复调用 Reviewer。",
+                "finding_count": len(getattr(report, "findings", []) or []),
+                "score_total": sum(int(item.score) for item in (getattr(report, "scorecard", []) or [])),
+                "review_path": str(project.root / str(record.get("path") or "")),
+                "reused": True,
+            },
+        }
 
     async def _conditionally_accept(
         self,

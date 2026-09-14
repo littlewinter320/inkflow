@@ -702,10 +702,18 @@ class StudioService:
                 )
             )
 
-        reviews = [
-            self._tree_file(path, label=path.stem, kind="review")
-            for path in sorted((self.project.root / "reviews").glob("*.md"), reverse=True)
-        ]
+        reviews: list[dict[str, Any]] = []
+        for path in sorted((self.project.root / "reviews").glob("*.md"), reverse=True):
+            match = re.search(r"chapter_(\d+)", path.name)
+            chapter_no = int(match.group(1)) if match else None
+            reviews.append(
+                self._tree_file(
+                    path,
+                    label=f"第 {chapter_no} 章审查" if chapter_no else path.stem,
+                    kind="review",
+                    extra={"chapter_no": chapter_no} if chapter_no else None,
+                )
+            )
         planning_dir = self.project.root / "planning"
         planning = (
             [self._tree_file(path, label=path.stem, kind="planning") for path in sorted(planning_dir.glob("*.md"))]

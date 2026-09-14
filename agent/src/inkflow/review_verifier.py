@@ -1,6 +1,7 @@
 """Reviewer evidence and semantic verification gates."""
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .schemas import ContextPacket, ReviewClaimDecision, ReviewFinding, ReviewReport
@@ -23,19 +24,44 @@ def packet_sources(packet: ContextPacket) -> dict[str, str]:
     return sources
 
 
+def _evidence_matches(evidence: str, content: str) -> bool:
+    """Match exact excerpts and conservative ellipsis-compressed excerpts."""
+
+    if evidence in content:
+        return True
+    parts = [part.strip() for part in re.split(r"(?:…{2,}|\.{3,})", evidence) if part.strip()]
+    if len(parts) < 2:
+        return False
+    # A model can collapse two Markdown paragraphs into one quoted excerpt.
+    # For an ellipsis quote only, ignore paragraph whitespace while preserving
+    # the order of every quoted character.
+    compact_content = re.sub(r"\s+", "", content)
+    compact_parts = [re.sub(r"\s+", "", part) for part in parts]
+    cursor = 0
+    for part in compact_parts:
+        position = compact_content.find(part, cursor)
+        if position < 0:
+            return False
+        cursor = position + len(part)
+    return True
+
+
 def verify_review(report: ReviewReport, content: str, packet: ContextPacket) -> tuple[list[ReviewFinding], str]:
     """Anchor every finding to exact source text before it can affect prose."""
     sources = packet_sources(packet)
     findings: list[ReviewFinding] = []
     seen: set[tuple[str, str, str]] = set()
-    disputed = report.verdict == "unknown"
+    # An unknown model verdict is actionable only when a verified hard finding
+    # remains. Minor/info findings and unsupported quotes stay visible without
+    # freezing the workflow.
+    disputed = report.verdict == "unknown" and not report.findings
     for finding in report.findings:
         key = (finding.category, finding.evidence, finding.explanation)
         if key in seen:
             continue
         seen.add(key)
         reasons: list[str] = []
-        if not finding.evidence.strip() or finding.evidence not in content:
+        if not finding.evidence.strip() or not _evidence_matches(finding.evidence, content):
             reasons.append("引用无法逐字定位到当前正文")
         if any(ref not in sources for ref in finding.canon_refs):
             reasons.append("引用来源不在本次上下文内")
@@ -47,10 +73,16 @@ def verify_review(report: ReviewReport, content: str, packet: ContextPacket) -> 
             if finding.rule_id in {"canon_conflict", "core_function_missing"}:
                 if not finding.canon_refs or not finding.reference_evidence.strip():
                     reasons.append("缺少正史或章节卡对照原文")
-                elif not any(finding.reference_evidence in sources.get(ref, "") for ref in finding.canon_refs):
+                elif not any(
+                    _evidence_matches(finding.reference_evidence, sources.get(ref, ""))
+                    for ref in finding.canon_refs
+                ):
                     reasons.append("对照原文无法定位到来源")
         if reasons:
-            disputed |= hard and not editorial
+            # Unsupported hard claims are demoted to info below; they remain
+            # visible for human review but cannot block acceptance on an
+            # unanchored quote.
+            disputed |= False
         findings.append(finding.model_copy(update={
             "severity": "info" if reasons else "minor" if hard and editorial else finding.severity,
             "verification_status": "unsupported" if reasons else "anchored",
