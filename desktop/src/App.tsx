@@ -1464,7 +1464,7 @@ function App() {
           {activeTab === "memory" && <MemoryPanel dashboard={dashboard} workspace={chapterWorkspace} request={request} onRefresh={() => refresh()} />}
           {activeTab === "references" && <ReferencesPanel request={request} />}
           {activeTab === "listen" && <VoiceCenter refreshKey={voiceRevision} projectRoot={projectRoot} source={voiceSource} characterNames={(dashboard?.bible_entries || []).filter((item) => String(item.kind || "") === "character").map((item) => String(item.name || "")).filter(Boolean)} request={request} onNotice={setNotice} onError={setError} onPlay={(path) => playAudioPath(path)} />}
-          {activeTab === "process" && <ProcessPanel events={events} collaboration={collaboration} context={contextStatus} provider={provider} workspace={chapterWorkspace} request={request} referenceDocument={referenceDocument} onOpenReference={openReference} onCloseReference={() => setReferenceDocument(null)} />}
+          {activeTab === "process" && <ProcessPanelCompact events={events} collaboration={collaboration} context={contextStatus} provider={provider} workspace={chapterWorkspace} request={request} referenceDocument={referenceDocument} onOpenReference={openReference} onCloseReference={() => setReferenceDocument(null)} onNavigate={setActiveTab} />}
         </section>
       </main>
 
@@ -1921,6 +1921,127 @@ function ProcessPanel({ events, collaboration, context, provider, workspace, req
     const current = run.status === "done" ? plan.length : started ? Math.min(1, plan.length) : 0;
     return <article className={`run-card ${run.status}`} key={run.id}><header><strong>{String(ticket.objective || methodLabel(run.method))}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : "进行中"}</span></header>{Boolean(ticket.chapter_no) && <p>章节：第 {String(ticket.chapter_no)} 章{ticket.chapter_version ? ` · v${String(ticket.chapter_version)}` : ""}；验收模式：{acceptanceModeLabel(String(ticket.acceptance_confirmation_mode || "per_chapter"))}；授权来源：{authorizationLabel(String(ticket.authorization_source || "none"))}</p>}<ol>{plan.map((step, index) => <li key={`${index}-${step}`}><span>{index < current ? "✓" : index === current && run.status === "running" ? "进行中 ·" : "待完成 ·"} {step}</span></li>)}</ol><p>{run.summary}</p>{planned?.dispatch_plan?.stop_conditions?.length ? <details><summary>停止条件</summary><ul>{planned.dispatch_plan.stop_conditions.map((item) => <li key={item}>{item}</li>)}</ul></details> : null}<small>{run.method === "project.ideate" ? "结果位置：新建小说窗口" : run.method === "provider.test" ? "结果位置：模型设置窗口" : "结果位置：中间对话区；生成文件可从左侧小说结构打开"}</small></article>;
   })}</div></div>;
+}
+
+type ProcessDetailKey = "workflow" | "tasks" | "agents" | "context" | "retrieval" | "canon" | "versions" | "learning" | "usage";
+
+function ProcessSummaryCard({ icon, title, value, status, onOpen }: { icon: string; title: string; value: ReactNode; status: string; onOpen: () => void }) {
+  return <button type="button" className="process-summary-card" onClick={onOpen} aria-label={`${title}详情`}>
+    <span className="process-summary-icon" aria-hidden="true">{icon}</span>
+    <span className="process-summary-copy"><strong>{title}</strong><small>{status}</small></span>
+    <b>{value}</b>
+    <span className="process-card-action">详情 <span aria-hidden="true">→</span></span>
+  </button>;
+}
+
+function CompactWorkflowStrip({ runs, onOpen }: { runs: LiveRun[]; onOpen: () => void }) {
+  const latest = runs[0];
+  const status = latest ? (latest.status === "done" ? "已完成" : latest.status === "failed" ? "需处理" : latest.status === "cancelled" ? "已停止" : "运行中") : "等待任务";
+  const steps = ["规划", "写作", "审查", "验收", "记忆"];
+  const events = latest?.steps || [];
+  const completed = latest?.status === "done" ? steps.length : steps.filter((_, index) => {
+    const markers = [["controller.routing", "workflow.started"], ["writer.started", "writer.completed"], ["reviewer.started", "reviewer.completed"], ["chapter.accepted", "chapter.accept"], ["memory.started", "memory.completed"]];
+    return events.some((event) => markers[index].some((marker) => String(event.type || "").includes(marker)));
+  }).length;
+  return <button type="button" className="workflow-mini-card" onClick={onOpen}>
+    <span className="workflow-mini-head"><strong>本次工作流</strong><em>{status}</em><span>详情 →</span></span>
+    <span className="workflow-mini-track" aria-hidden="true">{steps.map((step, index) => <i className={index < completed ? "done" : index === completed && latest?.status === "running" ? "active" : ""} key={step}><b>{index < completed ? "✓" : index + 1}</b><small>{step}</small></i>)}</span>
+  </button>;
+}
+
+function ProcessDetailPane({ title, subtitle, onBack, detailRef, children }: { title: string; subtitle?: string; onBack: () => void; detailRef?: MutableRefObject<HTMLElement | null>; children: ReactNode }) {
+  return <section ref={detailRef} className="process-detail-pane" aria-live="polite">
+    <header className="process-detail-header"><button type="button" className="process-back" onClick={onBack}><span aria-hidden="true">←</span> 总览</button><div><span className="eyebrow">详情</span><h3>{title}</h3>{subtitle && <p>{subtitle}</p>}</div></header>
+    <div className="process-detail-body">{children}</div>
+  </section>;
+}
+
+function DetailMetric({ label, value, tone = "" }: { label: string; value: ReactNode; tone?: string }) {
+  return <div className={`detail-metric ${tone}`}><small>{label}</small><strong>{value}</strong></div>;
+}
+
+function ProcessPanelCompact({ events, collaboration, context, provider, workspace, request, referenceDocument, onOpenReference, onCloseReference, onNavigate }: { events: EngineEvent[]; collaboration: CollaborationOverview | null; context: ContextStatus | null; provider: Record<string, unknown> | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; referenceDocument: DocumentData | null; onOpenReference: (reference: TraceReference) => void | Promise<void>; onCloseReference: () => void; onNavigate: (tab: Tab) => void }) {
+  const [threadUpdates, setThreadUpdates] = useState<Record<string, Record<string, unknown>>>({});
+  const [detail, setDetail] = useState<ProcessDetailKey | null>(null);
+  const detailRef = useRef<HTMLElement | null>(null);
+  const runs = processRuns(events);
+  const tasks = collaboration?.tasks || [];
+  const activeTasks = tasks.filter((task) => ["running", "queued", "waiting"].includes(String(task.status))).length;
+  const failedTasks = tasks.filter((task) => ["failed", "interrupted"].includes(String(task.status))).length;
+  const messages = collaboration?.messages || [];
+  const learning = collaboration?.learning_events || [];
+  const usage = collaboration?.usage;
+  const retrieval = context?.retrieval_diagnostics;
+  const traceRuns = collaboration?.trace_runs || [];
+  const threads = collaboration?.threads || [];
+  const openThreads = threads.filter((thread) => ["open", "waiting", "escalated"].includes(String(thread.status))).length;
+  const latest = runs[0];
+  const estimated = Number(context?.estimated_tokens || 0);
+  const hardLimit = Math.max(1, Number(context?.hard_limit_tokens || 1));
+  const hardPercent = Math.max(0, Math.min(100, Number(context?.hard_usage_percent || (estimated / hardLimit) * 100)));
+  const detailTitle: Record<ProcessDetailKey, string> = { workflow: "工作流与运行记录", tasks: "并发任务", agents: "Agent 协作", context: "Context 检查器", retrieval: "检索诊断", canon: "正史变更", versions: "版本与正文", learning: "学习反馈", usage: "调用与缓存" };
+  const detailSubtitle: Record<ProcessDetailKey, string> = { workflow: "按时间查看公开步骤、阶段状态和可复核文件。", tasks: "只保留当前需要关注的任务，完成项可在详情中回看。", agents: "查看结构化消息、分歧和等待中的回复。", context: "查看容量、预算、压缩和来源保留情况。", retrieval: "查看召回数量、筛选原因和被舍弃的候选。", canon: "正史只在用户验收后生成预览并提交。", versions: "正文、草稿和审查版本分别保留，可从工作区继续处理。", learning: "只展示用户接受、拒绝和重写带来的可复用反馈。", usage: "查看四个 Agent 的调用量、缓存命中和模型信息。" };
+
+  const replyToThread = async (threadId: unknown) => {
+    const value = await request<{ thread: Record<string, unknown> }>("collaboration.reply", { thread_id: threadId });
+    setThreadUpdates((items) => ({ ...items, [String(threadId)]: value.thread }));
+  };
+
+  useEffect(() => {
+    if (!detail) return;
+    const timer = window.setTimeout(() => detailRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 0);
+    return () => window.clearTimeout(timer);
+  }, [detail]);
+
+  let detailContent: ReactNode = null;
+  if (detail === "workflow") {
+    detailContent = <>
+      <WorkflowProgressStrip runs={runs} />
+      <LiveRunTimeline runs={runs} onOpenReference={onOpenReference} />
+      <section className="detail-section"><header><h4>真实调用与引用</h4><span>{traceRuns.length} 条</span></header>{traceRuns.length === 0 && <p className="empty-mini">完成一次写作、审查或记忆任务后显示。</p>}{traceRuns.slice(0, 10).map((traceRun) => <details className="run-card" key={traceRun.run_id}><summary><strong>{operationLabel(traceRun.operation)}</strong><span>{traceRun.status === "completed" ? "已完成" : traceRun.status === "failed" ? "未完成" : traceRun.status}</span></summary><p>{traceRun.summary}</p><div className="settings-inline-actions">{traceRun.trace_reference?.exists && <button type="button" onClick={() => void onOpenReference(traceRun.trace_reference!)}>打开运行记录</button>}</div><ol>{traceRun.events.map((step, index) => { const metadata = step.metadata || {}; const usageData = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; return <li key={`${step.timestamp}-${index}`}><div><strong>{step.stage}</strong> · {step.summary}</div><small>{formatTime(step.timestamp)} · {step.status}{metadata.model ? ` · ${String(metadata.model)}` : ""}{usageData ? ` · 输入 ${Number(usageData.prompt_tokens || usageData.input_tokens || 0).toLocaleString()} / 输出 ${Number(usageData.completion_tokens || usageData.output_tokens || 0).toLocaleString()}` : ""}</small>{step.details && <p>{step.details}</p>}{(step.references || []).length > 0 && <div className="settings-inline-actions">{(step.references || []).map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {reference.relative_path}</button>)}</div>}</li>; })}</ol></details>)}</section>
+    </>;
+  } else if (detail === "tasks") {
+    detailContent = <section className="detail-section"><header><h4>任务队列</h4><span>{activeTasks} 进行中 · {failedTasks} 需处理</span></header>{tasks.length === 0 && <p className="empty-mini">当前没有待处理任务。</p>}{tasks.slice(0, 20).map((task, index) => <article className={`detail-list-row ${String(task.status)}`} key={String(task.task_id || task.id || index)}><div><strong>{String(task.objective || task.title || task.operation || "未命名任务")}</strong><small>{String(task.agent_role || task.role || "Coordinator")} · {String(task.status || "queued")}</small></div><span>{task.chapter_no ? `第 ${String(task.chapter_no)} 章` : ""}</span></article>)}<button type="button" className="subtle-button" onClick={() => onNavigate("project")}>打开项目工作区 <span aria-hidden="true">→</span></button></section>;
+  } else if (detail === "agents") {
+    detailContent = <>
+      <section className="detail-section"><header><h4>结构化消息</h4><span>{messages.length} 条</span></header>{messages.length === 0 && <p className="empty-mini">暂时没有需要处理的 Agent 消息。</p>}{messages.slice(0, 16).map((message) => <article className="detail-message" key={message.message_id}><div><strong>{agentRoleLabel(String(message.sender_role))} → {agentRoleLabel(String(message.recipient_role))}</strong><small>{formatTime(message.created_at)} · {String(message.status)}</small></div><p>{message.claim}</p></article>)}</section>
+      <section className="detail-section"><header><h4>定向讨论</h4><span>{openThreads} 待处理</span></header>{threads.slice(0, 10).map((thread) => { const current = threadUpdates[String(thread.thread_id)] || thread; const active = ["open", "waiting"].includes(String(current.status)); return <article className="detail-thread" key={String(thread.thread_id)}><header><strong>{String(thread.topic)}</strong><span>{String(current.status)} · {String(current.current_round || 1)}/{String(current.max_rounds || 2)} 轮</span></header><p>{String(current.resolution || "等待目标 Agent 回答")}</p>{active && <button type="button" onClick={() => void replyToThread(thread.thread_id)}>让目标 Agent 回答</button>}{String(current.status) === "escalated" && <small>已交给 Coordinator 向你提出最小问题。</small>}</article>; })}</section>
+    </>;
+  } else if (detail === "context") {
+    detailContent = <>
+      <ContextCapacityCard value={context} />
+      {context && <section className="detail-section"><header><h4>预算分配</h4><span>输出预留 {Number((context as unknown as Record<string, unknown>).output_reserve_tokens || 0).toLocaleString()} tokens</span></header><div className="context-budget-list">{(context.budget_allocation || []).map((item) => <p key={item.key}><strong>{item.key} · {item.title}</strong><span>{item.estimated_tokens.toLocaleString()} tokens · {item.hard ? "固定保留" : "可压缩"} · {item.source_count} 来源</span></p>)}</div>{context.warnings.length > 0 && <ul className="detail-warning-list">{context.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}</section>}
+      <button type="button" className="subtle-button" onClick={() => setDetail("retrieval")}>查看检索诊断 <span aria-hidden="true">→</span></button>
+    </>;
+  } else if (detail === "retrieval") {
+    detailContent = <section className="detail-section"><header><h4>本次召回</h4><span>{retrieval?.selected?.length || 0} / {retrieval?.candidate_count || 0}</span></header><div className="detail-metrics"><DetailMetric label="初始 Top K" value={retrieval?.initial_top_k || 0} /><DetailMetric label="已选来源" value={retrieval?.selected?.length || 0} tone="good" /><DetailMetric label="已舍弃" value={retrieval?.discarded?.length || 0} tone={retrieval?.discarded?.length ? "warn" : ""} /></div>{context?.warnings?.length ? <ul className="detail-warning-list">{context.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul> : null}{retrieval?.adaptive_factors && <details className="detail-disclosure"><summary>查看自适应因素</summary><pre className="compact-json">{JSON.stringify(retrieval.adaptive_factors, null, 2)}</pre></details>}{retrieval?.discarded?.length ? <details className="detail-disclosure"><summary>查看舍弃原因（{retrieval.discarded.length}）</summary><pre className="compact-json">{JSON.stringify(retrieval.discarded, null, 2)}</pre></details> : <p className="empty-mini">本次没有舍弃候选。</p>}</section>;
+  } else if (detail === "canon") {
+    detailContent = <section className="detail-section"><header><h4>正史入口</h4><span>验收后提交</span></header><p className="detail-lead">Memory Keeper 只读取已接受正文，先生成补丁预览，再经过事务提交。</p><div className="detail-metrics"><DetailMetric label="已接受章节" value={String(workspace?.accepted_chapters ?? workspace?.acceptedChapterCount ?? "—")} /><DetailMetric label="开放线索" value={String(workspace?.open_threads ?? "—")} /></div><button type="button" className="subtle-button" onClick={() => onNavigate("memory")}>打开正史与记忆 <span aria-hidden="true">→</span></button></section>;
+  } else if (detail === "versions") {
+    detailContent = <section className="detail-section"><header><h4>版本入口</h4><span>保留旧版</span></header><p className="detail-lead">新草稿生成新版本；正文、审查和差异查看在各自工作区完成。</p><div className="detail-link-grid"><button type="button" onClick={() => onNavigate("editor")}>正文与草稿 <span aria-hidden="true">→</span></button><button type="button" onClick={() => onNavigate("review")}>审查与差异 <span aria-hidden="true">→</span></button></div></section>;
+  } else if (detail === "learning") {
+    detailContent = <section className="detail-section"><header><h4>反馈记录</h4><span>{learning.length} 条</span></header>{learning.length === 0 && <p className="empty-mini">完成接受、拒绝或重写后，这里会出现反馈。</p>}{learning.slice(0, 20).map((item) => <article className="detail-list-row" key={item.event_id}><div><strong>{learningLabel(item.event_type)}{item.chapter_no ? ` · 第 ${item.chapter_no} 章` : ""}</strong><small>{formatTime(item.created_at)}</small></div><details><summary>数据</summary><pre className="compact-json">{JSON.stringify(item.payload, null, 2)}</pre></details></article>)}</section>;
+  } else if (detail === "usage") {
+    detailContent = <><CacheSummary usage={usage} /><section className="detail-section"><header><h4>运行环境</h4><span>{String(provider?.model || "未配置")}</span></header><div className="detail-metrics"><DetailMetric label="调用次数" value={usage?.calls || 0} /><DetailMetric label="总 Token" value={(usage?.total_tokens || 0).toLocaleString()} /><DetailMetric label="估算费用" value={usage?.pricing_configured ? `${usage.currency} ${usage.estimated_cost.toFixed(4)}` : "未配置"} /></div><p className="detail-lead">缓存统计按 Agent 分开记录；服务商未回报时显示“未知”，不会把未知当成未命中。</p></section></>;
+  }
+
+  return <div className="scroll-panel process-panel"><div className="section-heading process-heading"><p className="eyebrow">协作台</p><h2>运行台</h2><div className="process-heading-meta"><span>{latest ? (latest.status === "done" ? "已完成" : latest.status === "failed" ? "需处理" : "运行中") : "等待任务"}</span><span>{provider?.model ? String(provider.model) : "模型未配置"}</span></div></div>
+    {workspace && <ChapterStatusStrip workspace={workspace} />}
+    {referenceDocument && <ReferenceDocumentViewer document={referenceDocument} onClose={onCloseReference} />}
+    <CompactWorkflowStrip runs={runs} onOpen={() => setDetail("workflow")} />
+    <div className="process-overview-grid">
+      <ProcessSummaryCard icon="▦" title="工作流" value={runs.length || "—"} status={latest ? "最近运行" : "等待请求"} onOpen={() => setDetail("workflow")} />
+      <ProcessSummaryCard icon="◫" title="任务" value={activeTasks} status={failedTasks ? `${failedTasks} 个需处理` : activeTasks ? "进行中" : "无待处理"} onOpen={() => setDetail("tasks")} />
+      <ProcessSummaryCard icon="◎" title="Agent" value={openThreads} status={messages.length ? `${messages.length} 条消息` : "无待处理讨论"} onOpen={() => setDetail("agents")} />
+      <ProcessSummaryCard icon="◌" title="Context" value={`${hardPercent.toFixed(0)}%`} status={context ? `${estimated.toLocaleString()} tokens` : "等待编译"} onOpen={() => setDetail("context")} />
+      <ProcessSummaryCard icon="⌁" title="检索" value={`${retrieval?.selected?.length || 0}/${retrieval?.candidate_count || 0}`} status={retrieval?.discarded?.length ? `${retrieval.discarded.length} 条已舍弃` : "按需召回"} onOpen={() => setDetail("retrieval")} />
+      <ProcessSummaryCard icon="▣" title="正史" value="预览" status="验收后提交" onOpen={() => setDetail("canon")} />
+      <ProcessSummaryCard icon="⇄" title="版本" value="保留" status="正文区查看" onOpen={() => setDetail("versions")} />
+      <ProcessSummaryCard icon="✦" title="学习" value={learning.length} status={learning.length ? "有新反馈" : "等待反馈"} onOpen={() => setDetail("learning")} />
+      <ProcessSummaryCard icon="◐" title="调用" value={usage?.calls || 0} status={usage?.prompt_cache_hit_rate != null ? `${Math.round(Number(usage.prompt_cache_hit_rate) * 100)}% 缓存` : "查看统计"} onOpen={() => setDetail("usage")} />
+    </div>
+    {detail && <ProcessDetailPane title={detailTitle[detail]} subtitle={detailSubtitle[detail]} onBack={() => setDetail(null)} detailRef={detailRef}>{detailContent}</ProcessDetailPane>}
+  </div>;
 }
 
 function ReferencesPanel({ request }: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> }) {
