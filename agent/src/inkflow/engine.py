@@ -966,8 +966,8 @@ class InkFlowEngine:
             task = (
                 f"创作第 {chapter_no} 章。用户补充：{instruction or '无'}\n"
                 f"本章章节卡目标有效字符约 {int(card['target_words'])}，允许范围 "
-                f"{int(int(card['target_words']) * (1 - _CHAPTER_LENGTH_TOLERANCE))}～"
-                f"{int(int(card['target_words']) * (1 + _CHAPTER_LENGTH_TOLERANCE))}；"
+                f"{int(int(card['target_words']) * (1 - self.settings.chapter_length_tolerance))}～"
+                f"{int(int(card['target_words']) * (1 + self.settings.chapter_length_tolerance))}；"
                 "交稿前必须把正文写到该范围内，不能用提纲、说明或重复标题代替正文。\n"
                 f"本章创意镜头软建议：{creative_lens}。只有在不违背正史、章节卡和人物动机时采用；"
                 "它用于改变信息呈现方式，不得凭空增加事件。"
@@ -1132,8 +1132,8 @@ class InkFlowEngine:
         Reviewer as the final authority if the repaired text is still short.
         """
         target = int(card["target_words"])
-        lower_bound = int(target * (1 - _CHAPTER_LENGTH_TOLERANCE))
-        upper_bound = int(target * (1 + _CHAPTER_LENGTH_TOLERANCE))
+        lower_bound = int(target * (1 - self.settings.chapter_length_tolerance))
+        upper_bound = int(target * (1 + self.settings.chapter_length_tolerance))
         current = _content_char_count(clean_content)
         if current > upper_bound:
             return await self._repair_long_draft(
@@ -1224,8 +1224,8 @@ class InkFlowEngine:
         as the authority on whether the resulting version is acceptable.
         """
         target = int(card["target_words"])
-        lower_bound = int(target * (1 - _CHAPTER_LENGTH_TOLERANCE))
-        upper_bound = int(target * (1 + _CHAPTER_LENGTH_TOLERANCE))
+        lower_bound = int(target * (1 - self.settings.chapter_length_tolerance))
+        upper_bound = int(target * (1 + self.settings.chapter_length_tolerance))
         current = _content_char_count(clean_content)
         card_requirements = json_dumps(
             {
@@ -1330,6 +1330,7 @@ class InkFlowEngine:
                 content,
                 int(card["target_words"]),
                 brief.user_rules,
+                length_tolerance=self.settings.chapter_length_tolerance,
             )
             trace.record(
                 "review.rules",
@@ -1707,8 +1708,8 @@ class InkFlowEngine:
             task = f"修订第 {chapter_no} 章。用户补充：{instruction or '无'}"
             current_characters = _content_char_count(current_draft)
             target_characters = int(card["target_words"])
-            lower_bound = int(target_characters * (1 - _CHAPTER_LENGTH_TOLERANCE))
-            upper_bound = int(target_characters * (1 + _CHAPTER_LENGTH_TOLERANCE))
+            lower_bound = int(target_characters * (1 - self.settings.chapter_length_tolerance))
+            upper_bound = int(target_characters * (1 + self.settings.chapter_length_tolerance))
             packet = self._context_builder(project).build(
                 chapter_no,
                 task,
@@ -4677,7 +4678,7 @@ _TEMPLATE_PHRASES = (
 
 # 章节卡给出的是每章自己的有效字符目标。允许小范围的自然波动，
 # 但把超出范围的草稿挡在 Reviewer 门禁之前，避免不同章节被硬套成同一长度。
-_CHAPTER_LENGTH_TOLERANCE = 0.15
+_DEFAULT_CHAPTER_LENGTH_TOLERANCE = 0.20
 
 
 def _enforce_review_severity(finding: ReviewFinding) -> ReviewFinding:
@@ -4743,6 +4744,8 @@ def _deterministic_audit(
     content: str,
     target_words: int,
     user_rules: list[str] | None = None,
+    *,
+    length_tolerance: float = _DEFAULT_CHAPTER_LENGTH_TOLERANCE,
 ) -> tuple[dict[str, Any], list[ReviewFinding]]:
     char_count = _content_char_count(content)
     paragraphs = [item for item in re.split(r"\n\s*\n", content) if item.strip()]
@@ -4750,6 +4753,11 @@ def _deterministic_audit(
     duplicate_count = len(normalized) - len(set(normalized))
     chapter_heading_count = len(re.findall(r"(?m)^\s*#+\s*(?:第\s*\d+\s*章|chapter\s*\d+)\b", content, flags=re.IGNORECASE))
     template_hits = {phrase: content.count(phrase) for phrase in _TEMPLATE_PHRASES if phrase in content}
+    sentences = [item for item in re.split(r"[。！？!?](?:[”’\"']|$)?", content) if item.strip()]
+    chinese_commas = content.count("，")
+    enumeration_commas = content.count("、")
+    latin_commas = content.count(",")
+    comma_dense_sentences = sum(1 for item in sentences if item.count("，") + item.count(",") >= 4)
     metrics = {
         "content_characters": char_count,
         "target_words": target_words,
@@ -4758,18 +4766,28 @@ def _deterministic_audit(
         "chapter_heading_count": chapter_heading_count,
         "placeholder_count": len(re.findall(r"TODO|TBD|待补|占位", content, flags=re.IGNORECASE)),
         "template_phrase_hits": template_hits,
+        "punctuation": {
+            "sentence_count": len(sentences),
+            "chinese_commas": chinese_commas,
+            "enumeration_commas": enumeration_commas,
+            "latin_commas": latin_commas,
+            "comma_dense_sentences": comma_dense_sentences,
+            "commas_per_100_characters": round((chinese_commas + latin_commas) * 100 / max(1, char_count), 2),
+        },
     }
     findings: list[ReviewFinding] = []
-    lower_bound = target_words * (1 - _CHAPTER_LENGTH_TOLERANCE)
-    upper_bound = target_words * (1 + _CHAPTER_LENGTH_TOLERANCE)
+    length_tolerance = max(0.10, min(1.00, float(length_tolerance)))
+    tolerance_percent = int(round(length_tolerance * 100))
+    lower_bound = target_words * (1 - length_tolerance)
+    upper_bound = target_words * (1 + length_tolerance)
     if char_count < lower_bound:
         findings.append(
             ReviewFinding(
                 category="format",
                 severity="blocking",
                 evidence=f"有效字符约 {char_count}，目标 {target_words}（下限约 {int(lower_bound)}）",
-                explanation="正文低于章节卡目标的 15% 容差，可能是截断或只生成了提纲。",
-                repair_instruction="按当前章节卡补足完整场景、决定和后果，直到有效字符回到目标上下 15% 内，再重新审查。",
+                explanation=f"正文低于章节卡目标的 {tolerance_percent}% 容差，可能是截断或只生成了提纲。",
+                repair_instruction=f"按当前章节卡补足完整场景、决定和后果，直到有效字符回到目标上下 {tolerance_percent}% 内，再重新审查。",
             )
         )
     if char_count > upper_bound:
@@ -4778,8 +4796,8 @@ def _deterministic_audit(
                 category="pacing",
                 severity="major",
                 evidence=f"有效字符约 {char_count}，目标 {target_words}（上限约 {int(upper_bound)}）",
-                explanation="正文超过章节卡目标的 15% 容差，可能同时塞入了多章功能或重复解释。",
-                repair_instruction="保留本章功能和钩子，删除重复解释、无效过场或不属于本章的内容，使有效字符回到目标上下 15% 内。",
+                explanation=f"正文超过章节卡目标的 {tolerance_percent}% 容差，可能同时塞入了多章功能或重复解释。",
+                repair_instruction=f"保留本章功能和钩子，删除重复解释、无效过场或不属于本章的内容，使有效字符回到目标上下 {tolerance_percent}% 内。",
             )
         )
     if duplicate_count:

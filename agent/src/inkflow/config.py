@@ -41,6 +41,7 @@ PERSISTED_SETTING_NAMES = {
     "show_provider_reasoning",
     "inquiry_frequency",
     "hook_strategy",
+    "chapter_length_tolerance",
     "acceptance_confirmation_mode",
     "dialogue_history_mode",
     "dialogue_history_interval",
@@ -178,6 +179,7 @@ class Settings:
     show_provider_reasoning: bool = True
     inquiry_frequency: str = "medium"
     hook_strategy: str = "most_chapters"
+    chapter_length_tolerance: float = 0.20
     acceptance_confirmation_mode: str = "per_chapter"
     dialogue_history_mode: str = "auto"
     dialogue_history_interval: int = 1
@@ -301,6 +303,12 @@ class Settings:
             "章节结尾策略",
             {"most_chapters", "key_chapters", "natural_afterglow"},
         )
+        chapter_length_tolerance = _bounded_float(
+            value.get("chapter_length_tolerance", defaults.chapter_length_tolerance),
+            "章节长度容差",
+            0.10,
+            1.00,
+        )
         acceptance_confirmation_mode = _choice(
             value.get("acceptance_confirmation_mode", defaults.acceptance_confirmation_mode),
             "验收确认策略",
@@ -352,6 +360,7 @@ class Settings:
             ),
             inquiry_frequency=inquiry_frequency,
             hook_strategy=hook_strategy,
+            chapter_length_tolerance=chapter_length_tolerance,
             acceptance_confirmation_mode=acceptance_confirmation_mode,
             dialogue_history_mode=dialogue_history_mode,
             dialogue_history_interval=dialogue_history_interval,
@@ -454,6 +463,7 @@ class Settings:
             "show_provider_reasoning": "INKFLOW_SHOW_REASONING",
             "inquiry_frequency": "INKFLOW_INQUIRY_FREQUENCY",
             "hook_strategy": "INKFLOW_HOOK_STRATEGY",
+            "chapter_length_tolerance": "INKFLOW_CHAPTER_LENGTH_TOLERANCE",
             "acceptance_confirmation_mode": "INKFLOW_ACCEPTANCE_CONFIRMATION_MODE",
             "review_verification_mode": "INKFLOW_REVIEW_VERIFICATION_MODE",
             "review_experience_detail": "INKFLOW_REVIEW_EXPERIENCE_DETAIL",

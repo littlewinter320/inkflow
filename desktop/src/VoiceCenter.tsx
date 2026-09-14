@@ -57,6 +57,12 @@ export type VoiceStatus = {
     installing?: boolean;
     python_available?: boolean;
     last_error?: string;
+    install_status?: string;
+    install_stage?: string;
+    install_progress?: number;
+    install_summary?: string;
+    downloaded_mb?: number;
+    retryable?: boolean;
     source?: string;
   };
   asr?: {
@@ -83,6 +89,12 @@ export type VoiceStatus = {
     estimated_model_download_mb: number;
     last_error?: string;
     model_message?: string;
+    install_status?: string;
+    install_stage?: string;
+    install_progress?: number;
+    install_summary?: string;
+    downloaded_mb?: number;
+    retryable?: boolean;
   };
   models_loaded?: { asr: boolean; tts: boolean };
 };

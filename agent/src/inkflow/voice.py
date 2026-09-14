@@ -253,6 +253,27 @@ def _directory_size(path: Path) -> int:
     return total
 
 
+def _friendly_pip_error(output: list[str], component: str) -> tuple[str, bool]:
+    """Return a short user-facing install error and whether the failure is retryable."""
+
+    joined = "\n".join(output)
+    lowered = joined.casefold()
+    if ("pip-unpack" in lowered or "no such file or directory" in lowered) and (
+        ".whl" in lowered or "oserror" in lowered
+    ):
+        return (
+            f"{component} 依赖安装时，Windows 临时目录中的下载文件被提前清理。"
+            "墨流已保留已有组件并清理本次暂存目录；重新安装时会使用应用自己的稳定缓存。",
+            True,
+        )
+    if "no space left" in lowered or "磁盘空间不足" in joined:
+        return (f"{component} 安装失败：磁盘空间不足。请释放空间后重试。", True)
+    if "ssl" in lowered or "connection" in lowered or "timed out" in lowered:
+        return (f"{component} 下载连接中断。已经下载到稳定缓存的文件会在重试时复用。", True)
+    detail = next((line for line in reversed(output) if "error" in line.casefold()), "依赖安装未完成。")
+    return (f"{component} 安装失败：{detail[:320]}", True)
+
+
 def _safe_extract_tar(archive_path: Path, destination: Path) -> None:
     destination = destination.resolve()
     with tarfile.open(archive_path, "r:bz2") as archive:
@@ -519,6 +540,12 @@ class VoiceRuntime:
             "installing": bool(self._moss_install_task and not self._moss_install_task.done()),
             "python_available": bool(self._python_command()),
             "last_error": str(state.get("error") or ""),
+            "install_status": str(state.get("status") or "idle"),
+            "install_stage": str(state.get("stage") or ""),
+            "install_progress": int(state.get("progress") or 0),
+            "install_summary": str(state.get("summary") or ""),
+            "downloaded_mb": float(state.get("downloaded_mb") or 0),
+            "retryable": bool(state.get("retryable", False)),
             "source": "local_optional" if state.get("status") == "installed" else "none",
         }
 
@@ -552,6 +579,12 @@ class VoiceRuntime:
             "estimated_dependency_download_mb": 7000,
             "estimated_model_download_mb": 9200,
             "last_error": str(state.get("error") or ""),
+            "install_status": str(state.get("status") or "idle"),
+            "install_stage": str(state.get("stage") or ""),
+            "install_progress": int(state.get("progress") or 0),
+            "install_summary": str(state.get("summary") or ""),
+            "downloaded_mb": float(state.get("downloaded_mb") or 0),
+            "retryable": bool(state.get("retryable", False)),
         }
 
     def _selected_backend(self, settings: Settings, moss: dict[str, Any], qwen: dict[str, Any]) -> str:
@@ -575,6 +608,203 @@ class VoiceRuntime:
         if launcher:
             return [launcher, "-3.12"]
         return None
+
+    async def _publish_install_progress(
+        self,
+        *,
+        component: str,
+        state_path: Path,
+        emit: VoiceEventSink,
+        status: str,
+        stage: str,
+        progress: int,
+        summary: str,
+        downloaded_mb: float = 0,
+        error: str = "",
+        retryable: bool = False,
+        event_type: str | None = None,
+    ) -> None:
+        state = _read_json(state_path)
+        state.update(
+            {
+                "status": status,
+                "stage": stage,
+                "progress": max(0, min(100, int(progress))),
+                "summary": summary,
+                "downloaded_mb": round(max(0.0, downloaded_mb), 1),
+                "error": error[:500],
+                "retryable": retryable,
+                "updated_at": _now(),
+            }
+        )
+        _atomic_json(state_path, state)
+        await emit(
+            {
+                "type": event_type or f"voice.{component}.install.progress",
+                "component": component,
+                "status": status,
+                "stage": stage,
+                "progress": state["progress"],
+                "summary": summary,
+                "downloaded_mb": state["downloaded_mb"],
+                "retryable": retryable,
+                "error": error[:500],
+            }
+        )
+
+    async def _install_python_packages(
+        self,
+        *,
+        component: str,
+        root: Path,
+        staging: Path,
+        state_path: Path,
+        command: list[str],
+        requirements: tuple[str, ...],
+        estimated_mb: int,
+        emit: VoiceEventSink,
+    ) -> None:
+        cache_dir = root / "pip-cache"
+        install_temp = root / "install-temp"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        last_output: list[str] = []
+        for attempt in range(2):
+            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(install_temp, ignore_errors=True)
+            staging.mkdir(parents=True, exist_ok=False)
+            install_temp.mkdir(parents=True, exist_ok=False)
+            await self._publish_install_progress(
+                component=component,
+                state_path=state_path,
+                emit=emit,
+                status="installing",
+                stage="dependencies" if attempt == 0 else "retrying",
+                progress=4 if attempt == 0 else 10,
+                summary="正在准备依赖" if attempt == 0 else "临时文件失效，正在从稳定缓存自动重试",
+            )
+            args = command + [
+                "-m", "pip", "install", "--disable-pip-version-check", "--upgrade",
+                "--cache-dir", str(cache_dir), "--target", str(staging), *requirements,
+            ]
+            env = {**os.environ, "TMP": str(install_temp), "TEMP": str(install_temp), "PYTHONUTF8": "1"}
+            process = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+            output: list[str] = []
+            progress = 10
+            published_progress = -1
+            assert process.stdout is not None
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                value = line.decode("utf-8", errors="replace").strip()
+                if not value:
+                    continue
+                output.append(value)
+                lowered = value.casefold()
+                if "successfully installed" in lowered:
+                    progress = 55
+                elif "installing collected packages" in lowered:
+                    progress = max(progress, 46)
+                elif "downloading" in lowered or "using cached" in lowered:
+                    progress = min(42, max(progress + 2, 18))
+                elif "collecting" in lowered:
+                    progress = min(17, progress + 1)
+                if progress == published_progress and len(output) % 25:
+                    continue
+                published_progress = progress
+                written_mb = (_directory_size(staging) + _directory_size(install_temp)) / 1024 / 1024
+                await self._publish_install_progress(
+                    component=component,
+                    state_path=state_path,
+                    emit=emit,
+                    status="installing",
+                    stage="dependencies",
+                    progress=progress,
+                    summary=f"正在安装依赖 · 已写入约 {written_mb:.0f}MB / 预计 {estimated_mb}MB",
+                    downloaded_mb=written_mb,
+                )
+            return_code = await process.wait()
+            shutil.rmtree(install_temp, ignore_errors=True)
+            if return_code == 0:
+                await self._publish_install_progress(
+                    component=component,
+                    state_path=state_path,
+                    emit=emit,
+                    status="installing",
+                    stage="dependencies",
+                    progress=56,
+                    summary="依赖安装完成，正在整理文件",
+                    downloaded_mb=_directory_size(staging) / 1024 / 1024,
+                )
+                return
+            last_output = output
+            message, retryable = _friendly_pip_error(output, component)
+            if attempt == 0 and "临时目录" in message:
+                continue
+            await self._publish_install_progress(
+                component=component,
+                state_path=state_path,
+                emit=emit,
+                status="failed",
+                stage="failed",
+                progress=progress,
+                summary="安装未完成，可从设置中重试",
+                error=message,
+                retryable=retryable,
+                event_type=f"voice.{component}.install.failed",
+            )
+            shutil.rmtree(staging, ignore_errors=True)
+            raise RuntimeError(message)
+        message, retryable = _friendly_pip_error(last_output, component)
+        await self._publish_install_progress(
+            component=component,
+            state_path=state_path,
+            emit=emit,
+            status="failed",
+            stage="failed",
+            progress=10,
+            summary="自动重试仍未完成，可稍后再次安装",
+            error=message,
+            retryable=retryable,
+            event_type=f"voice.{component}.install.failed",
+        )
+        shutil.rmtree(staging, ignore_errors=True)
+        raise RuntimeError(message)
+
+    async def _prepare_models_with_progress(
+        self,
+        *,
+        component: str,
+        state_path: Path,
+        model_dir: Path,
+        estimated_mb: int,
+        prepare: Callable[[], None],
+        emit: VoiceEventSink,
+    ) -> None:
+        task = asyncio.create_task(asyncio.to_thread(prepare))
+        while not task.done():
+            size_mb = _directory_size(model_dir) / 1024 / 1024
+            progress = 58 + min(39, int((size_mb / max(1, estimated_mb)) * 39))
+            await self._publish_install_progress(
+                component=component,
+                state_path=state_path,
+                emit=emit,
+                status="installing",
+                stage="models",
+                progress=progress,
+                summary=f"正在准备模型 · 本地已有 {size_mb:.0f}MB / 预计 {estimated_mb}MB",
+                downloaded_mb=size_mb,
+            )
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.8)
+            except asyncio.TimeoutError:
+                continue
+        await task
 
     def _sherpa_asr_model_path(self) -> Path | None:
         if not (self.sherpa_asr_dir / "tokens.txt").is_file():
@@ -605,49 +835,46 @@ class VoiceRuntime:
             if existing.get("installed") and existing.get("models_ready"):
                 return self.status()
             if existing.get("installed"):
-                await emit({"type": "voice.qwen.install.progress", "stage": "models", "summary": "Qwen 依赖已存在，正在重新准备语音模型"})
+                await self._publish_install_progress(
+                    component="qwen", state_path=self.qwen_state_path, emit=emit,
+                    status="installing", stage="models", progress=58,
+                    summary="Qwen 依赖已存在，正在继续准备语音模型",
+                )
                 model_error = ""
                 try:
-                    await asyncio.to_thread(self._prepare_models_sync, Settings.from_env())
+                    await self._prepare_models_with_progress(
+                        component="qwen", state_path=self.qwen_state_path,
+                        model_dir=self.qwen_model_cache_dir, estimated_mb=9200,
+                        prepare=lambda: self._prepare_models_sync(Settings.from_env()), emit=emit,
+                    )
                 except Exception as exc:
                     model_error = str(exc)[:500]
                 result = self.status()
                 result["qwen_setup"] = "installed_but_models_pending" if model_error else "ready"
                 if model_error:
                     result["qwen"]["last_error"] = model_error
+                    await self._publish_install_progress(
+                        component="qwen", state_path=self.qwen_state_path, emit=emit,
+                        status="failed", stage="models", progress=int(result["qwen"].get("install_progress") or 58),
+                        summary="模型准备未完成，可继续重试", error=model_error, retryable=True,
+                        event_type="voice.qwen.models_failed",
+                    )
+                else:
+                    await self._publish_install_progress(
+                        component="qwen", state_path=self.qwen_state_path, emit=emit,
+                        status="installed", stage="ready", progress=100,
+                        summary="Qwen 高品质语音已准备完成", event_type="voice.qwen.ready",
+                    )
                 return result
             command = self._python_command()
             if not command:
                 raise RuntimeError("没有找到可用于安装 Qwen 的 Python 3.12/3.13。请安装 Python 后重试，或设置 INKFLOW_PYTHON 指向 python.exe。")
             staging = self.qwen_root / f"packages-staging-{uuid.uuid4().hex}"
-            staging.mkdir(parents=True, exist_ok=False)
-            _atomic_json(self.qwen_state_path, {"status": "installing", "started_at": _now(), "error": ""})
-            await emit({"type": "voice.qwen.installing", "stage": "dependencies", "summary": "正在安装 Qwen 本地依赖，过程可能持续较长时间"})
-            args = command + [
-                "-m", "pip", "install", "--disable-pip-version-check", "--no-cache-dir", "--upgrade",
-                "--target", str(staging), *QWEN_REQUIREMENTS,
-            ]
-            process = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+            await self._install_python_packages(
+                component="qwen", root=self.qwen_root, staging=staging,
+                state_path=self.qwen_state_path, command=command,
+                requirements=QWEN_REQUIREMENTS, estimated_mb=7000, emit=emit,
             )
-            output: list[str] = []
-            assert process.stdout is not None
-            while True:
-                line = await process.stdout.readline()
-                if not line:
-                    break
-                text = line.decode("utf-8", errors="replace").strip()
-                if text:
-                    output.append(text)
-                    await emit({"type": "voice.qwen.install.progress", "stage": "dependencies", "summary": text[-240:]})
-            return_code = await process.wait()
-            if return_code != 0:
-                message = next((line for line in reversed(output) if "error" in line.casefold()), "pip 安装失败，请检查网络、Python 版本和磁盘空间。")
-                _atomic_json(self.qwen_state_path, {"status": "failed", "finished_at": _now(), "error": message[:500]})
-                shutil.rmtree(staging, ignore_errors=True)
-                raise RuntimeError(message[:500])
             if self.qwen_packages_dir.exists():
                 previous = self.qwen_root / "packages-previous"
                 if previous.exists():
@@ -665,10 +892,18 @@ class VoiceRuntime:
                 },
             )
             self._activate_optional_packages()
-            await emit({"type": "voice.qwen.install.progress", "stage": "models", "summary": "依赖安装完成，正在下载 Qwen 预设与克隆模型"})
+            await self._publish_install_progress(
+                component="qwen", state_path=self.qwen_state_path, emit=emit,
+                status="installing", stage="models", progress=58,
+                summary="依赖安装完成，正在下载预设与克隆模型",
+            )
             model_error = ""
             try:
-                await asyncio.to_thread(self._prepare_models_sync, Settings.from_env())
+                await self._prepare_models_with_progress(
+                    component="qwen", state_path=self.qwen_state_path,
+                    model_dir=self.qwen_model_cache_dir, estimated_mb=9200,
+                    prepare=lambda: self._prepare_models_sync(Settings.from_env()), emit=emit,
+                )
             except Exception as exc:
                 model_error = str(exc)[:500]
             result = self.status()
@@ -676,9 +911,18 @@ class VoiceRuntime:
             if model_error:
                 result["qwen"]["last_error"] = model_error
                 result["qwen"]["model_message"] = "Qwen 依赖已安装，但模型下载未完成；可稍后重试模型准备。"
-                await emit({"type": "voice.qwen.models_failed", "summary": model_error})
+                await self._publish_install_progress(
+                    component="qwen", state_path=self.qwen_state_path, emit=emit,
+                    status="failed", stage="models", progress=int(result["qwen"].get("install_progress") or 58),
+                    summary="模型下载未完成，可继续重试", error=model_error, retryable=True,
+                    event_type="voice.qwen.models_failed",
+                )
             else:
-                await emit({"type": "voice.qwen.ready", "summary": "Qwen 高品质语音已安装并完成适配"})
+                await self._publish_install_progress(
+                    component="qwen", state_path=self.qwen_state_path, emit=emit,
+                    status="installed", stage="ready", progress=100,
+                    summary="Qwen 高品质语音已安装并完成适配", event_type="voice.qwen.ready",
+                )
             return result
 
     async def install_moss(self, confirmation: str, emit: VoiceEventSink) -> dict[str, Any]:
@@ -702,32 +946,11 @@ class VoiceRuntime:
                 if not command:
                     raise RuntimeError("没有找到可用的 Python。请设置 INKFLOW_PYTHON 指向 python.exe。")
                 staging = self.moss_root / f"packages-staging-{uuid.uuid4().hex}"
-                staging.mkdir(parents=True, exist_ok=False)
-                _atomic_json(self.moss_state_path, {"status": "installing", "started_at": _now(), "error": ""})
-                await emit({"type": "voice.moss.installing", "stage": "dependencies", "summary": "正在安装 MOSS ONNX 运行库，完成后会单独准备模型。"})
-                args = command + [
-                    "-m", "pip", "install", "--disable-pip-version-check", "--no-cache-dir", "--upgrade",
-                    "--target", str(staging), *MOSS_REQUIREMENTS,
-                ]
-                process = await asyncio.create_subprocess_exec(
-                    *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                await self._install_python_packages(
+                    component="moss", root=self.moss_root, staging=staging,
+                    state_path=self.moss_state_path, command=command,
+                    requirements=MOSS_REQUIREMENTS, estimated_mb=1800, emit=emit,
                 )
-                output: list[str] = []
-                assert process.stdout is not None
-                while True:
-                    line = await process.stdout.readline()
-                    if not line:
-                        break
-                    value = line.decode("utf-8", errors="replace").strip()
-                    if value:
-                        output.append(value)
-                        await emit({"type": "voice.moss.install.progress", "stage": "dependencies", "summary": value[-240:]})
-                return_code = await process.wait()
-                if return_code != 0:
-                    message = next((line for line in reversed(output) if "error" in line.casefold()), "MOSS 依赖安装失败，请查看上方安装日志。")
-                    _atomic_json(self.moss_state_path, {"status": "failed", "finished_at": _now(), "error": message[:500]})
-                    shutil.rmtree(staging, ignore_errors=True)
-                    raise RuntimeError(message[:500])
                 if self.moss_packages_dir.exists():
                     previous = self.moss_root / "packages-previous"
                     if previous.exists():
@@ -736,28 +959,45 @@ class VoiceRuntime:
                 staging.replace(self.moss_packages_dir)
                 _atomic_json(self.moss_state_path, {"status": "installed", "installed_at": _now(), "python": " ".join(command), "requirements": list(MOSS_REQUIREMENTS), "error": ""})
                 self._activate_optional_packages()
-            await emit({"type": "voice.moss.install.progress", "stage": "models", "summary": "正在准备 MOSS 的 ONNX 语音模型。"})
+            await self._publish_install_progress(
+                component="moss", state_path=self.moss_state_path, emit=emit,
+                status="installing", stage="models", progress=58,
+                summary="正在准备 MOSS ONNX 语音模型",
+            )
             model_error = ""
             try:
-                await asyncio.to_thread(self._prepare_moss_models_sync)
+                await self._prepare_models_with_progress(
+                    component="moss", state_path=self.moss_state_path,
+                    model_dir=self.moss_model_dir, estimated_mb=900,
+                    prepare=self._prepare_moss_models_sync, emit=emit,
+                )
             except Exception as exc:
                 model_error = str(exc)[:500]
                 state = _read_json(self.moss_state_path)
-                state.update({"status": "installed", "error": model_error})
+                state.update({"status": "failed", "stage": "models", "error": model_error, "retryable": True})
                 _atomic_json(self.moss_state_path, state)
             else:
                 state = _read_json(self.moss_state_path)
-                state.update({"status": "installed", "error": "", "models_ready_at": _now()})
+                state.update({"status": "installed", "stage": "ready", "progress": 100, "summary": "MOSS 本地普通话朗读已准备完成", "error": "", "retryable": False, "models_ready_at": _now()})
                 _atomic_json(self.moss_state_path, state)
                 save_user_settings({"voice_engine": "moss", "voice_light_tts_model": MOSS_TTS_MODEL_ID})
             result = self.status()
             if model_error:
                 result["moss_setup"] = "installed_but_models_pending"
                 result["moss"]["last_error"] = model_error
-                await emit({"type": "voice.moss.models_failed", "summary": model_error})
+                await self._publish_install_progress(
+                    component="moss", state_path=self.moss_state_path, emit=emit,
+                    status="failed", stage="models", progress=int(result["moss"].get("install_progress") or 58),
+                    summary="模型下载未完成，可继续重试", error=model_error, retryable=True,
+                    event_type="voice.moss.models_failed",
+                )
             else:
                 result["moss_setup"] = "ready"
-                await emit({"type": "voice.moss.ready", "summary": "MOSS 本地普通话朗读已准备完成。"})
+                await self._publish_install_progress(
+                    component="moss", state_path=self.moss_state_path, emit=emit,
+                    status="installed", stage="ready", progress=100,
+                    summary="MOSS 本地普通话朗读已准备完成", event_type="voice.moss.ready",
+                )
             return result
 
     def _prepare_moss_models_sync(self) -> None:
@@ -804,8 +1044,16 @@ class VoiceRuntime:
     def _delete_voice_component_sync(self, component: str) -> dict[str, Any]:
         self._clear_loaded_tts()
         target_map = {
-            "moss": (self.moss_packages_dir, self.moss_model_dir, self.moss_state_path),
-            "qwen": (self.qwen_packages_dir, self.qwen_model_cache_dir, self.qwen_state_path, self.qwen_models_path),
+            "moss": (
+                self.moss_packages_dir, self.moss_model_dir, self.moss_state_path,
+                self.moss_root / "pip-cache", self.moss_root / "install-temp",
+                self.moss_root / "packages-previous", *self.moss_root.glob("packages-staging-*"),
+            ),
+            "qwen": (
+                self.qwen_packages_dir, self.qwen_model_cache_dir, self.qwen_state_path, self.qwen_models_path,
+                self.qwen_root / "pip-cache", self.qwen_root / "install-temp",
+                self.qwen_root / "packages-previous", *self.qwen_root.glob("packages-staging-*"),
+            ),
             "sherpa": (self.sherpa_root,),
             "kokoro": (self.kokoro_root,),
         }

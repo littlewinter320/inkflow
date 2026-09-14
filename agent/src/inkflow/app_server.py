@@ -87,6 +87,7 @@ class InkFlowAppService:
                 "max_output_tokens": settings.max_output_tokens,
                 "inquiry_frequency": settings.inquiry_frequency,
                 "hook_strategy": settings.hook_strategy,
+                "chapter_length_tolerance": settings.chapter_length_tolerance,
                 "acceptance_confirmation_mode": settings.acceptance_confirmation_mode,
                 "dialogue_history_mode": settings.dialogue_history_mode,
                 "dialogue_history_interval": settings.dialogue_history_interval,
@@ -124,6 +125,7 @@ class InkFlowAppService:
                     "max_output_tokens",
                     "inquiry_frequency",
                     "hook_strategy",
+                    "chapter_length_tolerance",
                     "acceptance_confirmation_mode",
                     "dialogue_history_mode",
                     "dialogue_history_interval",
@@ -1429,6 +1431,12 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
             "total_tokens": bucket["prompt_tokens"] + bucket["completion_tokens"],
             "prompt_cache_hit_rate": round(bucket["prompt_cache_hit_tokens"] / cache_total, 4)
             if cache_total else None,
+            "prompt_cache_miss_rate": round(bucket["prompt_cache_miss_tokens"] / cache_total, 4)
+            if cache_total else None,
+            "average_prompt_tokens": round(bucket["prompt_tokens"] / bucket["calls"])
+            if bucket["calls"] else 0,
+            "average_completion_tokens": round(bucket["completion_tokens"] / bucket["calls"])
+            if bucket["calls"] else 0,
         }
 
     usage = public_bucket(overall)

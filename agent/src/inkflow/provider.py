@@ -130,7 +130,9 @@ class DeepSeekProvider:
     ) -> ProviderResult[T]:
         api_key = self.settings.require_api_key()
         schema = output_model.model_json_schema()
-        schema_prompt = json.dumps(schema, ensure_ascii=False)
+        # A canonical schema string keeps the long system-prefix byte-identical
+        # across repeated calls of the same Agent/output contract.
+        schema_prompt = json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         system = (
             system_prompt.rstrip()
             + "\n\n你必须只输出一个合法 JSON 对象，不能使用 Markdown 代码围栏。"
@@ -148,6 +150,11 @@ class DeepSeekProvider:
             "max_tokens": requested_max_tokens,
             "stream": False,
         }
+        if self.settings.provider_kind == "openai":
+            payload["prompt_cache_key"] = (
+                f"inkflow:{agent_role or 'unknown'}:{model_override or self.settings.model}:"
+                f"{output_model.__name__}:v1"
+            )
         generation = self.settings.agent_generation.get(agent_role or "")
         if generation:
             payload["temperature"] = generation["temperature"]
@@ -300,7 +307,9 @@ class AnthropicProvider:
         model_override: str | None = None,
     ) -> ProviderResult[T]:
         del effort, thinking
-        schema_prompt = json.dumps(output_model.model_json_schema(), ensure_ascii=False)
+        schema_prompt = json.dumps(
+            output_model.model_json_schema(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
         generation = self.settings.agent_generation.get(agent_role or "", {})
         payload: dict[str, Any] = {
             "model": model_override or self.settings.model,

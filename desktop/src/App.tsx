@@ -76,6 +76,11 @@ type EngineEvent = {
   references?: TraceReference[];
   method?: string;
   action?: string;
+  component?: string;
+  progress?: number;
+  downloaded_mb?: number;
+  retryable?: boolean;
+  error?: string;
   timestamp?: string;
   task_ticket?: Record<string, unknown>;
   dispatch_plan?: {
@@ -168,7 +173,8 @@ type TraceStep = { timestamp: string; stage: string; status: string; summary: st
 type TraceRun = { run_id: string; operation: string; status: string; summary: string; started_at: string; finished_at: string; events: TraceStep[]; trace_reference?: TraceReference };
 type BatchSummary = { batch_id: string; status: string; start_chapter_no?: number; end_chapter_no?: number; chapters: Array<{ chapter_no?: number; version?: number; review_verdict?: string; memory_status?: string }> };
 type LearningEvent = { event_id: string; event_type: string; chapter_no?: number; created_at: string; payload: Record<string, unknown> };
-type UsageSummary = { calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; prompt_cache_hit_rate?: number | null; cache_reported_calls?: number; cache_unknown_calls?: number; cache_unknown_prompt_tokens?: number };
+type UsageSummary = { calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; prompt_cache_hit_rate?: number | null; prompt_cache_miss_rate?: number | null; average_prompt_tokens?: number; average_completion_tokens?: number; cache_reported_calls?: number; cache_unknown_calls?: number; cache_unknown_prompt_tokens?: number };
+type VoiceInstallProgress = { status: string; stage: string; progress: number; summary: string; downloaded_mb: number; retryable: boolean; error?: string };
 type CollaborationOverview = { messages: CollaborationMessage[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; trace_runs?: TraceRun[]; usage?: UsageSummary & { by_agent_role?: Record<string, UsageSummary>; estimated_cost: number; currency: string; pricing_configured: boolean } };
 type PrefillResult = { insertion: string; document_hash: string; cursor_offset: number; confidence: string };
 type WorkspacePreset = "balanced" | "writing" | "planning" | "review";
@@ -2239,20 +2245,20 @@ type SettingsSection = "appearance" | "layout" | "models" | "creation" | "voice"
 const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string; note: string }> = [
   { id: "appearance", label: "外观", note: "主题、配色与密度" },
   { id: "layout", label: "布局", note: "面板、位置与宽度" },
-  { id: "models", label: "模型", note: "服务商、模型与密钥" },
+  { id: "models", label: "模型", note: "连接、参数与效率" },
   { id: "creation", label: "创作", note: "预设、询问与预填" },
   { id: "voice", label: "语音", note: "输入、朗读与设备" },
   { id: "context", label: "上下文", note: "预算与记忆检索" },
   { id: "review", label: "审查", note: "证据与核验方式" },
   { id: "learning", label: "学习", note: "本地反馈与内测数据" },
-  { id: "advanced", label: "高级", note: "角色参数与本机能力" },
+  { id: "advanced", label: "高级", note: "本机开发能力" },
 ];
 
 const AGENT_TUNING_META: Array<{ id: AgentRole; label: string; note: string }> = [
-  { id: "coordinator", label: "Coordinator", note: "理解需求、日常交流、拆解派工与汇总，不碰正文和正史。" },
-  { id: "writer", label: "Writer", note: "规划、起草与定点修订；默认保留更多表达空间。" },
-  { id: "reviewer", label: "Reviewer", note: "证据审查与篇章复核；默认更稳定、少发散。" },
-  { id: "memory_keeper", label: "Memory Keeper", note: "提取正史事实；默认最保守。" },
+  { id: "coordinator", label: "Coordinator", note: "理解、派工、汇总" },
+  { id: "writer", label: "Writer", note: "规划、起草、修订" },
+  { id: "reviewer", label: "Reviewer", note: "证据审查" },
+  { id: "memory_keeper", label: "Memory Keeper", note: "提取已接受正史" },
 ];
 
 function agentGenerationFromProvider(value: unknown): AgentGenerationProfiles {
@@ -2285,7 +2291,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   onSaved: (value: Record<string, unknown>) => void;
   onVoiceSaved: (settings: VoiceSettings, status: VoiceStatus) => void;
 }) {
-  const [form, setForm] = useState({ provider_kind: String(provider?.provider_kind || "deepseek"), api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), hook_strategy: String(provider?.hook_strategy || "most_chapters"), acceptance_confirmation_mode: String(provider?.acceptance_confirmation_mode || "per_chapter"), dialogue_history_mode: String(provider?.dialogue_history_mode || "auto"), dialogue_history_interval: Number(provider?.dialogue_history_interval || 1), dialogue_history_limit: Number(provider?.dialogue_history_limit || 100), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), context_budget_mode: String(provider?.context_budget_mode || "unified"), agent_context_budgets: agentContextBudgetsFromProvider(provider?.agent_context_budgets), max_output_tokens: Number(provider?.max_output_tokens || 16000), input_price_per_million: Number(provider?.input_price_per_million || 0), output_price_per_million: Number(provider?.output_price_per_million || 0), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_experience_detail: String(provider?.review_experience_detail || "standard"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), agent_generation: agentGenerationFromProvider(provider?.agent_generation) });
+  const [form, setForm] = useState({ provider_kind: String(provider?.provider_kind || "deepseek"), api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), hook_strategy: String(provider?.hook_strategy || "most_chapters"), chapter_length_tolerance: Number(provider?.chapter_length_tolerance || 0.2), acceptance_confirmation_mode: String(provider?.acceptance_confirmation_mode || "per_chapter"), dialogue_history_mode: String(provider?.dialogue_history_mode || "auto"), dialogue_history_interval: Number(provider?.dialogue_history_interval || 1), dialogue_history_limit: Number(provider?.dialogue_history_limit || 100), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), context_budget_mode: String(provider?.context_budget_mode || "unified"), agent_context_budgets: agentContextBudgetsFromProvider(provider?.agent_context_budgets), max_output_tokens: Number(provider?.max_output_tokens || 16000), input_price_per_million: Number(provider?.input_price_per_million || 0), output_price_per_million: Number(provider?.output_price_per_million || 0), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_experience_detail: String(provider?.review_experience_detail || "standard"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), agent_generation: agentGenerationFromProvider(provider?.agent_generation) });
   const [voiceForm, setVoiceForm] = useState<VoiceSettings>(voiceSettings || {
     voice_enabled: false, voice_input_enabled: true, voice_output_enabled: true, voice_auto_read: false, voice_auto_send: false,
     voice_default_profile: "narrator_female", voice_speed: 1, voice_volume: 1, voice_pause_scale: 1, voice_input_device: "", voice_output_device: "",
@@ -2307,6 +2313,8 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   const [qwenInstalling, setQwenInstalling] = useState(false);
   const [mossInstalling, setMossInstalling] = useState(false);
   const [voiceDeleting, setVoiceDeleting] = useState(false);
+  const [usageSummary, setUsageSummary] = useState<CollaborationOverview["usage"] | null>(null);
+  const [voiceInstallProgress, setVoiceInstallProgress] = useState<Record<"moss" | "qwen", VoiceInstallProgress | null>>({ moss: null, qwen: null });
   const settingsSaveInFlightRef = useRef(false);
   const voiceFormDirtyRef = useRef(false);
   const initialVoiceSettingsRef = useRef<VoiceSettings | null>(voiceSettings);
@@ -2317,6 +2325,51 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
       if (!learningSettingsDirtyRef.current) setLearningSettings(value);
     }).catch(() => undefined);
   }, [projectRoot]);
+  useEffect(() => {
+    if (!projectRoot) { setUsageSummary(null); return; }
+    void window.inkflow.request<CollaborationOverview["usage"]>("usage.overview", { project_root: projectRoot })
+      .then((value) => setUsageSummary(value || null))
+      .catch(() => setUsageSummary(null));
+  }, [projectRoot]);
+  useEffect(() => {
+    setVoiceInstallProgress({
+      moss: voiceStatus?.moss ? {
+        status: String(voiceStatus.moss.install_status || (voiceStatus.moss.installing ? "installing" : "idle")),
+        stage: String(voiceStatus.moss.install_stage || ""),
+        progress: Number(voiceStatus.moss.install_progress || 0),
+        summary: String(voiceStatus.moss.install_summary || ""),
+        downloaded_mb: Number(voiceStatus.moss.downloaded_mb || 0),
+        retryable: Boolean(voiceStatus.moss.retryable),
+        error: String(voiceStatus.moss.last_error || ""),
+      } : null,
+      qwen: voiceStatus?.qwen ? {
+        status: String(voiceStatus.qwen.install_status || (voiceStatus.qwen.installing ? "installing" : "idle")),
+        stage: String(voiceStatus.qwen.install_stage || ""),
+        progress: Number(voiceStatus.qwen.install_progress || 0),
+        summary: String(voiceStatus.qwen.install_summary || ""),
+        downloaded_mb: Number(voiceStatus.qwen.downloaded_mb || 0),
+        retryable: Boolean(voiceStatus.qwen.retryable),
+        error: String(voiceStatus.qwen.last_error || ""),
+      } : null,
+    });
+  }, [voiceStatus]);
+  useEffect(() => window.inkflow.onEvent((value) => {
+    const event = value as EngineEvent;
+    const component = event.component || event.type?.match(/^voice\.(moss|qwen)\./)?.[1];
+    if (component !== "moss" && component !== "qwen") return;
+    setVoiceInstallProgress((current) => ({
+      ...current,
+      [component]: {
+        status: String(event.status || (event.type?.endsWith("ready") ? "installed" : event.type?.includes("failed") ? "failed" : "installing")),
+        stage: String(event.stage || (event.type?.endsWith("ready") ? "ready" : current[component]?.stage || "dependencies")),
+        progress: Number(event.progress ?? (event.type?.endsWith("ready") ? 100 : current[component]?.progress || 0)),
+        summary: String(event.summary || current[component]?.summary || ""),
+        downloaded_mb: Number(event.downloaded_mb ?? current[component]?.downloaded_mb ?? 0),
+        retryable: Boolean(event.retryable ?? event.type?.includes("failed") ?? current[component]?.retryable ?? false),
+        error: event.error !== undefined ? String(event.error) : String(current[component]?.error || ""),
+      },
+    }));
+  }), []);
   useEffect(() => {
     // The initial voice request runs in the background. Do not replace a value
     // the user has already touched if that request finishes after the click.
@@ -2493,7 +2546,18 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
       setQwenInstalling(false);
     }
   };
-  return <Modal title="设置" subtitle="布局、外观、模型和创作参数集中在这里。外观与布局即时保存，模型参数点保存后生效。" onClose={onClose} className="settings-modal">
+  const refreshUsage = async () => {
+    if (!projectRoot) return;
+    try {
+      setUsageSummary(await window.inkflow.request<NonNullable<CollaborationOverview["usage"]>>("usage.overview", { project_root: projectRoot }));
+    } catch (cause) {
+      setError(errorMessage(cause));
+    }
+  };
+  const roleBudget = (role: AgentRole) => form.context_budget_mode === "custom"
+    ? form.agent_context_budgets[role]
+    : { soft: form.context_soft_tokens, hard: form.context_hard_tokens };
+  return <Modal title="设置" subtitle="选择左侧项目；复杂信息按需展开。" onClose={onClose} className="settings-modal">
     <form className="settings-shell" onSubmit={(event) => { event.preventDefault(); void persist(); }}>
       <aside className="settings-nav">
         <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索设置" aria-label="搜索设置" />
@@ -2511,12 +2575,18 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
           <div className={`provider-status ${provider?.api_key_configured ? "ready" : "missing"}`}><strong>{provider?.api_key_configured ? "模型密钥已保存" : "尚未保存模型密钥"}</strong><span>{provider?.api_key_configured ? `凭据来源：${credentialLabel(String(provider?.api_key_storage || ""))}` : "密钥只交给本机引擎，并保存在系统凭据库。"}</span></div>
           <div className="settings-fields"><label>模型名称<input list="provider-models" value={form.model} onChange={(event) => updateForm({ model: event.target.value })} placeholder="填写平台当前模型 ID" /><datalist id="provider-models">{[...PROVIDER_OPTIONS.flatMap((item) => Array.from(item.models)), ...remoteModels].map((model) => <option key={model} value={model} />)}</datalist></label><label>接口地址<input value={form.base_url} onChange={(event) => updateForm({ base_url: event.target.value })} /></label><label>更换密钥 <small>{provider?.api_key_configured ? "留空继续使用当前服务商的已有密钥" : "本机模型可以留空"}</small><input type="password" autoComplete="new-password" value={form.api_key} onChange={(event) => updateForm({ api_key: event.target.value })} placeholder="不会回显" /></label></div>
            <div className="settings-inline-actions"><button type="button" disabled={working} onClick={() => void saveModelSettings()}>保存并读取模型列表</button><span>先保存模型配置，再尝试读取列表；读取失败不会撤销已保存的 Key。</span></div>
+          <SettingGroup title="生成参数与实际效率" note="四个 Agent 分开设置；统计来自当前小说的真实调用。">
+            <div className="model-efficiency-head"><div><strong>{form.model || "未选择模型"}</strong><span>思考 {form.reasoning_effort} · 单次输出最多 {form.max_output_tokens.toLocaleString()} tokens</span></div><button type="button" disabled={!projectRoot} onClick={() => void refreshUsage()}>刷新统计</button></div>
+            <div className="settings-fields two"><label>单次输出上限 <small>最多 16,000 tokens</small><input type="number" min={1000} max={16000} step={500} value={form.max_output_tokens} onChange={(event) => updateForm({ max_output_tokens: Number(event.target.value) })} /></label><label>缓存解释<input readOnly value={form.provider_kind === "deepseek" ? "按相同输入前缀自动复用" : "按服务商返回值统计"} /></label></div>
+            <section className="agent-tuning compact">{AGENT_TUNING_META.map((meta) => { const values = form.agent_generation[meta.id]; const roleStats = usageSummary?.by_agent_role?.[meta.id]; const budget = roleBudget(meta.id); const hit = roleStats?.prompt_cache_hit_rate; const miss = typeof hit === "number" ? 1 - hit : null; return <details key={meta.id} open={meta.id === "writer"}><summary><span><strong>{meta.label}</strong><small>{meta.note}</small></span><span>{roleStats?.calls ? `${roleStats.calls} 次 · 命中 ${typeof hit === "number" ? `${(hit * 100).toFixed(1)}%` : "未报告"}` : "暂无调用"}</span></summary><div className="agent-efficiency-grid"><div><small>输入 / 输出</small><strong>{roleStats ? `${roleStats.prompt_tokens.toLocaleString()} / ${roleStats.completion_tokens.toLocaleString()}` : "—"}</strong></div><div><small>命中 / 未命中</small><strong>{roleStats && typeof hit === "number" ? `${(hit * 100).toFixed(1)}% / ${((miss || 0) * 100).toFixed(1)}%` : "服务商未报告"}</strong></div><div><small>上下文预算</small><strong>{`${Math.round(budget.soft / 1000)}k / ${Math.round(budget.hard / 1000)}k`}</strong></div><div><small>平均输出</small><strong>{roleStats?.calls ? `${Math.round(roleStats.completion_tokens / roleStats.calls).toLocaleString()} tokens` : "—"}</strong></div></div><div className="agent-tuning-grid"><label>温度 <small>0～2</small><input type="number" min={0} max={2} step={0.05} value={values.temperature} onChange={(event) => updateAgentGeneration(meta.id, { temperature: Number(event.target.value) })} /></label><label>Top P <small>0.01～1</small><input type="number" min={0.01} max={1} step={0.01} value={values.top_p} onChange={(event) => updateAgentGeneration(meta.id, { top_p: Number(event.target.value) })} /></label><label>Top K <small>接口支持时发送</small><input type="number" min={1} max={200} step={1} value={values.top_k ?? ""} placeholder="自动" onChange={(event) => updateAgentGeneration(meta.id, { top_k: event.target.value === "" ? null : Number(event.target.value) })} /></label></div><button type="button" className="text-button" onClick={() => updateAgentGeneration(meta.id, DEFAULT_AGENT_GENERATION[meta.id])}>恢复该 Agent 默认值</button></details>; })}</section>
+            <p className="form-hint">温度和 Top P 影响输出取样，不改变输入缓存是否命中。缓存要靠相同前缀复用；墨流会把稳定规则放在前面，把本章任务放在末尾。未报告缓存数据的调用不会被误算成 0%。</p>
+          </SettingGroup>
           <SettingGroup title="费用估算" note="按服务商账单货币填写；留 0 时只统计 Token，不猜价格。"><div className="settings-fields two"><label>输入单价 / 百万 Token<input type="number" min={0} step={0.01} value={form.input_price_per_million} onChange={(event) => updateForm({ input_price_per_million: Number(event.target.value) })} /></label><label>输出单价 / 百万 Token<input type="number" min={0} step={0.01} value={form.output_price_per_million} onChange={(event) => updateForm({ output_price_per_million: Number(event.target.value) })} /></label></div></SettingGroup>
         </SettingsPane>}
         {section === "creation" && <SettingsPane title="创作" note="预设会同时调整上下文、询问策略、审查模式和四个角色的生成参数。">
           <div className="preset-grid">{SETTINGS_PRESETS.map((preset) => <button type="button" key={preset.id} className={activePreset === preset.id ? "active" : ""} onClick={() => applyCreationPreset(preset)}><strong>{activePreset === preset.id ? "✓ " : ""}{preset.name}</strong><span>{preset.note}</span><small>{preset.context_soft_tokens / 10000} 万常用上下文</small></button>)}</div>
           <div className="settings-fields two"><label>思考强度<select value={form.reasoning_effort} onChange={(event) => updateForm({ reasoning_effort: event.target.value })}><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最高</option></select></label><label>主动询问<select value={form.inquiry_frequency} onChange={(event) => updateForm({ inquiry_frequency: event.target.value })}><option value="low">只问必需信息</option><option value="medium">把握较低时询问</option><option value="high">重要创作分岔也询问</option><option value="ultra">有明显未知项就询问</option></select></label></div>
-          <SettingGroup title="章节结尾策略" note="控制规划和 Writer 的默认力度；章节卡、正史与当前指令仍然优先。"><label>钩子密度<select value={form.hook_strategy} onChange={(event) => updateForm({ hook_strategy: event.target.value })}><option value="most_chapters">大多数章节保留前向期待（默认）</option><option value="key_chapters">重点章节使用明确钩子</option><option value="natural_afterglow">自然余味优先</option></select></label><p className="form-hint">普通剧情可以用未完成行动、关系变化、信息差或情绪余波，不会被强行改成反转或危险悬念。</p></SettingGroup>
+          <SettingGroup title="章节控制"><div className="settings-fields two"><label>结尾钩子<select value={form.hook_strategy} onChange={(event) => updateForm({ hook_strategy: event.target.value })}><option value="most_chapters">大多数章节保留期待</option><option value="key_chapters">重点章节使用明确钩子</option><option value="natural_afterglow">自然余味优先</option></select></label><label>字数容差 <small>上下 {(form.chapter_length_tolerance * 100).toFixed(0)}%</small><input type="range" min={0.1} max={1} step={0.05} value={form.chapter_length_tolerance} onChange={(event) => updateForm({ chapter_length_tolerance: Number(event.target.value) })} /></label></div><p className="form-hint">默认上下 20%，可调 10%～100%。例如目标 3000 字、20% 容差时，可接受约 2400～3600 字。</p></SettingGroup>
           <SettingGroup title="验收确认策略" note="只改变何时取得你的授权；Reviewer 当前版本通过、正文哈希和 Memory Keeper 事务门禁始终保留。"><label>确认方式<select value={form.acceptance_confirmation_mode} onChange={(event) => updateForm({ acceptance_confirmation_mode: event.target.value })}><option value="per_chapter">逐章确认（默认）</option><option value="batch_once">批次提交前确认一次</option><option value="auto_after_review">Reviewer 通过后自动验收</option></select></label><p className="form-hint">“自动验收”只在你主动发起审查且当前版本通过时生效；只生成草稿不会提交正史。切换设置只影响之后的操作。</p></SettingGroup>
           <SettingGroup title="预填续写" note="启用后，编辑停顿会调用当前 Writer 模型，因此可能产生费用。"><label className="setting-check"><input type="checkbox" checked={preferences.prefillEnabled} onChange={(event) => updatePreferences({ prefillEnabled: event.target.checked })} />允许在编辑器中手动开启灰字预填候选</label><div className="settings-fields two"><label>等待时间 <small>{preferences.prefillDelayMs} 毫秒</small><input type="range" min="300" max="3000" step="100" value={preferences.prefillDelayMs} onChange={(event) => updatePreferences({ prefillDelayMs: Number(event.target.value) })} /></label><label>候选长度<select value={preferences.prefillLength} onChange={(event) => updatePreferences({ prefillLength: event.target.value as PrefillLength })}><option value="short">短句</option><option value="medium">一小段</option><option value="long">长段落</option></select></label></div></SettingGroup>
           <SettingGroup title="智能提示词" note="输入框上方的快捷按钮会按最近对话和项目阶段实时预测你下一步想说的话。"><label className="setting-check"><input type="checkbox" checked={preferences.suggestedPromptsEnabled} onChange={(event) => updatePreferences({ suggestedPromptsEnabled: event.target.checked })} />显示预测的下一步提示词 <small>每轮对话后会调用一次模型预测，可能产生少量费用；关闭后隐藏整行快捷按钮</small></label></SettingGroup>
@@ -2529,8 +2599,8 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
           <SettingGroup title="设备偏好" note="不选择时使用 Windows 默认设备。"><div className="settings-inline-actions"><button type="button" onClick={() => void refreshVoiceDevices()}>读取可用设备</button><span>首次读取会触发系统麦克风权限提示。</span></div><div className="settings-fields two"><label>麦克风<select value={voiceForm.voice_input_device} onChange={(event) => updateVoiceForm({ voice_input_device: event.target.value })}><option value="">Windows 默认麦克风</option>{voiceDevices.filter((item) => item.kind === "audioinput").map((item, index) => <option value={item.deviceId} key={item.deviceId}>{item.label || `麦克风 ${index + 1}`}</option>)}</select></label><label>播放设备<select value={voiceForm.voice_output_device} onChange={(event) => updateVoiceForm({ voice_output_device: event.target.value })}><option value="">Windows 默认扬声器</option>{voiceDevices.filter((item) => item.kind === "audiooutput").map((item, index) => <option value={item.deviceId} key={item.deviceId}>{item.label || `扬声器 ${index + 1}`}</option>)}</select></label></div></SettingGroup>
           <p className="form-hint">旧 sherpa 和 Kokoro 组件已从本机移除；当前版本只提供 MOSS 本地朗读，语音输入暂不可用。录音、声音档案和听读结果保留。</p>
           {voiceStatus?.migration?.errors?.length ? <p className="form-error">旧语音资源清理未完成：{voiceStatus.migration.errors.join("；")} 下次启动会重试。</p> : null}
-          <SettingGroup title="MOSS 标准组件（默认）" note="日常朗读默认使用 MOSS-TTS-Nano 100M ONNX；依赖和模型只在你点击安装时下载。"><div className="settings-inline-actions"><button type="button" disabled={mossInstalling || voiceDeleting || Boolean(voiceStatus?.moss?.tts_ready)} onClick={() => void installMoss()}>{mossInstalling ? "正在安装 MOSS…" : voiceStatus?.moss?.tts_ready ? "MOSS 已就绪" : "安装 MOSS"}</button><button type="button" className="danger" disabled={mossInstalling || voiceDeleting || !voiceStatus?.moss?.model_size_mb} onClick={() => void deleteVoiceComponent("moss")}>删除 MOSS</button><span>{voiceStatus?.moss?.model_size_mb ? `已占用 ${voiceStatus.moss.model_size_mb.toFixed(1)}MB` : "只在你点击后下载，不会随保存设置自动执行。"}</span></div>{voiceStatus?.moss?.last_error && <p className="form-error">MOSS：{voiceStatus.moss.last_error}</p>}</SettingGroup>
-          <SettingGroup title="Qwen 高品质组件（可选）" note="Qwen3-TTS 1.7B：预设朗读与授权克隆，两套模型合计约 9.2GB，依赖另计。安装不自动切换默认引擎。"><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_engine === "qwen"} disabled={!voiceStatus?.qwen?.installed || voiceDeleting} onChange={(event) => updateVoiceForm({ voice_engine: event.target.checked ? "qwen" : "moss" })} />使用 Qwen 高品质模式</label><div className="settings-inline-actions"><button type="button" disabled={qwenInstalling || voiceDeleting || Boolean(voiceStatus?.qwen?.installed && voiceStatus?.qwen?.models_ready)} onClick={() => void installQwen()}>{qwenInstalling ? "正在安装并适配 Qwen…" : voiceStatus?.qwen?.installed ? voiceStatus.qwen.models_ready ? "Qwen 已就绪" : "重新准备 Qwen 模型" : "安装 Qwen 并一键适配"}</button><button type="button" className="danger" disabled={qwenInstalling || voiceDeleting || Boolean(voiceStatus?.qwen?.installing) || !voiceStatus?.qwen || (!voiceStatus.qwen.package_size_mb && !voiceStatus.qwen.model_size_mb)} onClick={() => void deleteVoiceComponent("qwen")}>删除 Qwen</button><span>{voiceStatus?.qwen?.installed ? `组件 ${voiceStatus.qwen.package_size_mb.toFixed(1)}MB · 模型 ${voiceStatus.qwen.model_size_mb.toFixed(1)}MB` : `预计依赖约 ${(voiceStatus?.qwen?.estimated_dependency_download_mb || 7000) / 1000}GB，模型另计`}</span></div>{voiceStatus?.qwen?.last_error && <p className="form-error">{voiceStatus.qwen.last_error}</p>}{!voiceStatus?.qwen?.python_available && !voiceStatus?.qwen?.installed && <p className="form-hint">当前安装包没有找到 Python。安装 Qwen 需要本机有 Python 3.12/3.13，或设置 INKFLOW_PYTHON 指向 python.exe。</p>}</SettingGroup>
+          <SettingGroup title="MOSS 标准组件（默认）" note="点击安装后在这里显示依赖、模型、完成或失败四种状态。"><div className="settings-inline-actions"><button type="button" disabled={mossInstalling || voiceDeleting || Boolean(voiceStatus?.moss?.tts_ready)} onClick={() => void installMoss()}>{mossInstalling ? "安装中…" : voiceStatus?.moss?.tts_ready ? "MOSS 已就绪" : voiceInstallProgress.moss?.retryable ? "重新安装 MOSS" : "安装 MOSS"}</button><button type="button" className="danger" disabled={mossInstalling || voiceDeleting || !voiceStatus?.moss?.model_size_mb} onClick={() => void deleteVoiceComponent("moss")}>删除 MOSS</button><span>{voiceStatus?.moss?.model_size_mb ? `已占用 ${voiceStatus.moss.model_size_mb.toFixed(1)}MB` : "预计下载约 2.7GB"}</span></div><VoiceInstallProgressCard value={voiceInstallProgress.moss} />{voiceStatus?.moss?.last_error && !voiceInstallProgress.moss?.summary && <p className="form-error">{voiceStatus.moss.last_error}</p>}</SettingGroup>
+          <SettingGroup title="Qwen 高品质组件（可选）" note="安装不改变默认引擎；准备完成后再手动切换。"><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_engine === "qwen"} disabled={!voiceStatus?.qwen?.installed || voiceDeleting} onChange={(event) => updateVoiceForm({ voice_engine: event.target.checked ? "qwen" : "moss" })} />使用 Qwen 高品质模式</label><div className="settings-inline-actions"><button type="button" disabled={qwenInstalling || voiceDeleting || Boolean(voiceStatus?.qwen?.installed && voiceStatus?.qwen?.models_ready)} onClick={() => void installQwen()}>{qwenInstalling ? "安装中…" : voiceStatus?.qwen?.installed ? voiceStatus.qwen.models_ready ? "Qwen 已就绪" : "继续准备模型" : voiceInstallProgress.qwen?.retryable ? "重新安装 Qwen" : "安装 Qwen"}</button><button type="button" className="danger" disabled={qwenInstalling || voiceDeleting || Boolean(voiceStatus?.qwen?.installing) || !voiceStatus?.qwen || (!voiceStatus.qwen.package_size_mb && !voiceStatus.qwen.model_size_mb)} onClick={() => void deleteVoiceComponent("qwen")}>删除 Qwen</button><span>{voiceStatus?.qwen?.installed ? `组件 ${voiceStatus.qwen.package_size_mb.toFixed(1)}MB · 模型 ${voiceStatus.qwen.model_size_mb.toFixed(1)}MB` : "预计依赖 7GB，模型 9.2GB"}</span></div><VoiceInstallProgressCard value={voiceInstallProgress.qwen} />{voiceStatus?.qwen?.last_error && !voiceInstallProgress.qwen?.summary && <p className="form-error">{voiceStatus.qwen.last_error}</p>}{!voiceStatus?.qwen?.python_available && !voiceStatus?.qwen?.installed && <p className="form-hint">未找到可用 Python，请安装 Python 3.12/3.13 或设置 INKFLOW_PYTHON。</p>}</SettingGroup>
           <SettingGroup title="声音调试与资源" note="这些参数只影响本机音频生成，不修改正文或正史。"><div className="settings-fields two"><label>输出采样率<select value={voiceForm.voice_sample_rate} onChange={(event) => updateVoiceForm({ voice_sample_rate: Number(event.target.value) })}><option value={16000}>16 kHz（省空间）</option><option value={22050}>22.05 kHz</option><option value={24000}>24 kHz（推荐）</option><option value={44100}>44.1 kHz（更大文件）</option><option value={48000}>48 kHz（更大文件）</option></select></label><label>每段最多字数 <small>{voiceForm.voice_segment_chars} 字</small><input type="range" min="120" max="800" step="20" value={voiceForm.voice_segment_chars} onChange={(event) => updateVoiceForm({ voice_segment_chars: Number(event.target.value) })} /></label><label>短音频缓存 <small>{voiceForm.voice_cache_limit_mb} MB</small><input type="range" min="128" max="4096" step="128" value={voiceForm.voice_cache_limit_mb} onChange={(event) => updateVoiceForm({ voice_cache_limit_mb: Number(event.target.value) })} /></label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_debug} onChange={(event) => updateVoiceForm({ voice_debug: event.target.checked })} />开启语音调试日志 <small>只记录运行状态，不记录录音内容</small></label></div><p className="form-hint">分段越短越容易暂停和恢复，但文件数量会增加；缓存达到上限时会自动清理最早的短音频。</p></SettingGroup>
           <details className="voice-technical"><summary>组件与模型信息</summary><p>当前引擎：{voiceForm.voice_engine}</p><p>默认朗读：MOSS · {voiceForm.voice_light_tts_model}</p><p>Qwen 预设：{voiceForm.voice_tts_model}</p><p>声音克隆：Qwen3-TTS · {voiceForm.voice_clone_model}</p><p>语音输入：sherpa 已移除（当前不可用）</p><p>本地目录：{voiceStatus?.data_root || "尚未读取"}</p></details>
         </SettingsPane>}
@@ -2547,10 +2617,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
           <SettingGroup title="内测训练数据" note="默认关闭"><label className="setting-check"><input type="checkbox" disabled={!projectRoot} checked={learningSettings.allow_training_exports} onChange={(event) => updateLearningSettings({ allow_training_exports: event.target.checked })} />允许从这个项目导出本地训练数据</label><p className="form-hint">外部参考默认排除，只使用本项目可复核事件；LoRA/DPO 只生成待确认训练单，实际训练仍需再次确认资源影响。</p></SettingGroup>
           <SettingGroup title="本地学习工具" note="不会自动上传"><div className="settings-inline-actions"><button type="button" disabled={!projectRoot} onClick={async () => { try { await window.inkflow.request("learning.settings.update", { project_root: projectRoot, ...learningSettings }); const value = await window.inkflow.request<{ export_id: string; records: number }>("learning.dataset.export", { project_root: projectRoot, include_prose: false }); setTrainingExportId(value.export_id); setLearningNotice(`已导出 ${value.records} 条结构化反馈，不含正文`); } catch (cause) { setError(errorMessage(cause)); } }}>导出结构化反馈</button><button type="button" disabled={!projectRoot} onClick={async () => { try { const value = await window.inkflow.request<{ pairs: number }>("learning.preference.train", { project_root: projectRoot }); setLearningNotice(`本地偏好排序器已更新：${value.pairs} 组比较`); } catch (cause) { setError(errorMessage(cause)); } }}>更新偏好排序器</button></div><div className="settings-fields two"><label>训练方式<select value={trainingMethod} onChange={(event) => setTrainingMethod(event.target.value as "lora" | "dpo")}><option value="lora">LoRA</option><option value="dpo">DPO</option></select></label><label>本地基础模型路径<input value={baseModelPath} onChange={(event) => setBaseModelPath(event.target.value)} placeholder="只接受本机已存在路径" /></label></div><button type="button" disabled={!projectRoot || !trainingExportId || !baseModelPath} onClick={async () => { try { const value = await window.inkflow.request<{ confirmation_token: string }>("learning.training.prepare", { project_root: projectRoot, export_id: trainingExportId, base_model_path: baseModelPath, training_method: trainingMethod }); setLearningNotice(`训练单已准备，尚未运行。确认码：${value.confirmation_token}`); } catch (cause) { setError(errorMessage(cause)); } }}>准备训练单</button>{learningNotice && <p className="form-success">{learningNotice}</p>}</SettingGroup>
         </SettingsPane>}
-        {section === "advanced" && <SettingsPane title="高级" note="创作预设已经覆盖常见情况；这里只处理单个角色的细调。">
-          <div className="agent-tuning-notice">temperature 与 top_p 会按角色发送；Top K 默认留空。Reviewer 和 Memory Keeper 应保持低随机性。</div>
-          <section className="agent-tuning">{AGENT_TUNING_META.map((meta) => { const values = form.agent_generation[meta.id]; return <article key={meta.id}><header><div><strong>{meta.label}</strong><small>{meta.note}</small></div><button type="button" onClick={() => updateAgentGeneration(meta.id, DEFAULT_AGENT_GENERATION[meta.id])}>恢复默认</button></header><div className="agent-tuning-grid"><label>温度 <small>0～2</small><input type="number" min={0} max={2} step={0.05} value={values.temperature} onChange={(event) => updateAgentGeneration(meta.id, { temperature: Number(event.target.value) })} /></label><label>Top P <small>0.01～1</small><input type="number" min={0.01} max={1} step={0.01} value={values.top_p} onChange={(event) => updateAgentGeneration(meta.id, { top_p: Number(event.target.value) })} /></label><label>Top K <small>自动或 1～200</small><input type="number" min={1} max={200} step={1} value={values.top_k ?? ""} placeholder="自动" onChange={(event) => updateAgentGeneration(meta.id, { top_k: event.target.value === "" ? null : Number(event.target.value) })} /></label></div></article>; })}</section>
-          <SettingGroup title="语音高级参数" note="与语音页共用同一份设置；保存时会单独写入本地语音设置。"><div className="settings-fields two"><label>语音引擎<select value={voiceForm.voice_engine} onChange={(event) => updateVoiceForm({ voice_engine: event.target.value as VoiceSettings["voice_engine"] })}><option value="moss">MOSS（默认）</option><option value="qwen" disabled={!voiceStatus?.qwen?.installed}>Qwen（需先安装）</option></select></label><label>计算设备<select value={voiceForm.voice_compute_device} onChange={(event) => updateVoiceForm({ voice_compute_device: event.target.value as VoiceSettings["voice_compute_device"] })}><option value="auto">自动（优先 CUDA）</option><option value="cpu">CPU</option><option value="cuda">NVIDIA CUDA</option></select></label><label>语速 <small>0.75～1.35</small><input type="number" min={0.75} max={1.35} step={0.05} value={voiceForm.voice_speed} onChange={(event) => updateVoiceForm({ voice_speed: Number(event.target.value) })} /></label><label>音量 <small>0.25～1.5</small><input type="number" min={0.25} max={1.5} step={0.05} value={voiceForm.voice_volume} onChange={(event) => updateVoiceForm({ voice_volume: Number(event.target.value) })} /></label><label>自然停顿 <small>0.6～1.8</small><input type="number" min={0.6} max={1.8} step={0.1} value={voiceForm.voice_pause_scale} onChange={(event) => updateVoiceForm({ voice_pause_scale: Number(event.target.value) })} /></label><label>输出采样率<select value={voiceForm.voice_sample_rate} onChange={(event) => updateVoiceForm({ voice_sample_rate: Number(event.target.value) })}><option value={16000}>16 kHz</option><option value={22050}>22.05 kHz</option><option value={24000}>24 kHz</option><option value={44100}>44.1 kHz</option><option value={48000}>48 kHz（MOSS原生）</option></select></label><label>外层分段长度 <small>{voiceForm.voice_segment_chars} 字</small><input type="number" min={120} max={800} step={20} value={voiceForm.voice_segment_chars} onChange={(event) => updateVoiceForm({ voice_segment_chars: Number(event.target.value) })} /></label><label>短音频缓存 <small>{voiceForm.voice_cache_limit_mb} MB</small><input type="number" min={128} max={4096} step={128} value={voiceForm.voice_cache_limit_mb} onChange={(event) => updateVoiceForm({ voice_cache_limit_mb: Number(event.target.value) })} /></label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_debug} onChange={(event) => updateVoiceForm({ voice_debug: event.target.checked })} />开启语音调试日志</label></div><div className="settings-inline-actions"><button type="button" onClick={() => updateVoiceForm({ voice_engine: "moss", voice_compute_device: "auto", voice_speed: 1, voice_volume: 1, voice_pause_scale: 1, voice_sample_rate: 24000, voice_segment_chars: 360, voice_cache_limit_mb: 1024, voice_debug: false })}>恢复默认语音参数</button><span>逐句拆分由 MOSS 运行时内部处理，外层分段只影响任务进度与恢复粒度。</span></div></SettingGroup>
+        {section === "advanced" && <SettingsPane title="高级" note="普通创作不需要修改这里。模型参数已归到模型页，语音参数只在语音页出现一次。">
           <SettingGroup title="本机 PowerShell" note="默认关闭。"><label className="setting-check"><input type="checkbox" checked={form.powershell_enabled} onChange={(event) => updateForm({ powershell_enabled: event.target.checked })} />允许墨流工具在当前小说项目目录内执行 PowerShell</label></SettingGroup>
         </SettingsPane>}
       </div>
@@ -2565,6 +2632,12 @@ function SettingsPane({ title, note, children }: { title: string; note: string; 
 
 function SettingGroup({ title, note, children }: { title: string; note?: string; children: ReactNode }) {
   return <section className="setting-group"><header><strong>{title}</strong>{note && <small>{note}</small>}</header>{children}</section>;
+}
+
+function VoiceInstallProgressCard({ value }: { value: VoiceInstallProgress | null }) {
+  if (!value || (!value.summary && value.status === "idle")) return null;
+  const stage = ({ dependencies: "安装依赖", retrying: "自动重试", models: "下载模型", ready: "安装完成", failed: "安装失败" } as Record<string, string>)[value.stage] || value.stage || "准备中";
+  return <div className={`voice-install-progress ${value.status}`}><header><strong>{stage}</strong><span>{Math.max(0, Math.min(100, value.progress)).toFixed(0)}%</span></header><div><i style={{ width: `${Math.max(0, Math.min(100, value.progress))}%` }} /></div><p>{value.error || value.summary}{value.downloaded_mb > 0 ? ` · 当前写入约 ${value.downloaded_mb.toFixed(0)}MB` : ""}</p>{value.status === "failed" && <small>{value.retryable ? "可以直接点击重新安装，稳定缓存会复用已经下载的文件。" : "请根据上方原因处理后再试。"}</small>}</div>;
 }
 
 function WorkspaceLayoutPane({ layout, onChange, onPreset, onReset }: { layout: WorkspaceLayout; onChange: (change: Partial<WorkspaceLayout>) => void; onPreset: (preset: WorkspacePreset) => void; onReset: () => void }) {
@@ -2809,8 +2882,13 @@ function isSensitivePresentationKey(key: string): boolean {
     || normalized === "thinking";
 }
 function errorMessage(cause: unknown): string {
-  const message = cause instanceof Error ? cause.message : String(cause);
+  const message = (cause instanceof Error ? cause.message : String(cause))
+    .replace(/^Error invoking remote method ['"]engine:request['"]:\s*Error:\s*/i, "")
+    .replace(/^Error:\s*/i, "")
+    .trim();
   if (/影响：/.test(message) && /下一步：/.test(message)) return message;
+  if (/pip-unpack|No such file or directory.*\.whl|临时目录中的下载文件/.test(message)) return "语音组件安装时，Windows 临时下载文件失效。墨流已清理本次暂存目录；请回到语音设置点击重新安装，稳定缓存会复用已下载文件。";
+  if (/MOSS|Qwen|语音组件|依赖安装|模型下载/.test(message)) return `${message}\n已有录音、声音档案和生成音频不会被删除。请在语音设置查看进度或重试。`;
   if (/API Key|密钥|模型接口|服务商/.test(message)) return `${message}\n影响：当前模型任务未完成，小说文件和正史未改变。下一步：打开设置检查服务商、模型名称和密钥。`;
   if (/版本|哈希|正文已变化|重新审查/.test(message)) return `${message}\n影响：系统已停止使用旧审查或旧正文继续提交。已保存：当前草稿版本仍在。下一步：打开当前章重新审查，再决定是否验收。`;
   if (/章节卡|尚未生成.*规划|缺少.*规划/.test(message)) return `${message}\n影响：Writer 没有可靠的章节约束，因此没有继续写作。下一步：先生成或补齐当前篇章规划。`;
