@@ -22,8 +22,9 @@ $env:PATH = "$systemPowerShellDirectory;$system32Directory;$env:PATH"
 
 $desktopVersion = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $repositoryRoot 'desktop\package.json') | ConvertFrom-Json).version
 $agentVersion = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $agentRoot 'pyproject.toml') | Select-String -Pattern 'version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
-if (-not $desktopVersion -or $desktopVersion -ne $agentVersion) {
-    throw "Desktop and agent versions must match before publishing: desktop=$desktopVersion agent=$agentVersion."
+$extensionVersion = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $repositoryRoot 'extension\package.json') | ConvertFrom-Json).version
+if (-not $desktopVersion -or $desktopVersion -ne $agentVersion -or $desktopVersion -ne $extensionVersion) {
+    throw "Desktop, agent and extension versions must match before publishing: desktop=$desktopVersion agent=$agentVersion extension=$extensionVersion."
 }
 
 if (-not (Test-Path -LiteralPath $python)) {
@@ -119,4 +120,4 @@ finally {
 }
 
 $extensionNote = if ($IncludeExtension) { ' and artifacts\extension' } else { '' }
-Write-Host ('InkFlow desktop {0} build completed: artifacts\desktop{1}.' -f $desktopVersion, $extensionNote)
+Write-Host ('InkFlow {0} build completed: artifacts\desktop{1}.' -f $desktopVersion, $extensionNote)

@@ -34,9 +34,10 @@ jobs:
         run: |
           $desktopVersion = (Get-Content -Raw -LiteralPath ./desktop/package.json | ConvertFrom-Json).version
           $agentVersion = (Get-Content -Raw -LiteralPath ./agent/pyproject.toml | Select-String -Pattern 'version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+          $extensionVersion = (Get-Content -Raw -LiteralPath ./extension/package.json | ConvertFrom-Json).version
           $tagVersion = $env:RELEASE_TAG -replace '^v', ''
-          if ($desktopVersion -ne $agentVersion -or $tagVersion -ne $desktopVersion) {
-            throw "Release tag and package versions must match: tag=$tagVersion desktop=$desktopVersion agent=$agentVersion"
+          if ($desktopVersion -ne $agentVersion -or $desktopVersion -ne $extensionVersion -or $tagVersion -ne $desktopVersion) {
+            throw "Release tag and package versions must match: tag=$tagVersion desktop=$desktopVersion agent=$agentVersion extension=$extensionVersion"
           }
 
       - name: Build local engine

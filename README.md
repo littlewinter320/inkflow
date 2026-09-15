@@ -10,7 +10,7 @@
   <a href="https://github.com/littlewinter320/inkflow/issues">反馈问题</a>
 </p>
 
-当前版本：**0.6.5**。Windows 安装包、差分更新文件和完整更新说明都放在 [GitHub Releases](https://github.com/littlewinter320/inkflow/releases/latest)；源码版本、Release 标签和安装包版本保持一致。
+当前版本：**0.6.5**。Windows 安装包、VS Code 扩展、差分更新文件和完整更新说明都放在 [GitHub Releases](https://github.com/littlewinter320/inkflow/releases/latest)；源码、桌面端、Agent 引擎、扩展、Release 标签和安装包版本保持一致。
 
 ## 目录
 
