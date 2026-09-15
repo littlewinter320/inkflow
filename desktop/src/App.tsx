@@ -90,6 +90,7 @@ type EngineEvent = {
   };
 };
 type Message = { id: string; role: "user" | "assistant" | "system"; text: string; details?: string; reasoning?: string[]; animate?: boolean; createdAt?: string };
+type CoordinatorNextStep = { label: string; reason: string; prompt: string };
 type ConversationHistoryEntry = { id: string; user: string; assistant: string; action_note: string; recorded_at: string };
 type SuggestedPromptItem = { label: string; prompt: string };
 
@@ -97,6 +98,7 @@ type SuggestedPromptItem = { label: string; prompt: string };
 const defaultSuggestedPrompts: SuggestedPromptItem[] = [
   { label: "先问我", prompt: "先不要执行任务。请根据当前项目状态和最近讨论，用选项卡主动问我一到三个最值得确认、容易回答的问题。" },
   { label: "规划当前篇章", prompt: "帮我规划当前篇章" },
+  { label: "生成独立大纲", prompt: "生成第 1 到第 10 章的独立大纲" },
   { label: "写当前章", prompt: "写当前章的草稿，先不要审查" },
   { label: "审查当前章", prompt: "审查当前章" },
   { label: "查看状态", prompt: "查看当前项目状态" },
@@ -340,6 +342,11 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [projectLoading, setProjectLoading] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const activeRunIdRef = useRef<string | null>(null);
+  const projectRootRef = useRef("");
+  const projectOpenRequestRef = useRef(0);
+  const pendingChatRef = useRef<string[]>([]);
+  const cancelRequestedRef = useRef(false);
   const [mascotMood, setMascotMood] = useState<MascotMood>("idle");
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>(loadRecentProjects);
   const [notice, setNotice] = useState("");
@@ -350,6 +357,7 @@ function App() {
   const [showSearch, setShowSearch] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [pendingQuestions, setPendingQuestions] = useState<QuestionCard[]>([]);
+  const [nextGuide, setNextGuide] = useState<CoordinatorNextStep | null>(null);
   const [selectionDraft, setSelectionDraft] = useState<SelectionDraft | null>(null);
   const [mascotSpeech, setMascotSpeech] = useState("我在。先说今天想推进哪一步。");
   const [searchResult, setSearchResult] = useState<Record<string, unknown> | null>(null);
@@ -377,6 +385,7 @@ function App() {
   const [suggestedPrompts, setSuggestedPrompts] = useState<SuggestedPromptItem[]>(defaultSuggestedPrompts);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
   const voiceLiveTimerRef = useRef<number | null>(null);
   const voiceLiveBusyRef = useRef(false);
   const voiceRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
@@ -387,6 +396,9 @@ function App() {
   const resizeRef = useRef<{ target: WorkspaceResizeTarget; startX: number; startWidth: number; direction: 1 | -1 } | null>(null);
   const voiceRecorderRef = useRef<LocalWavRecorder | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => { activeRunIdRef.current = activeRunId; }, [activeRunId]);
+  useEffect(() => { projectRootRef.current = projectRoot; }, [projectRoot]);
 
   useEffect(() => () => {
     audioRef.current?.pause();
@@ -469,6 +481,7 @@ function App() {
         }),
         window.inkflow.request<CollaborationOverview>("collaboration.overview", { project_root: root }),
       ]);
+      if (root !== projectRootRef.current && projectRootRef.current) return;
       setDashboard(opened.dashboard);
       setTree(opened.tree);
       setCollaboration(overview);
@@ -478,10 +491,13 @@ function App() {
   );
 
   const openProject = useCallback(async (root: string, options: { optimistic?: boolean } = {}) => {
+    const requestId = ++projectOpenRequestRef.current;
     setError("");
-    setBusy(true);
     setProjectLoading(true);
-    if (options.optimistic) setProjectRoot(root);
+    if (options.optimistic) {
+      setProjectRoot(root);
+      projectRootRef.current = root;
+    }
     setMascotMood("thinking");
     try {
       const [opened, history, overview] = await Promise.all([
@@ -489,7 +505,9 @@ function App() {
         window.inkflow.request<{ entries: ConversationHistoryEntry[] }>("conversation.history", { project_root: root, limit: 100 }),
         window.inkflow.request<CollaborationOverview>("collaboration.overview", { project_root: root }),
       ]);
+      if (requestId !== projectOpenRequestRef.current) return;
       setProjectRoot(root);
+      projectRootRef.current = root;
       setDashboard(opened.dashboard);
       setTree(opened.tree);
       setCollaboration(overview);
@@ -515,13 +533,13 @@ function App() {
       ]);
       setMascotMood("success");
     } catch (cause) {
+      if (requestId !== projectOpenRequestRef.current) return;
       setError(errorMessage(cause));
       setMascotMood("rest");
       if (options.optimistic) setProjectRoot("");
       localStorage.removeItem("inkflow.lastProject");
     } finally {
-      setBusy(false);
-      setProjectLoading(false);
+      if (requestId === projectOpenRequestRef.current) setProjectLoading(false);
     }
   }, []);
 
@@ -971,11 +989,21 @@ function App() {
       setPromptUndo(null);
       setMessages((items) => [...items, { id: crypto.randomUUID(), role: "user", text: message, createdAt: queuedAt }]);
       setMascotMood("waiting");
-      if (activeRunId) {
+      const runningId = activeRunIdRef.current;
+      if (runningId) {
         setNotice("\u5df2\u53d1\u51fa\u8fd0\u884c\u4e2d\u5f15\u5bfc\u3002\u5f53\u524d\u4efb\u52a1\u4f1a\u5728\u5b89\u5168\u8282\u70b9\u8bfb\u53d6\u5b83\uff1b\u4f60\u53ef\u4ee5\u7ee7\u7eed\u8f93\u5165\u4e0b\u4e00\u6761\uff0c\u4e0d\u9700\u8981\u518d\u6b21\u786e\u8ba4\u3002");
-        void window.inkflow.request<{ accepted: boolean; reason?: string }>("run.steer", { run_id: activeRunId, message }).then((result) => {
+        void window.inkflow.request<{ accepted: boolean; reason?: string }>("run.steer", { run_id: runningId, message }).then((result) => {
           if (!result.accepted) setNotice(result.reason === "unsupported_run" ? "\u8fd9\u6761\u5f15\u5bfc\u5df2\u663e\u793a\u5728\u5bf9\u8bdd\u4e2d\uff0c\u4f46\u5f53\u524d\u56fa\u5b9a\u5de5\u4f5c\u6d41\u4e0d\u80fd\u4e2d\u9014\u6539\u53c2\u6570\uff1b\u4efb\u52a1\u7ed3\u675f\u540e\u53ef\u76f4\u63a5\u53d1\u9001\u65b0\u8bf7\u6c42\u3002" : "\u5f53\u524d\u4efb\u52a1\u521a\u597d\u7ed3\u675f\uff0c\u8fd9\u6761\u5f15\u5bfc\u5df2\u663e\u793a\u5728\u5bf9\u8bdd\u4e2d\uff1b\u8bf7\u76f4\u63a5\u53d1\u9001\u4e0b\u4e00\u8f6e\u8bf7\u6c42\u3002");
-        }).catch((cause) => setError(errorMessage(cause)));
+          return result;
+        }).then((result) => {
+          if (!result.accepted) {
+            pendingChatRef.current.push(message);
+            setNotice("这条消息已排队，当前固定工作流完成后会自动提交，不会丢失。");
+          }
+        }).catch((cause) => {
+          pendingChatRef.current.push(message);
+          setError(errorMessage(cause));
+        });
       } else {
         setNotice("\u8fd9\u6761\u6d88\u606f\u5df2\u663e\u793a\u5728\u5bf9\u8bdd\u4e2d\uff1b\u5f53\u524d\u6ca1\u6709\u53ef\u63a5\u6536\u5f15\u5bfc\u7684\u4efb\u52a1\uff0c\u8bf7\u5728\u4efb\u52a1\u7ed3\u675f\u540e\u76f4\u63a5\u53d1\u9001\u4e0b\u4e00\u8f6e\u3002");
       }
@@ -989,6 +1017,9 @@ function App() {
     setBusy(true);
     setMascotMood("thinking");
     const runId = `desktop-${crypto.randomUUID()}`;
+    const runRoot = projectRootRef.current || projectRoot;
+    activeRunIdRef.current = runId;
+    cancelRequestedRef.current = false;
     setActiveRunId(runId);
     let assistantReply = "";
     try {
@@ -999,10 +1030,23 @@ function App() {
       if (Array.isArray(questionSource)) setPendingQuestions(questionSource as QuestionCard[]);
       const assistantMessageId = crypto.randomUUID();
       setMessages((items) => [...items, { id: assistantMessageId, role: "assistant", text: visible.summary, details: visible.details, reasoning: visible.reasoning, animate: true, createdAt: new Date().toISOString() }]);
+      const nextStep = result && typeof result === "object" ? (result as Record<string, unknown>).next_step : null;
+      if (nextStep && typeof nextStep === "object") setNextGuide(nextStep as CoordinatorNextStep);
+      if (result && typeof result === "object" && (result as Record<string, unknown>).settings_updated) {
+        // Coordinator settings changes are persisted by the engine. Refresh
+        // the two settings snapshots so reopening Settings immediately shows
+        // the values just reported in chat.
+        void window.inkflow.request<Record<string, unknown>>("provider.status", { workspace_root: projectRootRef.current }).then(setProvider).catch(() => undefined);
+        void window.inkflow.request<VoiceSettings>("voice.settings.get", { workspace_root: projectRootRef.current }).then(setVoiceSettings).catch(() => undefined);
+      }
       if (voiceSettings?.voice_enabled && voiceSettings.voice_output_enabled && voiceSettings.voice_auto_read) void speakText(assistantMessageId, visible.summary);
-      const history = await request<{ entries: ConversationHistoryEntry[] }>("conversation.history", { limit: 100 });
-      setConversationHistory(history.entries);
-      await refresh();
+      try {
+        const history = await request<{ entries: ConversationHistoryEntry[] }>("conversation.history", { limit: 100 });
+        setConversationHistory(history.entries);
+        if (runRoot === projectRootRef.current) await refresh(runRoot);
+      } catch (cause) {
+        setNotice("结果已收到；项目面板刷新稍后重试，不影响本次回复。\n" + errorMessage(cause));
+      }
       setMascotMood("success");
     } catch (cause) {
       const messageText = errorMessage(cause);
@@ -1011,12 +1055,19 @@ function App() {
       if (!cancelled) setError(messageText);
       setMascotMood(cancelled ? "waiting" : "rest");
     } finally {
-      setBusy(false);
-      setActiveRunId(null);
+      if (activeRunIdRef.current === runId) {
+        activeRunIdRef.current = null;
+        setBusy(false);
+        setActiveRunId(null);
+      }
       void refreshSuggestedPrompts([
         { role: "user", text: message },
         ...(assistantReply ? [{ role: "assistant", text: assistantReply }] : []),
       ]);
+      if (!cancelRequestedRef.current && pendingChatRef.current.length > 0 && projectRootRef.current) {
+        const next = pendingChatRef.current.shift();
+        if (next) window.setTimeout(() => void sendChat(undefined, next), 0);
+      }
     }
   };
 
@@ -1167,6 +1218,9 @@ function App() {
     setMascotMood("thinking");
     setError("");
     const runId = `desktop-${crypto.randomUUID()}`;
+    const runRoot = projectRootRef.current || projectRoot;
+    activeRunIdRef.current = runId;
+    cancelRequestedRef.current = false;
     setActiveRunId(runId);
     try {
       const result = await request<unknown>("workflow.run", {
@@ -1181,7 +1235,9 @@ function App() {
         ...items,
         { id: crypto.randomUUID(), role: "assistant", text: visible.summary, details: visible.details, reasoning: visible.reasoning, animate: true },
       ]);
-      await refresh();
+      const nextStep = result && typeof result === "object" ? (result as Record<string, unknown>).next_step : null;
+      if (nextStep && typeof nextStep === "object") setNextGuide(nextStep as CoordinatorNextStep);
+      if (runRoot === projectRootRef.current) await refresh(runRoot);
       const resultRecord = result && typeof result === "object" ? result as Record<string, unknown> : {};
       const targetPath = String(resultRecord.review_path || resultRecord.draft_path || "");
       if (targetPath) {
@@ -1207,17 +1263,31 @@ function App() {
         setMascotMood("rest");
       }
     } finally {
-      setBusy(false);
-      setActiveRunId(null);
+      if (activeRunIdRef.current === runId) {
+        activeRunIdRef.current = null;
+        setBusy(false);
+        setActiveRunId(null);
+      }
+      if (!cancelRequestedRef.current && pendingChatRef.current.length > 0 && projectRootRef.current) {
+        const next = pendingChatRef.current.shift();
+        if (next) window.setTimeout(() => void sendChat(undefined, next), 0);
+      }
     }
   };
 
   const cancelActiveRun = async () => {
-    if (!activeRunId) return;
+    const runId = activeRunIdRef.current;
+    if (!runId) return;
+    cancelRequestedRef.current = true;
     try {
-      await window.inkflow.request("run.cancel", { run_id: activeRunId });
+      await window.inkflow.request("run.cancel", { run_id: runId });
       setNotice("已请求停止当前任务；已经写入的草稿会保留，未验收内容不会越过正史门禁。");
       setMascotMood("waiting");
+      if (activeRunIdRef.current === runId) {
+        activeRunIdRef.current = null;
+        setActiveRunId(null);
+        setBusy(false);
+      }
     } catch (cause) {
       setError(errorMessage(cause));
     }
@@ -1412,10 +1482,11 @@ function App() {
                 </div>
               </article>
             ))}
-            {busy && activeRunId && <LiveRunCard summary={[...events].reverse().find(item => item.run_id === activeRunId && item.summary)?.summary} />}
+            {busy && activeRunId && <LiveRunCard summary={[...events].reverse().find(item => item.run_id === activeRunId && item.summary)?.summary} steps={events.filter(item => item.run_id === activeRunId).slice(-6)} />}
           </div>
           <form className="composer" onSubmit={sendChat}>
             <textarea
+              ref={chatInputRef}
               value={chatInput}
               onChange={(event) => {
                 const value = event.target.value;
@@ -1556,6 +1627,7 @@ function App() {
         setPendingQuestions([]);
         void sendChat(undefined, answer);
       }} />}
+      {nextGuide && <CoordinatorGuideDialog guide={nextGuide} onClose={() => setNextGuide(null)} onUse={(prompt) => { setChatInput(prompt); setNextGuide(null); setMascotMood("waiting"); window.setTimeout(() => chatInputRef.current?.focus(), 0); }} />}
       {selectionDraft && <SelectionDialog selection={selectionDraft} busy={busy} onClose={() => { setSelectionDraft(null); setMascotMood("idle"); }} onSubmit={(mode, comment) => void applySelectionAction(mode, comment)} />}
       {showMigration && canonMigration?.required && <CanonMigrationDialog migration={canonMigration} busy={busy} onClose={() => setShowMigration(false)} onApply={() => void applyCanonMigration()} />}
     </div>
@@ -1881,7 +1953,7 @@ function CacheSummary({ usage }: { usage?: CollaborationOverview["usage"] }) {
   const roleUsage = usage.by_agent_role || {};
   const roleKeys = ["coordinator", "writer", "reviewer", "memory_keeper", ...(roleUsage.unknown?.calls ? ["unknown"] : [])];
   const roles = roleKeys.map((role) => [role, roleUsage[role] || { calls: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }] as const);
-  return <article className="cache-summary"><header><strong>模型上下文缓存</strong><span>{rate === null ? "服务商未报告" : `${rate}% / 目标 80%`}</span></header><p>{rate === null ? `已记录 ${usage.calls} 次调用，但当前服务商或旧记录没有返回缓存字段。` : `已复用 ${hit.toLocaleString()} tokens；未命中 ${miss.toLocaleString()} tokens。`} 缓存只复用相同前缀，不会压缩正史、章节卡或当前任务。</p><div className="cache-role-list">{roles.map(([role, value]) => { const roleHit = Number(value.prompt_cache_hit_tokens || 0); const roleMiss = Number(value.prompt_cache_miss_tokens || 0); const roleTotal = roleHit + roleMiss; const roleRate = roleTotal ? Math.round((roleHit / roleTotal) * 100) : null; return <div key={role}><strong>{labels[role] || role}</strong><span>{value.calls ? roleRate === null ? `未知 · ${value.calls} 次` : `${roleRate}% · ${value.calls} 次` : "暂无调用"}</span></div>; })}</div></article>;
+  return <article className="cache-summary"><header><strong>模型上下文缓存</strong><span>{rate === null ? "服务商未报告" : `${rate}% 命中 · 目标未命中 ≤20%`}</span></header><p>{rate === null ? `已记录 ${usage.calls} 次调用，但当前服务商或旧记录没有返回缓存字段。` : `已复用 ${hit.toLocaleString()} tokens；未命中 ${miss.toLocaleString()} tokens。`} 墨流会把稳定规则和来源放在前缀、把本次章节信息放在末尾，以提高连续任务的命中率；不会压缩正史或章节卡。</p><div className="cache-role-list">{roles.map(([role, value]) => { const roleHit = Number(value.prompt_cache_hit_tokens || 0); const roleMiss = Number(value.prompt_cache_miss_tokens || 0); const roleTotal = roleHit + roleMiss; const roleRate = roleTotal ? Math.round((roleHit / roleTotal) * 100) : null; return <div key={role}><strong>{labels[role] || role}</strong><span>{value.calls ? roleRate === null ? `未知 · ${value.calls} 次` : `${roleRate}% · ${value.calls} 次` : "暂无调用"}</span></div>; })}</div></article>;
 }
 
 type LiveRun = { id: string; steps: EngineEvent[]; method?: string; status: string; summary: string };
@@ -2788,23 +2860,23 @@ function ConversationHistoryDialog({ entries, mode, limit, onSaveLast, onClose, 
 
 function PublicEvidence({ reasoning, details }: { reasoning: string[]; details?: string }) {
   const count = reasoning.length;
-  return <details className="message-evidence">
+  return <details className="message-evidence" open={count > 0 || Boolean(details)}>
     <summary><span>{"\u516c\u5f00\u5224\u65ad\u6458\u8981"}</span><small>{count > 0 ? `${count} \u6761\u516c\u5f00\u4f9d\u636e` : "\u67e5\u770b\u53ef\u590d\u6838\u8fd4\u56de"}</small></summary>
     <div className="evidence-body">
       {count > 0 && <section><strong>{"\u5224\u65ad\u4f9d\u636e"}</strong><ol className="reasoning-list">{reasoning.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ol></section>}
-      {details && <section><strong>{"\u53ef\u590d\u6838\u8fd4\u56de"}</strong><pre>{details}</pre></section>}
-      <small className="evidence-note">{"\u8fd9\u91cc\u53ea\u4fdd\u7559\u53ef\u5c55\u793a\u7684\u6458\u8981\u3001\u8bc1\u636e\u548c\u5de5\u5177\u8fd4\u56de\uff0c\u4e0d\u5c55\u793a\u6a21\u578b\u79c1\u6709\u601d\u7ef4\u94fe\u3002"}</small>
+      {details && <details className="evidence-details"><summary>{"\u67e5\u770b\u5b8c\u6574\u53ef\u590d\u6838\u8fd4\u56de"}</summary><pre>{details}</pre></details>}
+      <small className="evidence-note">{"\u4e0a\u9762\u662f\u53ef\u516c\u5f00\u6838\u5bf9\u7684\u5224\u65ad\u6458\u8981\u3001\u8bc1\u636e\u548c\u5de5\u5177\u72b6\u6001\uff1b\u6a21\u578b\u79c1\u6709\u601d\u7ef4\u94fe\u4e0d\u5c55\u793a\u4e5f\u4e0d\u5199\u5165\u6587\u4ef6\u3002"}</small>
     </div>
   </details>;
 }
 
-function LiveRunCard({ summary }: { summary?: string }) {
+function LiveRunCard({ summary, steps = [] }: { summary?: string; steps?: EngineEvent[] }) {
   return <article className="message assistant pending live-run-card" aria-live="polite">
     <span className="avatar">{"\u58a8"}</span>
     <div>
       <p>{summary || "\u5df2\u6536\u5230\uff0c\u6b63\u5728\u6821\u5bf9\u76ee\u6807\u3001\u4e0a\u4e0b\u6587\u548c\u5de5\u4f5c\u6d41\u8fb9\u754c\u3002"}</p>
       <div className="live-run-meta"><span>{"Coordinator \u6b63\u5728\u7ec4\u7ec7\u4efb\u52a1"}</span><span>{"\u53ef\u7ee7\u7eed\u53d1\u9001\uff0c\u65b0\u6d88\u606f\u4f1a\u663e\u793a\u5728\u5bf9\u8bdd\u4e2d"}</span></div>
-      <details className="live-guidance"><summary>{"\u67e5\u770b\u5f53\u524d\u516c\u5f00\u9636\u6bb5"}</summary><p>{"\u53ea\u5c55\u793a\u5f53\u524d\u4efb\u52a1\u7684\u9636\u6bb5\u6458\u8981\u548c\u53ef\u590d\u6838\u8303\u56f4\uff0c\u4e0d\u5c55\u793a\u539f\u59cb\u601d\u7ef4\u3002"}</p></details>
+      <details className="live-guidance" open><summary>当前公开阶段</summary><p>这里直接显示 Coordinator 的调度摘要、Agent、模型和可复核状态；私有思维链不会写入界面或文件。</p>{steps.length > 0 && <ol className="chat-run-steps">{steps.map((step, index) => <li key={`${step.timestamp || index}-${index}`}><strong>{eventLabel(step.type || step.stage)}</strong><span>{step.summary || step.stage || "处理中"}</span>{(step.role || step.model) && <small>{step.role ? agentRoleLabel(String(step.role)) : ""}{step.model ? ` · ${String(step.model)}` : ""}</small>}</li>)}</ol>}</details>
     </div>
   </article>;
 }
@@ -2865,6 +2937,7 @@ function collectPublicSummaries(value: unknown, target: string[] = [], seen = ne
   const add = (item: unknown) => (Array.isArray(item) ? item : item ? [item] : []).map(String).map((item) => item.trim()).filter(Boolean).forEach((item) => { if (!target.includes(item)) target.push(item); });
   add(record.public_reasoning_summary);
   add(record.decision_summary);
+  add(record.settings_change_summary);
   if (record.session && typeof record.session === "object") add((record.session as Record<string, unknown>).visible_reason);
   Object.entries(record).forEach(([key, nested]) => { if (!isSensitivePresentationKey(key)) collectPublicSummaries(nested, target, seen); });
   return target.slice(0, 10);
@@ -2902,9 +2975,9 @@ async function withDeadline<T>(request: Promise<T>, ms: number, message: string)
 }
 function currentChapter(path?: string): number | null { const match = path?.match(/chapter_(\d+)/); return match ? Number(match[1]) : null; }
 function tabLabel(tab: Tab): string { return ({ project: "项目", editor: "正文", chapter: "章工位", review: "审查", memory: "记忆", references: "参考", listen: "听读", process: "协作台" })[tab]; }
-function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "run.cancelled": "任务已停止", "run.steered": "已接收人工引导", "workflow.started": "工作流启动", "workflow.planned": "真实任务单", "workflow.completed": "工作流完成", "controller.routing": "理解与路由", "coordinator.model.started": "Coordinator 请求模型", "writer.started": "Writer 请求模型", "writer.completed": "Writer 完成", "reviewer.started": "Reviewer 开始审查", "workflow.stage": "工作流阶段", "provider.testing": "模型连接" } as Record<string, string>)[value || ""] || value || "过程"; }
+function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "run.cancelled": "任务已停止", "run.steered": "已接收人工引导", "workflow.started": "工作流启动", "workflow.planned": "真实任务单", "workflow.completed": "工作流完成", "controller.routing": "理解与路由", "coordinator.model.started": "Coordinator 请求模型", "writer.started": "Writer 请求模型", "writer.completed": "Writer 完成", "reviewer.started": "Reviewer 开始审查", "workflow.stage": "工作流阶段", "outline.model": "Writer 生成独立大纲", "voice.moss.install.queued": "MOSS 已进入后台安装", "voice.qwen.install.queued": "Qwen 已进入后台安装", "voice.moss.install.progress": "MOSS 安装进度", "voice.qwen.install.progress": "Qwen 安装进度", "voice.moss.install.failed": "MOSS 安装失败", "voice.qwen.install.failed": "Qwen 安装失败", "provider.testing": "模型连接" } as Record<string, string>)[value || ""] || value || "过程"; }
 function agentRoleLabel(value: string): string { return ({ writer: "Writer", reviewer: "Reviewer", memory_keeper: "Memory Keeper", engine: "Novel Engine" } as Record<string, string>)[value] || value; }
-function operationLabel(value: string): string { return ({ "plan.generate": "生成四级规划", "chapter.write": "生成章节草稿", "chapter.review": "审查当前版本", "chapter.revise": "修订为新版本", "chapter.accept": "提交已通过版本的正史补丁", "batch.draft_loop": "逐章写作、审查与临时连续性", "batch.accept_loop": "按顺序提交通过章节", "arc.audit": "复审篇章承诺" } as Record<string, string>)[value] || value; }
+function operationLabel(value: string): string { return ({ "plan.generate": "生成四级规划", "plan.outline": "生成独立章节大纲", "settings.update": "修改运行设置", "chapter.write": "生成章节草稿", "chapter.review": "审查当前版本", "chapter.revise": "修订为新版本", "chapter.accept": "提交已通过版本的正史补丁", "batch.draft_loop": "逐章写作、审查与临时连续性", "batch.accept_loop": "按顺序提交通过章节", "arc.audit": "复审篇章承诺" } as Record<string, string>)[value] || value; }
 function authorizationLabel(value: string): string { return ({ none: "未取得", current_request: "当前明确操作", per_chapter_click: "逐章点击", batch_preapproval: "批次一次确认", settings_auto_accept: "设置中的自动验收" } as Record<string, string>)[value] || value; }
 function acceptanceModeLabel(value: string): string { return ({ per_chapter: "逐章确认", batch_once: "批次确认一次", auto_after_review: "审查通过后自动验收" } as Record<string, string>)[value] || value; }
 function credentialLabel(value: string): string { return ({ windows_credential_manager: "Windows 凭据库", "environment:INKFLOW_API_KEY": "系统环境变量", "environment:DEEPSEEK_API_KEY": "DeepSeek 环境变量" } as Record<string, string>)[value] || "本机安全存储"; }
@@ -2954,6 +3027,17 @@ function rememberRecentProject(items: RecentProject[], root: string, title: stri
   ].slice(0, 5);
   localStorage.setItem("inkflow.recentProjects.v1", JSON.stringify(next));
   return next;
+}
+
+function CoordinatorGuideDialog({ guide, onClose, onUse }: { guide: CoordinatorNextStep; onClose: () => void; onUse: (prompt: string) => void }) {
+  return <div className="modal-backdrop guide-backdrop"><section className="modal coordinator-guide" role="dialog" aria-modal="true" aria-labelledby="coordinator-guide-title">
+    <button className="modal-close" onClick={onClose} aria-label="关闭">×</button>
+    <p className="eyebrow">COORDINATOR</p>
+    <h2 id="coordinator-guide-title">下一步建议</h2>
+    <p className="modal-subtitle">我根据刚才的结果给出一个可选动作。不会自动执行。</p>
+    <div className="guide-card"><strong>{guide.label}</strong><p>{guide.reason}</p></div>
+    <div className="dialog-actions"><button onClick={onClose}>稍后再说</button><button className="primary" onClick={() => onUse(guide.prompt)}>放入输入框</button></div>
+  </section></div>;
 }
 
 function removeRecentProject(items: RecentProject[], root: string): RecentProject[] {

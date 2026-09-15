@@ -18,6 +18,7 @@ from .prompts import (
     ARC_AUDIT_SYSTEM,
     MEMORY_EVIDENCE_SYSTEM,
     MEMORY_SYSTEM,
+    OUTLINE_SYSTEM,
     PLANNER_SYSTEM,
     REVIEW_CLAIM_CHECK_SYSTEM,
     REVIEW_CORRECTION_SYSTEM,
@@ -62,6 +63,7 @@ from .schemas import (
     ReviewReport,
     ReviewScoreDimension,
     SelectionRevisionOutput,
+    OutlineOutput,
     VolumeArcPlan,
     VolumeCompass,
     VolumePlan,
@@ -317,7 +319,13 @@ class InkFlowEngine:
         }
 
     @project_mutation_locked
-    async def generate_plan(self, root: str | Path, *, instruction: str = "") -> dict[str, Any]:
+    async def generate_plan(
+        self,
+        root: str | Path,
+        *,
+        instruction: str = "",
+        chapter_range: tuple[int, int] | None = None,
+    ) -> dict[str, Any]:
         project = InkFlowProject(root)
         trace = TraceRecorder(project.root, "plan", self.settings.trace_level)
         try:
@@ -327,6 +335,14 @@ class InkFlowEngine:
                 "生成初始四级规划：全书所有卷给卷级罗盘，完整规划第一卷的篇章摘要，"
                 "只细化第一篇章的全部连续章节卡。"
             )
+            if chapter_range is not None:
+                start_chapter, end_chapter = chapter_range
+                if start_chapter < 1 or end_chapter < start_chapter:
+                    raise ValidationGateError("规划章节范围无效，请提供从小到大的正整数章节号。")
+                task = (
+                    "生成四级规划，并把当前篇章的详细章节卡严格限定为 "
+                    f"第 {start_chapter}～{end_chapter} 章；不要把用户范围缩短成固定长度。"
+                )
             if instruction.strip():
                 task += f"\n\n用户在本次任务中已经确认的方向：{instruction.strip()}"
             sections = [
@@ -361,6 +377,11 @@ class InkFlowEngine:
                     content=(
                         "只输出 PlanBundle JSON。每张章节卡目标字数接近 target_chapter_words；"
                         "第一卷篇章摘要应覆盖该卷，但只为第一篇章生成详细章节卡。"
+                        + (
+                            f"当前篇章必须连续覆盖第 {chapter_range[0]}～{chapter_range[1]} 章。"
+                            if chapter_range is not None
+                            else ""
+                        )
                         + _hook_planning_instruction(self.settings.hook_strategy)
                     ),
                     hard=True,
@@ -404,6 +425,12 @@ class InkFlowEngine:
                 agent_role="writer",
             )
             bundle = result.data
+            if chapter_range is not None:
+                actual_range = (bundle.current_arc.chapter_start, bundle.current_arc.chapter_end)
+                if actual_range != chapter_range:
+                    raise ValidationGateError(
+                        f"规划返回第 {actual_range[0]}～{actual_range[1]} 章，未遵守用户要求的第 {chapter_range[0]}～{chapter_range[1]} 章。"
+                    )
             trace.record_model(
                 "plan.model",
                 result,
@@ -439,6 +466,157 @@ class InkFlowEngine:
         except Exception as exc:
             trace.record("plan", "failed", "规划失败", str(exc))
             trace.finish(status="failed", summary="四级规划未提交")
+            raise
+
+    @project_mutation_locked
+    async def generate_outline(
+        self,
+        root: str | Path,
+        start_chapter: int,
+        end_chapter: int,
+        *,
+        instruction: str = "",
+    ) -> dict[str, Any]:
+        """Generate a standalone outline without touching the formal plan.
+
+        This is deliberately separate from ``generate_plan``: users can explore
+        a long range such as 11~30 before deciding whether any part should be
+        promoted into the rolling plan.  No draft, review, canon or Memory
+        Keeper operation is triggered here.
+        """
+
+        if start_chapter < 1 or end_chapter < start_chapter:
+            raise ValidationGateError("大纲章节范围无效，请提供从小到大的正整数章节号。")
+        project = InkFlowProject(root)
+        trace = TraceRecorder(project.root, "outline", self.settings.trace_level)
+        try:
+            brief = project.db.get_brief()
+            bundle = project.db.get_current_plan_bundle()
+            accepted = [
+                {
+                    "chapter_no": item.get("chapter_no"),
+                    "title": item.get("title") or "",
+                    "summary": item.get("summary") or "",
+                }
+                for item in project.db.accepted_chapters()[-12:]
+            ]
+            task = (
+                f"生成第 {start_chapter}～{end_chapter} 章的独立大纲。"
+                "大纲只供用户查看和讨论，不覆盖 PLAN.md，不生成草稿，不进入正史。"
+            )
+            if instruction.strip():
+                task += f"\n用户补充方向：{instruction.strip()}"
+            sections = [
+                ContextSection(key="A", title="大纲任务", content=task, hard=True),
+                ContextSection(
+                    key="B",
+                    title="书籍契约",
+                    content=json_dumps(brief.model_dump(mode="json")),
+                    hard=True,
+                ),
+                ContextSection(
+                    key="C",
+                    title="当前正式规划（只作依据）",
+                    content=json_dumps(bundle.model_dump(mode="json") if bundle else {"status": "尚未生成正式规划"}),
+                    hard=True,
+                ),
+                ContextSection(
+                    key="D",
+                    title="最近已接受结果",
+                    content=json_dumps(accepted),
+                    hard=True,
+                ),
+                ContextSection(
+                    key="J",
+                    title="输出契约",
+                    content=(
+                        f"只输出 OutlineOutput JSON，chapters 必须连续覆盖第 {start_chapter}～{end_chapter} 章；"
+                        "每章用自然简单中文写目的、冲突、转折和钩子。"
+                    ),
+                    hard=True,
+                ),
+            ]
+            packet = ContextPacket(
+                project_id=project.project_id,
+                chapter_no=start_chapter,
+                task=task,
+                sections=sections,
+                estimated_tokens=estimate_tokens("\n".join(item.content for item in sections)),
+            )
+            atomic_write_text(trace.run_dir / "context-packet.md", packet.to_markdown())
+            trace.record(
+                "outline.context",
+                "completed",
+                "已构建独立大纲 Context Packet",
+                metadata={"start_chapter": start_chapter, "end_chapter": end_chapter},
+            )
+            count = end_chapter - start_chapter + 1
+            max_tokens = min(32_000, max(8_000, count * 520))
+            trace.record_model_started(
+                "outline.model",
+                model=self.settings.model,
+                agent_role="writer",
+                max_tokens=max_tokens,
+                timeout_seconds=self.settings.planning_timeout_seconds,
+                thinking=False,
+            )
+            result = await self.provider.generate_json(
+                system_prompt=OUTLINE_SYSTEM,
+                user_prompt=packet.to_model_prompt(),
+                output_model=OutlineOutput,
+                effort="high",
+                max_tokens=max_tokens,
+                timeout_seconds=self.settings.planning_timeout_seconds,
+                thinking=False,
+                agent_role="writer",
+            )
+            outline = result.data
+            if (outline.start_chapter, outline.end_chapter) != (start_chapter, end_chapter):
+                raise ValidationGateError("模型返回的大纲范围与用户要求不一致。")
+            outline_id = f"outline-{trace.run_id}"
+            relative = Path("planning") / "outlines" / f"outline_{start_chapter:05d}_{end_chapter:05d}_{outline_id}.md"
+            payload = outline.model_dump(mode="json")
+            lines = [
+                f"# {outline.title}",
+                "",
+                f"> 独立大纲 · 第 {start_chapter}～{end_chapter} 章",
+                "> 这是规划草案，不会自动生成正文、审查报告或写入正史。",
+                "",
+                f"**故事前提**：{outline.premise}",
+                "",
+            ]
+            for chapter in outline.chapters:
+                lines.extend(
+                    [
+                        f"## 第 {chapter.chapter_no} 章 · {chapter.title}",
+                        f"- 本章目的：{chapter.purpose}",
+                        f"- 主要冲突：{chapter.conflict}",
+                        f"- 转折：{chapter.turn}",
+                        f"- 结尾钩子：{chapter.hook}",
+                        "",
+                    ]
+                )
+            if outline.public_reasoning_summary:
+                lines.extend(["## 规划依据", "", *[f"- {item}" for item in outline.public_reasoning_summary], ""])
+            atomic_write_text(project.root / relative, "\n".join(lines))
+            trace.record_model("outline.model", result, f"生成第 {start_chapter}～{end_chapter} 章独立大纲")
+            trace.record("outline.write", "completed", "独立大纲已写入 planning/outlines", metadata={"path": relative.as_posix()})
+            trace.finish(summary="独立大纲生成完成")
+            return {
+                "outline_id": outline_id,
+                "chapter_range": [start_chapter, end_chapter],
+                "outline_path": str(project.root / relative),
+                "outline": payload,
+                "trace_id": trace.run_id,
+                "next_action": "阅读大纲后，可以让 Coordinator 按指定章节生成草稿；大纲本身不会进入正史。",
+            }
+        except asyncio.CancelledError:
+            trace.record("outline", "cancelled", "独立大纲请求被停止；正式规划保持不变")
+            trace.finish(status="cancelled", summary="独立大纲已停止")
+            raise
+        except Exception as exc:
+            trace.record("outline", "failed", "独立大纲生成失败", str(exc))
+            trace.finish(status="failed", summary="独立大纲未生成")
             raise
 
     @project_mutation_locked
@@ -907,8 +1085,6 @@ class InkFlowEngine:
         project = InkFlowProject(root)
         if end_chapter < start_chapter:
             raise ValidationGateError("结束章节不能早于起始章节。")
-        if end_chapter - start_chapter + 1 > 20:
-            raise ValidationGateError("一次最多预览 20 张章节卡；请缩小范围后分批查看。")
 
         cards: list[dict[str, Any]] = []
         missing: list[int] = []
@@ -1332,6 +1508,8 @@ class InkFlowEngine:
                 brief.user_rules,
                 length_tolerance=self.settings.chapter_length_tolerance,
             )
+            regression = _regression_check(content, chapter_no, metrics)
+            metrics["regression"] = regression
             trace.record(
                 "review.rules",
                 "completed",
@@ -1374,6 +1552,7 @@ class InkFlowEngine:
                     "trace_id": trace.run_id,
                     "next_action": "按审查意见修改章节",
                     "model_skipped": True,
+                    "regression_check": regression,
                 }
             packet = self._context_builder(project, "reviewer").build(
                 chapter_no,
@@ -1497,6 +1676,7 @@ class InkFlowEngine:
                 "review_path": str(project.root / relative),
                 "trace_id": trace.run_id,
                 "next_action": "接受章节" if report.verdict == "pass" else "按审查意见修改章节",
+                "regression_check": regression,
             }
         except asyncio.CancelledError:
             trace.record("review", "cancelled", "Reviewer 请求被停止；当前版本没有被放行")
@@ -4171,8 +4351,8 @@ def _lock_next_arc(
             )
         if candidate.chapter_end > volume.chapter_end:
             raise ValidationGateError("下一篇章超出当前卷边界。")
-        if not 2 <= len(candidate.chapter_cards) <= 16:
-            raise ValidationGateError("动态补出的篇章应包含 2～16 张连续章节卡。")
+        if not candidate.chapter_cards:
+            raise ValidationGateError("动态补出的篇章至少需要一张连续章节卡。")
         data["volume_no"] = volume.volume_no
         if summary is not None:
             data.update(
@@ -4852,3 +5032,43 @@ def _deterministic_audit(
             )
         )
     return metrics, findings
+
+
+def _regression_check(content: str, chapter_no: int, metrics: dict[str, Any]) -> dict[str, Any]:
+    """Run a small deterministic post-write regression scan.
+
+    It catches output contamination and continuity-shaped formatting faults
+    after every revision.  Editorial quality remains Reviewer territory; these
+    checks only report objective signals and never invent a story judgment.
+    """
+
+    markers = (
+        "Reviewer",
+        "审查意见",
+        "审查报告",
+        "DraftOutput",
+        "hook_note",
+        "修改说明",
+        "根据审查",
+    )
+    found_markers = [item for item in markers if item in content]
+    paragraph_count = int(metrics.get("paragraph_count") or 0)
+    duplicate_count = int(metrics.get("duplicate_paragraphs") or 0)
+    heading_count = int(metrics.get("chapter_heading_count") or 0)
+    checks = [
+        {"id": "heading", "passed": heading_count <= 1, "detail": f"章节标题 {heading_count} 行"},
+        {"id": "duplicate", "passed": duplicate_count == 0, "detail": f"重复段落 {duplicate_count} 个"},
+        {"id": "contamination", "passed": not found_markers, "detail": "正文未混入工作说明" if not found_markers else f"发现工作标记：{'、'.join(found_markers)}"},
+        {"id": "paragraphs", "passed": paragraph_count > 0, "detail": f"有效段落 {paragraph_count} 段"},
+    ]
+    warnings: list[str] = []
+    punctuation = metrics.get("punctuation") if isinstance(metrics.get("punctuation"), dict) else {}
+    dense = int(punctuation.get("comma_dense_sentences") or 0) if isinstance(punctuation, dict) else 0
+    if dense:
+        warnings.append(f"有 {dense} 句逗号偏密，修订时可检查断句")
+    return {
+        "chapter_no": chapter_no,
+        "passed": all(bool(item["passed"]) for item in checks),
+        "checks": checks,
+        "warnings": warnings,
+    }

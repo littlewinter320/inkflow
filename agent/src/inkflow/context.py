@@ -612,8 +612,6 @@ class ContextBuilder:
 
         if start_chapter_no < 1 or end_chapter_no < start_chapter_no:
             raise ValidationGateError("篇章复审范围不合法。")
-        if end_chapter_no - start_chapter_no + 1 > 20:
-            raise ValidationGateError("一次篇章复审最多 20 章；请分段复审。")
         database = self.project.db
         brief = database.get_brief()
         bundle = database.get_current_plan_bundle()

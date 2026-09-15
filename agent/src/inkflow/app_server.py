@@ -443,8 +443,18 @@ class InkFlowAppService:
         studio = StudioService(project)
 
         if method == "project.open":
-            with project_write_lock_sync(project.root):
-                studio.db.reconcile_interrupted_tasks(self.instance_id)
+            # Reconciliation is a small write, but opening a project must never
+            # wait behind a long Writer/Reviewer operation.  Try it briefly in
+            # a worker thread; the read-only dashboard/tree can still open when
+            # another task currently owns the project lock.
+            def reconcile() -> None:
+                try:
+                    with project_write_lock_sync(project.root, timeout=0.25):
+                        studio.db.reconcile_interrupted_tasks(self.instance_id)
+                except InkFlowError:
+                    return
+
+            await asyncio.to_thread(reconcile)
             return {
                 "dashboard": studio.dashboard(),
                 "tree": studio.tree(),
@@ -1018,6 +1028,7 @@ class InkFlowAppService:
         settings = Settings.from_env(project.root)
         workflow_actions = {
             "plan": "plan",
+            "outline": "outline",
             "write": "write_draft",
             "review": "review_accept" if settings.acceptance_confirmation_mode == "auto_after_review" else "review",
             "revise": "revise_draft",
@@ -1097,6 +1108,28 @@ class InkFlowAppService:
             )
             result = await engine.generate_plan(
                 project.root,
+                instruction=str(params.get("instruction") or ""),
+                chapter_range=(
+                    int(params.get("start_chapter_no") or params.get("chapter_no") or 1),
+                    int(params["end_chapter_no"]),
+                )
+                if params.get("end_chapter_no") is not None
+                else None,
+            )
+        elif action == "outline":
+            await emit(
+                {
+                    "type": "writer.started",
+                    "stage": "outline.model",
+                    "role": "writer",
+                    "model": settings.model,
+                    "summary": "Writer 正在生成独立大纲；不会修改正式规划或正史",
+                }
+            )
+            result = await engine.generate_outline(
+                project.root,
+                int(params.get("start_chapter_no") or params.get("chapter_no") or 1),
+                int(params["end_chapter_no"]),
                 instruction=str(params.get("instruction") or ""),
             )
         elif action == "write":
@@ -1204,6 +1237,10 @@ class InkFlowAppService:
             result = engine.rollback_recover(project.root)
         else:
             raise ValueError(f"不支持的工作流动作：{action}")
+        if isinstance(result, dict) and not result.get("gate"):
+            recommendation = _workflow_next_step(action, result)
+            if recommendation:
+                result = {**result, "next_step": recommendation}
         await emit({"type": "workflow.completed", "action": action, "summary": _visible_result_summary(result)})
         return result
 
@@ -1734,15 +1771,46 @@ def _short_provider_error(error: ProviderError) -> str:
 
 def _visible_result_summary(result: Any) -> str:
     if isinstance(result, dict):
+        if result.get("settings_change_summary"):
+            return "；".join(str(item) for item in result["settings_change_summary"])[:300]
+        if result.get("settings_updated"):
+            return f"已修改 {len(result['settings_updated'])} 项设置。"
         for key in ("reply", "help", "gate", "message", "summary", "next_action"):
             if result.get(key):
                 return str(result[key])[:300]
         if result.get("result") and isinstance(result["result"], dict):
             nested = result["result"]
-            for key in ("summary", "message", "status"):
+            for key in ("summary", "message", "status", "outline_path"):
                 if nested.get(key):
                     return str(nested[key])[:300]
     return "工作流返回了可查看结果。"
+
+
+def _workflow_next_step(action: str, result: dict[str, Any]) -> dict[str, str] | None:
+    """给桌面按钮触发的固定工作流也提供同一套用户可控引导。"""
+
+    if action == "review" and result.get("automatic_acceptance"):
+        return {"label": "继续下一章", "reason": "Reviewer 已通过且当前设置已自动验收，可以继续安排下一章。", "prompt": "推荐下一章安排"}
+    if action == "batch_draft" and result.get("authorization_source") in {"batch_preapproval", "settings_auto_accept"}:
+        return {"label": "查看已提交批次", "reason": "本批次已按当前确认策略处理，先查看提交结果再继续。", "prompt": "查看当前项目状态"}
+
+    suggestions = {
+        "plan": ("查看章节规划", "先核对章节卡，再决定从哪一章开始写。", "查看当前规划"),
+        "outline": ("从大纲开始写", "独立大纲已保存，选择起点后再生成草稿。", "根据大纲生成草稿"),
+        "write": ("审查当前章节", "草稿已生成，先让 Reviewer 检查当前版本。", "审查当前章"),
+        "review": ("处理审查结果", "先查看 Reviewer 的证据，再决定修订或验收。", "打开当前审查报告"),
+        "revise": ("重新审查", "修订产生了新版本，旧报告不能替代新版本审查。", "重新审查当前章"),
+        "accept": ("继续下一章", "当前章节已经完成正史提交，可以继续安排下一章。", "推荐下一章安排"),
+        "batch_draft": ("查看批次进度", "批量草稿仍在临时区，先查看逐章结果再决定是否验收。", "查看批次进度"),
+        "batch_accept": ("安排后续章节", "批次提交完成，可以继续规划或生成下一段。", "推荐后续章节安排"),
+        "arc_audit": ("查看复审报告", "跨章复审只生成报告，先查看风险与规划差异。", "打开篇章复审报告"),
+        "checkpoint_create": ("继续创作", "检查点已经保存，接下来可以继续写作。", "推荐下一步"),
+    }
+    item = suggestions.get(action)
+    if not item:
+        return None
+    label, reason, prompt = item
+    return {"label": label, "reason": reason, "prompt": prompt}
 
 
 def _list_batch_summaries(project: InkFlowProject) -> list[dict[str, Any]]:
@@ -1858,6 +1926,9 @@ def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
             "chapter_no",
             "start_chapter_no",
             "end_chapter_no",
+            "draft_only",
+            "start_chapter",
+            "end_chapter",
             "instruction",
             "max_revision_rounds",
             "batch_id",

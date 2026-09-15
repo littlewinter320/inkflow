@@ -819,12 +819,19 @@ class VoiceRuntime:
         if confirmation != "install_optional_qwen":
             raise ValueError("安装 Qwen 前需要确认会下载数 GB 依赖与模型，并可能占用显存。")
         if self._qwen_install_task and not self._qwen_install_task.done():
-            return await self._qwen_install_task
-        self._qwen_install_task = asyncio.create_task(self._install_qwen_impl(emit))
-        try:
-            return await self._qwen_install_task
-        finally:
-            self._qwen_install_task = None
+            return {**self.status(), "queued": False, "message": "Qwen 已在后台安装，关闭设置不会停止任务。"}
+        self._qwen_install_task = asyncio.create_task(
+            self._background_install("qwen", self._install_qwen_impl, emit)
+        )
+        await emit({
+            "type": "voice.qwen.install.queued",
+            "component": "qwen",
+            "status": "installing",
+            "stage": "queued",
+            "progress": 0,
+            "summary": "Qwen 已加入后台安装；关闭设置不会停止任务。",
+        })
+        return {**self.status(), "queued": True, "message": "Qwen 已加入后台安装，可关闭设置继续使用墨流。"}
 
     async def _install_qwen_impl(self, emit: VoiceEventSink) -> dict[str, Any]:
         if self._qwen_install_lock is None:
@@ -929,12 +936,58 @@ class VoiceRuntime:
         if confirmation != "install_moss_voice":
             raise ValueError("安装 MOSS 前需要确认约 900MB 模型和 1.8GB 依赖下载，实际占用会随环境变化。")
         if self._moss_install_task and not self._moss_install_task.done():
-            return await self._moss_install_task
-        self._moss_install_task = asyncio.create_task(self._install_moss_impl(emit))
+            return {**self.status(), "queued": False, "message": "MOSS 已在后台安装，关闭设置不会停止任务。"}
+        self._moss_install_task = asyncio.create_task(
+            self._background_install("moss", self._install_moss_impl, emit)
+        )
+        await emit({
+            "type": "voice.moss.install.queued",
+            "component": "moss",
+            "status": "installing",
+            "stage": "queued",
+            "progress": 0,
+            "summary": "MOSS 已加入后台安装；关闭设置不会停止任务。",
+        })
+        return {**self.status(), "queued": True, "message": "MOSS 已加入后台安装，可关闭设置继续使用墨流。"}
+
+    async def _background_install(
+        self,
+        component: str,
+        operation: Callable[[VoiceEventSink], Awaitable[dict[str, Any]]],
+        emit: VoiceEventSink,
+    ) -> dict[str, Any]:
+        """Run an optional voice installation independently from the settings RPC.
+
+        The settings window only starts this task.  Progress is persisted in the
+        component state file and emitted as events, so closing the window cannot
+        cancel a long pip/model download.  Errors are converted into a visible,
+        retryable status instead of an unobserved asyncio exception.
+        """
+
         try:
-            return await self._moss_install_task
-        finally:
-            self._moss_install_task = None
+            return await operation(emit)
+        except asyncio.CancelledError:
+            return self.status()
+        except Exception as exc:
+            state_path = self.qwen_state_path if component == "qwen" else self.moss_state_path
+            state = _read_json(state_path)
+            if state.get("status") != "failed":
+                await self._publish_install_progress(
+                    component=component,
+                    state_path=state_path,
+                    emit=emit,
+                    status="failed",
+                    stage=str(state.get("stage") or "failed"),
+                    progress=int(state.get("progress") or 0),
+                    summary="后台安装未完成，可从设置中重试。",
+                    error=str(exc)[:500],
+                    retryable=True,
+                    event_type=f"voice.{component}.install.failed",
+                )
+            result = self.status()
+            result[f"{component}_setup"] = "failed"
+            result[component]["last_error"] = str(exc)[:500]
+            return result
 
     async def _install_moss_impl(self, emit: VoiceEventSink) -> dict[str, Any]:
         if self._moss_install_lock is None:

@@ -262,6 +262,38 @@ class ArcPlanningBrief(StrictModel):
     risks_to_verify: list[str] = Field(default_factory=list, max_length=8)
 
 
+class OutlineChapter(StrictModel):
+    """一章大纲的可执行摘要；不等同于章节卡，也不写入正史。"""
+
+    chapter_no: int = Field(ge=1)
+    title: str = Field(min_length=1, max_length=160)
+    purpose: str = Field(min_length=4, max_length=500)
+    conflict: str = Field(min_length=4, max_length=500)
+    turn: str = Field(min_length=4, max_length=500)
+    hook: str = Field(min_length=4, max_length=500)
+
+
+class OutlineOutput(StrictModel):
+    """独立大纲生成器的输出，和正式 PLAN/草稿保持文件边界。"""
+
+    title: str = Field(min_length=1, max_length=160)
+    start_chapter: int = Field(ge=1)
+    end_chapter: int = Field(ge=1)
+    premise: str = Field(min_length=8, max_length=1_500)
+    chapters: list[OutlineChapter] = Field(min_length=1, max_length=500)
+    public_reasoning_summary: list[str] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "OutlineOutput":
+        if self.end_chapter < self.start_chapter:
+            raise ValueError("大纲结束章节不能早于开始章节")
+        expected = list(range(self.start_chapter, self.end_chapter + 1))
+        actual = [item.chapter_no for item in self.chapters]
+        if actual != expected:
+            raise ValueError(f"大纲章节必须连续覆盖 {expected[0]}～{expected[-1]}")
+        return self
+
+
 class PlanBundle(StrictModel):
     book: BookPlan
     current_volume: VolumePlan
@@ -707,6 +739,7 @@ TerminalAction = Literal[
     "status",
     "plan",
     "plan_preview",
+    "outline",
     "plan_brief",
     "plan_next_arc",
     "arc_audit",
@@ -730,6 +763,7 @@ TerminalAction = Literal[
     "accept",
     "help",
     "voice_clone_script",
+    "settings_update",
     "exit",
 ]
 
@@ -760,6 +794,7 @@ class TerminalIntent(StrictModel):
     target_characters: int | None = Field(default=None, ge=1_000, le=5_000_000)
     max_revision_rounds: int = Field(default=1, ge=0, le=6)
     operation_instruction: str = Field(default="", max_length=4_000)
+    settings_patch: dict[str, Any] = Field(default_factory=dict, max_length=16)
     visible_reason: str = Field(min_length=1, max_length=240)
     conversation_reply: str = Field(default="", max_length=1_500)
 

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from .config import Settings
+from .config import Settings, save_user_settings
 from .coordinator import Coordinator
 from .engine import InkFlowEngine
 from .errors import InkFlowError, ValidationGateError
@@ -24,7 +25,7 @@ from .utils import atomic_write_text, content_hash, estimate_tokens, json_dumps
 TERMINAL_ROUTER_SYSTEM = """
 你是墨流的第四个 AI Agent：Coordinator（AI 产品经理与协作管家）。你不是 Writer、Reviewer 或 Memory Keeper。
 
-你的工作是理解和维护用户需求、把自然语言整理成任务单，并映射到一个已存在、不可跳过门禁的工作流。你绝不能：
+你的工作是理解和维护用户需求、把自然语言整理成任务单，并映射到一个已存在、不可跳过门禁的工作流。你还要在执行结果中给出一条简短、可操作的下一步建议；建议只是用户可选择的入口，不代表自动授权。你绝不能：
 - 写小说正文、续写任何段落、生成审查意见或记忆事实；
 - 修改文件、数据库、计划、章节状态或调用工具；
 - 选择 force、绕过审查、绕过 Memory Keeper，或把“直接通过/别审查”解释成许可；
@@ -42,7 +43,9 @@ TERMINAL_ROUTER_SYSTEM = """
 - ideate：用户要从零构思、想要灵感、点子或天马行空的提案，且当前没有正史或规划依据可查（如“帮我想几个故事点子”“给我一个全新的方向”）。这会交给 Writer 的灵感分身产出创意提案，不写正文、不入正史、不做证据核验；用户明确要求出点子时 authorization=approved。
 - status：只读取项目状态。
 - plan：让 Writer 生成四级规划。
-- plan_preview：集中查看已经存在的连续章节卡，不调用 Writer、不改规划。chapter_no 是起始章，end_chapter_no 是结束章；最多 20 章。用户说“把第7到11章规划一起给我看”时使用此动作。
+- settings_update：用户明确要求调整墨流设置时使用；只能修改白名单设置，执行后必须逐项告诉用户改了什么和当前值。仅询问“怎么设置”时不要执行。
+- plan_preview：集中查看已经存在的连续章节卡，不调用 Writer、不改规划。chapter_no 是起始章，end_chapter_no 是结束章；范围完全按用户给出的章节号处理，不人为截断。用户说“把第7到30章规划一起给我看”时使用此动作。
+- outline：让 Writer 生成指定范围的独立大纲。它只写入 planning/outlines/，不覆盖 PLAN.md、不生成草稿、不进入正史。
 - plan_brief：当前篇章已全部进入正史后，让 Writer 先生成下一篇章的公开判断单。它只展示依据、约束、取舍、章节节拍和待核对风险，写入 planning/，不改 PLAN.md、正文或 SQLite；绝不要求或输出隐藏思维链。
 - arc_audit：让 Reviewer 对 chapter_no 到 end_chapter_no 的实际正文与章节卡、篇章承诺作跨章复审；只写报告，不改正文、规划或正史。若范围包含尚未接收的临时批次，batch_id 可逐字复制用户提供的编号；未提供时由宿主只在唯一匹配批次存在时采用它。
 - plan_next_arc：只有当前篇章全部进入正史后，才让 Writer 基于实际结果细化紧邻的下一篇章。operation_instruction 非空表示用户要调整未来规划；只要整句语义明确要求现在执行，authorization=approved 且 plan_change_confirmed=true，不限定必须出现“确认/同意”两个词。
@@ -120,6 +123,7 @@ _READ_ONLY_ACTIONS = {
     "status",
     "help",
     "plan_preview",
+    "outline",
     "plan_brief",
     "checkpoint_list",
     "rollback_preview",
@@ -135,6 +139,7 @@ _CANON_MUTATION_ACTIONS = {
     "revise_review_accept",
     "accept",
 }
+_SETTINGS_MUTATION_ACTIONS = {"settings_update"}
 _RESTORE_ACTIONS = {"rollback_restore"}
 
 _FIELD_LABELS = {
@@ -145,6 +150,39 @@ _FIELD_LABELS = {
     "checkpoint_id": "检查点编号或章节边界",
     "confirmation_token": "回退确认码",
     "target": "结束章节号或正史字符目标",
+    "settings_patch": "要修改的设置项和值",
+}
+
+_SETTING_LABELS = {
+    "model": "默认模型",
+    "reasoning_effort": "思考强度",
+    "inquiry_frequency": "主动询问频率",
+    "hook_strategy": "章节结尾钩子",
+    "chapter_length_tolerance": "章节长度容错",
+    "acceptance_confirmation_mode": "验收确认方式",
+    "context_budget_mode": "上下文预算方式",
+    "context_soft_tokens": "常用上下文预算",
+    "context_hard_tokens": "最大上下文上限",
+    "voice_auto_read": "自动朗读",
+    "voice_output_enabled": "语音输出",
+    "voice_input_enabled": "语音输入",
+    "agent_generation": "Agent 生成参数",
+}
+
+_SETTING_VALUE_LABELS = {
+    "reasoning_effort": {"low": "低", "medium": "中", "high": "高", "max": "最高"},
+    "inquiry_frequency": {"low": "少问", "medium": "适中", "high": "多问", "ultra": "频繁"},
+    "hook_strategy": {
+        "most_chapters": "大多数章节",
+        "key_chapters": "重点章节",
+        "natural_afterglow": "自然余味",
+    },
+    "acceptance_confirmation_mode": {
+        "per_chapter": "逐章确认",
+        "batch_once": "批次确认一次",
+        "auto_after_review": "审查通过后自动验收",
+    },
+    "context_budget_mode": {"unified": "统一预算", "custom": "按 Agent 分开"},
 }
 
 
@@ -247,7 +285,7 @@ class TerminalSession:
                     thinking=False,
                     agent_role="coordinator",
                 )
-            raw_intent = route_result.data
+            raw_intent = self._coerce_settings_intent(text, route_result.data)
             intent, routing_response = self._resolve_intent(project, text, raw_intent)
             intent = self._apply_acceptance_policy(text, intent)
             ticket, dispatch_plan = Coordinator(project).compile(intent)
@@ -337,7 +375,7 @@ class TerminalSession:
             self._append_dialogue(project, text, intent, response)
             trace.record("session.dispatch", "completed", "受限工作流已返回结果")
             trace.finish(summary="终端自然语言请求处理完成")
-            return {
+            payload = {
                 "session": {
                     "route": intent.action,
                     "requested_outcome": intent.requested_outcome,
@@ -354,6 +392,10 @@ class TerminalSession:
                 },
                 **response,
             }
+            recommendation = self._recommend_next_step(intent, response)
+            if recommendation:
+                payload["next_step"] = recommendation
+            return payload
         except asyncio.CancelledError:
             trace.record("session", "cancelled", "当前请求被停止；没有提交新的正文或正史")
             trace.finish(status="cancelled", summary="终端任务已停止，已有项目内容保留")
@@ -375,7 +417,15 @@ class TerminalSession:
 
         normalized = re.sub(r"\s+", "", text).lower()
         if normalized in {"状态", "项目状态", "当前状态", "当前进度", "进度"}:
-            return {"session": {"route": "status", "cost": "无需模型调用"}, "result": self.engine.status(project.root)}
+            return {
+                "session": {"route": "status", "cost": "无需模型调用"},
+                "result": self.engine.status(project.root),
+                "next_step": {
+                    "label": "让 Coordinator 推荐下一步",
+                    "reason": "状态已经读完；你可以让 Coordinator 根据当前进度选择最合适的动作。",
+                    "prompt": "根据当前项目状态，给我推荐下一步并说明原因",
+                },
+            }
         if normalized in {"帮助", "help", "/help", "怎么用"}:
             return {
                 "session": {"route": "help", "cost": "无需模型调用"},
@@ -427,14 +477,26 @@ class TerminalSession:
         missing = {item for item in intent.missing_fields if item in relevant_fields}
         action = intent.action
 
+        if action == "settings_update":
+            patch = self._sanitize_settings_patch(intent.settings_patch or self._parse_settings_patch(message))
+            updates["settings_patch"] = patch
+            if not patch:
+                missing.add("settings_patch")
+            else:
+                missing.discard("settings_patch")
+
         explicit_start, explicit_end = self._explicit_chapter_range(message)
         if action in _CHAPTER_ACTIONS and explicit_start is not None:
             updates["chapter_no"] = explicit_start
             missing.discard("chapter_no")
-        if action in {"plan_preview", "arc_audit", "batch_draft", "batch_draft_accept", "batch_repair"} and explicit_start is not None:
+        if action in {"plan", "plan_preview", "outline", "arc_audit", "batch_draft", "batch_draft_accept", "batch_repair"} and explicit_start is not None:
             updates["chapter_no"] = explicit_start
             updates["end_chapter_no"] = explicit_end or explicit_start
-            missing.difference_update({"chapter_no", "end_chapter_no", "chapter_range"})
+            if action != "plan":
+                missing.difference_update({"chapter_no", "end_chapter_no", "chapter_range"})
+            elif explicit_end is None:
+                updates.pop("chapter_no", None)
+                updates.pop("end_chapter_no", None)
         if action == "continue_run" and explicit_start is not None:
             updates["end_chapter_no"] = explicit_end or explicit_start
             missing.difference_update({"end_chapter_no", "target"})
@@ -450,7 +512,7 @@ class TerminalSession:
                 updates["chapter_no"] = chapter_no
                 missing.discard("chapter_no")
 
-        if action in {"plan_preview", "arc_audit"} and (
+        if action in {"plan_preview", "outline", "arc_audit"} and (
             intent.chapter_no is None or intent.end_chapter_no is None
         ):
             bundle = project.db.get_current_plan_bundle()
@@ -548,8 +610,27 @@ class TerminalSession:
 
         mode = self.engine.settings.acceptance_confirmation_mode
         intent = intent.model_copy(update={"acceptance_confirmation_mode": mode})
-        if re.search(r"只(?:要|做|生成)?(?:草稿|审查)|不要(?:验收|接收|入正史)|先(?:给我)?看", message):
-            return intent
+        # A draft-only request is a hard per-request constraint.  It must win
+        # over the saved batch/auto acceptance preference, including fuzzy
+        # natural-language wording such as “先给我看成品，暂时别收进正史”。
+        if re.search(
+            r"(?:只|仅|先)(?:要|做|生成|给我看)?(?:草稿|审查|初稿)|"
+            r"(?:不要|暂不|先别|不必)(?:验收|接收|入正史|写入正史)|"
+            r"草稿(?:即可|就好|先看)",
+            message,
+        ):
+            downgrade = {
+                "batch_draft_accept": "batch_draft",
+                "write_review_accept": "write_review",
+                "revise_review_accept": "revise_review",
+                "review_accept": "review",
+            }.get(intent.action)
+            return intent.model_copy(
+                update={
+                    "action": downgrade or intent.action,
+                    "authorization_source": "current_request",
+                }
+            )
         if mode == "batch_once" and intent.action == "batch_draft" and intent.authorization == "approved":
             return intent.model_copy(
                 update={"action": "batch_draft_accept", "authorization_source": "batch_preapproval"}
@@ -567,6 +648,165 @@ class TerminalSession:
         return intent.model_copy(
             update={"action": upgraded, "authorization_source": "settings_auto_accept"}
         )
+
+    @classmethod
+    def _coerce_settings_intent(cls, message: str, intent: TerminalIntent) -> TerminalIntent:
+        """Turn a clear settings request into a bounded Coordinator route.
+
+        The language can be loose, but only values understood by the host are
+        accepted.  Questions such as “怎么调” stay in discussion mode.
+        """
+
+        patch = cls._sanitize_settings_patch(cls._parse_settings_patch(message))
+        setting_words = re.search(r"(?:设置|参数|温度|top[\s_-]*p|上下文|容错|自动朗读|语音输出|语音输入|模型|思考|推理)", message, re.I)
+        imperative = re.search(r"(?:设置|调整|调到|调成|调为|调低|调高|降低|提高|改成|改为|换成|开启|关闭|设为|默认)", message)
+        if patch and setting_words and imperative and intent.action in {"chat", "discuss", "settings_update"}:
+            return intent.model_copy(
+                update={
+                    "action": "settings_update",
+                    "settings_patch": patch,
+                    "authorization": "approved",
+                    "authorization_source": "current_request",
+                    "requested_outcome": "按用户当前说法调整墨流设置",
+                    "visible_reason": "Coordinator 已识别到明确设置变更，并会在完成后列出每一项变化。",
+                    "confidence": "high",
+                }
+            )
+        return intent
+
+    @staticmethod
+    def _sanitize_settings_patch(patch: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(patch, dict):
+            return {}
+        allowed = {
+            "model", "reasoning_effort", "inquiry_frequency", "hook_strategy",
+            "chapter_length_tolerance", "acceptance_confirmation_mode",
+            "context_budget_mode", "context_soft_tokens", "context_hard_tokens",
+            "voice_auto_read", "voice_output_enabled", "voice_input_enabled",
+            "agent_generation",
+        }
+        clean: dict[str, Any] = {}
+        for key, value in patch.items():
+            if key not in allowed:
+                continue
+            try:
+                if key == "chapter_length_tolerance":
+                    number = float(value)
+                    if not math.isfinite(number):
+                        continue
+                    if number > 1:
+                        number /= 100
+                    if 0.10 <= number <= 1.00:
+                        clean[key] = round(number, 4)
+                elif key in {"context_soft_tokens", "context_hard_tokens"}:
+                    number = int(value)
+                    if 16_000 <= number <= 2_000_000:
+                        clean[key] = number
+                elif key in {"voice_auto_read", "voice_output_enabled", "voice_input_enabled"}:
+                    if isinstance(value, str):
+                        normalized = value.strip().casefold()
+                        if normalized in {"1", "true", "yes", "on", "open", "开启", "打开", "是"}:
+                            clean[key] = True
+                        elif normalized in {"0", "false", "no", "off", "close", "关闭", "取消", "否"}:
+                            clean[key] = False
+                    elif isinstance(value, (bool, int, float)):
+                        clean[key] = bool(value)
+                elif key == "reasoning_effort" and str(value).casefold() in {"low", "medium", "high", "max"}:
+                    clean[key] = str(value).casefold()
+                elif key == "inquiry_frequency" and str(value).casefold() in {"low", "medium", "high", "ultra"}:
+                    clean[key] = str(value).casefold()
+                elif key == "hook_strategy" and str(value) in {"most_chapters", "key_chapters", "natural_afterglow"}:
+                    clean[key] = str(value)
+                elif key == "acceptance_confirmation_mode" and str(value) in {"per_chapter", "batch_once", "auto_after_review"}:
+                    clean[key] = str(value)
+                elif key == "context_budget_mode" and str(value) in {"unified", "custom"}:
+                    clean[key] = str(value)
+                elif key == "agent_generation" and isinstance(value, dict):
+                    generation: dict[str, dict[str, float | int | None]] = {}
+                    for role, raw in value.items():
+                        if role not in {"coordinator", "writer", "reviewer", "memory_keeper"} or not isinstance(raw, dict):
+                            continue
+                        role_values: dict[str, float | int | None] = {}
+                        if "temperature" in raw:
+                            temperature = float(raw["temperature"])
+                            if math.isfinite(temperature) and 0 <= temperature <= 2:
+                                role_values["temperature"] = temperature
+                        if "top_p" in raw:
+                            top_p = float(raw["top_p"])
+                            if math.isfinite(top_p) and 0 < top_p <= 1:
+                                role_values["top_p"] = top_p
+                        if "top_k" in raw and raw["top_k"] not in (None, "", 0, "0"):
+                            top_k = int(raw["top_k"])
+                            if 1 <= top_k <= 200:
+                                role_values["top_k"] = top_k
+                        if role_values:
+                            generation[role] = role_values
+                    if generation:
+                        clean[key] = generation
+                elif key == "model" and str(value).strip() and len(str(value).strip()) <= 160:
+                    clean[key] = str(value).strip()
+            except (TypeError, ValueError, OverflowError):
+                # One malformed field must not discard otherwise valid changes.
+                continue
+        return clean
+
+    @staticmethod
+    def _parse_settings_patch(message: str) -> dict[str, Any]:
+        compact = re.sub(r"\s+", "", message.lower())
+        patch: dict[str, Any] = {}
+        tolerance = re.search(r"(?:字数|章节)?(?:容错|误差)(?:率)?(?:改为|设为|调整为)?(\d{1,3})%", compact)
+        if tolerance:
+            patch["chapter_length_tolerance"] = int(tolerance.group(1)) / 100
+        if re.search(r"(?:逐章|每章).*确认|每个章节.*确认", compact):
+            patch["acceptance_confirmation_mode"] = "per_chapter"
+        elif re.search(r"(?:批量|批次).*确认|确认一次", compact):
+            patch["acceptance_confirmation_mode"] = "batch_once"
+        elif re.search(r"自动(?:验收|接收)|通过.*自动", compact):
+            patch["acceptance_confirmation_mode"] = "auto_after_review"
+        if re.search(r"(?:少问|少打断|不要总问)", compact):
+            patch["inquiry_frequency"] = "low"
+        elif re.search(r"(?:多问|经常确认|主动问)", compact):
+            patch["inquiry_frequency"] = "high"
+        if re.search(r"各个模型.*独立|自定义.*上下文|分别调整", compact):
+            patch["context_budget_mode"] = "custom"
+        elif re.search(r"统一.*上下文|综合.*上下文", compact):
+            patch["context_budget_mode"] = "unified"
+        if re.search(r"关闭.*自动朗读|不要自动播报|取消自动朗读", compact):
+            patch["voice_auto_read"] = False
+        elif re.search(r"开启.*自动朗读|打开.*自动播报|自动朗读", compact):
+            patch["voice_auto_read"] = True
+        if re.search(r"关闭.*语音输出|不要.*语音输出", compact):
+            patch["voice_output_enabled"] = False
+        elif re.search(r"开启.*语音输出|打开.*语音输出", compact):
+            patch["voice_output_enabled"] = True
+        if re.search(r"关闭.*语音输入|不要.*语音输入", compact):
+            patch["voice_input_enabled"] = False
+        elif re.search(r"开启.*语音输入|打开.*语音输入", compact):
+            patch["voice_input_enabled"] = True
+        effort = re.search(r"(?:思考|推理)(?:强度)?(?:改为|设为|调到|调成|调整为|调|设|改)?(低|中|高|最高|max|low|medium|high)", compact)
+        if effort:
+            patch["reasoning_effort"] = {"低": "low", "中": "medium", "高": "high", "最高": "max"}.get(effort.group(1), effort.group(1))
+        temperature = re.search(r"(?:(writer|写作|coordinator|协调|reviewer|审查|memorykeeper|记忆)[^\d]{0,8})?(?:temperature|温度)[^\d]{0,8}(0(?:\.\d+)?|1(?:\.\d+)?|2(?:\.0)?)", compact)
+        top_p = re.search(r"(?:(writer|写作|coordinator|协调|reviewer|审查|memorykeeper|记忆)[^\d]{0,8})?(?:top[-_ ]?p|topp)[^\d]{0,8}(0?\.\d+|1(?:\.0)?)", compact)
+        if temperature or top_p:
+            role = "writer"
+            role_hint = (temperature.group(1) if temperature else None) or (top_p.group(1) if top_p else None) or ""
+            if re.search(r"coordinator|协调", role_hint):
+                role = "coordinator"
+            elif re.search(r"reviewer|审查", role_hint):
+                role = "reviewer"
+            elif re.search(r"memorykeeper|记忆", role_hint):
+                role = "memory_keeper"
+            generation: dict[str, Any] = {role: {}}
+            if temperature:
+                generation[role]["temperature"] = float(temperature.group(2))
+            if top_p:
+                generation[role]["top_p"] = float(top_p.group(2))
+            patch["agent_generation"] = generation
+        model = re.search(r"(?:模型|默认模型)(?:改为|设为|换成|使用)([a-z0-9_.:/-]{2,160})", compact)
+        if model:
+            patch["model"] = model.group(1)
+        return patch
 
     @staticmethod
     def _explicit_chapter_range(message: str) -> tuple[int | None, int | None]:
@@ -642,7 +882,7 @@ class TerminalSession:
         missing: set[str] = set()
         if intent.action in _CHAPTER_ACTIONS and intent.chapter_no is None:
             missing.add("chapter_no")
-        if intent.action in {"plan_preview", "arc_audit", "batch_draft", "batch_draft_accept", "batch_repair"}:
+        if intent.action in {"plan_preview", "outline", "arc_audit", "batch_draft", "batch_draft_accept", "batch_repair"}:
             if intent.chapter_no is None or intent.end_chapter_no is None:
                 missing.add("chapter_range")
         if intent.action in {"batch_accept", "batch_repair"} and not intent.batch_id:
@@ -650,6 +890,8 @@ class TerminalSession:
         if intent.action == "continue_run":
             if intent.target_characters is None and intent.end_chapter_no is None:
                 missing.add("target")
+        if intent.action == "settings_update" and not intent.settings_patch:
+            missing.add("settings_patch")
         if intent.action in {"rollback_preview", "rollback_restore"}:
             if not intent.checkpoint_id and intent.chapter_no is None:
                 missing.add("checkpoint_id")
@@ -662,12 +904,14 @@ class TerminalSession:
         fields: set[str] = set()
         if action in _CHAPTER_ACTIONS:
             fields.add("chapter_no")
-        if action in {"plan_preview", "arc_audit", "batch_draft", "batch_draft_accept", "batch_repair"}:
+        if action in {"plan_preview", "outline", "arc_audit", "batch_draft", "batch_draft_accept", "batch_repair"}:
             fields.update({"chapter_no", "end_chapter_no", "chapter_range"})
         if action in {"batch_accept", "batch_repair"}:
             fields.add("batch_id")
         if action == "continue_run":
             fields.update({"end_chapter_no", "target_characters", "target"})
+        if action == "settings_update":
+            fields.add("settings_patch")
         if action in {"rollback_preview", "rollback_restore"}:
             fields.update({"checkpoint_id", "chapter_no"})
         if action == "rollback_restore":
@@ -846,6 +1090,7 @@ class TerminalSession:
                 "只有 Reviewer pass 才可进入接受",
                 "accept 永远使用 force=false",
             ],
+            "settings_boundary": "用户明确要求时，可以通过 Novel Engine 修改白名单设置；执行后必须返回旧值、新值和下一步建议。",
             "inquiry_frequency": self.engine.settings.inquiry_frequency,
             "inquiry_policy": {
                 "low": "只追问缺少的执行条件和真实歧义",
@@ -1113,6 +1358,7 @@ class TerminalSession:
                     "当前篇章完成后，规划下一个篇章",
                     "继续按完整门禁写作，直到已接受正文达到 10 万汉字",
                     "按章节卡写第 1 章并审查",
+                    "生成第 11 到第 30 章的独立大纲（只写入 planning/outlines）",
                     "根据审查意见修订第 1 章，复审；仅通过才接受",
                     "审查第 1 章，通过后入正史",
                     "只尝试接受第 1 章，不要 force",
@@ -1125,6 +1371,40 @@ class TerminalSession:
             }
         if intent.action == "status":
             return {"result": self.engine.status(root)}
+        if intent.action == "settings_update":
+            patch = self._sanitize_settings_patch(intent.settings_patch)
+            if not patch:
+                return {"gate": "我还没有识别出可执行的设置项。请说清要改哪项，例如“把章节长度容错改为 30%”。"}
+            before = Settings.from_env(root)
+            saved = save_user_settings(patch)
+            after = Settings.from_env(root)
+            changes = {
+                key: {"before": getattr(before, key, None), "after": getattr(after, key, saved.get(key))}
+                for key in patch
+                if getattr(before, key, None) != getattr(after, key, saved.get(key))
+            }
+            unchanged = [
+                key
+                for key in patch
+                if key not in changes
+            ]
+            change_summary = [
+                self._setting_change_summary(key, item["before"], item["after"])
+                for key, item in changes.items()
+            ]
+            if change_summary:
+                summary = "已修改设置：" + "；".join(change_summary)
+            elif unchanged:
+                summary = "设置没有变化：" + "、".join(self._setting_label(key) for key in unchanged)
+            else:
+                summary = "没有识别到可保存的设置变化。"
+            return {
+                "settings_updated": changes,
+                "settings_unchanged": unchanged,
+                "settings_change_summary": change_summary,
+                "summary": summary,
+                "next_action": "新的设置会用于下一次任务；你可以继续说要做什么，Coordinator 会按当前设置安排。",
+            }
         if intent.action == "voice_clone_script":
             return {"result": await self.engine.generate_voice_clone_script(root)}
         if intent.action == "plan":
@@ -1135,6 +1415,9 @@ class TerminalSession:
                         "result": await self.engine.generate_plan(
                             root,
                             instruction=intent.operation_instruction,
+                            chapter_range=(intent.chapter_no, intent.end_chapter_no)
+                            if intent.chapter_no is not None and intent.end_chapter_no is not None
+                            else None,
                         ),
                     }
                 ]
@@ -1145,6 +1428,18 @@ class TerminalSession:
             return {
                 "result": self.engine.preview_plan_range(root, intent.chapter_no, intent.end_chapter_no),
                 "next_action": "你可以一次确认全部，或只指出需要调整的章节号；当前操作没有修改规划。",
+            }
+        if intent.action == "outline":
+            if intent.chapter_no is None or intent.end_chapter_no is None:
+                return {"gate": "独立大纲需要明确起止章节，例如“生成第 11 到第 30 章大纲”。"}
+            return {
+                "result": await self.engine.generate_outline(
+                    root,
+                    intent.chapter_no,
+                    intent.end_chapter_no,
+                    instruction=intent.operation_instruction,
+                ),
+                "next_action": "大纲已经单独保存；你可以点开文件查看，再决定从哪一章开始写草稿。",
             }
         if intent.action == "plan_next_arc":
             if (
@@ -1340,6 +1635,72 @@ class TerminalSession:
             return {"steps": steps}
 
         return {"gate": f"不支持的路由结果：{intent.action}"}
+
+    @staticmethod
+    def _setting_label(key: str) -> str:
+        return _SETTING_LABELS.get(key, key)
+
+    @staticmethod
+    def _setting_value_label(key: str, value: Any) -> str:
+        if key == "chapter_length_tolerance":
+            try:
+                return f"{float(value) * 100:g}%"
+            except (TypeError, ValueError):
+                return str(value)
+        if key in {"voice_auto_read", "voice_output_enabled", "voice_input_enabled"}:
+            return "开启" if bool(value) else "关闭"
+        if key in {"context_soft_tokens", "context_hard_tokens"}:
+            try:
+                return f"{int(value):,} tokens"
+            except (TypeError, ValueError):
+                return str(value)
+        if key == "agent_generation":
+            if isinstance(value, dict):
+                roles = "、".join(str(role) for role in value)
+                return f"已调整（{roles or '四个 Agent'}）"
+            return str(value)
+        mapped = _SETTING_VALUE_LABELS.get(key, {})
+        return str(mapped.get(str(value), value))
+
+    @staticmethod
+    def _setting_change_summary(key: str, before: Any, after: Any) -> str:
+        if key == "agent_generation" and isinstance(before, dict) and isinstance(after, dict):
+            role_labels = {"coordinator": "Coordinator", "writer": "Writer", "reviewer": "Reviewer", "memory_keeper": "Memory Keeper"}
+            fields = ("temperature", "top_p", "top_k")
+            items: list[str] = []
+            for role, label in role_labels.items():
+                old_values = before.get(role) if isinstance(before.get(role), dict) else {}
+                new_values = after.get(role) if isinstance(after.get(role), dict) else {}
+                for field in fields:
+                    if old_values.get(field) != new_values.get(field):
+                        items.append(f"{label} {field} {old_values.get(field)} → {new_values.get(field)}")
+            if items:
+                return "Agent 生成参数：" + "、".join(items)
+        return f"{TerminalSession._setting_label(key)}：{TerminalSession._setting_value_label(key, before)} → {TerminalSession._setting_value_label(key, after)}"
+
+    @staticmethod
+    def _recommend_next_step(intent: TerminalIntent, response: dict[str, Any]) -> dict[str, str] | None:
+        """Return one short, user-controlled next action for the Coordinator UI."""
+
+        if response.get("gate") or response.get("needs_clarification"):
+            return None
+        suggestions: dict[str, tuple[str, str, str]] = {
+            "plan": ("查看第一章规划", "先看章节卡，再决定从哪一章写草稿。", "查看当前规划"),
+            "outline": ("从大纲开始写", "独立大纲已保存，选定起点后再生成草稿。", "根据大纲生成第 1 章草稿"),
+            "write_draft": ("审查这章", "草稿还没有进入正史，先读一遍或交给 Reviewer。", "审查当前章"),
+            "write_review": ("查看审查结果", "Writer 和 Reviewer 已完成当前版本的交接。", "打开当前审查报告"),
+            "review": ("处理审查意见", "根据报告决定修订，或在通过后明确验收。", "按审查意见修改当前章"),
+            "revise_draft": ("重新审查", "修订产生了新版本，旧报告不能替代新版本审查。", "重新审查当前章"),
+            "revise_review": ("查看新的审查", "新版本已完成复审，可以继续阅读结果。", "打开当前审查报告"),
+            "batch_draft": ("查看批次", "草稿批次仍在临时区，先查看逐章结果再决定是否验收。", "查看批次进度"),
+            "settings_update": ("继续安排任务", "新设置会从下一次任务开始生效。", "查看当前项目状态"),
+            "status": ("选择下一步", "Coordinator 已读完当前状态，可以直接告诉我想推进哪一项。", "先问我下一步建议"),
+        }
+        item = suggestions.get(intent.action)
+        if not item:
+            return None
+        label, reason, prompt = item
+        return {"label": label, "reason": reason, "prompt": prompt}
 
     def _reuse_current_pass_review(self, project: InkFlowProject, chapter_no: int) -> dict[str, Any] | None:
         """Return a safe handoff when the current draft already has a pass report."""

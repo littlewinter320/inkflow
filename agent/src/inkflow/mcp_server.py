@@ -213,10 +213,28 @@ def novel_plan_preview(
     end_chapter: int,
     project_root: str | None = None,
 ) -> dict[str, Any]:
-    """一次集中查看 1～20 张已有章节卡；只读、不调用模型、不修改规划。"""
+    """按用户给出的范围集中查看已有章节卡；只读、不调用模型、不修改规划。"""
 
     root = _root(project_root)
     return _engine(root).preview_plan_range(root, start_chapter, end_chapter)
+
+
+@mcp.tool(annotations=MODEL_WRITE)
+async def novel_outline_generate(
+    start_chapter: int,
+    end_chapter: int,
+    instruction: str = "",
+    project_root: str | None = None,
+) -> dict[str, Any]:
+    """生成独立章节大纲；只写入 planning/outlines，不改正式规划或正史。"""
+
+    root = _root(project_root)
+    return await _engine(root).generate_outline(
+        root,
+        start_chapter,
+        end_chapter,
+        instruction=instruction,
+    )
 
 
 @mcp.tool(annotations=CANON_WRITE)

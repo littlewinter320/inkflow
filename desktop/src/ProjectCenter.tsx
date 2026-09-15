@@ -224,6 +224,8 @@ export function ProjectCenter({
   const arc = (currentPlan?.arc || {}) as Record<string, unknown>;
   const chapterCards = (arc.chapter_cards || []) as Array<Record<string, unknown>>;
   const chapterFiles = (tree?.groups || []).find((group) => group.id === "chapters")?.items || [];
+  const defaultOutlineStart = Number(arc.chapter_start || 1);
+  const defaultOutlineEnd = Number(arc.chapter_end || defaultOutlineStart);
 
   return (
     <div className="scroll-panel project-center">
@@ -254,7 +256,7 @@ export function ProjectCenter({
       {chapterCards.length > 0 && <ChapterNavigator cards={chapterCards} files={chapterFiles} onOpen={onOpen} onPrompt={onPrompt} />}
 
       <section className="project-section plan-overview">
-        <div className="project-section-title"><div><h3>四级规划与章节卡</h3><p>这里直接展示当前卷、篇章、章节功能和钩子；完整版本仍保存在“当前规划”文档。</p></div>{chapterCards.length > 0 && <button onClick={() => onPrompt(`请把第 ${String(arc.chapter_start)} 到第 ${String(arc.chapter_end)} 章的章节卡一次性整理给我看，只预览，不改规划。`)}>集中预览本篇</button>}</div>
+        <div className="project-section-title"><div><h3>四级规划与章节卡</h3><p>这里直接展示当前卷、篇章、章节功能和钩子；完整版本仍保存在“当前规划”文档。</p></div><div className="settings-inline-actions">{chapterCards.length > 0 && <button onClick={() => onPrompt(`请把第 ${String(arc.chapter_start)} 到第 ${String(arc.chapter_end)} 章的章节卡一次性整理给我看，只预览，不改规划。`)}>集中预览本篇</button>}<button onClick={() => onPrompt(`生成第 ${defaultOutlineStart} 到第 ${defaultOutlineEnd} 章的独立大纲，只保存规划草案，不生成正文。`)}>生成独立大纲</button></div></div>
         {!currentPlan && <div className="plan-empty"><strong>还没有四级规划</strong><p>先生成全书罗盘、当前卷、当前篇章和篇章内章节卡，写作角色才会开始正文。</p><button onClick={() => onPrompt("请先和我确认方向，再生成全书罗盘、当前卷、当前篇章及篇章内全部章节卡。")}>把规划请求放入对话框</button></div>}
         {currentPlan && <>
           <div className="plan-levels">

@@ -11,8 +11,8 @@ ROLE_CAPABILITIES: tuple[RoleCapability, ...] = (
     RoleCapability(
         role="coordinator",
         novel_production_agent=False,
-        can=["理解自然语言", "拆解任务", "选择预定义工作流", "提出最小澄清", "汇总分歧"],
-        cannot=["写正文", "审查正文", "提交正史", "绕过引擎门禁", "自行扩权"],
+        can=["理解自然语言", "拆解任务", "选择预定义工作流", "提出最小澄清", "汇总分歧", "通过 Novel Engine 请求白名单设置变更"],
+        cannot=["写正文", "审查正文", "提交正史", "直接写设置文件或数据库", "绕过引擎门禁", "自行扩权"],
     ),
     RoleCapability(
         role="writer",
@@ -40,6 +40,7 @@ _WORKFLOWS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
     "help": (("engine", "help.read", "", "使用说明"),),
     "plan": (("writer", "plan.generate", "", "四级规划"),),
     "plan_preview": (("engine", "plan.preview", "", "规划预览"),),
+    "outline": (("writer", "plan.outline", "", "独立章节大纲"),),
     "plan_brief": (("writer", "plan.brief", "", "公开规划判断单"),),
     "plan_next_arc": (("writer", "plan.advance", "", "下一篇章规划"),),
     "write_draft": (("writer", "chapter.write", "", "章节草稿"),),
@@ -84,6 +85,7 @@ _WORKFLOWS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
     "chat": (),
     "ideate": (("writer", "idea.brainstorm", "", "创意提案"),),
     "voice_clone_script": (("writer", "voice.clone_script", "", "声音克隆参考朗读稿"),),
+    "settings_update": (("engine", "settings.update", "", "设置变更结果"),),
     "discuss": (),
     "exit": (),
 }
@@ -175,6 +177,8 @@ class Coordinator:
     def _input_sources(intent: TerminalIntent) -> list[str]:
         if intent.action == "voice_clone_script":
             return ["user:current", "voice:local-only"]
+        if intent.action == "settings_update":
+            return ["user:current", "settings:global"]
         sources = ["user:current", "canon:sqlite", "preferences:active", "plan:current"]
         if intent.chapter_no:
             sources.extend([f"chapter:{intent.chapter_no:05d}", f"review:{intent.chapter_no:05d}"])
@@ -184,7 +188,7 @@ class Coordinator:
 
     @staticmethod
     def _model_call_budget(intent: TerminalIntent, chapter_count: int) -> int:
-        if intent.action in {"status", "help", "plan_preview", "checkpoint_list", "rollback_preview", "exit"}:
+        if intent.action in {"status", "help", "plan_preview", "outline", "checkpoint_list", "rollback_preview", "exit"}:
             return 0
         if intent.action in {"discuss", "chat"}:
             return 1

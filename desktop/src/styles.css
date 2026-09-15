@@ -176,6 +176,8 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .evidence-body { display: grid; gap: 10px; padding: 0 9px 10px; }
 .evidence-body section { padding-top: 8px; border-top: 1px solid var(--line-soft); }
 .evidence-body section > strong { color: var(--text); font-size: 10px; }
+.evidence-details { margin-top: 8px; border-top: 1px solid var(--line-soft); }
+.evidence-details > summary { padding-top: 8px; color: var(--accent-dim); cursor: pointer; font-size: 10px; }
 .message .reasoning-list { margin: 8px 0 0; padding-left: 20px; }
 .message .reasoning-list li { margin-top: 5px; color: var(--muted); line-height: 1.55; }
 .evidence-body pre { max-height: 230px; overflow: auto; margin: 7px 0 0; padding: 9px; border: 1px solid var(--line-soft); border-radius: 6px; background: #11110f; color: var(--muted); font-size: 10px; }
@@ -814,6 +816,16 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .search-results strong { font-size: 10px; }
 .search-results p { margin: 5px 0 0; color: var(--muted); font-size: 11px; }
 .question-backdrop { z-index: 130; }
+.guide-backdrop { z-index: 125; }
+.coordinator-guide { width: min(480px, 100%); padding: 24px; }
+.coordinator-guide .modal-subtitle { margin-bottom: 14px; }
+.guide-card { padding: 14px 16px; border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--line)); border-radius: 10px; background: color-mix(in srgb, var(--accent) 9%, var(--panel-2)); }
+.guide-card strong { display: block; color: var(--accent-dim); font-size: 13px; }
+.guide-card p { margin: 7px 0 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.chat-run-steps { display: grid; gap: 6px; margin: 10px 0 0; padding-left: 18px; color: var(--muted); font-size: 10px; }
+.chat-run-steps li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 5px 8px; }
+.chat-run-steps li strong { color: var(--accent-dim); }
+.chat-run-steps li small { grid-column: 2; color: var(--faint); }
 .question-dialog { width: min(760px, 100%); }
 .question-list { display: flex; flex-direction: column; gap: 12px; }
 .question-card { min-width: 0; margin: 0; padding: 15px; border: 1px solid #454238; background: #141411; }
