@@ -8,7 +8,23 @@ from pathlib import Path
 from typing import Any
 
 from .provider import ProviderResult
+from .schemas import ConflictRecord
 from .utils import atomic_write_text, json_dumps, utc_now
+from .runtime import active_runtime
+from .role_protocol import normalize_role
+
+
+def _versioned_role_metadata(metadata: dict[str, Any], protocol_version: int) -> dict[str, Any]:
+    """Annotate a view without renaming historical role fields or rewriting logs."""
+    result = dict(metadata)
+    role = result.get("agent_role")
+    if role:
+        try:
+            result["canonical_agent_role"] = normalize_role(role, protocol_version)
+        except ValueError:
+            # Service events and future protocol versions remain readable.
+            result.pop("canonical_agent_role", None)
+    return result
 
 
 def recent_trace_runs(project_root: str | Path, limit: int = 12) -> list[dict[str, Any]]:
@@ -39,6 +55,8 @@ def recent_trace_runs(project_root: str | Path, limit: int = 12) -> list[dict[st
             except json.JSONDecodeError:
                 continue
             metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+            protocol_version = event.setdefault("role_protocol_version", 1)
+            metadata = _versioned_role_metadata(metadata, protocol_version)
             references = _trace_file_references(root, metadata)
             event["metadata"] = metadata
             event["references"] = references
@@ -109,10 +127,16 @@ class TraceEvent:
     summary: str
     details: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    role_protocol_version: int = 1
 
 
 class TraceRecorder:
-    def __init__(self, project_root: str | Path, operation: str, trace_level: str = "full"):
+    def __init__(
+        self, project_root: str | Path, operation: str, trace_level: str = "full",
+        *, role_protocol_version: int = 1,
+    ):
+        normalize_role("coordinator", role_protocol_version)
+        self.role_protocol_version = role_protocol_version
         self.project_root = Path(project_root).resolve()
         stamp = utc_now().replace(":", "").replace("+00:00", "Z").replace("-", "")
         self.run_id = f"{stamp}-{operation}-{uuid.uuid4().hex[:8]}"
@@ -139,12 +163,42 @@ class TraceRecorder:
             status=status,
             summary=summary,
             details=details,
-            metadata=metadata or {},
+            metadata=_versioned_role_metadata(metadata or {}, self.role_protocol_version),
+            role_protocol_version=self.role_protocol_version,
         )
         self.events.append(event)
         with self.events_path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(asdict(event), ensure_ascii=False) + "\n")
         self._render()
+        runtime = active_runtime.get()
+        if runtime and not stage.endswith("provider_reasoning"):
+            runtime.publish({"type": "workflow.stage", "trace_id": self.run_id,
+                             "role_protocol_version": self.role_protocol_version,
+                             "stage": stage, "status": status, "summary": summary,
+                             "details": details, "role": event.metadata.get("agent_role", ""),
+                             "model": event.metadata.get("model", ""), "metadata": event.metadata,
+                             "references": _trace_file_references(self.project_root, event.metadata)})
+
+    def record_conflict(self, conflict: ConflictRecord) -> None:
+        """Persist the focused evidence locally; publish only an actionable summary."""
+        if conflict.role_protocol_version != self.role_protocol_version:
+            raise ValueError("冲突记录与运行任务的角色协议版本不一致。")
+        safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", conflict.conflict_id)[:80]
+        record_path = self.run_dir / f"conflict-{safe_id}-{len(self.events) + 1:03d}.json"
+        atomic_write_text(record_path, json_dumps(conflict.model_dump(mode="json")))
+        self.record(
+            "workflow.conflict",
+            "waiting" if conflict.status.startswith("waiting_") else conflict.status,
+            conflict.public_summary,
+            metadata={
+                "conflict_id": conflict.conflict_id,
+                "category": conflict.category,
+                "next_action": conflict.next_action,
+                "ticket_id": conflict.ticket_id,
+                "task_revision": conflict.task_revision,
+                "conflict_record_path": str(record_path),
+            },
+        )
 
     def record_model(self, stage: str, result: ProviderResult[Any], decision_summary: str) -> None:
         metadata = {
@@ -152,6 +206,12 @@ class TraceRecorder:
             "response_id": result.response_id,
             "usage": result.usage,
         }
+        if self.trace_level == "full":
+            ordinal = 1 + sum(event.stage == stage and event.status == "completed" for event in self.events)
+            output_path = self.run_dir / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', stage)}.{ordinal}.output.json"
+            # Structured deliverable only; never persist hidden reasoning_content.
+            atomic_write_text(output_path, json_dumps(result.data.model_dump(mode="json")))
+            metadata["output_path"] = str(output_path)
         started = next(
             (
                 event for event in reversed(self.events)
@@ -163,6 +223,11 @@ class TraceRecorder:
             metadata["agent_role"] = started.metadata["agent_role"]
         elif result.agent_role:
             metadata["agent_role"] = result.agent_role
+        for recovery in result.usage.get("recovery_events", []):
+            self.record(
+                f"{stage}.recovery", "completed", str(recovery.get("strategy", "请求已自动恢复")),
+                metadata={**recovery, "agent_role": metadata.get("agent_role", "")},
+            )
         self.record(stage, "completed", decision_summary, metadata=json.loads(json_dumps(metadata)))
         if self.trace_level == "full" and result.reasoning_content:
             self.record(

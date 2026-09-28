@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$Publish,
     [switch]$IncludeExtension
 )
@@ -6,13 +6,23 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
-$python = Join-Path $repositoryRoot '.venv\Scripts\python.exe'
-$pyinstaller = Join-Path $repositoryRoot '.venv\Scripts\pyinstaller.exe'
-$engineOutput = Join-Path $repositoryRoot 'dist\engine'
+$releaseRoot = 'D:\墨流\release\0.7.0'
+$python = Join-Path $releaseRoot 'venv\Scripts\python.exe'
+$pyinstaller = Join-Path $releaseRoot 'venv\Scripts\pyinstaller.exe'
+$engineOutput = Join-Path $releaseRoot 'engine'
 $agentRoot = Join-Path $repositoryRoot 'agent'
 $extensionBin = Join-Path $repositoryRoot 'extension\bin'
-$extensionRelease = Join-Path $repositoryRoot 'artifacts\extension'
-$desktopRelease = Join-Path $repositoryRoot 'artifacts\desktop'
+$extensionRelease = Join-Path $releaseRoot 'extension'
+$desktopRelease = Join-Path $releaseRoot 'desktop'
+$buildWorkPath = Join-Path $releaseRoot 'build\pyinstaller'
+$env:PIP_CACHE_DIR = Join-Path $releaseRoot 'cache\pip'
+$env:npm_config_cache = Join-Path $releaseRoot 'cache\npm'
+$env:TEMP = Join-Path $releaseRoot 'temp'
+$env:TMP = $env:TEMP
+$env:PYINSTALLER_CONFIG_DIR = Join-Path $releaseRoot 'cache\pyinstaller'
+foreach ($directory in @($engineOutput, $extensionRelease, $desktopRelease, $buildWorkPath, $env:PIP_CACHE_DIR, $env:npm_config_cache, $env:TEMP, $env:PYINSTALLER_CONFIG_DIR)) {
+    New-Item -ItemType Directory -Force -Path $directory | Out-Null
+}
 $systemPowerShellDirectory = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0'
 $system32Directory = Join-Path $env:SystemRoot 'System32'
 
@@ -28,7 +38,8 @@ if (-not $desktopVersion -or $desktopVersion -ne $agentVersion -or $desktopVersi
 }
 
 if (-not (Test-Path -LiteralPath $python)) {
-    throw 'Missing .venv. Create the Python virtual environment in the repository root first.'
+    & python -m venv (Join-Path $releaseRoot 'venv')
+    if ($LASTEXITCODE -ne 0) { throw 'Could not create the release Python environment on D:.' }
 }
 
 & $python -m pip install -e "${agentRoot}[build]"
@@ -45,11 +56,12 @@ if ($LASTEXITCODE -ne 0) {
     --collect-submodules mcp.server `
     --collect-submodules mcp.shared `
     --collect-data mcp `
+    --collect-all edge_tts `
     --hidden-import mcp.types `
     --exclude-module mcp.cli `
     --distpath $engineOutput `
-    --workpath (Join-Path $repositoryRoot 'build\pyinstaller') `
-    --specpath (Join-Path $repositoryRoot 'build\pyinstaller') `
+    --workpath $buildWorkPath `
+    --specpath $buildWorkPath `
     (Join-Path $agentRoot 'scripts\inkflow_app_server_entry.py')
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller failed with exit code $LASTEXITCODE."
@@ -93,7 +105,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Desktop build failed with exit code $LASTEXITCODE." }
         npx electron-builder --win nsis --publish never
         if ($LASTEXITCODE -ne 0) { throw "Desktop package generation failed with exit code $LASTEXITCODE." }
-        $desktopAssets = @(Get-ChildItem -LiteralPath (Join-Path $desktopRelease $desktopVersion) -File | Where-Object {
+        $desktopAssets = @(Get-ChildItem -LiteralPath $desktopRelease -File | Where-Object {
             $_.Name -eq "InkFlow-Setup-$desktopVersion.exe" -or
             $_.Name -eq "InkFlow-Setup-$desktopVersion.exe.blockmap" -or
             $_.Name -eq "latest.yml"
@@ -110,7 +122,9 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "GitHub Release asset upload failed with exit code $LASTEXITCODE." }
     }
     else {
-        npm run dist:win
+        npm run build
+        if ($LASTEXITCODE -ne 0) { throw "Desktop build failed with exit code $LASTEXITCODE." }
+        npx electron-builder --win nsis --publish never
     }
     if ($LASTEXITCODE -ne 0) { throw "Desktop packaging failed with exit code $LASTEXITCODE." }
 }
@@ -119,5 +133,5 @@ finally {
     Pop-Location
 }
 
-$extensionNote = if ($IncludeExtension) { ' and artifacts\extension' } else { '' }
-Write-Host ('InkFlow {0} build completed: artifacts\desktop{1}.' -f $desktopVersion, $extensionNote)
+$extensionNote = if ($IncludeExtension) { " and $extensionRelease" } else { '' }
+Write-Host ('InkFlow {0} build completed: {1}{2}.' -f $desktopVersion, $desktopRelease, $extensionNote)

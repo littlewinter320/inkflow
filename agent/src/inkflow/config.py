@@ -10,6 +10,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .errors import ConfigurationError
+from .role_protocol import (
+    LEGACY_ROLE_PROTOCOL_VERSION,
+    ROLE_PROTOCOL_VERSION,
+    migrate_role_settings,
+    normalize_role,
+)
 
 
 KEYRING_SERVICE = "InkFlow"
@@ -34,7 +40,9 @@ PERSISTED_SETTING_NAMES = {
     "context_hard_tokens",
     "context_budget_mode",
     "agent_context_budgets",
+    "role_settings_version",
     "max_output_tokens",
+    "max_concurrent_model_requests",
     "request_timeout_seconds",
     "planning_timeout_seconds",
     "trace_level",
@@ -42,7 +50,9 @@ PERSISTED_SETTING_NAMES = {
     "inquiry_frequency",
     "hook_strategy",
     "chapter_length_tolerance",
+    "review_min_confidence",
     "acceptance_confirmation_mode",
+    "planning_window_chapters",
     "dialogue_history_mode",
     "dialogue_history_interval",
     "dialogue_history_limit",
@@ -66,10 +76,10 @@ PERSISTED_SETTING_NAMES = {
     "voice_input_device",
     "voice_output_device",
     "voice_compute_device",
-    "voice_engine",
-    "voice_asr_model",
-    "voice_tts_model",
-    "voice_clone_model",
+    "voice_input_engine",
+    "voice_dialogue_engine",
+    "voice_text_engine",
+    "voice_novel_engine",
     "voice_light_asr_model",
     "voice_light_tts_model",
     "voice_sample_rate",
@@ -84,14 +94,29 @@ DEFAULT_AGENT_GENERATION: dict[str, dict[str, float | int | None]] = {
     "coordinator": {"temperature": 0.25, "top_p": 0.8, "top_k": None},
     "writer": {"temperature": 0.85, "top_p": 0.95, "top_k": None},
     "reviewer": {"temperature": 0.2, "top_p": 0.8, "top_k": None},
-    "memory_keeper": {"temperature": 0.1, "top_p": 0.7, "top_k": None},
 }
 
 DEFAULT_AGENT_CONTEXT_BUDGETS: dict[str, dict[str, int]] = {
     "coordinator": {"soft": 96_000, "hard": 160_000},
     "writer": {"soft": 192_000, "hard": 208_000},
     "reviewer": {"soft": 160_000, "hard": 176_000},
-    "memory_keeper": {"soft": 96_000, "hard": 128_000},
+}
+
+# The old three-role attributes remain a compatibility projection. Canonical
+# settings distinguish Editor from the optional specialist Reviewer.
+DEFAULT_ROLE_GENERATION: dict[str, dict[str, float | int | None]] = {
+    "coordinator": dict(DEFAULT_AGENT_GENERATION["coordinator"]),
+    "writer": dict(DEFAULT_AGENT_GENERATION["writer"]),
+    "editor": dict(DEFAULT_AGENT_GENERATION["reviewer"]),
+    "reviewer": dict(DEFAULT_AGENT_GENERATION["reviewer"]),
+    "memory_keeper": dict(DEFAULT_AGENT_GENERATION["reviewer"]),
+}
+DEFAULT_ROLE_CONTEXT_BUDGETS: dict[str, dict[str, int]] = {
+    "coordinator": dict(DEFAULT_AGENT_CONTEXT_BUDGETS["coordinator"]),
+    "writer": dict(DEFAULT_AGENT_CONTEXT_BUDGETS["writer"]),
+    "editor": dict(DEFAULT_AGENT_CONTEXT_BUDGETS["reviewer"]),
+    "reviewer": dict(DEFAULT_AGENT_CONTEXT_BUDGETS["reviewer"]),
+    "memory_keeper": dict(DEFAULT_AGENT_CONTEXT_BUDGETS["reviewer"]),
 }
 
 # Settings can be written by the voice and provider routes at the same time.
@@ -126,7 +151,11 @@ def load_user_settings() -> dict[str, Any]:
 
 
 def save_user_settings(updates: dict[str, Any]) -> dict[str, Any]:
-    """只保存白名单内的非敏感设置，并以替换文件的方式原子写入。"""
+    """Merge the caller's versioned patch and atomically persist canonical v2.
+
+    Unversioned callers still edit the legacy three-role view. Their reviewer
+    fields belong to Editor and cannot overwrite specialist Reviewer settings.
+    """
 
     forbidden = {key for key in updates if "key" in key.lower() or "secret" in key.lower()}
     if forbidden:
@@ -135,14 +164,17 @@ def save_user_settings(updates: dict[str, Any]) -> dict[str, Any]:
     if unknown:
         raise ConfigurationError(f"不支持的设置项：{', '.join(sorted(unknown))}")
     with _SETTINGS_WRITE_LOCK:
-        current = load_user_settings()
-        current.update(updates)
+        caller_version = _settings_protocol_version(updates.get("role_settings_version"))
+        current = Settings.from_mapping(load_user_settings()).to_mapping()
+        for key, value in updates.items():
+            if key in {"agent_generation", "agent_context_budgets"}:
+                migrated, _ = _migrate_settings_roles(value, updates.get("role_settings_version"))
+                for role, fields in migrated.items():
+                    current[key].setdefault(role, {}).update(fields)
+            elif key != "role_settings_version":
+                current[key] = value
         validated = Settings.from_mapping(current)
-        clean = {
-            key: value
-            for key, value in asdict(validated).items()
-            if key in PERSISTED_SETTING_NAMES
-        }
+        clean = validated.to_mapping()
         path = user_settings_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         handle, temporary_name = tempfile.mkstemp(prefix="settings-", suffix=".tmp", dir=path.parent)
@@ -155,7 +187,7 @@ def save_user_settings(updates: dict[str, Any]) -> dict[str, Any]:
         finally:
             if temporary.exists():
                 temporary.unlink()
-    return clean
+    return validated.to_mapping(protocol_version=caller_version)
 
 
 @dataclass(slots=True)
@@ -172,15 +204,18 @@ class Settings:
     agent_context_budgets: dict[str, dict[str, int]] = field(
         default_factory=lambda: {name: dict(values) for name, values in DEFAULT_AGENT_CONTEXT_BUDGETS.items()}
     )
-    max_output_tokens: int = 16_000
+    max_output_tokens: int = 32_000
+    max_concurrent_model_requests: int = 3
     request_timeout_seconds: float = 180.0
     planning_timeout_seconds: float = 600.0
     trace_level: str = "full"
     show_provider_reasoning: bool = True
     inquiry_frequency: str = "medium"
     hook_strategy: str = "most_chapters"
-    chapter_length_tolerance: float = 0.20
-    acceptance_confirmation_mode: str = "per_chapter"
+    chapter_length_tolerance: float = 0.10
+    review_min_confidence: float = 0.80
+    acceptance_confirmation_mode: str = "auto_after_review"
+    planning_window_chapters: int = 10
     dialogue_history_mode: str = "auto"
     dialogue_history_interval: int = 1
     dialogue_history_limit: int = 100
@@ -206,10 +241,10 @@ class Settings:
     voice_input_device: str = ""
     voice_output_device: str = ""
     voice_compute_device: str = "auto"
-    voice_engine: str = "moss"
-    voice_asr_model: str = ""
-    voice_tts_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
-    voice_clone_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    voice_input_engine: str = "off"
+    voice_dialogue_engine: str = "edge"
+    voice_text_engine: str = "edge"
+    voice_novel_engine: str = "edge"
     voice_light_asr_model: str = ""
     voice_light_tts_model: str = "MOSS-TTS-Nano-100M-ONNX"
     voice_sample_rate: int = 24000
@@ -219,14 +254,60 @@ class Settings:
     input_price_per_million: float = 0.0
     output_price_per_million: float = 0.0
     workspace_root: Path | None = None
+    role_settings_version: int = field(default=ROLE_PROTOCOL_VERSION, init=False)
+    role_settings_warnings: tuple[str, ...] = field(default_factory=tuple)
+    role_generation: dict[str, dict[str, float | int | None]] = field(default_factory=dict, repr=False)
+    role_context_budgets: dict[str, dict[str, int]] = field(default_factory=dict, repr=False)
 
-    def context_budget_for(self, role: str) -> tuple[int, int]:
+    def __post_init__(self) -> None:
+        # Direct Settings(agent_generation=...) construction retains its legacy
+        # meaning; from_mapping supplies canonical groups explicitly.
+        warnings = list(self.role_settings_warnings)
+        generation = self.role_generation
+        if not generation:
+            generation, notices = _migrate_settings_roles(self.agent_generation, LEGACY_ROLE_PROTOCOL_VERSION)
+            warnings.extend(notices)
+        budgets = self.role_context_budgets
+        if not budgets:
+            budgets, notices = _migrate_settings_roles(self.agent_context_budgets, LEGACY_ROLE_PROTOCOL_VERSION)
+            warnings.extend(notices)
+        self.role_generation = _agent_generation(generation)
+        self.role_context_budgets = _agent_context_budgets(budgets)
+        self.role_settings_warnings = tuple(dict.fromkeys(warnings))
+        self.agent_generation = _legacy_role_view(self.role_generation)
+        self.agent_context_budgets = _legacy_role_view(self.role_context_budgets)
+
+    def generation_for(self, role: str, protocol_version: int = 1) -> dict[str, float | int | None]:
+        canonical = _settings_role(role, protocol_version)
+        return dict(self.role_generation[canonical])
+
+    def context_budget_for(self, role: str, protocol_version: int = 1) -> tuple[int, int]:
         """返回一次 Agent 调用可用的上下文预算；统一模式保持旧行为。"""
 
+        canonical = _settings_role(role, protocol_version)
         if self.context_budget_mode != "custom":
             return self.context_soft_tokens, self.context_hard_tokens
-        selected = self.agent_context_budgets.get(role) or self.agent_context_budgets["writer"]
+        selected = self.role_context_budgets[canonical]
         return int(selected["soft"]), int(selected["hard"])
+
+    def role_settings_view(self, protocol_version: int = 1) -> dict[str, Any]:
+        version = _settings_protocol_version(protocol_version)
+        legacy = version == LEGACY_ROLE_PROTOCOL_VERSION
+        return {
+            "role_settings_version": version,
+            "agent_generation": _legacy_role_view(self.role_generation) if legacy else {
+                role: dict(values) for role, values in self.role_generation.items()
+            },
+            "agent_context_budgets": _legacy_role_view(self.role_context_budgets) if legacy else {
+                role: dict(values) for role, values in self.role_context_budgets.items()
+            },
+        }
+
+    def to_mapping(self, protocol_version: int = ROLE_PROTOCOL_VERSION) -> dict[str, Any]:
+        """Serialize one explicit role view, excluding internal canonical copies."""
+        values = {key: value for key, value in asdict(self).items() if key in PERSISTED_SETTING_NAMES}
+        values.update(self.role_settings_view(protocol_version))
+        return values
 
     @classmethod
     def from_mapping(
@@ -238,11 +319,8 @@ class Settings:
         # Normalize legacy model IDs even when they come from workspace settings
         # or environment variables, rather than only the global settings file.
         for key, previous, current in (
-            ("voice_tts_model", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"),
-            ("voice_clone_model", "Qwen/Qwen3-TTS-12Hz-0.6B-Base", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
             ("voice_light_tts_model", "sherpa-onnx-vits-zh-ll", "MOSS-TTS-Nano-100M-ONNX"),
             ("voice_light_tts_model", "kokoro-int8-multi-lang-v1_1", "MOSS-TTS-Nano-100M-ONNX"),
-            ("voice_asr_model", "paraformer-zh-streaming", ""),
             ("voice_light_asr_model", "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09", ""),
         ):
             if str(value.get(key, "")).strip() == previous:
@@ -267,6 +345,12 @@ class Settings:
         soft = _positive_int(value.get("context_soft_tokens", defaults.context_soft_tokens), "软上下文预算")
         hard = _positive_int(value.get("context_hard_tokens", defaults.context_hard_tokens), "硬上下文上限")
         output = _positive_int(value.get("max_output_tokens", defaults.max_output_tokens), "单次输出上限")
+        max_concurrent_model_requests = _bounded_int_range(
+            value.get("max_concurrent_model_requests", defaults.max_concurrent_model_requests),
+            "模型请求并发上限",
+            1,
+            16,
+        )
         if soft > hard:
             raise ConfigurationError("软上下文预算不能大于硬上下文上限。")
         context_budget_mode = _choice(
@@ -274,21 +358,13 @@ class Settings:
             "上下文预算模式",
             {"unified", "custom"},
         )
-        raw_agent_budgets = value.get("agent_context_budgets", defaults.agent_context_budgets)
-        if not isinstance(raw_agent_budgets, dict):
-            raise ConfigurationError("各 Agent 上下文预算必须是对象。")
-        agent_context_budgets: dict[str, dict[str, int]] = {}
-        for role, fallback in DEFAULT_AGENT_CONTEXT_BUDGETS.items():
-            raw = raw_agent_budgets.get(role, fallback)
-            if not isinstance(raw, dict):
-                raise ConfigurationError(f"{role} 的上下文预算格式无效。")
-            role_soft = _positive_int(raw.get("soft", fallback["soft"]), f"{role} 常用上下文预算")
-            role_hard = _positive_int(raw.get("hard", fallback["hard"]), f"{role} 最大上下文预算")
-            if role_soft > role_hard:
-                raise ConfigurationError(f"{role} 的常用上下文不能大于最大上下文。")
-            agent_context_budgets[role] = {"soft": role_soft, "hard": role_hard}
-        if output > 16_000:
-            raise ConfigurationError("墨流的单次模型输出上限固定为 16K tokens。")
+        source_version = value.get("role_settings_version")
+        raw_agent_budgets, context_warnings = _migrate_settings_roles(
+            value.get("agent_context_budgets", {}), source_version
+        )
+        agent_context_budgets = _agent_context_budgets(raw_agent_budgets)
+        if output > 128_000:
+            raise ConfigurationError("单次模型输出上限不能超过 128K tokens。")
         timeout = _positive_float(
             value.get("request_timeout_seconds", defaults.request_timeout_seconds), "普通请求超时"
         )
@@ -306,13 +382,23 @@ class Settings:
         chapter_length_tolerance = _bounded_float(
             value.get("chapter_length_tolerance", defaults.chapter_length_tolerance),
             "章节长度容差",
-            0.10,
+            0.05,
+            0.30,
+        )
+        review_min_confidence = _bounded_float(
+            value.get("review_min_confidence", defaults.review_min_confidence),
+            "审查最低把握度",
+            0.70,
             1.00,
         )
         acceptance_confirmation_mode = _choice(
             value.get("acceptance_confirmation_mode", defaults.acceptance_confirmation_mode),
             "验收确认策略",
             {"per_chapter", "batch_once", "auto_after_review"},
+        )
+        planning_window_chapters = _bounded_int_range(
+            value.get("planning_window_chapters", defaults.planning_window_chapters),
+            "默认近期规划章数", 1, 50,
         )
         dialogue_history_mode = _choice(
             value.get("dialogue_history_mode", defaults.dialogue_history_mode),
@@ -331,7 +417,10 @@ class Settings:
             5,
             1000,
         )
-        agent_generation = _agent_generation(value.get("agent_generation", defaults.agent_generation))
+        raw_generation, generation_warnings = _migrate_settings_roles(
+            value.get("agent_generation", {}), source_version
+        )
+        agent_generation = _agent_generation(raw_generation)
         review_verification_mode = str(
             value.get("review_verification_mode", defaults.review_verification_mode)
         ).lower()
@@ -350,8 +439,10 @@ class Settings:
             context_soft_tokens=soft,
             context_hard_tokens=hard,
             context_budget_mode=context_budget_mode,
-            agent_context_budgets=agent_context_budgets,
+            role_context_budgets=agent_context_budgets,
+            role_settings_warnings=tuple(dict.fromkeys((*context_warnings, *generation_warnings))),
             max_output_tokens=output,
+            max_concurrent_model_requests=max_concurrent_model_requests,
             request_timeout_seconds=timeout,
             planning_timeout_seconds=planning_timeout,
             trace_level=trace_level,
@@ -361,11 +452,13 @@ class Settings:
             inquiry_frequency=inquiry_frequency,
             hook_strategy=hook_strategy,
             chapter_length_tolerance=chapter_length_tolerance,
+            review_min_confidence=review_min_confidence,
             acceptance_confirmation_mode=acceptance_confirmation_mode,
+            planning_window_chapters=planning_window_chapters,
             dialogue_history_mode=dialogue_history_mode,
             dialogue_history_interval=dialogue_history_interval,
             dialogue_history_limit=dialogue_history_limit,
-            agent_generation=agent_generation,
+            role_generation=agent_generation,
             review_verification_mode=review_verification_mode,
             review_experience_detail=review_experience_detail,
             review_local_nli_model=str(
@@ -402,19 +495,10 @@ class Settings:
                 {"auto", "cpu", "cuda"},
             ),
             # ??? auto / sherpa / Kokoro ????????? MOSS?
-            voice_engine=_choice(
-                "moss"
-                if str(value.get("voice_engine", defaults.voice_engine)).strip().lower() in {"", "auto", "sherpa", "kokoro"}
-                else value.get("voice_engine", defaults.voice_engine),
-                "语音引擎",
-                {"moss", "qwen"},
-            ),
-            voice_asr_model=str(value.get("voice_asr_model", defaults.voice_asr_model)).strip()
-            or defaults.voice_asr_model,
-            voice_tts_model=str(value.get("voice_tts_model", defaults.voice_tts_model)).strip()
-            or defaults.voice_tts_model,
-            voice_clone_model=str(value.get("voice_clone_model", defaults.voice_clone_model)).strip()
-            or defaults.voice_clone_model,
+            voice_input_engine=_choice(value.get("voice_input_engine", defaults.voice_input_engine), "语音输入引擎", {"off", "local", "browser"}),
+            voice_dialogue_engine=_choice(value.get("voice_dialogue_engine", defaults.voice_dialogue_engine), "对话朗读引擎", {"off", "edge", "moss"}),
+            voice_text_engine=_choice(value.get("voice_text_engine", defaults.voice_text_engine), "文本朗读引擎", {"off", "edge", "moss"}),
+            voice_novel_engine=_choice(value.get("voice_novel_engine", defaults.voice_novel_engine), "正文朗读引擎", {"off", "edge", "moss"}),
             voice_light_asr_model=str(value.get("voice_light_asr_model", defaults.voice_light_asr_model)).strip()
             or defaults.voice_light_asr_model,
             voice_light_tts_model=str(value.get("voice_light_tts_model", defaults.voice_light_tts_model)).strip()
@@ -457,6 +541,7 @@ class Settings:
             "context_soft_tokens": "INKFLOW_CONTEXT_SOFT_TOKENS",
             "context_hard_tokens": "INKFLOW_CONTEXT_HARD_TOKENS",
             "max_output_tokens": "INKFLOW_MAX_OUTPUT_TOKENS",
+            "max_concurrent_model_requests": "INKFLOW_MAX_CONCURRENT_MODEL_REQUESTS",
             "request_timeout_seconds": "INKFLOW_TIMEOUT_SECONDS",
             "planning_timeout_seconds": "INKFLOW_PLANNING_TIMEOUT_SECONDS",
             "trace_level": "INKFLOW_TRACE_LEVEL",
@@ -464,7 +549,9 @@ class Settings:
             "inquiry_frequency": "INKFLOW_INQUIRY_FREQUENCY",
             "hook_strategy": "INKFLOW_HOOK_STRATEGY",
             "chapter_length_tolerance": "INKFLOW_CHAPTER_LENGTH_TOLERANCE",
+            "review_min_confidence": "INKFLOW_REVIEW_MIN_CONFIDENCE",
             "acceptance_confirmation_mode": "INKFLOW_ACCEPTANCE_CONFIRMATION_MODE",
+            "planning_window_chapters": "INKFLOW_PLANNING_WINDOW_CHAPTERS",
             "review_verification_mode": "INKFLOW_REVIEW_VERIFICATION_MODE",
             "review_experience_detail": "INKFLOW_REVIEW_EXPERIENCE_DETAIL",
             "review_local_nli_model": "INKFLOW_REVIEW_LOCAL_NLI_MODEL",
@@ -474,10 +561,10 @@ class Settings:
             "powershell_enabled": "INKFLOW_POWERSHELL_ENABLED",
             "voice_enabled": "INKFLOW_VOICE_ENABLED",
             "voice_compute_device": "INKFLOW_VOICE_DEVICE",
-            "voice_engine": "INKFLOW_VOICE_ENGINE",
-            "voice_asr_model": "INKFLOW_VOICE_ASR_MODEL",
-            "voice_tts_model": "INKFLOW_VOICE_TTS_MODEL",
-            "voice_clone_model": "INKFLOW_VOICE_CLONE_MODEL",
+            "voice_input_engine": "INKFLOW_VOICE_INPUT_ENGINE",
+            "voice_dialogue_engine": "INKFLOW_VOICE_DIALOGUE_ENGINE",
+            "voice_text_engine": "INKFLOW_VOICE_TEXT_ENGINE",
+            "voice_novel_engine": "INKFLOW_VOICE_NOVEL_ENGINE",
             "voice_light_asr_model": "INKFLOW_VOICE_LIGHT_ASR_MODEL",
             "voice_light_tts_model": "INKFLOW_VOICE_LIGHT_TTS_MODEL",
             "input_price_per_million": "INKFLOW_INPUT_PRICE_PER_MILLION",
@@ -636,16 +723,65 @@ def _as_bool(value: Any) -> bool:
     return str(value).strip().casefold() not in {"0", "false", "no", "off"}
 
 
+def _settings_protocol_version(value: Any) -> int:
+    try:
+        normalize_role("writer", value)
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+    return LEGACY_ROLE_PROTOCOL_VERSION if value is None else value
+
+
+def _settings_role(role: str, protocol_version: int) -> str:
+    try:
+        return normalize_role(role, protocol_version)
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+
+
+def _migrate_settings_roles(value: Any, version: int | None) -> tuple[dict[str, dict[str, Any]], tuple[str, ...]]:
+    try:
+        return migrate_role_settings(value, protocol_version=version)
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+
+
+def _legacy_role_view(values: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        "coordinator": dict(values["coordinator"]),
+        "writer": dict(values["writer"]),
+        "reviewer": dict(values["editor"]),
+    }
+
+
+def _agent_context_budgets(value: Any) -> dict[str, dict[str, int]]:
+    if not isinstance(value, dict):
+        raise ConfigurationError("各 Agent 上下文预算必须是对象。")
+    unknown = set(value) - DEFAULT_ROLE_CONTEXT_BUDGETS.keys()
+    if unknown:
+        raise ConfigurationError(f"不支持的 Agent 角色：{', '.join(sorted(unknown))}")
+    result: dict[str, dict[str, int]] = {}
+    for role, fallback in DEFAULT_ROLE_CONTEXT_BUDGETS.items():
+        raw = value.get(role, fallback)
+        if not isinstance(raw, dict):
+            raise ConfigurationError(f"{role} 的上下文预算格式无效。")
+        extra = set(raw) - {"soft", "hard"}
+        if extra:
+            raise ConfigurationError(f"{role} 包含不支持的上下文参数：{', '.join(sorted(extra))}")
+        role_soft = _positive_int(raw.get("soft", fallback["soft"]), f"{role} 常用上下文预算")
+        role_hard = _positive_int(raw.get("hard", fallback["hard"]), f"{role} 最大上下文预算")
+        if role_soft > role_hard:
+            raise ConfigurationError(f"{role} 的常用上下文不能大于最大上下文。")
+        result[role] = {"soft": role_soft, "hard": role_hard}
+    return result
+
+
 def _agent_generation(value: Any) -> dict[str, dict[str, float | int | None]]:
     if not isinstance(value, dict):
         raise ConfigurationError("Agent 高级生成参数必须是对象。")
-    result = {name: dict(defaults) for name, defaults in DEFAULT_AGENT_GENERATION.items()}
-    # Agent roles may be added by a newer desktop. Ignore role groups this
-    # engine does not know so one forward-version setting cannot block startup;
-    # known roles and their fields are still validated strictly below.
+    result = {name: dict(defaults) for name, defaults in DEFAULT_ROLE_GENERATION.items()}
     for role, raw in value.items():
         if role not in result:
-            continue
+            raise ConfigurationError(f"不支持的 Agent 角色：{role}")
         if not isinstance(raw, dict):
             raise ConfigurationError(f"{role} 的高级生成参数必须是对象。")
         extra = set(raw) - {"temperature", "top_p", "top_k"}

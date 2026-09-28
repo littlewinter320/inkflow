@@ -102,12 +102,15 @@ class HybridRetriever:
             "query": query,
             "candidate_count": len(candidates),
             "initial_top_k": limit,
+            "retrieved_count": len(result),
+            "not_retrieved_count": len(candidates) - len(result),
             "adaptive_factors": factors,
             "selected": [{"source_id": item["source_id"], "score": item["score"], "reasons": item["retrieval_reasons"]} for item in result],
             "discarded": [
                 {"source_id": item["source_id"], "reason": "低于动态预算截断线" if item["source_id"] in scores else "未匹配查询"}
                 for item in candidates if item["source_id"] not in selected_ids
             ][:80],
+            "discarded_display_limit": 80,
         }
         if self.embedding_model:
             self.last_diagnostics["embedding_cache_hits"] = self._embedding_cache_hits
@@ -133,23 +136,19 @@ class HybridRetriever:
 
     def _candidates(self, *, role: str, chapter_no: int, chapter_version: int | None) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
-        for fact in self.project.db.current_facts():
-            if int(fact["valid_from_chapter"]) > chapter_no:
-                continue
+        for fact in self.project.db.facts_as_of(chapter_no - 1):
             items.append({
                 "source_id": str(fact["fact_id"]), "source_type": "canon_fact",
                 "title": f"{fact['subject']} / {fact['predicate']}",
                 "body": json.dumps(fact["value"], ensure_ascii=False) + "\n" + str(fact.get("evidence") or ""),
-                "chapter_no": int(fact["source_chapter"]), "version": None,
+                "chapter_no": int(fact["source_chapter"]), "version": fact.get("source_version"),
                 "authority_rank": 2, "authority": "已验收正史", "entities": [str(fact["subject"])],
             })
-        for thread in self.project.db.open_threads():
-            if int(thread.get("last_advanced_chapter") or 0) > chapter_no:
-                continue
+        for thread in self.project.db.threads_as_of(chapter_no - 1):
             items.append({
                 "source_id": str(thread["thread_id"]), "source_type": "canon_thread",
                 "title": str(thread["title"]), "body": str(thread["description"]),
-                "chapter_no": int(thread.get("last_advanced_chapter") or 0), "version": None,
+                "chapter_no": int(thread.get("last_advanced_chapter") or 0), "version": thread.get("source_version"),
                 "authority_rank": 2, "authority": "已验收正史", "entities": _entities(str(thread["title"]) + str(thread["description"])),
             })
         for chapter in self.project.db.accepted_chapters():

@@ -5,6 +5,7 @@ type InkFlowEvent = Record<string, unknown>;
 interface Window {
   inkflow: {
     request<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>;
+    confirm(message: string): Promise<boolean>;
     chooseFolder(title: string): Promise<string | null>;
     trashProject(root: string): Promise<{ root: string; recoverable: boolean }>;
     moveProject(root: string, targetParent: string): Promise<{ source: string; destination: string }>;

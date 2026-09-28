@@ -4,14 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inkflow-novel-agent"
-version = "0.6.5"
-description = "墨流（InkFlow）——面向长篇中文网文的四 Agent 协作创作引擎"
+version = "0.7.0"
+description = "墨流（InkFlow）——面向长篇中文小说的协作创作引擎"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "InkFlow contributors"}]
 dependencies = [
   "beautifulsoup4>=4.12,<5",
+  "edge-tts>=7.2.8,<8",
   "httpx>=0.27,<1",
   "keyring>=25,<27",
   "mcp>=1.20,<2",
@@ -31,12 +32,6 @@ review = [
   "transformers>=4.44,<6",
 ]
 rag = ["sentence-transformers>=3,<6"]
-voice = [
-  "qwen-tts>=0.1,<1",
-  "soundfile>=0.12,<1",
-  "torch>=2.4,<3",
-  "torchaudio>=2.4,<3",
-]
 
 [project.scripts]
 inkflow = "inkflow.cli:main"

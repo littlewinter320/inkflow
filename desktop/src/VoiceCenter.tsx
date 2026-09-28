@@ -22,10 +22,10 @@ export type VoiceSettings = {
   voice_input_device: string;
   voice_output_device: string;
   voice_compute_device: "auto" | "cpu" | "cuda";
-  voice_engine: "moss" | "qwen";
-  voice_asr_model: string;
-  voice_tts_model: string;
-  voice_clone_model: string;
+  voice_input_engine: "off" | "local" | "browser";
+  voice_dialogue_engine: "off" | "edge" | "moss";
+  voice_text_engine: "off" | "edge" | "moss";
+  voice_novel_engine: "off" | "edge" | "moss";
   voice_light_asr_model: string;
   voice_light_tts_model: string;
   voice_sample_rate: number;
@@ -43,7 +43,21 @@ export type VoiceStatus = {
   data_root: string;
   message: string;
   backend?: string;
-  migration?: { completed: boolean; removed: string[]; errors: string[] };
+  edge?: {
+    installed: boolean;
+    packages_dir: string;
+    storage_size_mb: number;
+    has_local_files?: boolean;
+    installing?: boolean;
+    python_available?: boolean;
+    last_error?: string;
+    install_status?: string;
+    install_stage?: string;
+    install_progress?: number;
+    install_summary?: string;
+    downloaded_mb?: number;
+    retryable?: boolean;
+  };
   moss?: {
     package_installed: boolean;
     dependencies_ready: boolean;
@@ -51,6 +65,8 @@ export type VoiceStatus = {
     models_ready: boolean;
     model_root: string;
     model_size_mb: number;
+    storage_size_mb?: number;
+    has_local_files?: boolean;
     estimated_download_mb: number;
     estimated_dependency_download_mb: number;
     estimated_model_download_mb: number;
@@ -70,25 +86,13 @@ export type VoiceStatus = {
     asr_ready: boolean;
     model_root: string;
     model_size_mb: number;
+    storage_size_mb?: number;
+    has_local_files?: boolean;
     estimated_download_mb: number;
-  };
-  qwen?: {
-    installed: boolean;
-    dependencies_ready: boolean;
-    source: string;
-    installing: boolean;
-    python_available: boolean;
-    python: string;
-    packages_dir: string;
-    model_cache_dir: string;
-    model_loaded: boolean;
-    models_ready: boolean;
-    package_size_mb: number;
-    model_size_mb: number;
-    estimated_dependency_download_mb: number;
-    estimated_model_download_mb: number;
+    estimated_dependency_download_mb?: number;
+    installing?: boolean;
+    python_available?: boolean;
     last_error?: string;
-    model_message?: string;
     install_status?: string;
     install_stage?: string;
     install_progress?: number;
@@ -121,6 +125,8 @@ type VoiceSegment = {
 
 type VoiceJob = {
   job_id: string;
+  engine?: "edge" | "moss";
+  reused_existing?: boolean;
   source_name: string;
   source_type: string;
   status: string;
@@ -169,6 +175,7 @@ export function VoiceCenter({
   const [roles, setRoles] = useState<VoiceRoleMap>({ narrator_profile_id: "narrator_female", characters: {}, updated_at: "" });
   const [detectedNames, setDetectedNames] = useState<string[]>([]);
   const [sourceText, setSourceText] = useState(source?.text || "");
+  const [sourceType, setSourceType] = useState<VoiceSource["type"]>(source?.type || "text");
   const [working, setWorking] = useState(false);
   const [showClone, setShowClone] = useState(false);
 
@@ -189,7 +196,7 @@ export function VoiceCenter({
   }, [onError, projectRoot, request]);
 
   useEffect(() => { void load(); }, [load, refreshKey]);
-  useEffect(() => { if (source) setSourceText(source.text); }, [source]);
+  useEffect(() => { if (source) { setSourceText(source.text); setSourceType(source.type); } }, [source]);
 
   const roleNames = useMemo(
     () => Array.from(new Set([...characterNames, ...detectedNames, ...Object.keys(roles.characters)])).filter(Boolean),
@@ -226,11 +233,13 @@ export function VoiceCenter({
       if (!await saveRoles()) return;
       const job = await request<VoiceJob>("voice.job.create", {
         text: sourceText,
-        source_name: source?.name || "听读中心文本",
-        source_type: source?.type || "text",
+        source_name: sourceType === "text" ? "听读中心文本" : source?.name || "听读中心文本",
+        source_type: sourceType,
       });
       setJobs((current) => [job, ...current.filter((item) => item.job_id !== job.job_id)]);
-      onNotice("已加入后台听读队列。离开这个页面或关闭进度框不会取消转换。");
+      onNotice(job.reused_existing
+        ? "已有相同任务，已显示正在进行或排队的转换，未重复创建。"
+        : "已加入后台听读队列。离开这个页面或关闭进度框不会取消转换。");
     } catch (cause) {
       onError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -262,14 +271,14 @@ export function VoiceCenter({
 
   return <section className="voice-center">
     <header className="panel-heading voice-heading">
-      <div><p className="eyebrow">本地普通话</p><h2>听读中心</h2><p>短消息朗读与长篇转换分别排队；这里的任务在后台继续运行。</p></div>
+      <div><p className="eyebrow">语音听读</p><h2>听读中心</h2><p>按语音设置选择在线或本地组件；这里的转换任务在后台继续运行。</p></div>
       <button onClick={() => setShowClone(true)}>＋ 克隆我的声音</button>
     </header>
 
     <div className="voice-grid">
       <article className="voice-card voice-source-card">
         <div className="voice-card-title"><strong>1. 选择文字</strong><span>{sourceText.length.toLocaleString()} 字</span></div>
-        <textarea value={sourceText} onChange={(event) => setSourceText(event.target.value)} placeholder="打开正文/草稿后会自动带入，也可以在这里粘贴文字。" />
+        <textarea value={sourceText} onChange={(event) => { setSourceText(event.target.value); setSourceType("text"); }} placeholder="打开正文/草稿后会自动带入，也可以在这里粘贴文字。" />
         <div className="voice-actions"><button onClick={() => void analyze()}>分析说话角色</button><button className="primary" disabled={working || !sourceText.trim()} onClick={() => void createJob()}>{working ? "正在创建…" : "后台转换"}</button></div>
       </article>
 
@@ -295,7 +304,7 @@ export function VoiceCenter({
         {jobs.length === 0 && <p className="muted">还没有转换任务。</p>}
         {jobs.map((job) => {
           const playable = job.segments.find((segment) => segment.audio_path);
-          return <article className="voice-job" key={job.job_id}><div><strong>{job.source_name}</strong><span>{job.status} · {job.completed_segments}/{job.total_segments}</span></div><div className="voice-progress"><i style={{ width: `${job.progress}%` }} /></div>{job.error && <p className="error-copy">{job.error}</p>}<div className="voice-actions">{playable && <button onClick={() => void onPlay(playable.audio_path)}>试听已完成片段</button>}{job.playlist_path && job.completed_segments > 0 && <button onClick={() => void window.inkflow.openPath(job.playlist_path!)}>连续播放</button>}<button onClick={() => void window.inkflow.openPath(job.output_dir)}>打开输出目录</button>{["queued", "running"].includes(job.status) && <button onClick={() => void jobAction(job, "pause")}>暂停</button>}{["paused", "interrupted", "failed"].includes(job.status) && <button onClick={() => void jobAction(job, "resume")}>继续</button>}{!["completed", "cancelled"].includes(job.status) && <button className="danger" onClick={() => void jobAction(job, "cancel")}>取消</button>}</div></article>;
+          return <article className="voice-job" key={job.job_id}><div><strong>{job.source_name}</strong><span>{job.engine === "edge" ? "Edge 在线" : job.engine === "moss" ? "本地 MOSS" : "旧任务"} · {job.status} · {job.completed_segments}/{job.total_segments}</span></div><div className="voice-progress"><i style={{ width: `${job.progress}%` }} /></div>{job.error && <p className="error-copy">{job.error}</p>}<div className="voice-actions">{playable && <button onClick={() => void onPlay(playable.audio_path)}>试听已完成片段</button>}{job.playlist_path && job.completed_segments > 0 && <button onClick={() => void window.inkflow.openPath(job.playlist_path!)}>连续播放</button>}<button onClick={() => void window.inkflow.openPath(job.output_dir)}>查看已保存音频</button>{["queued", "running"].includes(job.status) && <button onClick={() => void jobAction(job, "pause")}>暂停</button>}{["paused", "interrupted", "failed"].includes(job.status) && <button onClick={() => void jobAction(job, "resume")}>继续</button>}{!["completed", "cancelled"].includes(job.status) && <button className="danger" onClick={() => void jobAction(job, "cancel")}>取消</button>}</div></article>;
         })}
       </div>
     </section>
@@ -400,7 +409,7 @@ function VoiceCloneDialog({ projectRoot, request, onClose, onCreated, onNotice, 
     {scriptInfo && <p className="form-hint">发音覆盖：{scriptInfo.coverage_summary.join("；")}。</p>}
     <label>照读文字 / 录音原文 <small>{referenceText.length}/400 字</small><textarea maxLength={400} value={referenceText} disabled={recording || scriptWorking} onChange={(event) => { setReferenceText(event.target.value); setScriptInfo(null); }} placeholder="可以让 Writer 先生成朗读稿，也可以填写已有录音的准确原文；留空时使用本地识别。" /></label>
     <section className="voice-clone-recording"><strong>二、参考录音</strong><p>只负责采集声音，限制为 3～120 秒；达到 120 秒自动停止。请在安静环境用平常声音朗读，并确保录音与上方文字一致。</p><div className="clone-source"><button disabled={recording || working} onClick={() => void choose()}>上传语音</button><button disabled={working || scriptWorking} className={recording ? "recording" : ""} onClick={() => void toggleRecording()}>{recording ? "■ 停止录音" : "● 照稿录音"}</button><span>{audioPath || "尚未选择录音"}</span></div></section>
-    <p className="form-hint">重写朗读稿后需要重新录音。声音克隆使用 Qwen，普通朗读默认使用 MOSS。朗读稿只是参考材料，不是训练。</p>
+    <p className="form-hint">重写朗读稿后需要重新录音。声音克隆需在语音设置中选用本地 MOSS；Edge 在线朗读只使用预设声音。朗读稿只是参考材料，不是训练。</p>
     <label>声音名称<input value={name} onChange={(event) => setName(event.target.value)} /></label>
     <label>声音类型<select value={gender} onChange={(event) => setGender(event.target.value)}><option value="female">女声</option><option value="male">男声</option><option value="other">其他 / 不指定</option></select></label>
     <label>朗读要求<input value={instruction} onChange={(event) => setInstruction(event.target.value)} /></label>

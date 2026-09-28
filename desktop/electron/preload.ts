@@ -3,6 +3,7 @@ import { contextBridge, ipcRenderer } from "electron";
 contextBridge.exposeInMainWorld("inkflow", {
   request: (method: string, params: Record<string, unknown> = {}) =>
     ipcRenderer.invoke("engine:request", method, params),
+  confirm: (message: string): Promise<boolean> => ipcRenderer.invoke("dialog:confirm", message),
   chooseFolder: (title: string) => ipcRenderer.invoke("dialog:choose-folder", title),
   trashProject: (root: string) => ipcRenderer.invoke("project:trash", root),
   moveProject: (root: string, targetParent: string) => ipcRenderer.invoke("project:move", root, targetParent),

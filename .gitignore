@@ -25,6 +25,8 @@ agent/evals/
 development/
 .claude/
 .trae/
+/.inkflow-dev/
+/docs/research/vendor/
 CLAUDE.md
 AGENTS.md
 *_PLAN.md
