@@ -1,11 +1,12 @@
 {
   "name": "inkflow-desktop",
-  "version": "0.6.5",
+  "version": "0.7.0",
   "private": true,
   "author": "InkFlow contributors",
-  "description": "墨流（InkFlow）四 Agent 中文长篇小说桌面工作台",
+  "description": "墨流（InkFlow）中文长篇小说桌面工作台",
   "main": "dist-electron/main.js",
   "scripts": {
+    "dev:live": "cross-env INKFLOW_LIVE_RELOAD=1 npm run dev",
     "dev": "concurrently -k \"vite\" \"tsc -p tsconfig.electron.json --watch\" \"wait-on tcp:5173 file:dist-electron/main.js && cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron .\"",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.electron.json --noEmit",
     "build:web": "vite build",
@@ -45,7 +46,7 @@
       "en-US"
     ],
     "directories": {
-      "output": "../artifacts/desktop/0.6.5"
+      "output": "D:/墨流/release/0.7.0/desktop"
     },
     "files": [
       "dist/**/*",
@@ -54,8 +55,20 @@
     ],
     "extraResources": [
       {
-        "from": "../dist/engine/inkflow-engine.exe",
+        "from": "resources/icon.ico",
+        "to": "icon.ico"
+      },
+      {
+        "from": "D:/墨流/release/0.7.0/engine/inkflow-engine.exe",
         "to": "engine/inkflow-engine.exe"
+      },
+      {
+        "from": "../THIRD_PARTY_NOTICES.md",
+        "to": "THIRD_PARTY_NOTICES.md"
+      },
+      {
+        "from": "../third_party/edge-tts-LICENSE",
+        "to": "edge-tts-LICENSE"
       }
     ],
     "win": {

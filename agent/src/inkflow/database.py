@@ -5,9 +5,12 @@ import sqlite3
 import uuid
 from collections import Counter
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from .errors import ValidationGateError
+from .role_protocol import AGENT_ROLES, LEGACY_ROLE_PROTOCOL_VERSION, ROLE_PROTOCOL_VERSION, normalize_role
 from .schemas import BookBrief, MemoryPatch, PlanBundle, ReviewReport
 from .utils import content_hash, json_dumps, utc_now
 
@@ -50,7 +53,9 @@ CREATE TABLE IF NOT EXISTS reviews (
     verdict TEXT NOT NULL,
     data_json TEXT NOT NULL,
     path TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    role_protocol_version INTEGER NOT NULL DEFAULT 1,
+    review_role TEXT NOT NULL DEFAULT 'reviewer'
 );
 
 CREATE TABLE IF NOT EXISTS facts (
@@ -63,6 +68,12 @@ CREATE TABLE IF NOT EXISTS facts (
     source_chapter INTEGER NOT NULL,
     confidence REAL NOT NULL,
     evidence TEXT NOT NULL,
+    epistemic_kind TEXT NOT NULL DEFAULT 'objective',
+    event_time TEXT,
+    narrative_time TEXT,
+    source_version INTEGER,
+    source_hash TEXT,
+    branch_id TEXT NOT NULL DEFAULT 'main',
     status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL
 );
@@ -79,6 +90,9 @@ CREATE TABLE IF NOT EXISTS plot_threads (
     planted_chapter INTEGER,
     due_chapter INTEGER,
     last_advanced_chapter INTEGER NOT NULL,
+    source_version INTEGER,
+    source_hash TEXT,
+    branch_id TEXT NOT NULL DEFAULT 'main',
     updated_at TEXT NOT NULL
 );
 
@@ -111,6 +125,7 @@ CREATE TABLE IF NOT EXISTS collaboration_messages (
     run_id TEXT NOT NULL,
     sender_role TEXT NOT NULL,
     recipient_role TEXT NOT NULL,
+    role_protocol_version INTEGER NOT NULL DEFAULT 1,
     message_type TEXT NOT NULL,
     chapter_no INTEGER,
     chapter_version INTEGER,
@@ -150,6 +165,7 @@ CREATE TABLE IF NOT EXISTS agent_artifacts (
     chapter_no INTEGER,
     chapter_version INTEGER,
     role TEXT NOT NULL,
+    role_protocol_version INTEGER NOT NULL DEFAULT 1,
     dimension TEXT,
     status TEXT NOT NULL,
     data_json TEXT NOT NULL,
@@ -177,6 +193,20 @@ CREATE TABLE IF NOT EXISTS learning_events (
     chapter_version INTEGER,
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS computer_action_requests (
+    request_id TEXT PRIMARY KEY,
+    action_kind TEXT NOT NULL,
+    command TEXT NOT NULL,
+    command_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    decided_at TEXT,
+    completed_at TEXT,
+    exit_code INTEGER,
+    error TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS retrieval_feedback (
@@ -219,6 +249,22 @@ CREATE TABLE IF NOT EXISTS preference_pairs (
 """
 
 
+def _checked_role_protocol_version(value: int) -> int:
+    if type(value) is not int or value not in {LEGACY_ROLE_PROTOCOL_VERSION, ROLE_PROTOCOL_VERSION}:
+        raise ValueError("角色协议版本必须是整数 1 或 2。")
+    return value
+
+
+def _stored_role(role: str, protocol_version: int) -> str:
+    if role in {"engine", "user"}:
+        return role
+    if protocol_version == LEGACY_ROLE_PROTOCOL_VERSION and role not in {"coordinator", "writer", "reviewer"}:
+        raise ValueError("旧版协作记录只能使用已启用的 Agent 角色。")
+    if protocol_version == ROLE_PROTOCOL_VERSION and role not in AGENT_ROLES:
+        raise ValueError("新版协作记录使用了不支持的 Agent 角色。")
+    return normalize_role(role, protocol_version)
+
+
 class ProjectDatabase:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -239,6 +285,52 @@ class ProjectDatabase:
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            # Existing rows belong to the legacy protocol. Additive defaults keep
+            # their original role names while making later records unambiguous.
+            role_columns = {
+                "reviews": {
+                    "role_protocol_version": "INTEGER NOT NULL DEFAULT 1",
+                    "review_role": "TEXT NOT NULL DEFAULT 'reviewer'",
+                },
+                "collaboration_messages": {
+                    "role_protocol_version": "INTEGER NOT NULL DEFAULT 1",
+                },
+                "agent_artifacts": {
+                    "role_protocol_version": "INTEGER NOT NULL DEFAULT 1",
+                },
+                "facts": {
+                    "epistemic_kind": "TEXT NOT NULL DEFAULT 'objective'",
+                    "event_time": "TEXT",
+                    "narrative_time": "TEXT",
+                    "source_version": "INTEGER",
+                    "source_hash": "TEXT",
+                    "branch_id": "TEXT NOT NULL DEFAULT 'main'",
+                },
+                "plot_threads": {
+                    "source_version": "INTEGER",
+                    "source_hash": "TEXT",
+                    "branch_id": "TEXT NOT NULL DEFAULT 'main'",
+                },
+            }
+            for table, definitions in role_columns.items():
+                existing = {
+                    str(row["name"])
+                    for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for column, definition in definitions.items():
+                    if column not in existing:
+                        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            chapter_columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(chapters)")}
+            if "content_text" in chapter_columns:
+                # Older accepted facts had no source version. Pin only those
+                # whose evidence is still present in the accepted text.
+                connection.execute(
+                    """UPDATE facts SET source_version=(SELECT version FROM chapters WHERE chapter_no=source_chapter),
+                       source_hash=(SELECT content_hash FROM chapters WHERE chapter_no=source_chapter)
+                       WHERE source_version IS NULL AND source_hash IS NULL AND EXISTS (
+                         SELECT 1 FROM chapters WHERE chapter_no=source_chapter AND status='accepted'
+                           AND content_text IS NOT NULL AND instr(content_text,facts.evidence)>0)"""
+                )
             connection.commit()
 
     def canonical_content_migration_required(self) -> bool:
@@ -293,6 +385,43 @@ class ProjectDatabase:
         if not value:
             raise ValueError("项目缺少 book_brief")
         return BookBrief.model_validate(value)
+
+    def planning_source_hashes(self) -> dict[str, str | None]:
+        root = self.path.parent.parent
+        result: dict[str, str | None] = {}
+        for name in ("BOOK.md", "OUTLINE.md", "STORY_DETAIL.md"):
+            path = root / name
+            result[name] = content_hash(path.read_text(encoding="utf-8")) if path.is_file() else None
+        return result
+
+    def planning_source_impact(self) -> dict[str, Any]:
+        """Report stale future material without changing accepted chapters."""
+        current = self.planning_source_hashes()
+        plan_basis = self.get_metadata("current_plan_source_hashes", {})
+        detail_basis = self.get_metadata("story_detail_outline_hash")
+        accepted = self.accepted_chapters()
+        affected = []
+        if detail_basis and current["OUTLINE.md"] != detail_basis:
+            affected.append("剧情细纲需按新版大纲核对")
+        if plan_basis:
+            changed = [name for name in current if current[name] != plan_basis.get(name)]
+            if changed:
+                affected.append("近期计划及未写章节卡需按新版依据核对")
+        else:
+            changed = []
+        plan_path = self.path.parent.parent / "PLAN.md"
+        plan_text_hash = self.get_metadata("current_plan_text_hash")
+        plan_file_changed = bool(plan_text_hash and plan_path.is_file()
+                                 and content_hash(plan_path.read_text(encoding="utf-8")) != plan_text_hash)
+        if plan_file_changed:
+            affected.append("近期计划文本与结构化章节卡不同步，请决定是否按文本更新章节卡")
+        return {
+            "changed_sources": changed,
+            "affected": affected,
+            "accepted_chapters_preserved": len(accepted),
+            "plan_file_changed": plan_file_changed,
+            "next_step": "只核对受影响的细纲和未来安排；已接受正文不自动改写。" if affected else "依据与当前计划一致。",
+        }
 
     def save_plan_bundle(self, bundle: PlanBundle) -> None:
         now = utc_now()
@@ -353,7 +482,84 @@ class ProjectDatabase:
                 """,
                 (json_dumps(pointer, indent=None), now),
             )
+            connection.execute(
+                """INSERT INTO metadata(key, value_json, updated_at) VALUES ('current_plan_source_hashes', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at""",
+                (json_dumps(self.planning_source_hashes(), indent=None), now),
+            )
             connection.commit()
+
+    def replace_unaccepted_plan_window(
+        self, bundle: PlanBundle, *, revision_id: str, accepted_boundary: int,
+        old_cards: dict[int, dict[str, Any] | None], drafts: dict[int, dict[str, Any]],
+        instruction: str, source_fingerprint: str,
+    ) -> dict[str, Any]:
+        """Commit only authorized execution cards; preserve canon and revision history."""
+        arc = bundle.current_arc
+        numbers = list(range(arc.chapter_start, arc.chapter_end + 1))
+        if arc.chapter_start != accepted_boundary + 1 or set(old_cards) != set(numbers):
+            raise ValidationGateError("近期重规划只能覆盖紧邻正史且明确授权的连续范围。")
+        now = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            boundary = connection.execute("SELECT COALESCE(MAX(chapter_no),0) FROM chapters WHERE status='accepted'").fetchone()[0]
+            if boundary != accepted_boundary:
+                raise ValidationGateError("重规划期间正史边界已变化，候选未采用。")
+            for number in numbers:
+                row = connection.execute("SELECT data_json FROM plans WHERE kind='chapter' AND plan_key=? AND status='active'", (f"chapter:{number:05d}",)).fetchone()
+                if (json.loads(row[0]) if row else None) != old_cards[number]:
+                    raise ValidationGateError("重规划期间章节卡已变化，候选未采用。")
+                chapter = connection.execute("SELECT status,version,content_hash FROM chapters WHERE chapter_no=?", (number,)).fetchone()
+                expected = drafts.get(number)
+                if chapter and (chapter["status"] != "draft" or expected is None
+                                or chapter["version"] != expected["version"] or chapter["content_hash"] != expected["content_hash"]):
+                    raise ValidationGateError("重规划期间正文版本已变化，候选未采用。")
+                if expected is not None and chapter is None:
+                    raise ValidationGateError("重规划期间原草稿已不存在，候选未采用。")
+            record = {"revision_id": revision_id, "chapter_range": [arc.chapter_start, arc.chapter_end],
+                      "instruction": instruction, "source_fingerprint": source_fingerprint,
+                      "old_cards": old_cards, "old_drafts": drafts, "created_at": now}
+            connection.execute("INSERT INTO metadata(key,value_json,updated_at) VALUES (?,?,?)",
+                               (f"plan_revision:{revision_id}", json_dumps(record), now))
+            connection.execute("INSERT INTO metadata(key,value_json,updated_at) VALUES ('latest_pending_plan_revision',?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                               (json_dumps({"revision_id": revision_id, "chapter_range": [arc.chapter_start, arc.chapter_end], "instruction": instruction}), now))
+            connection.execute("INSERT INTO plans(kind,plan_key,parent_key,data_json,updated_at) VALUES ('supplement',?,?,?,?)",
+                               (revision_id, f"volume:{arc.volume_no:03d}", bundle.model_dump_json(), now))
+            for card in arc.chapter_cards:
+                connection.execute(
+                    """INSERT INTO plans(kind,plan_key,parent_key,data_json,updated_at) VALUES ('chapter',?,?,?,?)
+                       ON CONFLICT(kind,plan_key) DO UPDATE SET parent_key=excluded.parent_key,version=plans.version+1,
+                       status='active',data_json=excluded.data_json,updated_at=excluded.updated_at""",
+                    (f"chapter:{card.chapter_no:05d}", revision_id, card.model_dump_json(), now),
+                )
+                if card.chapter_no in drafts:
+                    marker = {"revision_id": revision_id, "status": "needs_writer",
+                              "draft_version": drafts[card.chapter_no]["version"],
+                              "draft_hash": drafts[card.chapter_no]["content_hash"],
+                              "card_hash": content_hash(json_dumps(card.model_dump(mode="json"))),
+                              "instruction": instruction}
+                    connection.execute("INSERT INTO metadata(key,value_json,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                                       (f"pending_plan_revision:{card.chapter_no}", json_dumps(marker), now))
+            # Any staged suffix can depend on changed cards. Retain it as
+            # history, but it must not bypass a fresh review/acceptance.
+            connection.execute("UPDATE provisional_memory_patches SET status='invalidated',invalidation_reason=?,updated_at=? WHERE chapter_no>=? AND status='active'",
+                               (f"近期计划更新：{revision_id}", now, arc.chapter_start))
+            connection.commit()
+        return record
+
+    def pending_plan_revision(self, chapter_no: int) -> dict[str, Any] | None:
+        value = self.get_metadata(f"pending_plan_revision:{chapter_no}")
+        return value if isinstance(value, dict) and value.get("status") == "needs_writer" else None
+
+    def complete_plan_revision_write(self, chapter_no: int, revision_id: str, version: int) -> None:
+        marker = self.pending_plan_revision(chapter_no)
+        chapter = self.get_chapter(chapter_no)
+        card = self.get_chapter_card(chapter_no)
+        if (not marker or marker["revision_id"] != revision_id or not chapter or chapter["status"] != "draft"
+                or chapter["version"] != version or version <= marker["draft_version"]
+                or content_hash(json_dumps(card)) != marker["card_hash"]):
+            raise ValidationGateError("计划修订交接与当前草稿或章节卡不一致，未复用旧审查。")
+        self.set_metadata(f"pending_plan_revision:{chapter_no}", {**marker, "status": "awaiting_review", "revised_version": version})
 
     def get_plan(self, kind: str, plan_key: str) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -408,13 +614,12 @@ class ProjectDatabase:
         )
 
     def upsert_draft(self, chapter_no: int, title: str, path: str, content: str) -> int:
-        needs_canon_migration = self.canonical_content_migration_required()
         with self.connect() as connection:
             existing = connection.execute(
                 "SELECT version,status FROM chapters WHERE chapter_no=?", (chapter_no,)
             ).fetchone()
-            if existing and existing["status"] == "accepted" and needs_canon_migration:
-                raise ValueError("旧版正史需先确认数据库备份与升级，不能直接覆盖为草稿。")
+            if existing and existing["status"] == "accepted":
+                raise ValueError("已接受正史不能直接覆盖为草稿；请先建立可恢复的分支修订。")
             version = int(existing["version"]) + 1 if existing else 1
             connection.execute(
                 """
@@ -434,11 +639,32 @@ class ProjectDatabase:
             connection.commit()
         return version
 
+    def mark_draft_discarded(self, chapter_no: int, path: str, expected_hash: str) -> bool:
+        """Keep the chapter row auditable without treating a trashed draft as current."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE chapters SET status='discarded', updated_at=?
+                   WHERE chapter_no=? AND status='draft' AND path=? AND content_hash=?""",
+                (utc_now(), chapter_no, path.replace("\\", "/"), expected_hash),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+
     def get_chapter(self, chapter_no: int) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
-                """SELECT chapter_no,title,status,version,path,content_hash,summary,updated_at,accepted_at
-                FROM chapters WHERE chapter_no=?""",
+                """SELECT chapter.chapter_no,chapter.title,chapter.status,chapter.version,
+                          chapter.path,chapter.content_hash,
+                          CASE WHEN chapter.status='accepted' AND chapter.version>1
+                                     AND (patch.committed_at IS NULL OR patch.committed_at<>chapter.updated_at)
+                               THEN NULL ELSE chapter.summary END AS summary,
+                          CASE WHEN chapter.status='accepted' AND chapter.version>1
+                                     AND (patch.committed_at IS NULL OR patch.committed_at<>chapter.updated_at)
+                               THEN 1 ELSE 0 END AS summary_stale,
+                          chapter.updated_at,chapter.accepted_at
+                   FROM chapters AS chapter
+                   LEFT JOIN memory_patches AS patch ON patch.chapter_no=chapter.chapter_no
+                   WHERE chapter.chapter_no=?""",
                 (chapter_no,),
             ).fetchone()
         return dict(row) if row else None
@@ -463,9 +689,17 @@ class ProjectDatabase:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT chapter_no,title,status,version,path,content_hash,summary,updated_at,accepted_at FROM chapters
-                WHERE status='accepted' AND chapter_no < ?
-                ORDER BY chapter_no DESC LIMIT ?
+                SELECT chapter.chapter_no,chapter.title,chapter.status,chapter.version,chapter.path,
+                       chapter.content_hash,
+                       CASE WHEN chapter.version>1 AND (patch.committed_at IS NULL OR patch.committed_at<>chapter.updated_at)
+                            THEN NULL ELSE chapter.summary END AS summary,
+                       CASE WHEN chapter.version>1 AND (patch.committed_at IS NULL OR patch.committed_at<>chapter.updated_at)
+                            THEN 1 ELSE 0 END AS summary_stale,
+                       chapter.updated_at,chapter.accepted_at
+                FROM chapters AS chapter
+                LEFT JOIN memory_patches AS patch ON patch.chapter_no=chapter.chapter_no
+                WHERE chapter.status='accepted' AND chapter.chapter_no < ?
+                ORDER BY chapter.chapter_no DESC LIMIT ?
                 """,
                 (before_chapter, limit),
             ).fetchall()
@@ -493,17 +727,32 @@ class ProjectDatabase:
     def accepted_chapters(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
-                """SELECT chapter_no,title,status,version,path,content_hash,summary,updated_at,accepted_at
-                FROM chapters WHERE status='accepted' ORDER BY chapter_no"""
+                """SELECT chapter.chapter_no,chapter.title,chapter.status,chapter.version,chapter.path,
+                          chapter.content_hash,
+                          CASE WHEN chapter.version>1 AND (patch.committed_at IS NULL OR patch.committed_at<>chapter.updated_at)
+                               THEN NULL ELSE chapter.summary END AS summary,
+                          CASE WHEN chapter.version>1 AND (patch.committed_at IS NULL OR patch.committed_at<>chapter.updated_at)
+                               THEN 1 ELSE 0 END AS summary_stale,
+                          chapter.updated_at,chapter.accepted_at
+                   FROM chapters AS chapter
+                   LEFT JOIN memory_patches AS patch ON patch.chapter_no=chapter.chapter_no
+                   WHERE chapter.status='accepted' ORDER BY chapter.chapter_no"""
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def save_review(self, chapter_no: int, chapter_version: int, report: ReviewReport, path: str) -> None:
+    def save_review(
+        self, chapter_no: int, chapter_version: int, report: ReviewReport, path: str,
+        *, role_protocol_version: int = LEGACY_ROLE_PROTOCOL_VERSION, review_role: str = "reviewer",
+    ) -> int:
+        protocol_version = _checked_role_protocol_version(role_protocol_version)
+        _stored_role(review_role, protocol_version)
         with self.connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
-                INSERT INTO reviews(chapter_no, chapter_version, verdict, data_json, path, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO reviews(
+                    chapter_no, chapter_version, verdict, data_json, path, created_at,
+                    role_protocol_version, review_role
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     chapter_no,
@@ -512,9 +761,40 @@ class ProjectDatabase:
                     report.model_dump_json(),
                     path,
                     utc_now(),
+                    protocol_version,
+                    review_role,
                 ),
             )
             connection.commit()
+            return int(cursor.lastrowid)
+
+    def save_mode_review(
+        self, chapter_no: int, chapter_version: int, report: ReviewReport, path: str,
+        *, run_id: str, primary_role: str, bundle: dict[str, Any],
+    ) -> tuple[int, str]:
+        """Atomically bind a v2 merged review to its check-coverage record."""
+        if primary_role not in {"editor", "reviewer"}:
+            raise ValueError("新版综合审查必须注明负责表达或逻辑的主要审查角色。")
+        artifact_id = f"artifact-{uuid.uuid4().hex}"
+        now = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """INSERT INTO reviews(chapter_no,chapter_version,verdict,data_json,path,created_at,
+                   role_protocol_version,review_role) VALUES (?,?,?,?,?,?,2,?)""",
+                (chapter_no, chapter_version, report.verdict, report.model_dump_json(), path, now, primary_role),
+            )
+            review_id = int(cursor.lastrowid)
+            data = {**bundle, "review_id": review_id}
+            connection.execute(
+                """INSERT INTO agent_artifacts(artifact_id,artifact_type,run_id,chapter_no,chapter_version,
+                   role,role_protocol_version,dimension,status,data_json,created_at)
+                   VALUES (?,'mode_review_bundle',?,?,?,?,2,?,'verified',?,?)""",
+                (artifact_id, run_id, chapter_no, chapter_version, primary_role, bundle["mode"],
+                 json_dumps(data, indent=None), now),
+            )
+            connection.commit()
+        return review_id, artifact_id
 
     def latest_review(self, chapter_no: int) -> ReviewReport | None:
         record = self.latest_review_record(chapter_no)
@@ -523,35 +803,130 @@ class ProjectDatabase:
     def latest_review_record(self, chapter_no: int) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT chapter_version, data_json, path FROM reviews WHERE chapter_no=? ORDER BY id DESC LIMIT 1",
+                """SELECT id, chapter_version, data_json, path, role_protocol_version, review_role
+                FROM reviews WHERE chapter_no=? ORDER BY id DESC LIMIT 1""",
                 (chapter_no,),
             ).fetchone()
         if not row:
             return None
+        protocol_version = int(row["role_protocol_version"])
+        mode_bundle = None
+        if protocol_version == ROLE_PROTOCOL_VERSION:
+            # A v2 specialist candidate lives in agent_artifacts, never in
+            # reviews. Only the Engine's merged and version-bound report may
+            # be consumed by revision or acceptance as the current review.
+            for item in self.list_agent_artifacts(
+                chapter_no=chapter_no, artifact_type="mode_review_bundle", limit=50,
+            ):
+                data = item["data"]
+                if item["status"] == "verified" and data.get("review_id") == int(row["id"]):
+                    mode_bundle = data
+                    break
+            if mode_bundle is None:
+                raise ValueError("新版审查缺少引擎汇合的检查覆盖记录，不能作为可接受的综合报告。")
         return {
+            "id": int(row["id"]),
             "chapter_version": int(row["chapter_version"]),
             "report": ReviewReport.model_validate_json(row["data_json"]),
             "path": str(row["path"]),
+            "role_protocol_version": protocol_version,
+            "review_role": str(row["review_role"]),
+            "canonical_role": _stored_role(str(row["review_role"]), protocol_version),
+            "mode_bundle": mode_bundle,
         }
 
     def current_facts(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
+            has_canonical_text = any(str(row["name"]) == "content_text"
+                                     for row in connection.execute("PRAGMA table_info(chapters)"))
+            evidence_filter = ("AND (source.content_text IS NULL OR instr(source.content_text,fact.evidence)>0)"
+                               if has_canonical_text else "")
+            newer_evidence_filter = (
+                "AND (newer_source.content_text IS NULL OR instr(newer_source.content_text,newer.evidence)>0)"
+                if has_canonical_text else ""
+            )
             rows = connection.execute(
-                """
+                f"""
                 SELECT fact.*
                 FROM facts AS fact
+                JOIN chapters AS source ON source.chapter_no=fact.source_chapter
                 WHERE fact.status='active' AND fact.valid_to_chapter IS NULL
+                  AND fact.branch_id='main' AND source.status='accepted'
+                  AND (fact.source_version IS NULL OR fact.source_version=source.version)
+                  AND (fact.source_hash IS NULL OR fact.source_hash=source.content_hash)
+                  {evidence_filter}
                   AND NOT EXISTS (
                       SELECT 1
                       FROM facts AS newer
+                      JOIN chapters AS newer_source ON newer_source.chapter_no=newer.source_chapter
                       WHERE newer.subject=fact.subject
                         AND newer.predicate=fact.predicate
                         AND newer.status='active'
                         AND newer.valid_to_chapter IS NULL
+                        AND newer.branch_id=fact.branch_id
                         AND newer.source_chapter > fact.source_chapter
+                        AND newer_source.status='accepted'
+                        AND (newer.source_version IS NULL OR newer.source_version=newer_source.version)
+                        AND (newer.source_hash IS NULL OR newer.source_hash=newer_source.content_hash)
+                        {newer_evidence_filter}
                   )
                 ORDER BY fact.subject, fact.predicate
                 """
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["value"] = json.loads(item.pop("value_json"))
+            result.append(item)
+        return result
+
+    def facts_as_of(self, chapter_no: int) -> list[dict[str, Any]]:
+        """Facts available after an accepted chapter, including later-superseded facts.
+
+        A later chapter must not erase the knowledge available to an earlier
+        chapter's review or revision. A rewritten source chapter, however,
+        invalidates facts from its old version even for historical queries.
+        """
+        if chapter_no < 1:
+            return []
+        with self.connect() as connection:
+            has_canonical_text = any(str(row["name"]) == "content_text"
+                                     for row in connection.execute("PRAGMA table_info(chapters)"))
+            evidence_filter = ("AND (source.content_text IS NULL OR instr(source.content_text,fact.evidence)>0)"
+                               if has_canonical_text else "")
+            newer_evidence_filter = (
+                "AND (newer_source.content_text IS NULL OR instr(newer_source.content_text,newer.evidence)>0)"
+                if has_canonical_text else ""
+            )
+            rows = connection.execute(
+                f"""
+                SELECT fact.* FROM facts AS fact
+                JOIN chapters AS source ON source.chapter_no=fact.source_chapter
+                WHERE fact.status IN ('active','superseded')
+                  AND fact.branch_id='main'
+                  AND fact.source_chapter<=? AND fact.valid_from_chapter<=?
+                  AND (fact.valid_to_chapter IS NULL OR fact.valid_to_chapter>=?)
+                  AND source.status='accepted'
+                  AND (fact.source_version IS NULL OR fact.source_version=source.version)
+                  AND (fact.source_hash IS NULL OR fact.source_hash=source.content_hash)
+                  {evidence_filter}
+                  AND NOT EXISTS (
+                      SELECT 1 FROM facts AS newer
+                      JOIN chapters AS newer_source ON newer_source.chapter_no=newer.source_chapter
+                      WHERE newer.subject=fact.subject AND newer.predicate=fact.predicate
+                        AND newer.branch_id=fact.branch_id
+                        AND newer.status IN ('active','superseded')
+                        AND newer.source_chapter>fact.source_chapter
+                        AND newer.source_chapter<=? AND newer.valid_from_chapter<=?
+                        AND (newer.valid_to_chapter IS NULL OR newer.valid_to_chapter>=?)
+                        AND newer_source.status='accepted'
+                        AND (newer.source_version IS NULL OR newer.source_version=newer_source.version)
+                        AND (newer.source_hash IS NULL OR newer.source_hash=newer_source.content_hash)
+                        {newer_evidence_filter}
+                  )
+                ORDER BY fact.subject,fact.predicate
+                """,
+                (chapter_no,) * 6,
             ).fetchall()
         result = []
         for row in rows:
@@ -564,12 +939,72 @@ class ProjectDatabase:
         with self.connect() as connection:
             rows = connection.execute(
                 """
-                SELECT * FROM plot_threads
-                WHERE status IN ('open', 'advanced', 'delayed')
+                SELECT thread.* FROM plot_threads AS thread
+                JOIN chapters AS source ON source.chapter_no=thread.last_advanced_chapter
+                LEFT JOIN memory_patches AS patch ON patch.chapter_no=source.chapter_no
+                WHERE thread.status IN ('open', 'advanced', 'delayed')
+                  AND thread.branch_id='main' AND source.status='accepted'
+                  AND (thread.source_version IS NULL OR thread.source_version=source.version)
+                  AND (thread.source_hash IS NULL OR thread.source_hash=source.content_hash)
+                  AND (source.version=1 OR patch.committed_at=source.updated_at)
                 ORDER BY COALESCE(due_chapter, 999999), thread_id
                 """
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def threads_as_of(self, chapter_no: int) -> list[dict[str, Any]]:
+        """Replay accepted memory patches to recover threads at a chapter boundary.
+
+        plot_threads is only the latest projection: a mystery paid off in a
+        later chapter was still open when an earlier chapter was written.
+        """
+        if chapter_no < 1:
+            return []
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT patch.chapter_no,patch.data_json,patch.committed_at,
+                          chapter.version,chapter.content_hash,chapter.updated_at
+                   FROM memory_patches AS patch
+                   JOIN chapters AS chapter ON chapter.chapter_no=patch.chapter_no
+                   WHERE patch.chapter_no<=? AND chapter.status='accepted'
+                   ORDER BY patch.chapter_no""",
+                (chapter_no,),
+            ).fetchall()
+        latest: dict[str, dict[str, Any]] = {}
+        tainted: set[str] = set()
+        for row in rows:
+            patch = MemoryPatch.model_validate_json(row["data_json"])
+            if patch.chapter_no != int(row["chapter_no"]):
+                raise ValueError(f"第 {row['chapter_no']} 章记忆补丁的章节编号不一致")
+            current_patch = int(row["version"]) == 1 or row["committed_at"] == row["updated_at"]
+            for thread in patch.threads:
+                if not current_patch:
+                    # A later repair changed the source chapter without
+                    # rebasing this memory. Do not revive its earlier state.
+                    latest.pop(thread.thread_id, None)
+                    tainted.add(thread.thread_id)
+                    continue
+                tainted.discard(thread.thread_id)
+                latest[thread.thread_id] = {
+                    **thread.model_dump(mode="json"),
+                    "last_advanced_chapter": int(row["chapter_no"]),
+                    "source_version": int(row["version"]),
+                    "source_hash": str(row["content_hash"]),
+                    "branch_id": "main",
+                    "updated_at": str(row["committed_at"]),
+                }
+        # Older imported projects may have no memory patch for some threads.
+        # Preserve valid earlier projections without overriding replayed events.
+        for thread in self.open_threads():
+            if (thread["thread_id"] not in latest
+                    and thread["thread_id"] not in tainted
+                    and int(thread["last_advanced_chapter"]) <= chapter_no):
+                latest[str(thread["thread_id"])] = thread
+        return sorted(
+            (thread for thread in latest.values()
+             if thread["status"] in {"open", "advanced", "delayed"}),
+            key=lambda item: (item.get("due_chapter") or 999999, item["thread_id"]),
+        )
 
     def save_provisional_memory_patch(
         self,
@@ -666,6 +1101,150 @@ class ProjectDatabase:
             connection.commit()
         return int(cursor.rowcount)
 
+    def apply_accepted_continuity_repair(
+        self, chapter_no: int, content: str, *, expected_version: int,
+        expected_hash: str, expected_review_id: int, run_id: str,
+        diagnosis: dict[str, Any], verification: dict[str, Any],
+        review_role: str, role_protocol_version: int,
+        previous_memory_json: str | None = None,
+        revised_memory: MemoryPatch | None = None,
+    ) -> int:
+        """Commit a bounded, independently checked repair without demoting canon."""
+        self._require_canonical_content_schema()
+        new_hash = content_hash(content)
+        if new_hash == expected_hash:
+            raise ValueError("修订没有改变正文。")
+        _stored_role(review_role, _checked_role_protocol_version(role_protocol_version))
+        now = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT status,version,content_hash FROM chapters WHERE chapter_no=?", (chapter_no,)
+            ).fetchone()
+            latest = connection.execute(
+                "SELECT COALESCE(MAX(chapter_no),0) FROM chapters WHERE status='accepted'"
+            ).fetchone()[0]
+            review = connection.execute(
+                "SELECT id,chapter_version FROM reviews WHERE chapter_no=? ORDER BY id DESC LIMIT 1",
+                (chapter_no,),
+            ).fetchone()
+            prior_verified = False
+            if review and int(review["chapter_version"]) != expected_version:
+                prior_rows = connection.execute(
+                    """SELECT data_json FROM agent_artifacts
+                       WHERE artifact_type='accepted_continuity_resolution' AND chapter_no=?
+                         AND chapter_version=? AND status='verified'""",
+                    (chapter_no, expected_version),
+                ).fetchall()
+                prior_verified = any(
+                    (data := json.loads(row["data_json"])).get("source_review_id") == expected_review_id
+                    and data.get("new_hash") == expected_hash
+                    for row in prior_rows
+                )
+            if (not current or current["status"] != "accepted"
+                    or int(current["version"]) != expected_version
+                    or current["content_hash"] != expected_hash
+                    or int(latest) != chapter_no
+                    or not review or int(review["id"]) != expected_review_id
+                    or (int(review["chapter_version"]) != expected_version and not prior_verified)):
+                raise ValueError("正史、依赖章节或审查版本已变化；没有覆盖当前正文。")
+            stored_memory = connection.execute(
+                "SELECT data_json FROM memory_patches WHERE chapter_no=?", (chapter_no,)
+            ).fetchone()
+            current_memory_json = str(stored_memory["data_json"]) if stored_memory else None
+            if current_memory_json != previous_memory_json:
+                raise ValueError("修订期间本章记忆已变化；候选未覆盖当前版本。")
+            if current_memory_json:
+                previous_memory = MemoryPatch.model_validate_json(current_memory_json)
+                if revised_memory is None and any(fact.evidence not in content for fact in previous_memory.facts):
+                    raise ValueError("局部修订使记忆证据失效，但没有可核对的记忆更新。")
+            if revised_memory is not None:
+                if not current_memory_json or revised_memory.chapter_no != chapter_no or revised_memory.unresolved_conflicts:
+                    raise ValueError("记忆更新缺少有效旧版本或仍有冲突。")
+                old_facts = {fact.fact_id: fact for fact in previous_memory.facts}
+                new_facts = {fact.fact_id: fact for fact in revised_memory.facts}
+                if (set(old_facts) != set(new_facts)
+                        or {thread.thread_id for thread in previous_memory.threads}
+                        != {thread.thread_id for thread in revised_memory.threads}):
+                    raise ValueError("记忆更新擅自增删了事实或线索编号。")
+                for fact_id, fact in new_facts.items():
+                    old = old_facts[fact_id]
+                    if (fact.evidence not in content or fact.subject != old.subject
+                            or fact.valid_from_chapter != old.valid_from_chapter
+                            or (old.evidence in content and fact != old)):
+                        raise ValueError("记忆更新改变了未受影响事实，或证据不在候选正文。")
+            new_version = expected_version + 1
+            connection.execute(
+                """UPDATE chapters SET version=?,content_hash=?,content_text=?,summary=?,updated_at=?
+                   WHERE chapter_no=?""",
+                (new_version, new_hash, content,
+                 revised_memory.chapter_summary if revised_memory is not None else None,
+                 now, chapter_no),
+            )
+            if revised_memory is not None:
+                for fact in revised_memory.facts:
+                    if fact == old_facts[fact.fact_id]:
+                        continue
+                    updated = connection.execute(
+                        """UPDATE facts SET predicate=?,value_json=?,confidence=?,evidence=?,
+                           epistemic_kind=?,event_time=?,narrative_time=?,created_at=?
+                           WHERE fact_id=? AND source_chapter=? AND status='active'""",
+                        (fact.predicate, json_dumps(fact.value, indent=None), fact.confidence,
+                         fact.evidence, fact.epistemic_kind, fact.event_time,
+                         fact.narrative_time or f"第{chapter_no}章", now, fact.fact_id, chapter_no),
+                    )
+                    if updated.rowcount != 1:
+                        raise ValueError(f"待更新事实 {fact.fact_id} 不属于当前已接受章。")
+                for thread in revised_memory.threads:
+                    old_thread = next(item for item in previous_memory.threads if item.thread_id == thread.thread_id)
+                    if thread == old_thread:
+                        continue
+                    connection.execute(
+                        """UPDATE plot_threads SET kind=?,title=?,status=?,description=?,
+                           planted_chapter=?,due_chapter=?,updated_at=? WHERE thread_id=?""",
+                        (thread.kind, thread.title, thread.status, thread.description,
+                         thread.planted_chapter, thread.due_chapter, now, thread.thread_id),
+                    )
+                connection.execute(
+                    "UPDATE memory_patches SET data_json=?,committed_at=? WHERE chapter_no=?",
+                    (revised_memory.model_dump_json(), now, chapter_no),
+                )
+                connection.execute(
+                    """INSERT INTO agent_artifacts(artifact_id,artifact_type,run_id,chapter_no,
+                       chapter_version,role,role_protocol_version,dimension,status,data_json,created_at)
+                       VALUES (?,'accepted_memory_rebase',?,?,?,?,?,'memory','verified',?,?)""",
+                    (f"artifact-{uuid.uuid4().hex}", run_id, chapter_no, new_version,
+                     review_role, role_protocol_version,
+                     json_dumps({"old_hash": expected_hash, "new_hash": new_hash,
+                                 "before": previous_memory.model_dump(mode="json"),
+                                 "after": revised_memory.model_dump(mode="json")}, indent=None), now),
+                )
+            # A verified local repair is the same accepted chapter at a new
+            # version. Rebind only its still-supported memory to that version.
+            connection.execute(
+                """UPDATE facts SET source_version=?,source_hash=?
+                   WHERE source_chapter=? AND status='active' AND instr(?,evidence)>0""",
+                (new_version, new_hash, chapter_no, content),
+            )
+            connection.execute(
+                """UPDATE plot_threads SET source_version=?,source_hash=?
+                   WHERE last_advanced_chapter=?""",
+                (new_version, new_hash, chapter_no),
+            )
+            connection.execute(
+                """INSERT INTO agent_artifacts(artifact_id,artifact_type,run_id,chapter_no,
+                   chapter_version,role,role_protocol_version,dimension,status,data_json,created_at)
+                   VALUES (?,'accepted_continuity_resolution',?,?,?,?,?,'continuity',
+                   'verified',?,?)""",
+                (f"artifact-{uuid.uuid4().hex}", run_id, chapter_no, new_version,
+                 review_role, role_protocol_version,
+                 json_dumps({"source_review_id": expected_review_id,
+                             "old_hash": expected_hash, "new_hash": new_hash,
+                             "diagnosis": diagnosis, "verification": verification}, indent=None), now),
+            )
+            connection.commit()
+        return new_version
+
     def accept_chapter(
         self,
         chapter_no: int,
@@ -674,6 +1253,9 @@ class ProjectDatabase:
         content: str,
         patch: MemoryPatch,
         *,
+        expected_draft_version: int,
+        expected_draft_hash: str,
+        expected_review_id: int,
         provisional_batch_id: str | None = None,
     ) -> None:
         self._require_canonical_content_schema()
@@ -681,10 +1263,26 @@ class ProjectDatabase:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
-                "SELECT version, content_hash FROM chapters WHERE chapter_no=?", (chapter_no,)
+                "SELECT status, version, content_hash FROM chapters WHERE chapter_no=?", (chapter_no,)
             ).fetchone()
             if not current:
                 raise ValueError(f"第 {chapter_no} 章没有草稿记录")
+            if (
+                current["status"] != "draft"
+                or int(current["version"]) != expected_draft_version
+                or current["content_hash"] != expected_draft_hash
+                or content_hash(content) != expected_draft_hash
+            ):
+                raise ValueError(f"第 {chapter_no} 章草稿在验收期间已变化；没有写入正史或重复提交记忆")
+            latest_review = connection.execute(
+                "SELECT id,chapter_version FROM reviews WHERE chapter_no=? ORDER BY id DESC LIMIT 1",
+                (chapter_no,),
+            ).fetchone()
+            if (
+                latest_review is None or int(latest_review["id"]) != expected_review_id
+                or int(latest_review["chapter_version"]) != expected_draft_version
+            ):
+                raise ValueError(f"第 {chapter_no} 章审查版本在验收期间已变化；没有写入正史")
             if provisional_batch_id:
                 staged = connection.execute(
                     """
@@ -725,8 +1323,9 @@ class ProjectDatabase:
                     """
                     INSERT OR REPLACE INTO facts(
                         fact_id, subject, predicate, value_json, valid_from_chapter, valid_to_chapter,
-                        source_chapter, confidence, evidence, status, created_at
-                    ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, 'active', ?)
+                        source_chapter, confidence, evidence, epistemic_kind, event_time,
+                        narrative_time, source_version, source_hash, branch_id, status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'main', 'active', ?)
                     """,
                     (
                         fact.fact_id,
@@ -737,6 +1336,11 @@ class ProjectDatabase:
                         chapter_no,
                         fact.confidence,
                         fact.evidence,
+                        "belief" if fact.epistemic_kind == "objective" and fact.predicate.startswith(("believes.", "knows.")) else ("rumor" if fact.epistemic_kind == "objective" and fact.predicate.startswith("rumor.") else fact.epistemic_kind),
+                        fact.event_time,
+                        fact.narrative_time or f"第{chapter_no}章",
+                        int(current["version"]),
+                        content_hash(content),
                         now,
                     ),
                 )
@@ -745,8 +1349,9 @@ class ProjectDatabase:
                     """
                     INSERT INTO plot_threads(
                         thread_id, kind, title, status, description, planted_chapter,
-                        due_chapter, last_advanced_chapter, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        due_chapter, last_advanced_chapter, source_version,
+                        source_hash, branch_id, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'main', ?)
                     ON CONFLICT(thread_id) DO UPDATE SET
                         kind=excluded.kind,
                         title=excluded.title,
@@ -755,6 +1360,9 @@ class ProjectDatabase:
                         planted_chapter=COALESCE(plot_threads.planted_chapter, excluded.planted_chapter),
                         due_chapter=excluded.due_chapter,
                         last_advanced_chapter=excluded.last_advanced_chapter,
+                        source_version=excluded.source_version,
+                        source_hash=excluded.source_hash,
+                        branch_id=excluded.branch_id,
                         updated_at=excluded.updated_at
                     """,
                     (
@@ -766,6 +1374,8 @@ class ProjectDatabase:
                         thread.planted_chapter,
                         thread.due_chapter,
                         chapter_no,
+                        int(current["version"]),
+                        content_hash(content),
                         now,
                     ),
                 )
@@ -833,12 +1443,13 @@ class ProjectDatabase:
         status: str = "pending",
         expires_at: str | None = None,
         response_to: str | None = None,
+        role_protocol_version: int = LEGACY_ROLE_PROTOCOL_VERSION,
     ) -> dict[str, Any]:
-        roles = {"coordinator", "writer", "reviewer", "memory_keeper", "user"}
+        protocol_version = _checked_role_protocol_version(role_protocol_version)
         message_types = {"task_assignment", "fact_query", "handoff", "review_issue", "revision_request", "objection", "risk", "memory_sync", "answer"}
         statuses = {"pending", "responded", "resolved", "escalated", "expired"}
-        if sender_role not in roles or recipient_role not in roles:
-            raise ValueError("协作消息角色不受支持")
+        _stored_role(sender_role, protocol_version)
+        _stored_role(recipient_role, protocol_version)
         if message_type not in message_types or status not in statuses:
             raise ValueError("协作消息类型或状态不受支持")
         message_id = f"message-{uuid.uuid4().hex}"
@@ -856,13 +1467,13 @@ class ProjectDatabase:
             connection.execute(
                 """
                 INSERT INTO collaboration_messages(
-                    message_id, thread_id, run_id, sender_role, recipient_role, message_type,
+                    message_id, thread_id, run_id, sender_role, recipient_role, role_protocol_version, message_type,
                     chapter_no, chapter_version, context_packet_id, claim, evidence_refs_json,
                     requested_response, status, expires_at, response_to, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    message_id, thread_id, run_id, sender_role, recipient_role, message_type,
+                    message_id, thread_id, run_id, sender_role, recipient_role, protocol_version, message_type,
                     chapter_no, chapter_version, context_packet_id, claim,
                     json_dumps(sorted(set(evidence_refs or [])), indent=None), requested_response,
                     status, expires_at, response_to, now,
@@ -877,6 +1488,7 @@ class ProjectDatabase:
         return {
             "message_id": message_id, "thread_id": thread_id, "run_id": run_id,
             "sender_role": sender_role, "recipient_role": recipient_role,
+            "role_protocol_version": protocol_version,
             "message_type": message_type, "chapter_no": chapter_no,
             "chapter_version": chapter_version, "context_packet_id": context_packet_id,
             "claim": claim, "evidence_refs": sorted(set(evidence_refs or [])),
@@ -968,16 +1580,26 @@ class ProjectDatabase:
         chapter_version: int | None = None,
         dimension: str = "",
         status: str = "candidate",
+        role_protocol_version: int = LEGACY_ROLE_PROTOCOL_VERSION,
     ) -> dict[str, Any]:
+        protocol_version = _checked_role_protocol_version(role_protocol_version)
+        _stored_role(role, protocol_version)
         artifact_id = f"artifact-{uuid.uuid4().hex}"
         now = utc_now()
         with self.connect() as connection:
             connection.execute(
-                "INSERT INTO agent_artifacts VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (artifact_id, artifact_type, run_id, chapter_no, chapter_version, role, dimension or None, status, json_dumps(data, indent=None), now),
+                """INSERT INTO agent_artifacts(
+                    artifact_id, artifact_type, run_id, chapter_no, chapter_version, role,
+                    role_protocol_version, dimension, status, data_json, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (artifact_id, artifact_type, run_id, chapter_no, chapter_version, role, protocol_version,
+                 dimension or None, status, json_dumps(data, indent=None), now),
             )
             connection.commit()
-        return {"artifact_id": artifact_id, "artifact_type": artifact_type, "run_id": run_id, "role": role, "chapter_no": chapter_no, "chapter_version": chapter_version, "dimension": dimension, "status": status, "data": data, "created_at": now}
+        return {"artifact_id": artifact_id, "artifact_type": artifact_type, "run_id": run_id, "role": role,
+                "role_protocol_version": protocol_version, "chapter_no": chapter_no,
+                "chapter_version": chapter_version, "dimension": dimension, "status": status,
+                "data": data, "created_at": now}
 
     def list_agent_artifacts(self, *, chapter_no: int | None = None, artifact_type: str = "", limit: int = 50) -> list[dict[str, Any]]:
         clauses: list[str] = []
@@ -1082,7 +1704,12 @@ class ProjectDatabase:
                 if current_plan_exists and item.get("message_type") == "task_assignment":
                     stale_ids.append(message_id)
                     continue
-                key = ("global", item.get("recipient_role"), item.get("message_type"))
+                key = (
+                    "global",
+                    item.get("role_protocol_version"),
+                    item.get("recipient_role"),
+                    item.get("message_type"),
+                )
             else:
                 current_version = int(chapter.get("version") or 0)
                 if chapter.get("status") == "accepted":
@@ -1093,12 +1720,15 @@ class ProjectDatabase:
                     continue
                 review = self.latest_review_record(int(chapter_no))
                 if review and int(review["chapter_version"]) == current_version and review["report"].verdict == "pass":
-                    if item.get("recipient_role") == "reviewer" or item.get("message_type") == "task_assignment":
+                    if int(item.get("role_protocol_version") or 1) == LEGACY_ROLE_PROTOCOL_VERSION and (
+                        item.get("recipient_role") == "reviewer" or item.get("message_type") == "task_assignment"
+                    ):
                         stale_ids.append(message_id)
                         continue
                 key = (
                     int(chapter_no),
                     current_version,
+                    item.get("role_protocol_version"),
                     item.get("recipient_role"),
                     item.get("message_type"),
                 )
@@ -1146,14 +1776,17 @@ class ProjectDatabase:
         *,
         chapter_no: int,
         recipient_role: str,
+        role_protocol_version: int = LEGACY_ROLE_PROTOCOL_VERSION,
     ) -> int:
+        protocol_version = _checked_role_protocol_version(role_protocol_version)
         with self.connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE collaboration_messages SET status='resolved', resolved_at=?
-                WHERE chapter_no=? AND recipient_role=? AND status IN ('pending','responded')
+                WHERE chapter_no=? AND recipient_role=? AND role_protocol_version=?
+                  AND status IN ('pending','responded')
                 """,
-                (utc_now(), chapter_no, recipient_role),
+                (utc_now(), chapter_no, recipient_role, protocol_version),
             )
             connection.commit()
         return int(cursor.rowcount)
@@ -1255,11 +1888,26 @@ class ProjectDatabase:
             return ""
         if event_type not in {"accepted", "rejected", "revised", "rolled_back", "preference_changed", "comparison"}:
             raise ValueError("学习事件类型不受支持")
+        if event_type == "rejected":
+            signal_origin = "machine_review"
+        elif event_type == "accepted":
+            signal_origin = "canon_commit"
+        elif event_type == "preference_changed":
+            signal_origin = "user_preference"
+        elif event_type == "comparison":
+            signal_origin = "user_comparison"
+        elif event_type == "revised" and payload.get("source") == "user_selection":
+            signal_origin = "user_revision"
+        elif event_type == "rolled_back":
+            signal_origin = "workflow_rollback"
+        else:
+            signal_origin = "workflow_revision"
+        stored_payload = {**payload, "_signal_origin": signal_origin}
         event_id = f"learning-{uuid.uuid4().hex}"
         with self.connect() as connection:
             connection.execute(
                 "INSERT INTO learning_events(event_id,event_type,chapter_no,chapter_version,payload_json,created_at) VALUES (?,?,?,?,?,?)",
-                (event_id, event_type, chapter_no, chapter_version, json_dumps(payload, indent=None), utc_now()),
+                (event_id, event_type, chapter_no, chapter_version, json_dumps(stored_payload, indent=None), utc_now()),
             )
             connection.commit()
         return event_id
@@ -1279,6 +1927,7 @@ class ProjectDatabase:
         for row in rows:
             item = dict(row)
             item["payload"] = json.loads(item.pop("payload_json"))
+            item["signal_origin"] = str(item["payload"].get("_signal_origin") or "legacy_unclassified")
             result.append(item)
         return result
 
@@ -1286,22 +1935,112 @@ class ProjectDatabase:
         """Derive small, explainable local signals; this is not model training."""
 
         events = self.list_learning_events(80)
-        counts = Counter(str(item["event_type"]) for item in events)
-        rule_counts: Counter[str] = Counter()
-        for item in events:
-            if item["event_type"] != "rejected":
-                continue
-            for rule in item.get("payload", {}).get("finding_rules", []):
-                if isinstance(rule, str) and rule:
-                    rule_counts[rule] += 1
+        counts = Counter(str(item["signal_origin"]) for item in events)
         return {
             "window_events": len(events),
-            "accepted": counts["accepted"],
-            "rejected": counts["rejected"],
-            "revised": counts["revised"],
-            "priority_review_rules": [rule for rule, _ in rule_counts.most_common(5)],
-            "notice": "来自本地接受、拒绝和修订记录；不包含模型思维链，也不会上传正文。",
+            "explicit_user_feedback": sum(counts[key] for key in ("user_preference", "user_comparison", "user_revision")),
+            "machine_review_events": counts["machine_review"],
+            "canon_commits": counts["canon_commit"],
+            "legacy_unclassified": counts["legacy_unclassified"],
+            "notice": "只把用户明确偏好、比较或选区修订视为写法反馈；机器审核、正史提交和旧版来源不作为文风样本。",
         }
+
+    def create_computer_action_request(self, command: str, command_hash: str, *, ttl_seconds: int = 300) -> dict[str, Any]:
+        request_id = f"computer-action-{uuid.uuid4().hex}"
+        now = datetime.now(timezone.utc)
+        created_at = now.isoformat()
+        expires_at = (now + timedelta(seconds=max(30, min(ttl_seconds, 600)))).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO computer_action_requests
+                   (request_id,action_kind,command,command_hash,status,created_at,expires_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (request_id, "powershell", command, command_hash, "pending", created_at, expires_at),
+            )
+            connection.commit()
+        return self.get_computer_action_request(request_id) or {}
+
+    def list_pending_computer_action_requests(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        now = utc_now()
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE computer_action_requests SET status='expired' WHERE status='pending' AND expires_at<=?",
+                (now,),
+            )
+            rows = connection.execute(
+                """SELECT * FROM computer_action_requests WHERE status='pending' AND expires_at>?
+                   ORDER BY created_at LIMIT ?""",
+                (now, max(1, min(limit, 50))),
+            ).fetchall()
+            connection.commit()
+        return [dict(row) for row in rows]
+
+    def get_computer_action_request(self, request_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM computer_action_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def resolve_computer_action_request(self, request_id: str, command_hash: str, *, approved: bool) -> dict[str, Any]:
+        now = utc_now()
+        status = "approved" if approved else "rejected"
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM computer_action_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+            if row is None:
+                raise ValidationGateError("电脑操作确认请求不存在，可能已过期或已处理。")
+            if row["status"] != "pending" or row["expires_at"] <= now:
+                if row["status"] == "pending":
+                    connection.execute(
+                        "UPDATE computer_action_requests SET status='expired' WHERE request_id=? AND status='pending'",
+                        (request_id,),
+                    )
+                    connection.commit()
+                raise ValidationGateError("该电脑操作确认已过期或已处理，没有执行任何命令。")
+            if row["command_hash"] != command_hash:
+                raise ValidationGateError("确认内容与当前命令不一致，没有执行任何命令。")
+            connection.execute(
+                "UPDATE computer_action_requests SET status=?,decided_at=? WHERE request_id=? AND status='pending'",
+                (status, now, request_id),
+            )
+            connection.commit()
+        return self.get_computer_action_request(request_id) or {}
+
+    def claim_approved_computer_action(self, request_id: str, command_hash: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE computer_action_requests SET status='executing'
+                   WHERE request_id=? AND command_hash=? AND status='approved' AND expires_at>?""",
+                (request_id, command_hash, utc_now()),
+            )
+            connection.commit()
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                "SELECT * FROM computer_action_requests WHERE request_id=?", (request_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def cancel_approved_computer_action(self, request_id: str, command_hash: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE computer_action_requests SET status='rejected',decided_at=?
+                   WHERE request_id=? AND command_hash=? AND status='approved'""",
+                (utc_now(), request_id, command_hash),
+            )
+            connection.commit()
+
+    def finish_computer_action_request(self, request_id: str, *, exit_code: int | None, error: str = "") -> None:
+        status = "completed" if exit_code == 0 else "failed"
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE computer_action_requests SET status=?,completed_at=?,exit_code=?,error=?
+                   WHERE request_id=? AND status='executing'""",
+                (status, utc_now(), exit_code, error[:1000], request_id),
+            )
+            connection.commit()
 
     def update_learning_strategy(self, strategy_key: str, reward: float) -> dict[str, Any]:
         key = strategy_key.strip()

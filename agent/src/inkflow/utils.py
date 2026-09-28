@@ -14,9 +14,64 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def workflow_failure_reason(result: Any) -> str:
+    """Inspect workflow envelopes, not arbitrary model data or earlier findings."""
+    if not isinstance(result, dict):
+        return ""
+    if result.get("gate"):
+        return str(result["gate"])
+    resumable_boundary = result.get("resumable") is True and result.get("status") == "interrupted"
+    if not resumable_boundary and (
+        result.get("status") in {"failed", "gate_stop", "needs_revision", "interrupted"}
+        or result.get("stop_reason")
+    ):
+        return str(result.get("stop_reason") or result.get("detail") or result.get("summary") or "任务未完成")
+    nested = workflow_failure_reason(result.get("result"))
+    if nested:
+        return nested
+    steps = result.get("steps")
+    if not isinstance(steps, list):
+        return ""
+    return next((reason for step in steps if (reason := workflow_failure_reason(step))), "")
+
+
+def workflow_result_status(result: Any) -> str:
+    """Classify explicit workflow outcomes without guessing from prose."""
+    if not isinstance(result, dict):
+        return "completed"
+    if result.get("needs_clarification") is True:
+        return "waiting_user"
+    status = result.get("status")
+    if status == "needs_input":
+        return "waiting_user"
+    if status in {"waiting_user", "waiting_condition"}:
+        return str(status)
+    if result.get("resumable") is True and status == "interrupted":
+        return "waiting_condition"
+
+    steps = result.get("steps")
+    children = [result.get("result")]
+    if isinstance(steps, list):
+        children.extend(steps)
+    children = [item for item in children if isinstance(item, dict)]
+    child_statuses = [workflow_result_status(item) for item in children]
+    if "failed" in child_statuses or workflow_failure_reason(result):
+        return "failed"
+    if "waiting_user" in child_statuses:
+        return "waiting_user"
+    if "waiting_condition" in child_statuses:
+        return "waiting_condition"
+    return "completed"
+
+
 def content_hash(value: str | bytes) -> str:
     raw = value.encode("utf-8") if isinstance(value, str) else value
     return hashlib.sha256(raw).hexdigest()
+
+
+def effective_character_count(content: str) -> int:
+    body = re.sub(r"\A\s*#{1,6}[^\n]*(?:\n|$)", "", content, count=1)
+    return len(re.findall(r"[\u3400-\u9fffA-Za-z0-9]", body))
 
 
 def project_source_revision(project_root: str | Path, internal: str | Path | None = None) -> str:
@@ -25,7 +80,7 @@ def project_source_revision(project_root: str | Path, internal: str | Path | Non
     root = Path(project_root)
     internal_path = Path(internal) if internal is not None else root / ".inkflow"
     candidates: set[Path] = set()
-    for relative in ("BOOK.md", "PLAN.md", "STATE.md", "DIALOGUE.md"):
+    for relative in ("BOOK.md", "OUTLINE.md", "STORY_DETAIL.md", "PLAN.md", "STATE.md", "DIALOGUE.md"):
         candidates.add(root / relative)
     for name in ("project.json", "inkflow.db", "studio.db"):
         candidates.add(internal_path / name)

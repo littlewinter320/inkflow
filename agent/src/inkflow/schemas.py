@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .role_protocol import AgentRole, CollaborationMode
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
@@ -271,6 +273,8 @@ class OutlineChapter(StrictModel):
     conflict: str = Field(min_length=4, max_length=500)
     turn: str = Field(min_length=4, max_length=500)
     hook: str = Field(min_length=4, max_length=500)
+    scenes: list[str] = Field(default_factory=list, max_length=12)
+    consequence: str = Field(default="", max_length=800)
 
 
 class OutlineOutput(StrictModel):
@@ -280,6 +284,9 @@ class OutlineOutput(StrictModel):
     start_chapter: int = Field(ge=1)
     end_chapter: int = Field(ge=1)
     premise: str = Field(min_length=8, max_length=1_500)
+    main_story: str = Field(default="", max_length=3000)
+    character_arc: str = Field(default="", max_length=2000)
+    ending: str = Field(default="", max_length=1500)
     chapters: list[OutlineChapter] = Field(min_length=1, max_length=500)
     public_reasoning_summary: list[str] = Field(default_factory=list, max_length=8)
 
@@ -292,6 +299,90 @@ class OutlineOutput(StrictModel):
         if actual != expected:
             raise ValueError(f"大纲章节必须连续覆盖 {expected[0]}～{expected[-1]}")
         return self
+
+
+class StoryDetailSegment(StrictModel):
+    title: str = Field(min_length=1, max_length=160)
+    motivation: str = Field(min_length=4, max_length=1200)
+    events: list[str] = Field(min_length=1, max_length=20)
+    conflict: str = Field(min_length=4, max_length=1200)
+    choice: str = Field(min_length=4, max_length=1200)
+    consequence: str = Field(min_length=4, max_length=1200)
+    setup_and_payoff: str = Field(min_length=4, max_length=1200)
+
+
+class StoryDetailOutput(StrictModel):
+    """剧情细纲：按故事阶段展开，不按章节分配内容。"""
+    title: str = Field(min_length=1, max_length=160)
+    scope: str = Field(min_length=4, max_length=600)
+    segments: list[StoryDetailSegment] = Field(min_length=1, max_length=60)
+    ending: str = Field(min_length=4, max_length=2000)
+
+
+class PlanningVolumeDirection(StrictModel):
+    volume_no: int = Field(ge=1)
+    title: str = Field(min_length=1, max_length=160)
+    chapter_start: int = Field(ge=1)
+    chapter_end: int = Field(ge=1)
+    central_conflict: str = Field(min_length=20, max_length=1500)
+    outcome: str = Field(min_length=20, max_length=1500)
+
+
+class BookOutlineV2(StrictModel):
+    """Whole-book narrative contract; chapter details belong downstream."""
+
+    title: str = Field(min_length=1, max_length=160)
+    body: str = Field(min_length=5000, max_length=25000)
+    volumes: list[PlanningVolumeDirection] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_volumes(self) -> "BookOutlineV2":
+        ordered = sorted(self.volumes, key=lambda item: item.volume_no)
+        if [item.volume_no for item in ordered] != list(range(1, len(ordered) + 1)):
+            raise ValueError("大纲的卷号必须从第一卷连续排列")
+        if ordered[0].chapter_start != 1:
+            raise ValueError("全书大纲必须从第一章开始")
+        for index, item in enumerate(ordered):
+            if item.chapter_end - item.chapter_start + 1 < 10:
+                raise ValueError(f"第 {item.volume_no} 卷不足十章")
+            if index and item.chapter_start != ordered[index - 1].chapter_end + 1:
+                raise ValueError("卷章节范围必须连续且不重叠")
+        return self
+
+
+class VolumeDetailV2(StrictModel):
+    volume_no: int = Field(ge=1)
+    title: str = Field(min_length=1, max_length=160)
+    chapter_start: int = Field(ge=1)
+    chapter_end: int = Field(ge=1)
+    body: str = Field(min_length=5000, max_length=25000)
+    rough_chapter_beats: list[str] = Field(min_length=5, max_length=80)
+
+
+class RollingChapterV2(StrictModel):
+    chapter_no: int = Field(ge=1)
+    title: str = Field(min_length=1, max_length=160)
+    body: str = Field(min_length=200, max_length=700)
+
+
+class RollingPlanV2(StrictModel):
+    anchor_chapter: int = Field(ge=1)
+    anchor_summary: str = Field(min_length=100, max_length=700)
+    chapters: list[RollingChapterV2] = Field(min_length=1, max_length=50)
+
+
+class PlanningReviewEvidence(StrictModel):
+    candidate_excerpt: str = Field(min_length=4, max_length=300)
+    source_excerpt: str = Field(min_length=4, max_length=300)
+    finding: str = Field(min_length=4, max_length=500)
+
+
+class PlanningReviewV2(StrictModel):
+    verdict: Literal["pass", "revise", "insufficient_context"]
+    confidence: float = Field(ge=0, le=1)
+    summary: str = Field(min_length=8, max_length=1000)
+    evidence: list[PlanningReviewEvidence] = Field(default_factory=list, max_length=8)
+    repair_instruction: str = Field(default="", max_length=1200)
 
 
 class PlanBundle(StrictModel):
@@ -390,12 +481,82 @@ class DraftOutput(StrictModel):
     hook_note: HookNote | None = None
     scene_blueprint: list[SceneBlueprintItem] = Field(default_factory=list, max_length=8)
 
+    @field_validator("content")
+    @classmethod
+    def validate_novel_punctuation(cls, value: str) -> str:
+        count = value.count("、")
+        if count:
+            raise ValueError(
+                f"小说正文禁止使用中文顿号，当前仍有 {count} 个；请改写包含顿号的完整句子，"
+                "用自然句法或‘和’‘跟’‘与’连接，不要机械替换成其他标点"
+            )
+        return value
+
+
+class SceneDraftOutput(StrictModel):
+    """Writer prose for an isolated scene draft; no review or canon authority."""
+
+    title: str = Field(min_length=1, max_length=120)
+    content: str = Field(min_length=1, max_length=20_000)
+    decision_summary: list[str] = Field(min_length=1, max_length=8)
+
+    @field_validator("content")
+    @classmethod
+    def validate_novel_punctuation(cls, value: str) -> str:
+        return DraftOutput.validate_novel_punctuation(value)
+
+
+class ParagraphInsertion(StrictModel):
+    before_paragraph: int = Field(ge=0)
+    content: str = Field(min_length=1, max_length=12_000)
+
+
+class ParagraphExpansionPlan(StrictModel):
+    insertions: list[ParagraphInsertion] = Field(min_length=1, max_length=12)
+    decision_summary: list[str] = Field(min_length=1, max_length=8)
+
+
+class ParagraphCutPlan(StrictModel):
+    paragraph_ids: list[int] = Field(min_length=1, max_length=80)
+    decision_summary: list[str] = Field(min_length=1, max_length=8)
+
 
 class SelectionRevisionOutput(StrictModel):
     """Writer 对一个已锁定正文选区给出的最小替换结果。"""
 
     replacement: str = Field(min_length=1, max_length=20_000)
     decision_summary: list[str] = Field(min_length=1, max_length=6)
+
+
+class AcceptedContinuityDiagnosis(StrictModel):
+    """An Editor's evidence-bound decision about an accepted-chapter hold."""
+
+    verdict: Literal["already_explained", "needs_local_repair", "needs_user"]
+    reason: str = Field(min_length=1, max_length=1_000)
+    bridge_evidence: str = Field(default="", max_length=1_000)
+    repair_instruction: str = Field(default="", max_length=1_000)
+    key_objects: list[str] = Field(default_factory=list, max_length=4)
+
+
+class AcceptedContinuityLocalEdit(StrictModel):
+    target_excerpt: str = Field(min_length=1, max_length=500)
+    replacement: str = Field(min_length=1, max_length=800)
+
+
+class AcceptedContinuityPatch(StrictModel):
+    """Writer returns a handful of exact local edits, never a rewritten chapter."""
+
+    edits: list[AcceptedContinuityLocalEdit] = Field(min_length=1, max_length=4)
+    reason: str = Field(min_length=1, max_length=1_000)
+
+
+class AcceptedContinuityVerification(StrictModel):
+    verdict: Literal["resolved", "not_resolved", "needs_user"]
+    confidence: float = Field(default=0.0, ge=0, le=1)
+    reason: str = Field(min_length=1, max_length=1_000)
+    evidence: str = Field(min_length=1, max_length=1_000)
+    anchor_excerpt: str = Field(min_length=8, max_length=500)
+    checked_state_ids: list[int] = Field(default_factory=list, max_length=80)
 
 
 FindingCategory = Literal[
@@ -424,12 +585,26 @@ class ReviewFinding(StrictModel):
     verification_note: str = ""
     claim: str = ""
     verification_status: Literal["unchecked", "anchored", "unsupported", "uncertain"] = "unchecked"
-    semantic_status: Literal["unchecked", "supported", "contradicted", "uncertain"] = "unchecked"
+    semantic_status: Literal["unchecked", "supported", "contradicted", "not_blocking", "uncertain"] = "unchecked"
     verification_confidence: float = Field(default=0.0, ge=0, le=1)
     proposed_severity: Literal["info", "minor", "major", "blocking"] | None = None
 
 
+class PlanConflictAnchor(StrictModel):
+    """Two exact quotes for a reported plan/canon conflict, not a new review."""
+
+    plan_excerpt: str = Field(min_length=8, max_length=240)
+    canon_ref: str = Field(min_length=1, max_length=100)
+    canon_excerpt: str = Field(min_length=8, max_length=240)
+    reason: str = Field(min_length=1, max_length=500)
+
+
 ReviewScoreDimensionName = Literal[
+    "剧情因果",
+    "人物动机与认知",
+    "线索来源与世界规则",
+    "章节职责与承接",
+    "文本完整性与阅读",
     "正史与认知",
     "因果与人物",
     "章节卡履约",
@@ -443,7 +618,7 @@ class ReviewScoreDimension(StrictModel):
 
     dimension: ReviewScoreDimensionName
     maximum_score: int = Field(ge=1, le=100)
-    score: int = Field(ge=0, le=100)
+    score: float = Field(ge=0, le=100)
     deductions: list[ReviewFinding] = Field(default_factory=list)
 
 
@@ -456,17 +631,121 @@ class ContextUseAudit(StrictModel):
     summary: str = ""
 
 
+class ReviewFocusObservation(StrictModel):
+    """Short, quote-grounded readback of the actual chapter before judgment."""
+
+    observed_goal: str = ""
+    goal_evidence: str = ""
+    observed_change: str = ""
+    change_evidence: str = ""
+    plan_alignment: Literal["aligned", "adapted", "diverged", "unclear"] = "unclear"
+    alignment_reason: str = ""
+
+
+class ReviewSourceComparison(StrictModel):
+    """A visible, quote-checkable comparison to one actual context source."""
+
+    source_id: str = Field(min_length=1, max_length=160)
+    source_evidence: str = Field(min_length=4, max_length=400)
+    chapter_evidence: str = Field(min_length=4, max_length=400)
+    relation: Literal["aligned", "adapted", "tension", "conflict"]
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class ReviewEvidenceAnchor(StrictModel):
+    criterion: str
+    chapter_span: str = Field(pattern=r"^(?:body\.\d+)?$")
+    source_span: str = Field(default="", pattern=r"^(?:source\d+\.\d+)?$")
+
+
+class ReviewComparisonAnchor(StrictModel):
+    chapter_span: str = Field(pattern=r"^(?:body\.\d+)?$")
+    source_span: str = Field(pattern=r"^(?:source\d+\.\d+)?$")
+    relation: Literal["aligned", "adapted", "tension", "conflict"]
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class ReviewEvidenceRepair(StrictModel):
+    """Select immutable source spans instead of asking models to transcribe quotes."""
+
+    goal_span: str = Field(pattern=r"^(?:body\.\d+)?$")
+    change_span: str = Field(pattern=r"^(?:body\.\d+)?$")
+    assessments: list[ReviewEvidenceAnchor] = Field(default_factory=list, max_length=6)
+    comparisons: list[ReviewComparisonAnchor] = Field(default_factory=list, max_length=8)
+
+
+class ReviewAssessment(StrictModel):
+    """One public rubric judgement, not a hidden reasoning trace or probability."""
+
+    criterion: Literal["continuity", "causality", "requirements", "motivation", "progression", "readability"]
+    status: Literal["met", "partial", "failed", "data_missing"]
+    grade: int = Field(ge=0, le=4)
+    chapter_evidence: str = Field(default="", max_length=400)
+    source_id: str = Field(default="", max_length=160)
+    source_evidence: str = Field(default="", max_length=400)
+    reason: str = Field(min_length=1, max_length=600)
+    alternative: str = Field(min_length=1, max_length=400)
+
+
 class ReviewReport(StrictModel):
     verdict: Literal["pass", "patch", "replan", "unknown"]
     confidence: float = Field(ge=0, le=1)
+    model_self_confidence: float | None = Field(default=None, ge=0, le=1)
+    confidence_basis: list[str] = Field(default_factory=list)
+    scoring_version: str = ""
+    assessments: list[ReviewAssessment] = Field(default_factory=list)
+    missing_source_ids: list[str] = Field(default_factory=list)
     summary: str
     strengths: list[str] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list)
     scorecard: list[ReviewScoreDimension] = Field(default_factory=list)
     source_hash: str = ""
     context_fingerprint: str = ""
+    instruction_hash: str = ""
     hook_assessment: HookAssessment | None = None
     context_use_audit: ContextUseAudit = Field(default_factory=ContextUseAudit)
+    focus_observation: ReviewFocusObservation = Field(default_factory=ReviewFocusObservation)
+    source_comparisons: list[ReviewSourceComparison] = Field(default_factory=list)
+    memory_patch: MemoryPatch | None = None
+
+
+class ReviewModelOutput(StrictModel):
+    """Only fields the Reviewer must generate; provenance and scores are deterministic."""
+
+    verdict: Literal["pass", "patch", "replan", "unknown"]
+    confidence: float = Field(ge=0, le=1)
+    assessments: list[ReviewAssessment] = Field(default_factory=list, max_length=6)
+    missing_source_ids: list[str] = Field(default_factory=list, max_length=6)
+    source_comparisons: list[ReviewSourceComparison] = Field(default_factory=list, max_length=8)
+    summary: str = Field(min_length=1, max_length=2_000)
+    strengths: list[str] = Field(default_factory=list, max_length=8)
+    findings: list[ReviewFinding] = Field(default_factory=list, max_length=24)
+    hook_assessment: HookAssessment | None = None
+    context_use_audit: ContextUseAudit = Field(default_factory=ContextUseAudit)
+    focus_observation: ReviewFocusObservation = Field(default_factory=ReviewFocusObservation)
+    memory_patch: MemoryPatch | None = None
+
+    @model_validator(mode="after")
+    def passed_review_must_handoff_memory(self) -> "ReviewModelOutput":
+        """Keep a successful review and its memory handoff in one cacheable call."""
+
+        if self.verdict == "pass" and self.memory_patch is None:
+            raise ValueError("Reviewer 通过章节时必须同时填写 memory_patch，不能另起低命中率的补提取调用")
+        return self
+
+
+class ModeCheckOutput(StrictModel):
+    """V2 role-scoped model output; the engine owns role and source identity."""
+
+    verdict: Literal["pass", "patch", "unknown"]
+    confidence: float = Field(ge=0, le=1)
+    assessments: list[ReviewAssessment] = Field(default_factory=list, max_length=6)
+    missing_source_ids: list[str] = Field(default_factory=list, max_length=6)
+    summary: str = Field(min_length=1, max_length=2_000)
+    findings: list[ReviewFinding] = Field(default_factory=list, max_length=24)
+    focus_observation: ReviewFocusObservation = Field(default_factory=ReviewFocusObservation)
+    source_comparisons: list[ReviewSourceComparison] = Field(default_factory=list, max_length=8)
+    memory_patch: MemoryPatch | None = None
 
 
 class ReviewFindingBatch(StrictModel):
@@ -475,9 +754,10 @@ class ReviewFindingBatch(StrictModel):
 
 class ReviewClaimDecision(StrictModel):
     finding_index: int = Field(ge=0)
-    verdict: Literal["supported", "contradicted", "uncertain"]
+    verdict: Literal["supported", "contradicted", "not_blocking", "uncertain"]
     confidence: float = Field(ge=0, le=1)
     reason: str
+    resolution_evidence: str = ""
 
 
 class ReviewClaimDecisionBatch(StrictModel):
@@ -487,9 +767,15 @@ class ReviewClaimDecisionBatch(StrictModel):
 class ArcAuditReport(StrictModel):
     verdict: Literal["aligned", "needs_replan", "blocked", "unknown"]
     confidence: float = Field(ge=0, le=1)
+    model_self_confidence: float | None = Field(default=None, ge=0, le=1)
+    confidence_basis: list[str] = Field(default_factory=list)
+    scoring_version: str = ""
+    assessments: list[ReviewAssessment] = Field(default_factory=list, max_length=6)
+    missing_source_ids: list[str] = Field(default_factory=list, max_length=6)
     summary: str
     fulfilled_commitments: list[str] = Field(default_factory=list)
     deviations: list[ReviewFinding] = Field(default_factory=list)
+    source_comparisons: list[ReviewSourceComparison] = Field(default_factory=list, max_length=8)
     future_impact: list[str] = Field(default_factory=list)
     body_repair_recommended: bool = False
     body_repair_scope: list[int] = Field(default_factory=list)
@@ -506,6 +792,9 @@ class FactMutation(StrictModel):
     valid_from_chapter: int = Field(ge=1)
     confidence: float = Field(default=1.0, ge=0, le=1)
     evidence: str = Field(min_length=2)
+    epistemic_kind: Literal["objective", "belief", "rumor"] = "objective"
+    event_time: str | None = None
+    narrative_time: str | None = None
 
 
 class ThreadMutation(StrictModel):
@@ -593,6 +882,9 @@ class ContextSection(StrictModel):
     content: str
     source_ids: list[str] = Field(default_factory=list)
     hard: bool = False
+    # Scope describes how long the source is expected to remain unchanged.
+    # Unknown/new sources default to the dynamic tail, never the cache prefix.
+    cache_scope: Literal["global", "book", "canon", "chapter", "request"] = "request"
 
 
 class ContextPacket(StrictModel):
@@ -620,21 +912,23 @@ class ContextPacket(StrictModel):
         return "\n".join(output).rstrip() + "\n"
 
     def to_model_prompt(self) -> str:
-        """Serialize stable material before task-specific material for provider caching."""
+        """Compile reusable source scopes before current chapter/request material."""
 
-        def priority(section: ContextSection) -> tuple[int, str]:
-            if section.key == "A0":
-                return (0, section.key)
-            if section.key == "J" and "输出契约" not in section.title:
-                return (1, section.key)
-            if "输出契约" in section.title:
-                return (2, section.key)
-            if section.key == "A":
-                return (4, section.key)
-            return (3, section.key)
+        scopes = {"global": 0, "book": 1, "canon": 2, "chapter": 3, "request": 4}
+
+        def priority(indexed: tuple[int, ContextSection]) -> tuple[int, int, int]:
+            index, section = indexed
+            # Book sections have a fixed order. Sorting by their changing length
+            # invalidated DeepSeek's exact-prefix cache on unrelated edits.
+            # The book contract is a longer-lived prefix than a revisable
+            # outline boundary. Keep it ahead of O0 so a new outline draft
+            # does not invalidate the book-level DeepSeek cache.
+            book_order = {"J": 0, "B": 1, "O0": 2, "O1": 3}
+            order = book_order.get(section.key, 10 + index) if section.cache_scope == "book" else index
+            return (scopes[section.cache_scope], order, index)
 
         output = ["# 墨流编译上下文", ""]
-        for section in sorted(self.sections, key=priority):
+        for _, section in sorted(enumerate(self.sections), key=priority):
             output.extend([f"## {section.key}. {section.title}", "", section.content or "（无）", ""])
             if section.source_ids:
                 output.extend([f"来源：{', '.join(sorted(section.source_ids))}", ""])
@@ -689,7 +983,7 @@ class CollaborationReply(StrictModel):
 
 
 class RoleCapability(StrictModel):
-    role: Literal["coordinator", "writer", "reviewer", "memory_keeper"]
+    role: AgentRole
     formal_ai_agent: bool = True
     novel_production_agent: bool
     can: list[str]
@@ -697,8 +991,24 @@ class RoleCapability(StrictModel):
 
 
 class TaskTicket(StrictModel):
+    # Missing version means the historical combined reviewer, not a specialist.
+    role_protocol_version: Literal[1, 2] = 1
+    collaboration_mode: CollaborationMode = "everyday"
+    task_snapshot_hash: str | None = None
     ticket_id: str
     objective: str
+    user_message: str = ""
+    task_revision: int = Field(default=1, ge=1)
+    related_task_id: str | None = None
+    pending_question_id: str | None = None
+    response_kind: Literal["new_task", "task_revision", "question_answer"] = "new_task"
+    narrative_scope: Literal["none", "scene", "chapter", "batch"] = "none"
+    edit_scope: Literal["none", "selection", "chapter", "document"] = "none"
+    preserve_constraints: list[str] = Field(default_factory=list)
+    forbidden_actions: list[str] = Field(default_factory=list)
+    target_excerpt: str = ""
+    document_kind: Literal["none", "book", "outline", "story_detail"] = "none"
+    setting_change: dict[str, Any] = Field(default_factory=dict)
     chapter_no: int | None = None
     end_chapter_no: int | None = None
     chapter_version: int | None = None
@@ -718,7 +1028,7 @@ class TaskTicket(StrictModel):
 
 class DispatchStep(StrictModel):
     step_id: str
-    role: Literal["writer", "reviewer", "memory_keeper", "engine"]
+    role: Literal["writer", "editor", "reviewer", "memory_keeper", "engine"]
     operation: str
     depends_on: list[str] = Field(default_factory=list)
     required_output: str
@@ -726,10 +1036,156 @@ class DispatchStep(StrictModel):
 
 
 class DispatchPlan(StrictModel):
+    role_protocol_version: Literal[1, 2] = 1
+    collaboration_mode: CollaborationMode = "everyday"
+    task_snapshot_hash: str | None = None
+    required_checks: list[str] = Field(default_factory=list)
+    check_owners: dict[str, Literal["editor", "reviewer", "memory_keeper"]] = Field(default_factory=dict)
+    memory_owner: Literal["editor", "memory_keeper"] | None = None
+    return_to_base: bool = False
     workflow: str
     steps: list[DispatchStep] = Field(default_factory=list, max_length=100)
     parallel: bool = False
     stop_conditions: list[str] = Field(default_factory=list)
+
+
+class ResultSources(StrictModel):
+    """Engine-supplied identities; a model must not choose its own evidence version."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, frozen=True)
+    project_id: str = Field(min_length=1)
+    chapter_no: int = Field(ge=1)
+    chapter_version: int = Field(ge=1)
+    source_hash: str = Field(min_length=1)
+    context_fingerprint: str = Field(min_length=1)
+    # Fingerprints bind settings, outline, story detail, plans and user rules.
+    foundation_fingerprint: str = Field(min_length=1)
+    canon_revision: str = Field(min_length=1)
+    rules_version: str = Field(min_length=1)
+
+
+class CheckCoverage(StrictModel):
+    check_id: str = Field(min_length=1)
+    scope: str = Field(min_length=1)
+    owner: Literal["editor", "reviewer", "memory_keeper", "engine"]
+    status: Literal["passed", "needs_revision", "insufficient_context", "not_run", "stale"]
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
+class ConflictClaim(StrictModel):
+    role: Literal["coordinator", "writer", "editor", "reviewer", "memory_keeper", "engine", "user"]
+    statement: str = Field(min_length=1, max_length=2_000)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=20)
+    source_excerpt: str = Field(default="", max_length=1_000)
+
+
+class ConflictAttempt(StrictModel):
+    strategy: str = Field(min_length=1, max_length=80)
+    input_fingerprint: str = Field(min_length=1)
+    outcome: str = Field(min_length=1, max_length=1_000)
+
+
+class ConflictRecord(StrictModel):
+    """One focused, versioned disagreement; not permission to bypass a gate."""
+
+    role_protocol_version: Literal[1, 2]
+    conflict_id: str = Field(min_length=1)
+    ticket_id: str = Field(min_length=1)
+    task_revision: int = Field(ge=1)
+    category: Literal[
+        "style", "compatible_creative", "fact_timeline", "character_perspective",
+        "goal_mismatch", "review_disagreement", "memory_conflict", "service_interruption", "other",
+    ]
+    source: ResultSources | None = None
+    first: ConflictClaim
+    second: ConflictClaim | None = None
+    user_request: str = Field(min_length=1, max_length=4_000)
+    hard_constraints: list[str] = Field(default_factory=list)
+    attempts: list[ConflictAttempt] = Field(default_factory=list)
+    remaining_model_calls: int = Field(ge=0)
+    remaining_raw_tokens: int = Field(ge=0)
+    remaining_cost_yuan: float | None = Field(default=None, ge=0)
+    next_action: Literal[
+        "check_evidence", "fetch_context", "local_revision", "specialist_review",
+        "replan", "offer_alternatives", "ask_user", "wait_for_condition", "continue_task", "other",
+    ]
+    status: Literal["recovering", "waiting_user", "waiting_condition", "resolved"]
+    public_summary: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def action_matches_conflict(self) -> "ConflictRecord":
+        if self.status == "waiting_user" and self.next_action != "ask_user":
+            raise ValueError("等待用户决定的冲突必须标明提问动作。")
+        if self.status == "waiting_condition" and self.next_action != "wait_for_condition":
+            raise ValueError("等待外部条件的冲突必须标明等待动作。")
+        return self
+
+
+class ReviewResultBase(StrictModel):
+    """Validated envelope, not a direct model output or permission to accept prose."""
+
+    role_protocol_version: Literal[2] = 2
+    role: Literal["editor", "reviewer"]
+    sources: ResultSources
+    verdict: Literal["pass", "revise", "insufficient_context"]
+    summary: str = Field(min_length=1)
+    coverage: list[CheckCoverage] = Field(min_length=1)
+    findings: list[ReviewFinding] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def consistent_coverage(self) -> "ReviewResultBase":
+        identifiers = [check.check_id for check in self.coverage]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("同一结果不能重复记录检查项")
+        if any(check.owner != self.role for check in self.coverage):
+            raise ValueError("审查角色不能代填其他角色的检查覆盖")
+        if self.verdict == "pass":
+            if any(check.status != "passed" for check in self.coverage):
+                raise ValueError("通过结论不能包含未完成、过期或需修订的检查")
+            if any(finding.severity == "blocking" for finding in self.findings):
+                raise ValueError("通过结论不能包含未解决的阻断问题")
+        return self
+
+
+class EditorResult(ReviewResultBase):
+    role: Literal["editor"] = "editor"
+    memory_owner: Literal["editor", "memory_keeper"]
+    memory_patch: MemoryPatch | None = None
+
+    @model_validator(mode="after")
+    def memory_handoff_matches_owner(self) -> "EditorResult":
+        if self.memory_owner != "editor" and self.memory_patch is not None:
+            raise ValueError("记忆已分派给 Memory Keeper，Editor 不重复提交记忆候选")
+        if self.verdict == "pass" and self.memory_owner == "editor" and self.memory_patch is None:
+            raise ValueError("日常综合编辑通过时必须交付同版本记忆候选")
+        if self.memory_patch and self.memory_patch.chapter_no != self.sources.chapter_no:
+            raise ValueError("记忆候选与审查正文不属于同一章节")
+        return self
+
+
+class ReviewerResult(ReviewResultBase):
+    role: Literal["reviewer"] = "reviewer"
+    # No memory_patch: the specialist must not inherit the old Editor contract.
+
+
+class MemoryResult(StrictModel):
+    role_protocol_version: Literal[2] = 2
+    role: Literal["memory_keeper"] = "memory_keeper"
+    sources: ResultSources
+    status: Literal["ready", "conflict", "insufficient_context"]
+    summary: str = Field(min_length=1)
+    memory_patch: MemoryPatch | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def ready_has_evidence(self) -> "MemoryResult":
+        if self.memory_patch and self.memory_patch.chapter_no != self.sources.chapter_no:
+            raise ValueError("记忆候选与来源正文不属于同一章节")
+        if self.status == "ready" and (
+            self.memory_patch is None or not self.evidence_refs or self.memory_patch.unresolved_conflicts
+        ):
+            raise ValueError("可提交的记忆候选须有来源且没有未解决冲突")
+        return self
 
 
 TerminalAction = Literal[
@@ -740,6 +1196,7 @@ TerminalAction = Literal[
     "plan",
     "plan_preview",
     "outline",
+    "redesign_story",
     "plan_brief",
     "plan_next_arc",
     "arc_audit",
@@ -753,10 +1210,14 @@ TerminalAction = Literal[
     "rollback_preview",
     "rollback_restore",
     "write_draft",
+    "scene_draft",
+    "story_setting_edit",
+    "revise_selection",
     "write_review",
     "write_review_accept",
     "review",
     "revise_draft",
+    "repair_accepted",
     "revise_review",
     "review_accept",
     "revise_review_accept",
@@ -772,7 +1233,20 @@ class TerminalIntent(StrictModel):
     """Coordinator 的受限路由输出；不能发明工作流、写正文或强制验收。"""
 
     action: TerminalAction
+    outline_level: Literal["story", "detail"] = "story"
     requested_outcome: str = Field(default="", max_length=1_000)
+    user_message: str = Field(default="", max_length=4_000)
+    task_revision: int = Field(default=1, ge=1)
+    related_task_id: str | None = Field(default=None, max_length=180)
+    pending_question_id: str | None = Field(default=None, max_length=180)
+    response_kind: Literal["new_task", "task_revision", "question_answer"] = "new_task"
+    narrative_scope: Literal["none", "scene", "chapter", "batch"] = "none"
+    edit_scope: Literal["none", "selection", "chapter", "document"] = "none"
+    target_excerpt: str = Field(default="", max_length=4_000)
+    preserve_constraints: list[str] = Field(default_factory=list, max_length=16)
+    forbidden_actions: list[str] = Field(default_factory=list, max_length=16)
+    document_kind: Literal["none", "book", "outline", "story_detail"] = "none"
+    setting_change: dict[str, Any] = Field(default_factory=dict, max_length=16)
     alternative_action: TerminalAction | None = None
     confidence: Literal["high", "medium", "low"] = "medium"
     authorization: Literal["none", "proposed", "approved"] = "none"
@@ -792,7 +1266,7 @@ class TerminalIntent(StrictModel):
     batch_id: str | None = Field(default=None, max_length=180)
     plan_change_confirmed: bool = False
     target_characters: int | None = Field(default=None, ge=1_000, le=5_000_000)
-    max_revision_rounds: int = Field(default=1, ge=0, le=6)
+    max_revision_rounds: int = Field(default=2, ge=0, le=6)
     operation_instruction: str = Field(default="", max_length=4_000)
     settings_patch: dict[str, Any] = Field(default_factory=dict, max_length=16)
     visible_reason: str = Field(min_length=1, max_length=240)
@@ -815,3 +1289,7 @@ class ClarificationQuestion(StrictModel):
     why_it_matters: str = Field(default="", max_length=300)
     selection: Literal["single", "multiple"] = "single"
     options: list[ClarificationOption] = Field(default_factory=list, max_length=5)
+
+
+ReviewReport.model_rebuild()
+ModeCheckOutput.model_rebuild()

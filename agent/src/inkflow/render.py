@@ -143,17 +143,59 @@ def render_plan(bundle: PlanBundle) -> str:
 
 
 def render_review(chapter_no: int, report: ReviewReport, code_metrics: dict[str, Any]) -> str:
-    score_total = sum(item.score for item in report.scorecard)
-    max_total = sum(item.maximum_score for item in report.scorecard)
     hard_findings = [item for item in report.findings if item.severity in {"major", "blocking"}]
+    pending_findings = [
+        item for item in report.findings
+        if item.verification_status in {"unsupported", "uncertain"}
+        or item.semantic_status == "uncertain"
+    ]
+    if report.verdict == "unknown":
+        gate_summary = "当前审核尚未形成可放行结论，需要核实以下依据。"
+        if not hard_findings:
+            gate_summary += "核验后未保留 major/blocking 级硬问题，不等于正文已证实存在硬矛盾。"
+    elif report.verdict == "pass" and not hard_findings:
+        gate_summary = "未发现 major/blocking 级、且有证据支撑的问题；本章可以通过。"
+    elif hard_findings:
+        gate_summary = "核验后保留的 major/blocking 级问题需要处理，当前不能放行。"
+    else:
+        gate_summary = "当前审查要求修订或重新规划，具体依据见分项记录。"
     lines = [
         f"# 第 {chapter_no} 章审查报告",
         "",
-        f"> 结论：`{report.verdict}`｜置信度：{report.confidence:.0%}",
+        f"> 结论：`{report.verdict}`｜{'审查符合度（规则计算）' if report.confidence_basis else '旧版模型自评（未校准）'}：{report.confidence:.2%}｜有效跨来源对照：{len(report.source_comparisons)} 条",
         "",
-        "## 摘要",
+        "## 把握度依据",
+        "",
+        *([f"- {item}" for item in report.confidence_basis] or ["- 旧版报告：尚无证据化计算明细。"]),
+        "- 自动通过采用设置中的底线（至少80%），不是固定得分。资料缺失的0%表示未完成评定，不代表正文质量为零；符合度也不是事实正确的概率。",
+        "",
+        "## 必需项与加权项的证据",
+        "",
+        *[f"- {item.criterion} · {item.status} · 等级{item.grade}/4：{item.reason}\n  - 正文：{item.chapter_evidence}\n  - 来源：{item.source_id} {item.source_evidence}\n  - 另一种解读：{item.alternative}" for item in report.assessments],
+        "",
+        "## 核验后的当前结论",
+        "",
+        gate_summary,
+        *(
+            [f"- 待核实依据：{item.verification_note or '尚未得到完整核验结果。'}" for item in pending_findings]
+            if report.verdict == "unknown"
+            else []
+        ),
+        "",
+        "## 模型摘要（保留记录）",
+        "",
+        "> 以下概括可能仍含后续核验未支持的原始断言；放行或阻断以上方当前结论为准。",
+        f"> 模型自评把握度：{(report.model_self_confidence if report.model_self_confidence is not None else report.confidence):.0%}。未经校准，不用于自动放行。",
         "",
         report.summary,
+        "",
+        "## 本章实际内容观察",
+        "",
+        f"- 人物目标：{report.focus_observation.observed_goal or '未定位'}",
+        f"- 目标原文：{report.focus_observation.goal_evidence or '未定位'}",
+        f"- 决定或变化：{report.focus_observation.observed_change or '未定位'}",
+        f"- 变化原文：{report.focus_observation.change_evidence or '未定位'}",
+        f"- 与章节卡关系：{report.focus_observation.plan_alignment}；{report.focus_observation.alignment_reason or '未说明'}",
         "",
         "## 确定性指标",
         "",
@@ -166,7 +208,7 @@ def render_review(chapter_no: int, report: ReviewReport, code_metrics: dict[str,
         *(
             [
                 f"- 清晰度：`{report.hook_assessment.clarity}`",
-                f"- 正文锚点：{report.hook_assessment.actual_anchor or '未单独记录'}",
+                f"- 钩子依据概括：{report.hook_assessment.actual_anchor or '未单独记录'}",
                 f"- 读者期待：{report.hook_assessment.reader_expectation or '未单独记录'}",
                 f"- 重复风险：{report.hook_assessment.repetition_risk or '未发现'}",
                 f"- 回应风险：{report.hook_assessment.payoff_risk or '未发现'}",
@@ -176,37 +218,52 @@ def render_review(chapter_no: int, report: ReviewReport, code_metrics: dict[str,
             else ["- 当前报告未包含单独的钩子判断；正史安全结论仍按下方证据门禁计算。"]
         ),
         "",
-        "## 上下文使用核对",
+        "## 上下文使用核对（模型判断）",
         "",
         f"- 结论：{report.context_use_audit.summary or '未发现需要单独说明的上下文使用问题。'}",
         f"- 已实际采用：{', '.join(report.context_use_audit.used_source_ids) or '未单独标记'}",
         f"- 应用但遗漏：{', '.join(report.context_use_audit.missing_required_source_ids) or '无'}",
         f"- 发生冲突：{', '.join(report.context_use_audit.conflicting_source_ids) or '无'}",
         "",
-        "## 透明评分（只按已列出的证据扣分）",
+        "## 与规划和前章的逐字对照",
         "",
-        (
-            f"- 总分：{score_total}/{max_total}。评分用于解释完成度，不替代正史门禁。"
-            if report.scorecard
-            else "- 当前报告来自旧版本，尚未生成分项评分。"
-        ),
-        "- 放行规则：只有 `major` / `blocking` 的证据化问题会阻止进入正史；`minor` 会扣分并保留修订建议，但不自动拦截。",
+        *([line for item in report.source_comparisons for line in (
+            f"- 来源 `{item.source_id}`｜关系：{item.relation}｜{item.reason}",
+            f"  - 来源原文：{item.source_evidence}",
+            f"  - 本章原文：{item.chapter_evidence}",
+        )] or ["- 本次报告未保存逐字对照；不能据此声称已完成跨章核对。"]),
+        "",
+        "## 多视角阅读画像",
+        "",
+        "- 各维度独立呈现，不汇总成单一总分，也不把某一种文风当成标准答案。",
+        "- 放行规则：已核实的 `major` / `blocking` 硬问题须处理；`unknown` 须先核实，不能按通过处理；`minor` 只是可选编辑建议。",
         "",
     ]
-    for item in report.scorecard:
+    if report.verdict == "unknown":
+        lines.extend(["### 审查未完成：不计算质量分", "", "- 未核实不等于没有问题，也不能显示满分。", ""])
+    for item in report.scorecard if report.verdict != "unknown" else []:
+        severities = {deduction.severity for deduction in item.deductions}
+        status = (
+            "必须修复"
+            if "blocking" in severities
+            else "需要修补"
+            if "major" in severities
+            else "可保留，有编辑建议"
+            if "minor" in severities
+            else "未见问题"
+        )
         lines.extend(
             [
-                f"### {item.dimension}：{item.score}/{item.maximum_score}",
+                f"### {item.dimension}：{status}",
                 "",
             ]
         )
         if not item.deductions:
-            lines.append("- 未见可引用的扣分证据，因此本项满分。")
+            lines.append("- 当前文本中没有找到需要提出的证据化问题。")
         for deduction in item.deductions:
-            loss = {"minor": 3, "major": 12, "blocking": 25}.get(deduction.severity, 0)
             lines.extend(
                 [
-                    f"- 扣 {loss} 分（[{deduction.severity}] {deduction.category}）：{deduction.evidence}",
+                    f"- [{deduction.severity}] {deduction.category}：{deduction.evidence}",
                     f"  - 原因：{deduction.explanation}",
                     f"  - 依据：{', '.join(deduction.canon_refs) if deduction.canon_refs else '本章正文证据'}",
                 ]
@@ -216,11 +273,7 @@ def render_review(chapter_no: int, report: ReviewReport, code_metrics: dict[str,
         [
             "## 放行或拦截依据",
             "",
-            (
-                "- 未发现 major/blocking 级、且有证据支撑的问题；本章可以通过。"
-                if report.verdict == "pass" and not hard_findings
-                else ("- 审核证据不足，等待核实；不等于正文已证实有错。" if report.verdict == "unknown" else "- 以下 major/blocking 问题需要处理：")
-            ),
+            f"- {gate_summary}",
             *(
                 [f"  - [{item.severity}] {item.evidence}：{item.explanation}" for item in hard_findings]
                 if hard_findings
@@ -246,7 +299,7 @@ def render_review(chapter_no: int, report: ReviewReport, code_metrics: dict[str,
                 f"- 正史引用：{', '.join(item.canon_refs) if item.canon_refs else '无'}",
                 f"- 说明：{item.explanation}",
                 f"- 证据核验：{item.verification_note or '旧报告未记录核验结果'}",
-                f"- 核验状态：{item.verification_status} / 语义状态：{item.semantic_status} / 置信度：{item.verification_confidence:.0%}",
+                f"- 引文定位：{item.verification_status} / 语义状态：{item.semantic_status} / " + (f"语义复核自评：{item.verification_confidence:.0%}" if item.semantic_status != "unchecked" else "尚无独立语义复核分数（引文存在不等于判断成立）"),
                 f"- 修复：{item.repair_instruction}",
                 "",
             ]
@@ -270,7 +323,7 @@ def render_memory_conflict(chapter_no: int, patch: MemoryPatch) -> str:
         json.dumps(patch.model_dump(mode="json"), ensure_ascii=False, indent=2),
         "```",
         "",
-        "> 需要由用户判断应修正文、修规划还是让 Memory Keeper 重新提取；不要直接编辑 SQLite。",
+        "> 需要由用户判断应修正文、修规划还是让 记忆服务 重新提取；不要直接编辑 SQLite。",
         "",
     ]
     return "\n".join(lines)

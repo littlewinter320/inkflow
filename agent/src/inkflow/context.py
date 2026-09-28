@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -8,13 +9,47 @@ from typing import Any, Literal
 from .craft import select_craft_guides
 from .errors import ValidationGateError
 from .project import InkFlowProject
+from .outline_context import outline_sections
 from .retrieval import HybridRetriever
-from .schemas import ContextPacket, ContextSection
+from .schemas import ArcPlan, ContextPacket, ContextSection, PlanBundle, VolumePlan
 from .studio import StudioDatabase
-from .utils import atomic_write_text, estimate_tokens, json_dumps, project_source_revision, utc_now
+from .utils import atomic_write_text, content_hash, estimate_tokens, json_dumps, project_source_revision, utc_now
 
 
 _COMPRESSED_NOTE = "（已按完整条目压缩；完整资料仍保存在本地）"
+
+
+def planning_bundle_for_chapter(project: InkFlowProject, chapter_no: int) -> PlanBundle | None:
+    """Resolve the card's persisted plan, not whichever window was opened last."""
+    current = project.db.get_current_plan_bundle()
+    if current is None:
+        return None
+    with project.db.connect() as connection:
+        row = connection.execute(
+            "SELECT parent_key FROM plans WHERE kind='chapter' AND plan_key=? AND status='active'",
+            (f"chapter:{chapter_no:05d}",),
+        ).fetchone()
+    if row is None:
+        return current
+    parent = str(row["parent_key"] or "")
+    supplement = project.db.get_plan("supplement", parent)
+    if supplement is not None:
+        bundle = PlanBundle.model_validate(supplement)
+    elif parent and parent != current.current_arc.arc_id:
+        arc_data = project.db.get_plan("arc", parent)
+        if arc_data is None:
+            raise ValidationGateError(f"第 {chapter_no} 章章节卡关联的近期计划缺失，不能混用其他篇章。")
+        arc = ArcPlan.model_validate(arc_data)
+        volume_data = project.db.get_plan("volume", f"volume:{arc.volume_no:03d}")
+        if volume_data is None:
+            raise ValidationGateError(f"第 {chapter_no} 章关联的卷规划缺失。")
+        bundle = PlanBundle(book=current.book, current_volume=VolumePlan.model_validate(volume_data), current_arc=arc)
+    else:
+        bundle = current
+    bound_card = next((item for item in bundle.current_arc.chapter_cards if item.chapter_no == chapter_no), None)
+    if bound_card is None:
+        raise ValidationGateError(f"第 {chapter_no} 章章节卡不在其关联的近期计划范围内。")
+    return bundle
 
 
 def _shorten_soft_text(value: str, limit: int, *, keep_tail: bool = False) -> str:
@@ -161,37 +196,47 @@ class ContextBuilder:
         )
         database = self.project.db
         brief = database.get_brief()
-        bundle = database.get_current_plan_bundle()
+        bundle = planning_bundle_for_chapter(self.project, chapter_no)
         card = database.get_chapter_card(chapter_no)
         if not bundle:
             raise ValidationGateError("尚未生成全书、卷和篇章规划。")
         if not card:
             raise ValidationGateError(f"缺少第 {chapter_no} 章章节卡，写作门禁拒绝继续。")
 
-        facts = database.current_facts()
-        threads = database.open_threads()
+        facts = database.facts_as_of(chapter_no - 1)
+        threads = database.threads_as_of(chapter_no - 1)
         preferences = database.list_preferences()
         forced_preferences = [item for item in preferences if item["strength"] == "hard"]
         forced_texts = list(dict.fromkeys(str(item["text"]).strip() for item in forced_preferences if str(item["text"]).strip()))
         voice_preferences = _voice_preferences_for_context(preferences, task, card)
-        learning_guidance = database.learning_guidance()
         studio_context = self._studio_context(chapter_no, task, card)
         pinned_sources = {str(item["source_id"]) for item in studio_context["pins"]}
         effective_recent_limit = recent_limit if recent_limit is not None else {
             "draft": 2,
-            "review": 1,
+            "review": 3,
             "revise": 1,
         }[mode]
         recent_for_patterns = database.recent_accepted_chapters(chapter_no, limit=max(6, effective_recent_limit))
+        for item in recent_for_patterns:
+            canonical = database.canonical_chapter_content(int(item["chapter_no"]))
+            if canonical is None:
+                # Legacy rows may predate DB-owned text. A Markdown projection
+                # is usable only while it still matches the accepted hash.
+                path = self.project.root / item["path"]
+                canonical = path.read_text(encoding="utf-8") if path.is_file() else None
+            if canonical is None or content_hash(canonical) != item["content_hash"]:
+                raise ValidationGateError(
+                    f"第 {item['chapter_no']} 章正史正文的数据库内容与已接受版本不符，"
+                    "不能把缺失或被改动的 Markdown 当成模型记忆；请先恢复该章正史投影。"
+                )
+            item["content"] = canonical
         recent = recent_for_patterns[-effective_recent_limit:] if effective_recent_limit else []
         recent_parts: list[str] = []
         recent_ids: list[str] = []
         provisional_memory: list[dict[str, Any]] = []
         provisional_memory_ids: list[str] = []
         for item in recent:
-            path = self.project.root / item["path"]
-            content = path.read_text(encoding="utf-8") if path.exists() else "（章节文件缺失）"
-            recent_parts.append(f"### 第 {item['chapter_no']} 章\n\n{content}")
+            recent_parts.append(f"### 第 {item['chapter_no']} 章\n\n{item['content']}")
             recent_ids.append(f"chapter:{item['chapter_no']:05d}")
         ending_pattern_inputs = [*recent_for_patterns]
         ending_pattern_ids = [f"chapter:{item['chapter_no']:05d}" for item in recent_for_patterns]
@@ -208,7 +253,7 @@ class ContextBuilder:
                 f"batch:{item.get('batch_id', 'current')}:chapter:{provisional_no:05d}"
             )
         ending_patterns = _recent_ending_patterns(self.project.root, ending_pattern_inputs)
-        for item in (provisional_chapters or [])[-2:]:
+        for item in (provisional_chapters or [])[-4 if mode == "review" else -2:]:
             provisional_no = int(item["chapter_no"])
             provisional_content = str(item["content"])
             recent_parts.append(
@@ -247,6 +292,9 @@ class ContextBuilder:
                 " ".join(str(value) for value in card.get("payoff") or []),
             ]
         )
+        if mode == "review" and protected_input:
+            # Retrieve for what the Writer actually wrote, not just the old card.
+            history_query += "\n" + protected_input
         chapter = database.get_chapter(chapter_no)
         retrieval_hits = self.retriever.retrieve(
             history_query,
@@ -254,16 +302,20 @@ class ContextBuilder:
             chapter_no=chapter_no,
             chapter_version=int(chapter["version"]) if chapter else None,
         )
-        state_facts = [
-            item for item in facts
-            if item["predicate"].startswith(("state.", "knows.", "believes."))
-        ]
-        general_facts = [
-            item for item in facts
-            if not item["predicate"].startswith(("state.", "knows.", "believes."))
-        ]
+        def required_now(item: dict[str, Any]) -> bool:
+            subject = str(item["subject"]).strip()
+            predicate = str(item["predicate"])
+            return (
+                subject in {"世界", "世界观", "全书"}
+                or predicate.startswith(("rule.", "world.", "constraint."))
+                or bool(subject and subject.casefold() in history_query.casefold())
+            )
+
+        mandatory_facts = [item for item in facts if required_now(item)]
+        state_facts = [item for item in mandatory_facts if item["predicate"].startswith(("state.", "knows.", "believes.")) or item.get("epistemic_kind") != "objective"]
+        general_facts = [item for item in mandatory_facts if item not in state_facts]
         already_loaded = {
-            *[str(item["fact_id"]) for item in facts],
+            *[str(item["fact_id"]) for item in mandatory_facts],
             *[str(item["thread_id"]) for item in threads],
             *[str(item["preference_id"]) for item in preferences],
         }
@@ -275,14 +327,19 @@ class ContextBuilder:
             item for item in retrieval_hits
             if str(item["source_id"]) not in already_loaded
         ]
+        retrieved_canon = [item for item in retrieval_hits if item.get("source_type") == "canon_fact"]
+        supplemental_hits = [item for item in retrieval_hits if item.get("source_type") != "canon_fact"]
         if duplicate_retrieval_ids:
             self.retriever.last_diagnostics["selected"] = retrieval_hits
             self.retriever.last_diagnostics["deduplicated_source_ids"] = duplicate_retrieval_ids
+        self.retriever.last_diagnostics["already_in_context_count"] = len(duplicate_retrieval_ids)
+        self.retriever.last_diagnostics["additional_selected_count"] = len(retrieval_hits)
 
         reference_cards = self._load_reference_cards(limit=6)
-        craft_guides = select_craft_guides(task=task, genre=brief.genre, card=card, limit=2)
+        craft_guides = select_craft_guides(task=task, genre=brief.genre, card=card, limit=1)
         sections = [
             ContextSection(key="A", title="当前任务与用户要求", content=task, hard=True),
+            *outline_sections(self.project.root, chapter_no, chapter_no),
             ContextSection(
                 key="A0",
                 title="冲突优先级与资料边界",
@@ -293,6 +350,7 @@ class ContextBuilder:
                     "人工 Story Bible 和协作消息不是正史。"
                 ),
                 hard=True,
+                cache_scope="global",
             ),
             ContextSection(
                 key="B",
@@ -302,6 +360,7 @@ class ContextBuilder:
                 else "当前尚无已提交事实。",
                 source_ids=[str(item["fact_id"]) for item in general_facts],
                 hard=True,
+                cache_scope="canon",
             ),
             ContextSection(
                 key="C",
@@ -309,6 +368,7 @@ class ContextBuilder:
                 content=json.dumps(_plan_for_model(bundle, card), ensure_ascii=False, indent=2),
                 source_ids=["plan:book", f"plan:volume:{bundle.current_volume.volume_no}", bundle.current_arc.arc_id],
                 hard=True,
+                cache_scope="chapter",
             ),
             ContextSection(
                 key="D",
@@ -326,6 +386,7 @@ class ContextBuilder:
                     for item in state_facts
                 ],
                 hard=True,
+                cache_scope="canon",
             ),
             ContextSection(
                 key="D1",
@@ -340,6 +401,7 @@ class ContextBuilder:
                     indent=2,
                 ),
                 source_ids=studio_context["source_ids"],
+                cache_scope="chapter",
             ),
             ContextSection(
                 key="D2",
@@ -351,6 +413,7 @@ class ContextBuilder:
                 ),
                 source_ids=sorted(pinned_sources),
                 hard=bool(pinned_sources),
+                cache_scope="chapter",
             ),
             ContextSection(
                 key="E0",
@@ -362,12 +425,14 @@ class ContextBuilder:
                 ),
                 source_ids=provisional_memory_ids,
                 hard=bool(provisional_memory),
+                cache_scope="chapter",
             ),
             ContextSection(
                 key="E",
                 title="最近已接受章节与批次临时草稿",
                 content="\n\n".join(recent_parts) or "尚无前章。",
                 source_ids=recent_ids,
+                cache_scope="chapter",
             ),
             ContextSection(
                 key="E1",
@@ -381,6 +446,7 @@ class ContextBuilder:
                     indent=2,
                 ),
                 source_ids=ending_pattern_ids,
+                cache_scope="chapter",
             ),
             ContextSection(
                 key="F",
@@ -388,12 +454,19 @@ class ContextBuilder:
                 content=json.dumps(
                     {
                         "检索链": "精确查询 → 本地 BM25 → 可选 BGE-M3 → 融合 → 可选 reranker → 一跳关系扩展 → 权限/章节/版本过滤",
-                        "自适应结果": retrieval_hits,
+                        "自适应结果": supplemental_hits,
                     },
                     ensure_ascii=False,
                     indent=2,
                 ),
-                source_ids=[str(item["source_id"]) for item in retrieval_hits],
+                source_ids=[str(item["source_id"]) for item in supplemental_hits],
+                cache_scope="chapter",
+            ),
+            ContextSection(
+                key="F0", title="本章检索命中的正史证据",
+                content=json.dumps(retrieved_canon, ensure_ascii=False, indent=2) if retrieved_canon else "无额外正史事实命中。",
+                source_ids=[str(item["source_id"]) for item in retrieved_canon],
+                hard=True, cache_scope="chapter",
             ),
             ContextSection(
                 key="G",
@@ -403,6 +476,7 @@ class ContextBuilder:
                 else "当前无已提交未结线索。",
                 source_ids=[str(item["thread_id"]) for item in threads],
                 hard=True,
+                cache_scope="canon",
             ),
             ContextSection(
                 key="H",
@@ -413,12 +487,14 @@ class ContextBuilder:
                     for item in reference_cards
                     if item.get("reference_id")
                 ],
+                cache_scope="chapter",
             ),
             ContextSection(
                 key="I",
                 title="按本章任务选择的写作引导",
                 content=json.dumps(craft_guides, ensure_ascii=False, indent=2),
                 source_ids=[f"craft:{item['技能编号']}" for item in craft_guides],
+                cache_scope="chapter",
             ),
             ContextSection(
                 key="J",
@@ -438,6 +514,7 @@ class ContextBuilder:
                 ),
                 source_ids=[str(item["preference_id"]) for item in forced_preferences],
                 hard=True,
+                cache_scope="book",
             ),
             ContextSection(
                 key="J2",
@@ -457,12 +534,6 @@ class ContextBuilder:
                     str(item["preference_id"])
                     for item in voice_preferences
                 ],
-            ),
-            ContextSection(
-                key="J1",
-                title="本地学习提示（非正史）",
-                content=json.dumps(learning_guidance, ensure_ascii=False, indent=2),
-                source_ids=["learning:local"],
             ),
             ContextSection(
                 key="K",
@@ -492,6 +563,15 @@ class ContextBuilder:
             if overlapping_manual
             else []
         )
+        stale_summaries = [int(item["chapter_no"]) for item in recent_for_patterns
+                           if item.get("summary_stale")]
+        if stale_summaries:
+            warnings.append(
+                "以下已接受章节的旧摘要或线索补丁与当前正文版本不同，"
+                "已停用未复核的派生记忆，改读数据库正史正文和版本有效的记忆；"
+                "需要时从该章定向重核，不重写正史："
+                + "、".join(f"第{number}章" for number in stale_summaries)
+            )
         if len(forced_texts) > 24 or sum(len(item) for item in forced_texts) > 12_000:
             warnings.append(
                 "强制记忆数量或体积偏大：已安全去除完全重复项，但没有删改任何原始记录；"
@@ -515,7 +595,7 @@ class ContextBuilder:
                 packet.warnings.append(
                     "接近软预算，已按相关性和资料权限压缩：" + "、".join(compressed) + "；硬约束未动。"
                 )
-        self._publish_context_status(packet, before_compression, has_protected_input=bool(protected_input))
+        self._publish_context_status(packet, before_compression, has_protected_input=bool(protected_input), role="editor" if mode == "review" else "writer")
         if packet.estimated_tokens > self.hard_token_limit:
             raise ValidationGateError(
                 "硬约束本身已超过最大上下文容量，墨流没有静默删除正史或用户指令；"
@@ -614,7 +694,7 @@ class ContextBuilder:
             raise ValidationGateError("篇章复审范围不合法。")
         database = self.project.db
         brief = database.get_brief()
-        bundle = database.get_current_plan_bundle()
+        bundle = planning_bundle_for_chapter(self.project, start_chapter_no)
         if not bundle:
             raise ValidationGateError("尚未生成全书、卷和篇章规划。")
         accepted = {int(item["chapter_no"]): item for item in database.accepted_chapters()}
@@ -622,11 +702,20 @@ class ContextBuilder:
         chapter_parts: list[str] = []
         source_ids: list[str] = []
         cards: list[dict[str, Any]] = []
+        planning_scopes: dict[str, dict[str, Any]] = {}
         for chapter_no in range(start_chapter_no, end_chapter_no + 1):
             card = database.get_chapter_card(chapter_no)
             if not card:
                 raise ValidationGateError(f"第 {chapter_no} 章缺少章节卡，不能进行篇章复审。")
             cards.append(_audit_card_for_model(card))
+            chapter_plan = planning_bundle_for_chapter(self.project, chapter_no)
+            if chapter_plan is None:
+                raise ValidationGateError(f"第 {chapter_no} 章关联的近期计划缺失。")
+            arc = chapter_plan.current_arc
+            planning_scopes[arc.arc_id] = {
+                "编号": arc.arc_id, "标题": arc.title, "范围": f"{arc.chapter_start}-{arc.chapter_end}",
+                "承诺": arc.promise, "核心冲突": arc.central_conflict, "出口桥": arc.exit_bridge,
+            }
             if chapter_no in provisional:
                 item = provisional[chapter_no]
                 chapter_parts.append(
@@ -649,8 +738,36 @@ class ContextBuilder:
         threads = database.open_threads()
         reference_cards = self._load_reference_cards(limit=6)
         task = f"复审第 {start_chapter_no}～{end_chapter_no} 章，并判断能否作为下一篇章可靠起点。"
+        planning_documents = []
+        for name, title in (
+            ("OUTLINE.md", "当前全书大纲"),
+            ("STORY_DETAIL.md", "当前卷细纲"),
+            ("RECENT_PLAN.md", "当前近期章节规划"),
+        ):
+            path = self.project.root / name
+            if not path.is_file():
+                raise ValidationGateError(f"篇章复审缺少 {name}；不能仅靠旧章节卡声称对照了当前规划。")
+            planning_documents.append(ContextSection(
+                key=f"C{len(planning_documents) + 1}", title=title,
+                content=path.read_text(encoding="utf-8"), source_ids=[name], hard=True,
+                cache_scope="book" if name == "OUTLINE.md" else "chapter",
+            ))
+        prior_chapters = []
+        for chapter_no in range(max(1, start_chapter_no - 2), start_chapter_no):
+            item = accepted.get(chapter_no)
+            if item:
+                path = self.project.root / item["path"]
+                if path.is_file():
+                    prior_chapters.append(ContextSection(
+                        key=f"C{len(planning_documents) + len(prior_chapters) + 1}",
+                        title=f"已接受第 {chapter_no} 章正文",
+                        content=path.read_text(encoding="utf-8"),
+                        source_ids=[f"chapter:{chapter_no:05d}"], hard=True, cache_scope="chapter",
+                    ))
         sections = [
             ContextSection(key="A", title="当前任务与用户要求", content=task, hard=True),
+            *planning_documents,
+            *prior_chapters,
             ContextSection(
                 key="B",
                 title="不可违反的硬正史",
@@ -659,27 +776,22 @@ class ContextBuilder:
                 else "当前尚无已提交事实。",
                 source_ids=[str(item["fact_id"]) for item in facts],
                 hard=True,
+                cache_scope="canon",
             ),
             ContextSection(
                 key="C",
                 title="篇章承诺与待复审章节卡",
                 content=json.dumps(
                     {
-                        "当前篇章": {
-                            "编号": bundle.current_arc.arc_id,
-                            "标题": bundle.current_arc.title,
-                            "范围": f"{bundle.current_arc.chapter_start}-{bundle.current_arc.chapter_end}",
-                            "承诺": bundle.current_arc.promise,
-                            "核心冲突": bundle.current_arc.central_conflict,
-                            "出口桥": bundle.current_arc.exit_bridge,
-                        },
+                        "涉及的近期计划": list(planning_scopes.values()),
                         "待复审章节卡": cards,
                     },
                     ensure_ascii=False,
                     indent=2,
                 ),
-                source_ids=[bundle.current_arc.arc_id],
+                source_ids=list(planning_scopes),
                 hard=True,
+                cache_scope="chapter",
             ),
             ContextSection(
                 key="D",
@@ -690,6 +802,7 @@ class ContextBuilder:
                     indent=2,
                 ),
                 hard=True,
+                cache_scope="canon",
             ),
             ContextSection(
                 key="E",
@@ -697,12 +810,14 @@ class ContextBuilder:
                 content="\n\n".join(chapter_parts),
                 source_ids=source_ids,
                 hard=True,
+                cache_scope="chapter",
             ),
             ContextSection(
                 key="F",
                 title="相关历史索引",
                 content=json.dumps(_fact_index_for_model(facts), ensure_ascii=False, indent=2) if facts else "无。",
                 source_ids=[str(item["fact_id"]) for item in facts],
+                cache_scope="canon",
             ),
             ContextSection(
                 key="G",
@@ -712,6 +827,7 @@ class ContextBuilder:
                 else "当前无已提交未结线索。",
                 source_ids=[str(item["thread_id"]) for item in threads],
                 hard=True,
+                cache_scope="canon",
             ),
             ContextSection(
                 key="H",
@@ -722,6 +838,7 @@ class ContextBuilder:
                     for item in reference_cards
                     if item.get("reference_id")
                 ],
+                cache_scope="chapter",
             ),
             ContextSection(
                 key="I",
@@ -732,6 +849,7 @@ class ContextBuilder:
                     indent=2,
                 ),
                 hard=True,
+                cache_scope="book",
             ),
             ContextSection(
                 key="J",
@@ -802,6 +920,7 @@ class ContextBuilder:
         before_compression: int,
         *,
         has_protected_input: bool = False,
+        role: str = "planner",
     ) -> None:
         soft_sections = [item for item in packet.sections if not item.hard]
         hard_sections = [item for item in packet.sections if item.hard]
@@ -818,6 +937,25 @@ class ContextBuilder:
         previous_updated_at = str(previous.get("updated_at") or "")
         previous_estimated = int(previous.get("estimated_tokens") or 0) if previous_updated_at else 0
         updated_at = utc_now()
+        ordered = sorted(enumerate(packet.sections), key=lambda pair: (
+            {"global": 0, "book": 1, "canon": 2, "chapter": 3, "request": 4}[pair[1].cache_scope],
+            {"J": 0, "B": 1, "O0": 2, "O1": 3}.get(pair[1].key, 10 + pair[0]) if pair[1].cache_scope == "book" else pair[0],
+        ))
+        prefix_sections = [item for _, item in ordered if item.cache_scope in {"global", "book"}]
+        prefix_hashes = {
+            item.key: hashlib.sha256((
+                f"## {item.key}. {item.title}\n\n{item.content or '（无）'}\n\n"
+                f"来源：{', '.join(sorted(item.source_ids))}"
+            ).encode("utf-8")).hexdigest()
+            for item in prefix_sections
+        }
+        prefix_history = previous.get("prefix_history_by_role") or {}
+        if not isinstance(prefix_history, dict):
+            prefix_history = {}
+        old_hashes = prefix_history.get(role, {})
+        changed_keys = [key for key, value in prefix_hashes.items() if old_hashes.get(key) != value]
+        changed_keys.extend(key for key in old_hashes if key not in prefix_hashes)
+        prefix_history[role] = prefix_hashes
         payload = {
             "project_id": self.project.project_id,
             "source_revision": project_source_revision(self.project.root, self.project.internal),
@@ -877,6 +1015,14 @@ class ContextBuilder:
                 for item in packet.sections
             ],
             "retrieval_diagnostics": self.retriever.last_diagnostics,
+            "cache_prefix": {
+                "role": role,
+                "changed_sections": changed_keys,
+                "first_changed_section": changed_keys[0] if changed_keys else None,
+                "reason": "首次记录该角色书籍段" if not old_hashes else ("书籍段内容、标题或来源已变化" if changed_keys else "书籍段未变化；还须对照调用记录中的模型、系统契约与前段输入指纹"),
+                "estimated_prefix_tokens": estimate_tokens("\n".join(item.content for item in prefix_sections)),
+            },
+            "prefix_history_by_role": prefix_history,
             "warnings": packet.warnings,
         }
         atomic_write_text(status_path, json_dumps(payload))
@@ -890,6 +1036,11 @@ def _fact_for_model(item: dict[str, Any]) -> dict[str, Any]:
         "内容": item["value"],
         "生效章节": item["valid_from_chapter"],
         "正文证据": item.get("evidence", ""),
+        "认识类型": item.get("epistemic_kind", "objective"),
+        "事件时间": item.get("event_time"),
+        "叙述时间": item.get("narrative_time"),
+        "来源章节": item.get("source_chapter"),
+        "来源版本": item.get("source_version"),
     }
 
 
@@ -899,6 +1050,9 @@ def _state_for_model(item: dict[str, Any]) -> dict[str, Any]:
         "状态或认知": item["predicate"],
         "当前内容": item["value"],
         "事实编号": item["fact_id"],
+        "认识类型": item.get("epistemic_kind", "objective"),
+        "来源章节": item.get("source_chapter"),
+        "来源版本": item.get("source_version"),
     }
 
 
@@ -933,6 +1087,11 @@ def _plan_for_model(bundle: Any, card: dict[str, Any]) -> dict[str, Any]:
             "暂定标题": item.title_working,
             "章节功能": item.function,
             "目标": item.goal,
+            "决定": item.decision,
+            "后果": item.consequence,
+            "不可逆变化": item.irreversible_delta,
+            "本章释放信息": item.information_release,
+            "场景边界": item.scenes,
             "钩子": item.hook_type,
         }
         for item in arc.chapter_cards
@@ -983,7 +1142,14 @@ def _plan_for_model(bundle: Any, card: dict[str, Any]) -> dict[str, Any]:
             "钩子问题": card["hook_question"],
             "目标字数": card["target_words"],
         },
-        "相邻章节提醒": neighbours,
+        "相邻章节提醒": {
+            "边界规则": (
+                "相邻卡用于防止提前消费和重复演出。当前正文不得把下一章的核心决定、"
+                "信息释放或首次会面完整演完；若前章已经实际发生某个动作，本章必须承接其结果，"
+                "不能再把它写成首次发生。"
+            ),
+            "章节": neighbours,
+        },
     }
 
 

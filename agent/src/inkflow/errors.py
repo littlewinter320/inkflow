@@ -10,6 +10,10 @@ class ProjectError(InkFlowError):
     """小说项目无效或状态不允许当前操作。"""
 
 
+class ProjectBusyError(ProjectError):
+    """项目写锁由另一项仍在执行的工作占用，可等待条件变化。"""
+
+
 class ProviderError(InkFlowError):
     """模型供应商调用失败。"""
 

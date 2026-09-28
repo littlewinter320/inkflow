@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import hashlib
+import importlib
 import importlib.util
 import json
 import os
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import urllib.request
 import uuid
 import wave
@@ -38,10 +40,10 @@ VOICE_SETTING_NAMES = (
     "voice_input_device",
     "voice_output_device",
     "voice_compute_device",
-    "voice_engine",
-    "voice_asr_model",
-    "voice_tts_model",
-    "voice_clone_model",
+    "voice_input_engine",
+    "voice_dialogue_engine",
+    "voice_text_engine",
+    "voice_novel_engine",
     "voice_light_asr_model",
     "voice_light_tts_model",
     "voice_sample_rate",
@@ -49,13 +51,14 @@ VOICE_SETTING_NAMES = (
     "voice_cache_limit_mb",
     "voice_debug",
 )
-
-QWEN_REQUIREMENTS = (
-    "qwen-tts>=0.1,<1",
-    "soundfile>=0.12,<1",
-    "torch>=2.4,<3",
-    "torchaudio>=2.4,<3",
+VOICE_JOB_CONFIG_SETTINGS = (
+    "voice_novel_engine", "voice_text_engine", "voice_compute_device", "voice_debug",
+    "voice_light_tts_model",
+    "voice_speed", "voice_volume", "voice_pause_scale",
+    "voice_sample_rate", "voice_segment_chars",
 )
+
+EDGE_REQUIREMENTS = ("edge-tts>=7.2.8,<8",)
 MOSS_TTS_MODEL_ID = "MOSS-TTS-Nano-100M-ONNX"
 MOSS_CODEC_MODEL_ID = "MOSS-Audio-Tokenizer-Nano-ONNX"
 MOSS_TTS_REPO_ID = "OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX"
@@ -67,7 +70,10 @@ MOSS_REQUIREMENTS = (
     "onnxruntime-gpu>=1.20,<2",
     "soundfile>=0.12,<1",
 )
-LEGACY_VITS_MODEL_ID = "sherpa-onnx-vits-zh-ll"
+SHERPA_REQUIREMENTS = (
+    "sherpa-onnx>=1.12,<2",
+    "soundfile>=0.12,<1",
+)
 SHERPA_ASR_MODEL_ID = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09"
 SHERPA_ASR_MODEL_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
@@ -159,7 +165,9 @@ def _mandarin_speech_units(text: str) -> list[tuple[str, float]]:
         "\uff1a": 0.20, ":": 0.20, "\u2026": 0.42,
         "\u2014": 0.28, "-": 0.16,
     }
-    terminal_marks = set(pause_seconds)
+    # Let the TTS model handle commas, colons and dashes inside one request.
+    # Splitting on every punctuation mark caused excessive inference overhead.
+    terminal_marks = set("。！？!?；;…")
     units: list[tuple[str, float]] = []
     buffer: list[str] = []
 
@@ -195,6 +203,16 @@ def _clean_text_for_speech(text: str) -> str:
     value = re.sub(r"[ \t]+", " ", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
     return value.strip()
+
+
+def _voice_segment_output_ready(segment: dict[str, Any]) -> bool:
+    """Resume by each durable segment, not by a fragile completed-prefix count."""
+    output = Path(str(segment.get("audio_path") or ""))
+    return segment.get("status") == "completed" and output.is_file()
+
+
+def _completed_voice_segment_count(segments: list[dict[str, Any]]) -> int:
+    return sum(_voice_segment_output_ready(segment) for segment in segments)
 
 
 def _voice_root() -> Path:
@@ -275,12 +293,17 @@ def _friendly_pip_error(output: list[str], component: str) -> tuple[str, bool]:
 
 
 def _safe_extract_tar(archive_path: Path, destination: Path) -> None:
-    destination = destination.resolve()
+    # Keep extraction on the caller's lexical path.  Under the Microsoft
+    # Store host, resolve() can rewrite LocalAppData to Packages/.../LocalCache;
+    # the caller then continues through the original alias and cannot find the
+    # files that were just extracted.  absolute() still normalizes traversal
+    # segments without switching to the other filesystem view.
+    safe_destination = destination.absolute()
     with tarfile.open(archive_path, "r:bz2") as archive:
         members = []
         for member in archive.getmembers():
-            target = (destination / member.name).resolve()
-            if target != destination and destination not in target.parents:
+            target = (safe_destination / member.name).absolute()
+            if target != safe_destination and safe_destination not in target.parents:
                 raise RuntimeError("语音模型压缩包包含不安全的文件路径，已停止解压。")
             if member.issym() or member.islnk():
                 raise RuntimeError("语音模型压缩包包含链接文件，已停止解压。")
@@ -297,47 +320,48 @@ class VoiceRuntime:
         self.projects_dir = self.root / "projects"
         self.jobs_dir = self.root / "jobs"
         self.short_cache_dir = self.root / "cache" / "short"
-        self.qwen_root = self.root / "qwen"
-        self.qwen_packages_dir = self.qwen_root / "packages"
-        self.qwen_model_cache_dir = self.qwen_root / "models"
-        self.qwen_state_path = self.qwen_root / "install.json"
-        self.qwen_models_path = self.qwen_root / "models.json"
-        # MOSS is the default local TTS. Keep the old sherpa path only for a
-        # clear "input is unavailable" status; do not recreate its files.
-        self.moss_root = self.root / "moss"
+        component_root = Path(os.getenv("INKFLOW_VOICE_COMPONENT_ROOT") or ("D:/墨流/voice" if os.name == "nt" and Path("D:/").exists() else str(self.root)))
+        self.edge_root = component_root / "edge"
+        self.edge_packages_dir = self.edge_root / "packages"
+        self.edge_state_path = self.edge_root / "install.json"
+        legacy_moss_root = self.root / "moss"
+        self.moss_root = legacy_moss_root if legacy_moss_root.is_dir() and any(legacy_moss_root.iterdir()) else component_root / "moss"
         self.moss_packages_dir = self.moss_root / "packages"
         self.moss_model_dir = self.moss_root / "models"
         self.moss_state_path = self.moss_root / "install.json"
-        self.sherpa_root = self.root / "sherpa"
+        legacy_sherpa_root = self.root / "sherpa"
+        self.sherpa_root = legacy_sherpa_root if legacy_sherpa_root.is_dir() and any(legacy_sherpa_root.iterdir()) else component_root / "sherpa"
+        self.sherpa_packages_dir = self.sherpa_root / "packages"
         self.sherpa_asr_dir = self.sherpa_root / "asr" / SHERPA_ASR_MODEL_ID
-        self.kokoro_root = self.root / "kokoro"  # legacy path; never created or loaded
-        self.migrations_dir = self.root / "migrations"
+        self.sherpa_state_path = self.sherpa_root / "install.json"
         for folder in (
             self.profiles_dir,
             self.projects_dir,
             self.jobs_dir,
             self.short_cache_dir,
-            self.qwen_root,
-            self.qwen_model_cache_dir,
             self.moss_root,
             self.moss_packages_dir,
             self.moss_model_dir,
-            self.migrations_dir,
         ):
             folder.mkdir(parents=True, exist_ok=True)
         self._jobs: dict[str, asyncio.Task[None]] = {}
         self._short_lock: asyncio.Lock | None = None
         self._long_lock: asyncio.Lock | None = None
         self._inference_lock: asyncio.Lock | None = None
-        self._qwen_install_lock: asyncio.Lock | None = None
-        self._qwen_install_task: asyncio.Task[dict[str, Any]] | None = None
+        self._edge_install_lock: asyncio.Lock | None = None
+        self._edge_install_task: asyncio.Task[dict[str, Any]] | None = None
         self._moss_install_lock: asyncio.Lock | None = None
         self._moss_install_task: asyncio.Task[dict[str, Any]] | None = None
-        self._tts_models: dict[str, Any] = {}
+        self._sherpa_install_lock: asyncio.Lock | None = None
+        self._sherpa_install_task: asyncio.Task[dict[str, Any]] | None = None
+        self._install_cancel_events = {
+            "edge": threading.Event(),
+            "moss": threading.Event(),
+            "asr": threading.Event(),
+        }
         self._moss_tts_models: dict[str, Any] = {}
         self._sherpa_asr_models: dict[str, Any] = {}
         self._activate_optional_packages()
-        self._migrate_legacy_voice_assets()
         self._mark_interrupted_jobs()
 
     def settings(self, workspace_root: str | Path | None = None) -> dict[str, Any]:
@@ -349,12 +373,11 @@ class VoiceRuntime:
         if allowed:
             # Validate and persist the complete normalized value in one atomic write.
             save_user_settings(allowed)
-            if {"voice_engine", "voice_compute_device", "voice_debug", "voice_tts_model", "voice_light_tts_model"} & set(allowed):
+            if {"voice_dialogue_engine", "voice_text_engine", "voice_novel_engine", "voice_compute_device", "voice_debug", "voice_light_tts_model"} & set(allowed):
                 self._clear_loaded_tts()
         return self.settings(workspace_root)
 
     def _clear_loaded_tts(self) -> None:
-        self._tts_models.clear()
         self._moss_tts_models.clear()
         gc.collect()
         torch = sys.modules.get("torch")
@@ -365,116 +388,91 @@ class VoiceRuntime:
             except Exception:
                 pass
 
-    def _migrate_legacy_voice_assets(self) -> None:
-        """Remove only the replaced, downloaded engines once after this upgrade.
-
-        Profiles, reference audio, generated audio, jobs and the whole voice root are
-        deliberately outside this list. A failed deletion stays visible in the marker
-        and is retried on the next application start.
-        """
-
-        marker = self.migrations_dir / "moss-voice-upgrade.json"
-        existing = _read_json(marker)
-        if existing.get("completed"):
-            return
-        safe_root = self.root.resolve()
-        targets = (
-            self.sherpa_root,
-            self.kokoro_root,
-            self.qwen_model_cache_dir / "hub" / "models--Qwen--Qwen3-TTS-12Hz-0.6B-CustomVoice",
-            self.qwen_model_cache_dir / "hub" / "models--Qwen--Qwen3-TTS-12Hz-0.6B-Base",
-        )
-        removed: list[str] = []
-        errors: list[str] = []
-        for target in targets:
-            resolved = target.resolve()
-            if not target.exists():
-                continue
-            if resolved != target.absolute() or resolved == safe_root or safe_root not in resolved.parents:
-                errors.append(f"{target.name}: 路径被重定向，未清理应用目录以外的数据。")
-                continue
-            try:
-                shutil.rmtree(resolved)
-                removed.append(target.name)
-            except OSError as exc:
-                errors.append(f"{target.name}: {exc}")
-        _atomic_json(
-            marker,
-            {
-                "completed": not errors,
-                "completed_at": _now() if not errors else "",
-                "removed": list(dict.fromkeys([*existing.get("removed", []), *removed])),
-                "errors": errors,
-                "scope": "legacy sherpa/Kokoro directories and Qwen 0.6B model caches",
-            },
-        )
-
     def status(self, workspace_root: str | Path | None = None) -> dict[str, Any]:
         settings = Settings.from_env(workspace_root)
         self._activate_optional_packages()
         packages = {
             "moss_tts": self._moss_package_ready(),
-            "qwen_tts": _package_available("qwen_tts"),
+            "edge_tts": _package_available("edge_tts"),
             "torch": _package_available("torch"),
             "soundfile": _package_available("soundfile"),
-            # sherpa is intentionally not part of the current voice bundle.
-            "sherpa_onnx": False,
+            "sherpa_onnx": _package_available("sherpa_onnx"),
         }
         moss = self._moss_status(packages)
-        qwen = self._qwen_status(packages)
-        asr = {
-            "package_installed": False,
-            "asr_ready": False,
-            "model_root": str(self.sherpa_asr_dir),
-            "model_size_mb": 0.0,
-            "estimated_download_mb": 0,
-            "message": "sherpa 已移除；当前版本只提供 MOSS 本地朗读。",
-        }
-        backend = self._selected_backend(settings, moss, qwen)
+        edge = self._edge_status(packages)
+        asr = self._sherpa_status(packages)
+        backend = settings.voice_dialogue_engine
+        output_ready = packages["edge_tts"] if backend == "edge" else bool(moss["tts_ready"]) if backend == "moss" else False
         return {
             "enabled": settings.voice_enabled,
-            "ready_for_input": False,
-            "ready_for_output": backend != "unavailable",
+            "ready_for_input": settings.voice_input_engine == "browser" or settings.voice_input_engine == "local" and bool(asr["asr_ready"]),
+            "ready_for_output": output_ready,
             "packages": packages,
             "compute_device": settings.voice_compute_device,
             "data_root": str(self.root),
             "formal_agent": False,
-            "mode": "local_mandarin",
+            "mode": "configured",
             "backend": backend,
             "moss": moss,
+            "edge": edge,
             "asr": asr,
-            "qwen": qwen,
-            "migration": _read_json(self.migrations_dir / "moss-voice-upgrade.json"),
             "models_loaded": {
-                "asr": False,
-                "tts": bool(self._tts_models or self._moss_tts_models),
+                "asr": bool(self._sherpa_asr_models),
+                "tts": bool(self._moss_tts_models),
             },
             "message": (
-                "MOSS 本地朗读已就绪。"
-                if backend == "moss"
-                else "Qwen 高品质中文朗读已就绪。"
-                if backend == "qwen"
-                else "当前选择的朗读模型尚未就绪，请在设置中安装 MOSS 或 Qwen。"
+                "当前对话朗读已就绪。" if output_ready else "请先为对话朗读选择已就绪的语音组件。"
             ),
         }
 
     def _activate_optional_packages(self) -> None:
-        # MOSS and Qwen are isolated under the application voice directory.
-        for package_dir in (self.moss_packages_dir, self.qwen_packages_dir):
+        for package_dir in (self.edge_packages_dir, self.moss_packages_dir, self.sherpa_packages_dir):
             package_path = str(package_dir.resolve())
             if package_dir.is_dir() and package_path not in sys.path:
                 sys.path.insert(0, package_path)
 
+    def _edge_status(self, packages: dict[str, bool] | None = None) -> dict[str, Any]:
+        ready = bool((packages or {}).get("edge_tts", _package_available("edge_tts")))
+        state = _read_json(self.edge_state_path)
+        return {
+            "installed": ready,
+            "packages_dir": str(self.edge_packages_dir),
+            "storage_size_mb": round(_directory_size(self.edge_root) / 1024 / 1024, 1),
+            "has_local_files": self._component_has_local_files(self.edge_root),
+            "installing": bool(self._edge_install_task and not self._edge_install_task.done()),
+            "python_available": bool(self._python_command()),
+            "last_error": str(state.get("error") or ""),
+            "install_status": str(state.get("status") or "idle"),
+            "install_stage": str(state.get("stage") or ""),
+            "install_progress": int(state.get("progress") or 0),
+            "install_summary": str(state.get("summary") or ""),
+            "downloaded_mb": float(state.get("downloaded_mb") or 0),
+            "retryable": bool(state.get("retryable", False)),
+        }
+
     def _sherpa_status(self, packages: dict[str, bool] | None = None) -> dict[str, Any]:
         package_ready = bool((packages or {}).get("sherpa_onnx", _package_available("sherpa_onnx")))
         asr_model = self._sherpa_asr_model_path()
+        state = _read_json(self.sherpa_state_path)
         return {
             "package_installed": package_ready,
             "asr_ready": package_ready and _package_available("soundfile") and asr_model is not None,
             "asr_model": str(asr_model) if asr_model else "",
             "model_root": str(self.sherpa_asr_dir),
             "model_size_mb": round(_directory_size(self.sherpa_asr_dir) / 1024 / 1024, 1),
+            "storage_size_mb": round(_directory_size(self.sherpa_root) / 1024 / 1024, 1),
+            "has_local_files": self._component_has_local_files(self.sherpa_root),
             "estimated_download_mb": 230,
+            "estimated_dependency_download_mb": 240,
+            "installing": bool(self._sherpa_install_task and not self._sherpa_install_task.done()),
+            "python_available": bool(self._python_command()),
+            "last_error": str(state.get("error") or ""),
+            "install_status": str(state.get("status") or "idle"),
+            "install_stage": str(state.get("stage") or ""),
+            "install_progress": int(state.get("progress") or 0),
+            "install_summary": str(state.get("summary") or ""),
+            "downloaded_mb": float(state.get("downloaded_mb") or 0),
+            "retryable": bool(state.get("retryable", False)),
         }
 
     def _moss_package_ready(self) -> bool:
@@ -534,6 +532,8 @@ class VoiceRuntime:
             "models_ready": models_ready,
             "model_root": str(self.moss_model_dir),
             "model_size_mb": round(_directory_size(self.moss_model_dir) / 1024 / 1024, 1),
+            "storage_size_mb": round(_directory_size(self.moss_root) / 1024 / 1024, 1),
+            "has_local_files": self._component_has_local_files(self.moss_root),
             "estimated_download_mb": 900,
             "estimated_dependency_download_mb": 1800,
             "estimated_model_download_mb": 900,
@@ -549,48 +549,16 @@ class VoiceRuntime:
             "source": "local_optional" if state.get("status") == "installed" else "none",
         }
 
-    def _qwen_status(self, packages: dict[str, bool] | None = None) -> dict[str, Any]:
-        self._activate_optional_packages()
-        values = packages or {
-            "qwen_tts": _package_available("qwen_tts"),
-            "torch": _package_available("torch"),
-            "soundfile": _package_available("soundfile"),
-        }
-        dependencies_ready = all(values.get(name, False) for name in ("qwen_tts", "torch", "soundfile"))
-        state = _read_json(self.qwen_state_path)
-        optional_ready = self.qwen_packages_dir.is_dir() and bool(state.get("status") == "installed")
-        installed = dependencies_ready
-        source = "optional" if optional_ready else "current_environment" if installed else "none"
-        python_command = self._python_command()
-        settings = Settings.from_env()
-        return {
-            "installed": installed,
-            "dependencies_ready": dependencies_ready,
-            "source": source,
-            "installing": bool(self._qwen_install_task and not self._qwen_install_task.done()),
-            "python_available": bool(python_command),
-            "python": " ".join(python_command or []),
-            "packages_dir": str(self.qwen_packages_dir),
-            "model_cache_dir": str(self.qwen_model_cache_dir),
-            "model_loaded": bool(self._tts_models),
-            "models_ready": all(self._qwen_model_path(name) is not None for name in (settings.voice_tts_model, settings.voice_clone_model)),
-            "package_size_mb": round(_directory_size(self.qwen_packages_dir) / 1024 / 1024, 1),
-            "model_size_mb": round(_directory_size(self.qwen_model_cache_dir) / 1024 / 1024, 1),
-            "estimated_dependency_download_mb": 7000,
-            "estimated_model_download_mb": 9200,
-            "last_error": str(state.get("error") or ""),
-            "install_status": str(state.get("status") or "idle"),
-            "install_stage": str(state.get("stage") or ""),
-            "install_progress": int(state.get("progress") or 0),
-            "install_summary": str(state.get("summary") or ""),
-            "downloaded_mb": float(state.get("downloaded_mb") or 0),
-            "retryable": bool(state.get("retryable", False)),
-        }
-
-    def _selected_backend(self, settings: Settings, moss: dict[str, Any], qwen: dict[str, Any]) -> str:
-        if settings.voice_engine == "qwen":
-            return "qwen" if qwen["installed"] and self._qwen_model_path(settings.voice_tts_model) else "unavailable"
-        return "moss" if moss["tts_ready"] else "unavailable"
+    @staticmethod
+    def _component_has_local_files(root: Path) -> bool:
+        """Count partial downloads; empty installer-created folders do not count."""
+        if not root.is_dir():
+            return False
+        try:
+            return any(item.is_file() for item in root.rglob("*"))
+        except OSError:
+            # Inaccessible local state should still leave the delete action enabled.
+            return True
 
     def _python_command(self) -> list[str] | None:
         configured = os.getenv("INKFLOW_PYTHON")
@@ -698,6 +666,12 @@ class VoiceRuntime:
             published_progress = -1
             assert process.stdout is not None
             while True:
+                if self._install_cancel_events[component].is_set():
+                    process.terminate()
+                    await process.wait()
+                    shutil.rmtree(staging, ignore_errors=True)
+                    shutil.rmtree(install_temp, ignore_errors=True)
+                    raise asyncio.CancelledError
                 line = await process.stdout.readline()
                 if not line:
                     break
@@ -815,128 +789,12 @@ class VoiceRuntime:
         )
         return next((path for path in candidates if path.is_file()), None)
 
-    async def install_qwen(self, confirmation: str, emit: VoiceEventSink) -> dict[str, Any]:
-        if confirmation != "install_optional_qwen":
-            raise ValueError("安装 Qwen 前需要确认会下载数 GB 依赖与模型，并可能占用显存。")
-        if self._qwen_install_task and not self._qwen_install_task.done():
-            return {**self.status(), "queued": False, "message": "Qwen 已在后台安装，关闭设置不会停止任务。"}
-        self._qwen_install_task = asyncio.create_task(
-            self._background_install("qwen", self._install_qwen_impl, emit)
-        )
-        await emit({
-            "type": "voice.qwen.install.queued",
-            "component": "qwen",
-            "status": "installing",
-            "stage": "queued",
-            "progress": 0,
-            "summary": "Qwen 已加入后台安装；关闭设置不会停止任务。",
-        })
-        return {**self.status(), "queued": True, "message": "Qwen 已加入后台安装，可关闭设置继续使用墨流。"}
-
-    async def _install_qwen_impl(self, emit: VoiceEventSink) -> dict[str, Any]:
-        if self._qwen_install_lock is None:
-            self._qwen_install_lock = asyncio.Lock()
-        async with self._qwen_install_lock:
-            self._activate_optional_packages()
-            existing = self._qwen_status()
-            if existing.get("installed") and existing.get("models_ready"):
-                return self.status()
-            if existing.get("installed"):
-                await self._publish_install_progress(
-                    component="qwen", state_path=self.qwen_state_path, emit=emit,
-                    status="installing", stage="models", progress=58,
-                    summary="Qwen 依赖已存在，正在继续准备语音模型",
-                )
-                model_error = ""
-                try:
-                    await self._prepare_models_with_progress(
-                        component="qwen", state_path=self.qwen_state_path,
-                        model_dir=self.qwen_model_cache_dir, estimated_mb=9200,
-                        prepare=lambda: self._prepare_models_sync(Settings.from_env()), emit=emit,
-                    )
-                except Exception as exc:
-                    model_error = str(exc)[:500]
-                result = self.status()
-                result["qwen_setup"] = "installed_but_models_pending" if model_error else "ready"
-                if model_error:
-                    result["qwen"]["last_error"] = model_error
-                    await self._publish_install_progress(
-                        component="qwen", state_path=self.qwen_state_path, emit=emit,
-                        status="failed", stage="models", progress=int(result["qwen"].get("install_progress") or 58),
-                        summary="模型准备未完成，可继续重试", error=model_error, retryable=True,
-                        event_type="voice.qwen.models_failed",
-                    )
-                else:
-                    await self._publish_install_progress(
-                        component="qwen", state_path=self.qwen_state_path, emit=emit,
-                        status="installed", stage="ready", progress=100,
-                        summary="Qwen 高品质语音已准备完成", event_type="voice.qwen.ready",
-                    )
-                return result
-            command = self._python_command()
-            if not command:
-                raise RuntimeError("没有找到可用于安装 Qwen 的 Python 3.12/3.13。请安装 Python 后重试，或设置 INKFLOW_PYTHON 指向 python.exe。")
-            staging = self.qwen_root / f"packages-staging-{uuid.uuid4().hex}"
-            await self._install_python_packages(
-                component="qwen", root=self.qwen_root, staging=staging,
-                state_path=self.qwen_state_path, command=command,
-                requirements=QWEN_REQUIREMENTS, estimated_mb=7000, emit=emit,
-            )
-            if self.qwen_packages_dir.exists():
-                previous = self.qwen_root / "packages-previous"
-                if previous.exists():
-                    shutil.rmtree(previous, ignore_errors=True)
-                self.qwen_packages_dir.replace(previous)
-            staging.replace(self.qwen_packages_dir)
-            _atomic_json(
-                self.qwen_state_path,
-                {
-                    "status": "installed",
-                    "installed_at": _now(),
-                    "python": " ".join(command),
-                    "requirements": list(QWEN_REQUIREMENTS),
-                    "error": "",
-                },
-            )
-            self._activate_optional_packages()
-            await self._publish_install_progress(
-                component="qwen", state_path=self.qwen_state_path, emit=emit,
-                status="installing", stage="models", progress=58,
-                summary="依赖安装完成，正在下载预设与克隆模型",
-            )
-            model_error = ""
-            try:
-                await self._prepare_models_with_progress(
-                    component="qwen", state_path=self.qwen_state_path,
-                    model_dir=self.qwen_model_cache_dir, estimated_mb=9200,
-                    prepare=lambda: self._prepare_models_sync(Settings.from_env()), emit=emit,
-                )
-            except Exception as exc:
-                model_error = str(exc)[:500]
-            result = self.status()
-            result["qwen_setup"] = "installed_but_models_pending" if model_error else "ready"
-            if model_error:
-                result["qwen"]["last_error"] = model_error
-                result["qwen"]["model_message"] = "Qwen 依赖已安装，但模型下载未完成；可稍后重试模型准备。"
-                await self._publish_install_progress(
-                    component="qwen", state_path=self.qwen_state_path, emit=emit,
-                    status="failed", stage="models", progress=int(result["qwen"].get("install_progress") or 58),
-                    summary="模型下载未完成，可继续重试", error=model_error, retryable=True,
-                    event_type="voice.qwen.models_failed",
-                )
-            else:
-                await self._publish_install_progress(
-                    component="qwen", state_path=self.qwen_state_path, emit=emit,
-                    status="installed", stage="ready", progress=100,
-                    summary="Qwen 高品质语音已安装并完成适配", event_type="voice.qwen.ready",
-                )
-            return result
-
     async def install_moss(self, confirmation: str, emit: VoiceEventSink) -> dict[str, Any]:
         if confirmation != "install_moss_voice":
             raise ValueError("安装 MOSS 前需要确认约 900MB 模型和 1.8GB 依赖下载，实际占用会随环境变化。")
         if self._moss_install_task and not self._moss_install_task.done():
             return {**self.status(), "queued": False, "message": "MOSS 已在后台安装，关闭设置不会停止任务。"}
+        self._install_cancel_events["moss"].clear()
         self._moss_install_task = asyncio.create_task(
             self._background_install("moss", self._install_moss_impl, emit)
         )
@@ -949,6 +807,133 @@ class VoiceRuntime:
             "summary": "MOSS 已加入后台安装；关闭设置不会停止任务。",
         })
         return {**self.status(), "queued": True, "message": "MOSS 已加入后台安装，可关闭设置继续使用墨流。"}
+
+    async def install_edge(self, confirmation: str, emit: VoiceEventSink) -> dict[str, Any]:
+        if confirmation != "install_edge_online_voice":
+            raise ValueError("安装 Edge 在线语音连接组件前需要确认；它不会下载语音模型。")
+        if self._edge_install_task and not self._edge_install_task.done():
+            return {**self.status(), "queued": False, "message": "Edge 在线语音组件已在后台安装。"}
+        self._install_cancel_events["edge"].clear()
+        self._edge_install_task = asyncio.create_task(self._background_install("edge", self._install_edge_impl, emit))
+        await emit({"type": "voice.edge.install.queued", "component": "edge", "status": "installing", "stage": "queued", "progress": 0, "summary": "Edge 在线语音连接组件已进入后台安装。"})
+        return {**self.status(), "queued": True, "message": "Edge 在线语音连接组件已进入后台安装；不会自动选为朗读引擎。"}
+
+    async def _install_edge_impl(self, emit: VoiceEventSink) -> dict[str, Any]:
+        if self._edge_install_lock is None:
+            self._edge_install_lock = asyncio.Lock()
+        async with self._edge_install_lock:
+            self._activate_optional_packages()
+            if not _package_available("edge_tts"):
+                command = self._python_command()
+                if not command:
+                    raise RuntimeError("没有找到可用的 Python。请设置 INKFLOW_PYTHON 指向 python.exe。")
+                staging = self.edge_root / f"packages-staging-{uuid.uuid4().hex}"
+                await self._install_python_packages(
+                    component="edge", root=self.edge_root, staging=staging,
+                    state_path=self.edge_state_path, command=command,
+                    requirements=EDGE_REQUIREMENTS, estimated_mb=40, emit=emit,
+                )
+                if self.edge_packages_dir.exists():
+                    previous = self.edge_root / "packages-previous"
+                    if previous.exists():
+                        shutil.rmtree(previous, ignore_errors=True)
+                    self.edge_packages_dir.replace(previous)
+                staging.replace(self.edge_packages_dir)
+                importlib.invalidate_caches()
+                self._activate_optional_packages()
+            if not _package_available("edge_tts"):
+                raise RuntimeError("Edge 在线语音连接组件安装后仍无法加载，请查看安装记录。")
+            await self._publish_install_progress(
+                component="edge", state_path=self.edge_state_path, emit=emit,
+                status="installed", stage="ready", progress=100,
+                summary="Edge 在线语音连接组件已就绪；朗读时仍需联网。",
+                event_type="voice.edge.ready",
+            )
+            return self.status()
+
+    async def install_asr(self, confirmation: str, emit: VoiceEventSink) -> dict[str, Any]:
+        """Install local Mandarin speech recognition as a resumable background job."""
+
+        if confirmation != "install_local_asr":
+            raise ValueError("安装本地语音识别前需要确认约 470MB 依赖与模型下载。")
+        if self._sherpa_install_task and not self._sherpa_install_task.done():
+            return {**self.status(), "queued": False, "message": "普通话识别已在后台安装。"}
+        self._install_cancel_events["asr"].clear()
+        self._sherpa_install_task = asyncio.create_task(
+            self._background_install("asr", self._install_asr_impl, emit)
+        )
+        await emit({
+            "type": "voice.asr.install.queued",
+            "component": "asr",
+            "status": "installing",
+            "stage": "queued",
+            "progress": 0,
+            "summary": "普通话识别已加入后台安装；关闭设置不会停止任务。",
+        })
+        return {**self.status(), "queued": True, "message": "普通话识别已加入后台安装。"}
+
+    async def _install_asr_impl(self, emit: VoiceEventSink) -> dict[str, Any]:
+        if self._sherpa_install_lock is None:
+            self._sherpa_install_lock = asyncio.Lock()
+        async with self._sherpa_install_lock:
+            self._activate_optional_packages()
+            if not (_package_available("sherpa_onnx") and _package_available("soundfile")):
+                command = self._python_command()
+                if not command:
+                    raise RuntimeError("没有找到可用于安装普通话识别的 Python。")
+                staging = self.sherpa_root / f"packages-staging-{uuid.uuid4().hex}"
+                await self._install_python_packages(
+                    component="asr",
+                    root=self.sherpa_root,
+                    staging=staging,
+                    state_path=self.sherpa_state_path,
+                    command=command,
+                    requirements=SHERPA_REQUIREMENTS,
+                    estimated_mb=240,
+                    emit=emit,
+                )
+                if self.sherpa_packages_dir.exists():
+                    previous = self.sherpa_root / "packages-previous"
+                    if previous.exists():
+                        shutil.rmtree(previous, ignore_errors=True)
+                    self.sherpa_packages_dir.replace(previous)
+                staging.replace(self.sherpa_packages_dir)
+                self._activate_optional_packages()
+            await self._publish_install_progress(
+                component="asr",
+                state_path=self.sherpa_state_path,
+                emit=emit,
+                status="installing",
+                stage="models",
+                progress=58,
+                summary="依赖已就绪，正在准备普通话识别模型",
+            )
+            await self._prepare_models_with_progress(
+                component="asr",
+                state_path=self.sherpa_state_path,
+                model_dir=self.sherpa_asr_dir,
+                estimated_mb=230,
+                prepare=lambda: self._download_voice_model(
+                    SHERPA_ASR_MODEL_URL,
+                    self.sherpa_asr_dir,
+                    self.sherpa_root,
+                    cancel_event=self._install_cancel_events["asr"],
+                ),
+                emit=emit,
+            )
+            if not self._sherpa_status()["asr_ready"]:
+                raise RuntimeError("普通话识别组件不完整：依赖或模型文件仍不可用。")
+            await self._publish_install_progress(
+                component="asr",
+                state_path=self.sherpa_state_path,
+                emit=emit,
+                status="installed",
+                stage="ready",
+                progress=100,
+                summary="本地普通话识别已准备完成",
+                event_type="voice.asr.ready",
+            )
+            return self.status()
 
     async def _background_install(
         self,
@@ -969,7 +954,11 @@ class VoiceRuntime:
         except asyncio.CancelledError:
             return self.status()
         except Exception as exc:
-            state_path = self.qwen_state_path if component == "qwen" else self.moss_state_path
+            state_path = {
+                "edge": self.edge_state_path,
+                "moss": self.moss_state_path,
+                "asr": self.sherpa_state_path,
+            }[component]
             state = _read_json(state_path)
             if state.get("status") != "failed":
                 await self._publish_install_progress(
@@ -1033,7 +1022,7 @@ class VoiceRuntime:
                 state = _read_json(self.moss_state_path)
                 state.update({"status": "installed", "stage": "ready", "progress": 100, "summary": "MOSS 本地普通话朗读已准备完成", "error": "", "retryable": False, "models_ready_at": _now()})
                 _atomic_json(self.moss_state_path, state)
-                save_user_settings({"voice_engine": "moss", "voice_light_tts_model": MOSS_TTS_MODEL_ID})
+                save_user_settings({"voice_light_tts_model": MOSS_TTS_MODEL_ID})
             result = self.status()
             if model_error:
                 result["moss_setup"] = "installed_but_models_pending"
@@ -1081,40 +1070,52 @@ class VoiceRuntime:
         """Delete downloaded voice files without blocking the event loop."""
         component = str(component or "").strip().lower()
         confirmations = {
+            "edge": "delete_edge_online_voice",
             "moss": "delete_moss_voice",
-            "qwen": "delete_qwen_voice",
             "sherpa": "delete_sherpa_voice",
-            "kokoro": "delete_kokoro_voice",
         }
         if component not in confirmations:
-            raise ValueError("只支持删除 moss 或 qwen；sherpa/kokoro 已在升级时移除。")
+            raise ValueError("只支持删除 Edge、MOSS 或本地普通话识别组件。")
         if confirmation != confirmations[component]:
             raise ValueError("删除前需要确认；只会删除语音组件文件，不会删除录音和声音档案。")
         if self._inference_lock is not None and self._inference_lock.locked():
             raise ValueError("当前有朗读任务正在使用语音模型，请先暂停或取消任务后再删除。")
+        task = {
+            "edge": self._edge_install_task,
+            "moss": self._moss_install_task,
+            "sherpa": self._sherpa_install_task,
+        }[component]
+        cancel_key = "asr" if component == "sherpa" else component
+        self._install_cancel_events[cancel_key].set()
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5)
+            except asyncio.TimeoutError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         return await asyncio.to_thread(self._delete_voice_component_sync, component)
 
     def _delete_voice_component_sync(self, component: str) -> dict[str, Any]:
         self._clear_loaded_tts()
+        if component == "sherpa":
+            self._sherpa_asr_models.clear()
         target_map = {
-            "moss": (
-                self.moss_packages_dir, self.moss_model_dir, self.moss_state_path,
-                self.moss_root / "pip-cache", self.moss_root / "install-temp",
-                self.moss_root / "packages-previous", *self.moss_root.glob("packages-staging-*"),
-            ),
-            "qwen": (
-                self.qwen_packages_dir, self.qwen_model_cache_dir, self.qwen_state_path, self.qwen_models_path,
-                self.qwen_root / "pip-cache", self.qwen_root / "install-temp",
-                self.qwen_root / "packages-previous", *self.qwen_root.glob("packages-staging-*"),
-            ),
+            # Component roots contain no recordings, voice profiles, generated
+            # audio or job history. Removing the root also catches partial
+            # .download archives, pip caches and failed staging folders.
+            "edge": (self.edge_root,),
+            "moss": (self.moss_root,),
             "sherpa": (self.sherpa_root,),
-            "kokoro": (self.kokoro_root,),
         }
         removed: list[str] = []
         errors: list[str] = []
-        root = self.root.resolve()
+        # The targets above are all constructed internally beneath the voice
+        # root. Use lexical containment on Windows: Microsoft Store process
+        # virtualization may resolve an existing child through LocalCache while
+        # the parent still resolves to LocalAppData, creating a false escape.
+        root = target_map[component][0].parent.absolute()
         for target in target_map[component]:
-            resolved = target.resolve()
+            resolved = target.absolute()
             if resolved == root or root not in resolved.parents:
                 errors.append(f"删除失败：{target}")
                 continue
@@ -1130,15 +1131,28 @@ class VoiceRuntime:
                 errors.append(f"{target}: {exc}")
         if errors:
             raise RuntimeError("语音组件删除失败：" + "；".join(errors))
-        settings = Settings.from_env()
-        if component == "qwen" and settings.voice_engine == "qwen":
-            save_user_settings({"voice_engine": "moss"})
         return self.status()
 
     @staticmethod
-    def _download_voice_model(url: str, destination: Path, required: tuple[str, ...] = ("tokens.txt",)) -> None:
+    def _download_voice_model(
+        url: str,
+        destination: Path,
+        safe_root: Path,
+        required: tuple[str, ...] = ("tokens.txt",),
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.resolve() != destination.absolute():
+        # Microsoft Store/AppContainer filesystem virtualization can resolve
+        # LocalAppData into Packages/.../LocalCache even though it is still
+        # the application's own voice directory.  Validate containment after
+        # resolving both sides instead of rejecting every redirected path.
+        safe_root = safe_root.absolute()
+        lexical_destination = destination.absolute()
+        # The destination is constructed internally from a fixed model id.
+        # Lexical containment is therefore the authoritative boundary on
+        # Windows, where an as-yet-uncreated child can resolve through the
+        # Microsoft Store LocalCache redirect while its existing root does not.
+        if lexical_destination != safe_root and safe_root not in lexical_destination.parents:
             raise RuntimeError("模型目标目录被重定向，无法安全更新，请检查本地语音目录。")
         if any(destination.glob("*.onnx")) and all((destination / name).is_file() for name in required):
             return
@@ -1147,6 +1161,8 @@ class VoiceRuntime:
         try:
             with urllib.request.urlopen(url, timeout=60) as response, archive_path.open("wb") as output:
                 while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RuntimeError("安装已由用户取消，正在清理已下载文件。")
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
@@ -1159,30 +1175,20 @@ class VoiceRuntime:
                 raise RuntimeError("下载的模型缺少必要文件，请重试下载。")
             if destination.exists():
                 shutil.rmtree(destination, ignore_errors=True)
-            source.replace(destination)
+            # A process launched from the Microsoft Store Codex host can see
+            # one LocalAppData directory through both its logical path and the
+            # package LocalCache path.  MoveFileEx treats those aliases as
+            # different locations and can report WinError 3 even though the
+            # extracted files are readable.  Copying keeps the commit within
+            # one filesystem view and the extraction directory is removed
+            # immediately afterwards.
+            shutil.copytree(source, destination)
             shutil.rmtree(extraction, ignore_errors=True)
         finally:
             if archive_path.exists():
                 archive_path.unlink()
             if extraction.exists():
                 shutil.rmtree(extraction)
-
-    async def prepare_models(self, workspace_root: str | Path | None, confirmation: str, emit: VoiceEventSink) -> dict[str, Any]:
-        if confirmation != "download_local_voice_models":
-            raise ValueError("准备本地语音模型前需要确认磁盘、等待时间与显存影响。")
-        self._activate_optional_packages()
-        settings = Settings.from_env(workspace_root)
-        missing = [name for name in ("qwen_tts", "torch", "soundfile") if not _package_available(name)]
-        if missing:
-            raise RuntimeError(f"Qwen 语音依赖尚未安装：{', '.join(missing)}。请在设置中点击‘安装 Qwen 并适配’。")
-        await emit({"type": "voice.models.preparing", "summary": "正在下载 Qwen 预设声音和克隆模型；下载期间不加载显卡"})
-        if self._inference_lock is None:
-            self._inference_lock = asyncio.Lock()
-        async with self._inference_lock:
-            await asyncio.to_thread(self._prepare_models_sync, settings)
-        result = self.status(workspace_root)
-        await emit({"type": "voice.models.ready", "summary": "本地语音模型已经准备完成"})
-        return result
 
     def list_profiles(self) -> list[dict[str, Any]]:
         profiles = [dict(item) for item in BUILTIN_PROFILES]
@@ -1330,55 +1336,102 @@ class VoiceRuntime:
         source = Path(audio_path).resolve()
         if not source.is_file() or source.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
             raise ValueError("音频文件不存在或格式不受支持。")
-        raise RuntimeError("sherpa 已移除；当前版本暂不提供语音输入（MOSS 只负责朗读）。")
+        if not self._sherpa_status()["asr_ready"]:
+            raise RuntimeError("本地普通话识别尚未准备好，请在设置的语音页后台安装识别组件。")
+        if self._inference_lock is None:
+            self._inference_lock = asyncio.Lock()
+        async with self._inference_lock:
+            try:
+                return await asyncio.to_thread(self._transcribe_sherpa_sync, source, settings)
+            except Exception as first_error:
+                # A just-finished background install can leave stale import or
+                # model objects in the long-lived engine. Refresh once and let
+                # the service repair itself before asking the user to retry.
+                self._sherpa_asr_models.clear()
+                importlib.invalidate_caches()
+                try:
+                    return await asyncio.to_thread(self._transcribe_sherpa_sync, source, settings)
+                except Exception as retry_error:
+                    raise RuntimeError(
+                        f"普通话识别自动恢复后仍未完成。首次原因：{first_error}；再次原因：{retry_error}"
+                    ) from retry_error
 
-    async def speak(self, text: str, profile_id: str | None = None) -> dict[str, Any]:
+    async def speak(self, text: str, profile_id: str | None = None, purpose: str = "dialogue") -> dict[str, Any]:
         settings = Settings.from_env()
         if not settings.voice_enabled or not settings.voice_output_enabled:
-            raise ValueError("请先在设置中开启本地语音与朗读输出。")
+            raise ValueError("请先在设置中开启语音功能与朗读输出。")
         clean = str(text).strip()
         if not clean:
             raise ValueError("没有可朗读的文字。")
         if len(clean) > 4_000:
             raise ValueError("单条对话朗读最多 4000 字；更长内容请使用听读中心后台转换。")
+        if purpose not in {"dialogue", "text"}:
+            raise ValueError("不支持的朗读用途。")
+        engine = settings.voice_dialogue_engine if purpose == "dialogue" else settings.voice_text_engine
+        if engine == "off":
+            raise ValueError("请先在语音设置中选择此用途的朗读组件。")
         self._activate_optional_packages()
         if self._short_lock is None:
             self._short_lock = asyncio.Lock()
         if self._inference_lock is None:
             self._inference_lock = asyncio.Lock()
         async with self._short_lock:
-            output = self.short_cache_dir / f"speech-{uuid.uuid4().hex}.wav"
+            output = self.short_cache_dir / f"speech-{uuid.uuid4().hex}{'.mp3' if engine == 'edge' else '.wav'}"
             profile = self._profile(profile_id or settings.voice_default_profile)
             async with self._inference_lock:
-                await asyncio.to_thread(self._synthesize_sync, clean, profile, output, settings)
+                await self._render_audio(clean, profile, output, settings, engine)
             self._prune_short_cache(settings.voice_cache_limit_mb)
-        return {"audio_path": str(output), "profile": profile, "characters": len(clean)}
+        return {"audio_path": str(output), "profile": profile, "characters": len(clean), "engine": engine}
 
     def create_job(self, project_root: str | Path, params: dict[str, Any], emit: VoiceEventSink) -> dict[str, Any]:
         settings = Settings.from_env(project_root)
         if not settings.voice_enabled or not settings.voice_output_enabled:
-            raise ValueError("请先在设置中开启本地语音与朗读输出。")
+            raise ValueError("请先在设置中开启语音功能与朗读输出。")
         text = str(params.get("text") or "").strip()
         if not text:
             raise ValueError("没有可转换的正文或草稿。")
         if len(text) > 2_000_000:
             raise ValueError("单次后台转换最多 200 万字，请按卷或章节分批处理。")
+        project_key = _project_key(project_root)
+        source_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        role_map = self.get_role_map(project_root)
+        engine = settings.voice_text_engine if str(params.get("source_type") or "text") == "text" else settings.voice_novel_engine
+        if engine == "off":
+            raise ValueError("请先在语音设置中选择此用途的朗读组件。")
+        if engine == "edge" and not _package_available("edge_tts"):
+            raise RuntimeError("Edge 在线朗读组件尚未随当前程序安装。")
+        if engine == "moss" and not self._moss_status()["tts_ready"]:
+            raise RuntimeError("此用途选了 MOSS，但本地组件尚未就绪。")
+        config_hash = self._job_voice_config_hash(role_map, settings, engine)
+        matching = [
+            value for path in self.jobs_dir.glob("voice-*/job.json")
+            if (value := _read_json(path)).get("status") in {"queued", "running"}
+            and value.get("project_key") == project_key
+            and value.get("source_hash") == source_hash
+            and value.get("voice_config_hash") == config_hash
+        ]
+        if matching:
+            existing = max(matching, key=lambda value: (
+                value.get("status") == "running", int(value.get("completed_segments") or 0),
+            ))
+            return {**self._public_job(existing), "reused_existing": True}
         job_id = f"voice-{uuid.uuid4().hex}"
         folder = self.jobs_dir / job_id
         segments_dir = folder / "segments"
         segments_dir.mkdir(parents=True, exist_ok=False)
         source_path = folder / "source.txt"
         source_path.write_text(text, encoding="utf-8", newline="\n")
-        role_map = self.get_role_map(project_root)
         segments = self._split_segments(text, role_map, settings.voice_segment_chars)
         manifest = {
             "job_id": job_id,
-            "project_key": _project_key(project_root),
+            "project_key": project_key,
             "project_root": str(Path(project_root).resolve()),
             "source_name": str(params.get("source_name") or "未命名文本")[:120],
             "source_type": str(params.get("source_type") or "text")[:40],
             "source_path": str(source_path),
-            "source_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "source_hash": source_hash,
+            "voice_config_hash": config_hash,
+            "engine": engine,
             "status": "queued",
             "progress": 0,
             "completed_segments": 0,
@@ -1394,7 +1447,25 @@ class VoiceRuntime:
         }
         self._write_job(manifest)
         self._start_job(manifest, emit)
-        return self._public_job(manifest)
+        return {**self._public_job(manifest), "reused_existing": False}
+
+    def _job_voice_config_hash(self, role_map: dict[str, Any], settings: Settings, engine: str) -> str:
+        characters = role_map.get("characters") if isinstance(role_map.get("characters"), dict) else {}
+        profile_ids = {str(role_map.get("narrator_profile_id") or "narrator_female")}
+        profile_ids.update(str(value) for value in characters.values())
+        profiles = {str(profile["profile_id"]): profile for profile in self.list_profiles()}
+        profile_fields = ("kind", "speaker", "moss_voice", "reference_audio", "reference_text", "instruction", "speed", "volume")
+        config = {
+            "roles": {"narrator_profile_id": role_map.get("narrator_profile_id"), "characters": characters},
+            "profiles": {
+                profile_id: {field: profiles.get(profile_id, {}).get(field) for field in profile_fields}
+                for profile_id in profile_ids
+            },
+            "settings": {name: getattr(settings, name) for name in VOICE_JOB_CONFIG_SETTINGS},
+            "engine": engine,
+        }
+        encoded = json.dumps(config, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def list_jobs(self, project_root: str | Path) -> list[dict[str, Any]]:
         key = _project_key(project_root)
@@ -1459,34 +1530,42 @@ class VoiceRuntime:
                     return
                 value["status"] = "running"
                 value["updated_at"] = _now()
+                settings = Settings.from_env(value.get("project_root"))
+                segments = value.get("segments") if isinstance(value.get("segments"), list) else []
+                value["completed_segments"] = _completed_voice_segment_count(segments)
+                value["progress"] = round(value["completed_segments"] * 100 / max(1, len(segments)))
                 self._write_job(value)
                 await emit({"type": "voice.job.progress", "job": self._public_job(value), "summary": "后台听读转换已开始"})
-                settings = Settings.from_env(value.get("project_root"))
-                completed = int(value.get("completed_segments") or 0)
-                segments = value.get("segments") if isinstance(value.get("segments"), list) else []
+                if not value.get("engine"):
+                    raise RuntimeError("旧听读任务没有记录朗读引擎；已完成片段保留，请按当前语音设置新建转换任务。")
                 for index, segment in enumerate(segments):
                     latest = self._read_job(job_id)
                     if latest.get("status") in {"paused", "cancelled"}:
                         return
-                    if index < completed and segment.get("audio_path") and Path(str(segment["audio_path"])).is_file():
+                    if _voice_segment_output_ready(segment):
                         continue
-                    output = Path(str(value["output_dir"])) / f"{index + 1:05d}.wav"
+                    engine = str(value["engine"])
+                    output = Path(str(value["output_dir"])) / f"{index + 1:05d}{'.mp3' if engine == 'edge' else '.wav'}"
                     profile = self._profile(str(segment.get("profile_id") or value["role_map"]["narrator_profile_id"]))
                     async with self._inference_lock:
-                        await asyncio.to_thread(self._synthesize_sync, str(segment["text"]), profile, output, settings)
+                        await self._render_audio(str(segment["text"]), profile, output, settings, engine)
                     value = self._read_job(job_id)
                     segments = value.get("segments") if isinstance(value.get("segments"), list) else []
                     segment = segments[index]
                     segment["audio_path"] = str(output)
                     segment["status"] = "completed"
-                    value["completed_segments"] = index + 1
-                    value["progress"] = round((index + 1) * 100 / max(1, len(segments)))
+                    completed_segments = _completed_voice_segment_count(segments)
+                    value["completed_segments"] = completed_segments
+                    value["progress"] = round(completed_segments * 100 / max(1, len(segments)))
                     value["updated_at"] = _now()
                     self._write_job(value)
                     self._write_playlist(value)
                     if value.get("status") in {"paused", "cancelled"}:
                         return
                     await emit({"type": "voice.job.progress", "job": self._public_job(value), "summary": f"听读转换 {value['progress']}%"})
+                value = self._read_job(job_id)
+                segments = value.get("segments") if isinstance(value.get("segments"), list) else []
+                value["completed_segments"] = _completed_voice_segment_count(segments)
                 value["status"] = "completed"
                 value["progress"] = 100
                 value["updated_at"] = _now()
@@ -1501,12 +1580,28 @@ class VoiceRuntime:
             value = self._read_job(job_id)
             value["status"] = "failed"
             value["error"] = str(exc)[:500]
+            value["failure_stage"] = "inference"
+            value["recovery_attempted"] = True
+            value["suggested_action"] = "墨流已自动刷新模型并重试一次；请在语音设置查看组件状态与完整原因。"
             value["updated_at"] = _now()
             self._write_job(value)
             await emit({"type": "voice.job.failed", "job": self._public_job(value), "summary": value["error"]})
 
     def _split_segments(self, text: str, role_map: dict[str, Any], max_chars: int = 360) -> list[dict[str, Any]]:
-        chunks = [chunk.strip() for chunk in re.split(r"(?<=[\u3002\uff01\uff1f!\uff1b;])\s*|\n+", text) if chunk.strip()]
+        # Keep closing quotes attached to their sentence, then pack adjacent
+        # sentences that use the same voice up to the configured limit.  The
+        # previous one-sentence-per-file strategy turned a 3,700-character
+        # chapter into 205 model calls and even created standalone `”` clips.
+        chunks: list[str] = []
+        for paragraph in re.split(r"\n+", text):
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+            chunks.extend(
+                item.strip()
+                for item in re.findall(r".+?(?:[。！？；!?;]+[”’\"]?|$)", paragraph)
+                if item.strip()
+            )
         characters = role_map.get("characters") if isinstance(role_map.get("characters"), dict) else {}
         narrator = str(role_map.get("narrator_profile_id") or "narrator_female")
         result: list[dict[str, Any]] = []
@@ -1518,17 +1613,27 @@ class VoiceRuntime:
             for piece in subchunks:
                 speaker = self._speaker_for_segment(piece)
                 profile_id = str(characters.get(speaker) or narrator)
-                result.append(
-                    {
-                        "index": len(result) + 1,
-                        "text": piece,
-                        "speaker": speaker or "旁白",
-                        "profile_id": profile_id,
-                        "ambiguous": speaker is None and ("“" in piece or '"' in piece),
-                        "status": "pending",
-                        "audio_path": "",
-                    }
-                )
+                ambiguous = speaker is None and ("“" in piece or '"' in piece)
+                previous = result[-1] if result else None
+                if (
+                    previous
+                    and previous["profile_id"] == profile_id
+                    and len(str(previous["text"])) + len(piece) <= max_chars
+                ):
+                    previous["text"] = str(previous["text"]) + piece
+                    previous["ambiguous"] = bool(previous["ambiguous"] or ambiguous)
+                    if speaker and previous["speaker"] != speaker:
+                        previous["speaker"] = "多角色"
+                    continue
+                result.append({
+                    "index": len(result) + 1,
+                    "text": piece,
+                    "speaker": speaker or "旁白",
+                    "profile_id": profile_id,
+                    "ambiguous": ambiguous,
+                    "status": "pending",
+                    "audio_path": "",
+                })
         return result
 
     @staticmethod
@@ -1550,7 +1655,7 @@ class VoiceRuntime:
             raise RuntimeError("sherpa-onnx 或 soundfile 尚未安装。")
         model_path = self._sherpa_asr_model_path()
         if model_path is None:
-            raise RuntimeError("普通话识别模型尚未下载，请在设置中点击‘下载 Kokoro’。")
+            raise RuntimeError("普通话识别模型尚未下载，请在语音设置中安装本地识别组件。")
         import sherpa_onnx
         import soundfile as sf
 
@@ -1636,58 +1741,40 @@ class VoiceRuntime:
         except Exception:
             return {"duration_seconds": None, "channels": None, "sample_rate": None, "warnings": ["当前环境无法读取音频参数，将在首次克隆试听时确认质量。"]}
 
-    def _qwen_model_path(self, model_name: str) -> Path | None:
-        value = _read_json(self.qwen_models_path).get(model_name)
-        if not isinstance(value, str):
-            return None
-        folder = Path(value)
-        if not folder.is_dir() or not (folder / "config.json").is_file():
-            return None
-        return folder
-
-    def _prepare_models_sync(self, settings: Settings) -> None:
-        """Only an explicit install/prepare action may download Qwen weights."""
-        self._activate_optional_packages()
-        from huggingface_hub import snapshot_download
-
-        # Download both preset and clone models to disk without reserving GPU memory.
-        # The same confirmed preparation action can resume an interrupted download.
-        paths = _read_json(self.qwen_models_path)
-        for model_name in dict.fromkeys((settings.voice_tts_model, settings.voice_clone_model)):
-            local = Path(model_name).expanduser()
-            if local.is_dir():
-                folder = str(local.resolve())
-            else:
-                folder = snapshot_download(
-                    repo_id=model_name,
-                    cache_dir=str(self.qwen_model_cache_dir / "hub"),
-                )
-            paths[model_name] = folder
-            _atomic_json(self.qwen_models_path, paths)
-
-    def _synthesize_sync(self, text: str, profile: dict[str, Any], output: Path, settings: Settings) -> None:
-        self._activate_optional_packages()
-        moss = self._moss_status()
-        qwen = self._qwen_status()
-        use_clone = profile.get("kind") == "clone"
-        if use_clone or settings.voice_engine == "qwen":
-            backend = "qwen"
-        elif moss["tts_ready"]:
-            backend = "moss"
-        else:
-            raise RuntimeError("没有可用的朗读模型，请在设置中安装 MOSS 或 Qwen。")
-        if backend == "moss":
-            self._clear_loaded_qwen_if_needed()
-            self._synthesize_moss_sync(text, profile, output, settings)
+    async def _render_audio(self, text: str, profile: dict[str, Any], output: Path, settings: Settings, engine: str) -> None:
+        if engine == "moss":
+            if not self._moss_status()["tts_ready"]:
+                raise RuntimeError("当前用途选了 MOSS，但组件尚未就绪；请安装 MOSS 或更改该用途的选项。")
+            await asyncio.to_thread(self._synthesize_moss_sync, text, profile, output, settings)
             return
-        if not qwen["installed"]:
-            raise RuntimeError("当前选择了 Qwen，但 Qwen 依赖或模型尚未安装。")
-        self._synthesize_qwen_sync(text, profile, output, settings)
-
-    def _clear_loaded_qwen_if_needed(self) -> None:
-        if self._tts_models:
-            self._tts_models.clear()
-            gc.collect()
+        if engine != "edge":
+            raise ValueError("不支持的朗读引擎。")
+        if profile.get("kind") == "clone":
+            raise ValueError("Edge 在线朗读不支持声音克隆；请为此用途选择本地 MOSS。")
+        try:
+            import edge_tts
+        except ImportError as exc:
+            raise RuntimeError("Edge 在线朗读组件尚未安装。") from exc
+        voice = {
+            "narrator_female": "zh-CN-XiaoxiaoNeural",
+            "female_bright": "zh-CN-XiaoyiNeural",
+            "female_warm": "zh-CN-XiaohanNeural",
+            "narrator_male": "zh-CN-YunyangNeural",
+            "male_calm": "zh-CN-YunxiNeural",
+            "male_firm": "zh-CN-YunjianNeural",
+        }.get(str(profile.get("profile_id")), "zh-CN-YunxiNeural" if profile.get("gender") == "male" else "zh-CN-XiaoxiaoNeural")
+        temporary = output.with_name(f".{output.stem}-{uuid.uuid4().hex}.mp3")
+        try:
+            await edge_tts.Communicate(
+                text, voice,
+                rate=f"{round((settings.voice_speed - 1) * 100):+d}%",
+                volume=f"{round((settings.voice_volume - 1) * 100):+d}%",
+            ).save(str(temporary))
+            if not temporary.is_file() or temporary.stat().st_size == 0:
+                raise RuntimeError("在线语音没有返回音频。")
+            temporary.replace(output)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _moss_execution_provider(self, settings: Settings) -> str:
         if settings.voice_compute_device == "cpu":
@@ -1712,7 +1799,7 @@ class VoiceRuntime:
             import soundfile as sf
             from onnx_tts_runtime import OnnxTtsRuntime
         except (ImportError, ModuleNotFoundError) as exc:
-            raise RuntimeError("MOSS ONNX 运行库加载失败，请重新安装 MOSS 依赖。")
+            raise RuntimeError(f"MOSS ONNX 运行库加载失败：{type(exc).__name__}: {exc}") from exc
         provider = self._moss_execution_provider(settings)
         thread_count = min(8, max(2, (os.cpu_count() or 4) // 2))
         cache_key = f"moss:{self.moss_model_dir}:{provider}:{thread_count}:{settings.voice_debug}"
@@ -1792,72 +1879,11 @@ class VoiceRuntime:
         output.parent.mkdir(parents=True, exist_ok=True)
         sf.write(str(output), samples, sample_rate, subtype="PCM_16")
 
-    def _synthesize_qwen_sync(self, text: str, profile: dict[str, Any], output: Path, settings: Settings) -> None:
-        if not _package_available("qwen_tts") or not _package_available("soundfile"):
-            raise RuntimeError("尚未安装 Qwen3-TTS 本地语音输出组件。")
-        self.qwen_model_cache_dir.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("HF_HOME", str(self.qwen_model_cache_dir))
-        import numpy as np
-        import soundfile as sf
-        import torch
-        from qwen_tts import Qwen3TTSModel
-
-        device = self._resolve_device(settings, torch)
-        is_clone = profile.get("kind") == "clone"
-        model_name = settings.voice_clone_model if is_clone else settings.voice_tts_model
-        model_path = self._qwen_model_path(model_name)
-        if model_path is None:
-            raise RuntimeError("Qwen 模型未准备完成；请在设置中确认安装或重新准备模型。朗读不会自动下载。")
-        cache_key = f"{model_name}:{device}"
-        model = self._tts_models.get(cache_key)
-        if model is None:
-            self._tts_models.clear()
-            self._moss_tts_models.clear()
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
-            model = Qwen3TTSModel.from_pretrained(str(model_path), device_map=device, dtype=dtype, local_files_only=True)
-            self._tts_models[cache_key] = model
-        if is_clone:
-            wavs, sample_rate = model.generate_voice_clone(
-                text=text.strip(),
-                language="Chinese",
-                ref_audio=str(profile["reference_audio"]),
-                ref_text=str(profile["reference_text"]),
-            )
-        else:
-            wavs, sample_rate = model.generate_custom_voice(
-                text=text.strip(),
-                language="Chinese",
-                speaker=str(profile["speaker"]),
-                instruct=(
-                    str(profile.get("instruction") or "自然普通话。")
-                    + " 按中文标点自然换气，逗号短停，句末完整停顿，避免逐字播报。"
-                ),
-            )
-        audio = np.asarray(wavs[0], dtype=np.float32)
-        speed = _clamp_float(profile.get("speed", settings.voice_speed), 0.75, 1.35)
-        volume = _clamp_float(profile.get("volume", settings.voice_volume), 0.25, 1.5)
-        if abs(speed - 1.0) > 0.01 and audio.size > 1:
-            original = np.arange(audio.size)
-            target = np.linspace(0, audio.size - 1, max(1, int(audio.size / speed)))
-            audio = np.interp(target, original, audio).astype(np.float32)
-        audio = np.clip(audio * volume, -1.0, 1.0)
-        target_rate = int(settings.voice_sample_rate)
-        if target_rate != int(sample_rate) and audio.size > 1:
-            original = np.arange(audio.size)
-            target = np.linspace(0, audio.size - 1, max(1, int(audio.size * target_rate / sample_rate)))
-            audio = np.interp(target, original, audio).astype(np.float32)
-            sample_rate = target_rate
-        output.parent.mkdir(parents=True, exist_ok=True)
-        sf.write(str(output), audio, int(sample_rate))
-
     def _prune_short_cache(self, limit_mb: int) -> None:
         limit_bytes = max(128, int(limit_mb)) * 1024 * 1024
         files = []
         total = 0
-        for path in self.short_cache_dir.glob("*.wav"):
+        for path in (*self.short_cache_dir.glob("*.wav"), *self.short_cache_dir.glob("*.mp3")):
             try:
                 stat = path.stat()
                 files.append((stat.st_mtime, path, stat.st_size))
@@ -1872,18 +1898,6 @@ class VoiceRuntime:
                 total -= size
             except OSError:
                 continue
-
-    @staticmethod
-    def _resolve_device(settings: Settings, torch_module: Any | None = None) -> str:
-        requested = settings.voice_compute_device
-        if requested == "cpu":
-            return "cpu"
-        if torch_module is None and importlib.util.find_spec("torch") is not None:
-            import torch as torch_module
-        cuda_available = bool(torch_module and torch_module.cuda.is_available())
-        if requested == "cuda" and not cuda_available:
-            raise RuntimeError("设置选择了 NVIDIA CUDA，但当前语音环境没有检测到可用 CUDA。")
-        return "cuda:0" if cuda_available else "cpu"
 
     def _role_map_path(self, project_root: str | Path) -> Path:
         return self.projects_dir / _project_key(project_root) / "roles.json"

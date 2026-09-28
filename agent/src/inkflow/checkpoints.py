@@ -61,6 +61,13 @@ class CheckpointService:
                 file_records.append(
                     {"path": relative, "sha256": content_hash(raw), "size": len(raw)}
                 )
+            file_records.extend(
+                self._snapshot_missing_accepted_projections(
+                    database_path,
+                    temp_dir / "files",
+                    {item["path"] for item in file_records},
+                )
+            )
             database_raw = database_path.read_bytes()
             status = self.project.db.project_status()
             manifest = {
@@ -101,6 +108,41 @@ class CheckpointService:
                 shutil.rmtree(temp_dir)
             raise
 
+    def _snapshot_missing_accepted_projections(
+        self,
+        database_path: Path,
+        files_root: Path,
+        recorded_paths: set[str],
+    ) -> list[dict[str, Any]]:
+        """Make a new checkpoint complete even if a committed Markdown view is late."""
+
+        added: list[dict[str, Any]] = []
+        with closing(sqlite3.connect(f"file:{database_path.as_posix()}?mode=ro", uri=True)) as snapshot:
+            snapshot.row_factory = sqlite3.Row
+            try:
+                rows = snapshot.execute(
+                    "SELECT path, content_hash, content_text FROM chapters WHERE status='accepted'"
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such column: content_text" not in str(exc):
+                    raise
+                rows = []  # Legacy database: its accepted text exists only in Markdown.
+            for row in rows:
+                relative = self._validate_managed_relative(str(row["path"]))
+                if not relative.startswith("chapters/"):
+                    raise ProjectError(f"已接受章节的正文路径不在 chapters 目录：{relative}")
+                if relative in recorded_paths:
+                    continue
+                content = row["content_text"]
+                if content is None or content_hash(str(content)) != row["content_hash"]:
+                    raise ProjectError(f"检查点缺少 {relative}，数据库也没有可校验的正史正文。")
+                destination = files_root / Path(relative)
+                raw = str(content).encode("utf-8")
+                atomic_write_bytes(destination, raw)
+                added.append({"path": relative, "sha256": content_hash(raw), "size": len(raw)})
+                recorded_paths.add(relative)
+        return added
+
     def list(self, limit: int = 50) -> list[dict[str, Any]]:
         manifests: list[dict[str, Any]] = []
         for directory in self.root.iterdir():
@@ -136,6 +178,24 @@ class CheckpointService:
         target_records = {item["path"]: item for item in manifest["files"]}
         current_paths = set(current_records)
         target_paths = set(target_records)
+        reproject_from_database: list[str] = []
+        database_path = self.root / checkpoint_id / "inkflow.db"
+        # A checkpoint taken during acceptance can have the canonical SQLite
+        # chapter before its Markdown projection. Show that distinction in
+        # the preview instead of implying an accepted chapter will disappear.
+        with closing(sqlite3.connect(f"file:{database_path.as_posix()}?mode=ro", uri=True)) as snapshot:
+            snapshot.row_factory = sqlite3.Row
+            try:
+                accepted_rows = snapshot.execute(
+                    "SELECT path, content_hash, content_text FROM chapters "
+                    "WHERE status='accepted' AND content_text IS NOT NULL"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                accepted_rows = []  # A legacy snapshot may predate canonical text.
+            for row in accepted_rows:
+                relative = self._validate_managed_relative(str(row["path"]))
+                if relative not in target_paths and content_hash(str(row["content_text"])) == row["content_hash"]:
+                    reproject_from_database.append(relative)
         create_paths = sorted(target_paths - current_paths)
         remove_paths = sorted(current_paths - target_paths)
         overwrite_paths = sorted(
@@ -159,6 +219,7 @@ class CheckpointService:
                 "create": create_paths,
                 "overwrite": overwrite_paths,
                 "remove_to_recoverable_trash": remove_paths,
+                "reproject_from_database": sorted(reproject_from_database),
                 "unchanged": unchanged,
             },
             "confirmation_token": confirmation_token,
@@ -232,6 +293,12 @@ class CheckpointService:
                     raise ProjectError("恢复目标路径越界。")
                 atomic_write_bytes(target, source.read_bytes())
 
+            # Older acceptance checkpoints can contain canonical SQLite prose
+            # before the corresponding Markdown projection was finalized.
+            # Materialize and hash-check those accepted files now, rather than
+            # leaving the restored branch with a missing chapter until reopen.
+            projection_warnings = self.project.recover_accepted_chapter_projections()
+
             restored_status = self.project.db.project_status()
             # 只比较清单里记录过的字段：旧检查点由更早的引擎写入，
             # 缺少后来新增的状态字段不应被判定为“恢复失败”。
@@ -245,6 +312,24 @@ class CheckpointService:
                     f"恢复后数据库状态不一致：{mismatched}"
                     f"（清单记录 {manifest['status']}，实际 {restored_status}）"
                 )
+            # A checkpoint can have been taken while the final acceptance
+            # workflow was still marked running. If every chapter in that
+            # saved batch is already accepted in the restored database, it is
+            # a completed historical task, not a live task to resume later.
+            pending = self.project.db.get_metadata("pending_creation_task")
+            if isinstance(pending, dict) and pending.get("status") in {"running", "interrupted"}:
+                intent = pending.get("intent")
+                if isinstance(intent, dict) and intent.get("action") == "batch_draft_accept":
+                    start = intent.get("chapter_no")
+                    end = intent.get("end_chapter_no")
+                    if isinstance(start, int) and isinstance(end, int) and 0 < start <= end:
+                        accepted = self.project.db.accepted_chapter_numbers(start, end)
+                        if accepted == list(range(start, end + 1)):
+                            self.project.db.set_metadata("pending_creation_task", {
+                                **pending,
+                                "status": "completed",
+                                "recovery_note": "恢复检查点时发现该批次全部章节已在正史，已关闭过期续跑入口。",
+                            })
             branch_id = f"branch-{stamp}-{uuid.uuid4().hex[:6]}"
             self._write_current(checkpoint_id, branch_id, restored_from=safety["checkpoint_id"])
             self._append_history(
@@ -264,6 +349,7 @@ class CheckpointService:
                 "new_branch_id": branch_id,
                 "safety_checkpoint_id": safety["checkpoint_id"],
                 "recoverable_trash": str(trash_dir),
+                "projection_warnings": projection_warnings,
                 "project_status": restored_status,
                 "next_action": f"从第 {int(manifest['boundary_chapter']) + 1} 章重新生成",
             }

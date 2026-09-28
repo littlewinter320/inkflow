@@ -265,7 +265,7 @@ async def novel_batch_draft(
     max_revision_rounds: int = 2,
     project_root: str | None = None,
 ) -> dict[str, Any]:
-    """生成临时批次草稿；逐章即时审查，但不调用 Memory Keeper 或提交正史。"""
+    """生成临时批次草稿；逐章即时审查，但不调用 记忆服务 或提交正史。"""
 
     root = _root(project_root)
     return await _engine(root).draft_batch(
@@ -457,14 +457,15 @@ def novel_file_delete(
 
 
 @mcp.tool(annotations=RECOVERY_WRITE)
-def novel_process_powershell(
+async def novel_process_powershell(
     command: str,
     timeout_seconds: int = 60,
     project_root: str | None = None,
 ) -> dict[str, Any]:
-    """用户在设置中明确开启后，以小说项目为 cwd 执行 PowerShell。"""
+    """用户在设置中明确开启后，先请求桌面逐条确认，再以项目目录为起点执行 PowerShell。"""
 
-    return InkFlowProject(_root(project_root)).run_powershell(command, timeout_seconds)
+    project = InkFlowProject(_root(project_root))
+    return await anyio.to_thread.run_sync(project.run_powershell, command, timeout_seconds)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -534,7 +535,7 @@ def novel_document_search(
 
 @mcp.tool(annotations=READ_ONLY)
 def novel_story_bible(project_root: str | None = None) -> dict[str, Any]:
-    """读取人工故事圣经以及 Memory Keeper 已提交的事实与开放线索。"""
+    """读取人工故事圣经以及 记忆服务 已提交的事实与开放线索。"""
 
     project = InkFlowProject(_root(project_root))
     studio = StudioService(project)
@@ -568,7 +569,7 @@ def novel_collaboration_messages(
     limit: int = 50,
     project_root: str | None = None,
 ) -> dict[str, Any]:
-    """查看四个 Agent 之间带版本与证据的任务、交接、异议和记忆同步消息。"""
+    """查看参与角色与引擎服务之间的任务、交接和记忆同步记录。"""
 
     project = InkFlowProject(_root(project_root))
     return {"messages": project.db.list_collaboration_messages(chapter_no=chapter_no, active_only=active_only, limit=limit)}
@@ -597,7 +598,7 @@ def resource_plan() -> str:
 @mcp.resource(
     "inkflow://project/state",
     title="墨流正史状态",
-    description="Memory Keeper 从已验收正文提交的正史状态投影。",
+    description="记忆服务 从已验收正文提交的正史状态投影。",
     mime_type="text/markdown",
 )
 def resource_state() -> str:
