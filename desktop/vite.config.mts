@@ -7,6 +7,7 @@ export default defineConfig({
   // Stable by default during real writing; opt in for isolated frontend work.
   server: {
     strictPort: true,
+    port: Number(process.env.INKFLOW_DEV_PORT || 5173),
     hmr: process.env.INKFLOW_LIVE_RELOAD === "1",
     watch: process.env.INKFLOW_LIVE_RELOAD === "1" ? undefined : null,
   },

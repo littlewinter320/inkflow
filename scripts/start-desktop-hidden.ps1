@@ -13,17 +13,19 @@ $inkflowPrograms = [Environment]::GetFolderPath('Programs')
 $inkflowIcon = Join-Path $desktopRoot 'resources\icon.ico'
 $inkflowElectron = Join-Path $desktopRoot 'node_modules\electron\dist\electron.exe'
 $inkflowLaunchScript = Join-Path $PSScriptRoot 'start-desktop-hidden.ps1'
+$inkflowSilentLauncher = Join-Path $PSScriptRoot 'start-desktop-hidden.vbs'
+$inkflowWScript = Join-Path $env:SystemRoot 'System32\wscript.exe'
 $inkflowPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $inkflowShortcutPath = Join-Path $inkflowPrograms '墨流（本地开发）.lnk'
 if ((Test-Path -LiteralPath $inkflowPrograms) -and (Test-Path -LiteralPath $inkflowIcon)) {
     $inkflowShortcutShell = New-Object -ComObject WScript.Shell
     $inkflowShortcut = $inkflowShortcutShell.CreateShortcut($inkflowShortcutPath)
-    $inkflowShortcut.TargetPath = $inkflowPowerShell
-    $inkflowShortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$inkflowLaunchScript`""
+    $inkflowShortcut.TargetPath = $inkflowWScript
+    $inkflowShortcut.Arguments = "`"$inkflowSilentLauncher`""
     $inkflowShortcut.WorkingDirectory = $repositoryRoot
     $inkflowShortcut.IconLocation = "$inkflowIcon,0"
     $inkflowShortcut.Description = '墨流 · 墨宝小说工作台（本机开发版）'
-    $inkflowShortcut.WindowStyle = 7
+    $inkflowShortcut.WindowStyle = 1
     $inkflowShortcut.Save()
 
     $inkflowLegacyShortcutPath = Join-Path $inkflowPrograms 'Electron.lnk'
@@ -44,7 +46,7 @@ if ($UseDesktopShortcut) {
     $inkflowShortcutShell = New-Object -ComObject WScript.Shell
     if (Test-Path -LiteralPath $inkflowDesktopShortcutPath) {
         $existingShortcut = $inkflowShortcutShell.CreateShortcut($inkflowDesktopShortcutPath)
-        if (-not [string]::Equals($existingShortcut.TargetPath, $inkflowPowerShell, [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not [string]::Equals($existingShortcut.TargetPath, $inkflowWScript, [StringComparison]::OrdinalIgnoreCase)) {
             $inkflowShortcutBackup = Join-Path $logRoot 'shortcut-backup'
             New-Item -ItemType Directory -Force -Path $inkflowShortcutBackup | Out-Null
             $inkflowBackupPath = Join-Path $inkflowShortcutBackup ('墨流 InkFlow-before-local-' + [DateTime]::Now.ToString('yyyyMMdd-HHmmss-fff') + '.lnk')
@@ -53,12 +55,12 @@ if ($UseDesktopShortcut) {
         }
     }
     $desktopShortcut = $inkflowShortcutShell.CreateShortcut($inkflowDesktopShortcutPath)
-    $desktopShortcut.TargetPath = $inkflowPowerShell
-    $desktopShortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$inkflowLaunchScript`""
+    $desktopShortcut.TargetPath = $inkflowWScript
+    $desktopShortcut.Arguments = "`"$inkflowSilentLauncher`""
     $desktopShortcut.WorkingDirectory = $repositoryRoot
     $desktopShortcut.IconLocation = "$inkflowIcon,0"
     $desktopShortcut.Description = '墨流 · 墨宝小说工作台（本机开发版，跟随当前源码）'
-    $desktopShortcut.WindowStyle = 7
+    $desktopShortcut.WindowStyle = 1
     $desktopShortcut.Save()
     Write-Output "桌面墨流入口现指向本机开发版：$inkflowDesktopShortcutPath"
 }
@@ -70,6 +72,13 @@ if ($RegisterShortcutOnly) {
 
 # Reopening the taskbar entry while InkFlow is running only activates the
 # existing app through its single-instance handler, without another Vite server.
+$startupMutex = [Threading.Mutex]::new($false, 'Local\InkFlowDevStartup')
+$startupLockHeld = $false
+try {
+    try { $startupLockHeld = $startupMutex.WaitOne(0) }
+    catch [Threading.AbandonedMutexException] { $startupLockHeld = $true }
+    if (-not $startupLockHeld) { return }
+
 $inkflowRunning = Get-CimInstance Win32_Process -Filter "Name='electron.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.ExecutablePath -eq $inkflowElectron -and $_.CommandLine -notmatch '(?:^|\s)--type=' } |
     Select-Object -First 1
@@ -215,3 +224,7 @@ if (-not $ready) {
 }
 
 Write-Output "墨流开发版窗口已就绪（启动 PID $($process.Id)）。本次日志：$stdout；$stderr"
+} finally {
+    if ($startupLockHeld) { $startupMutex.ReleaseMutex() }
+    $startupMutex.Dispose()
+}

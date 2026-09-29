@@ -534,9 +534,9 @@ function applicationIconPath(): string {
 }
 
 function developmentLaunchDetails(): { target: string; args: string } {
-  const powershell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  const launcher = path.resolve(app.getAppPath(), "..", "scripts", "start-desktop-hidden.ps1");
-  return { target: powershell, args: `-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "${launcher}"` };
+  const wscript = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "wscript.exe");
+  const launcher = path.resolve(app.getAppPath(), "..", "scripts", "start-desktop-hidden.vbs");
+  return { target: wscript, args: `"${launcher}"` };
 }
 
 function applicationRelaunchCommand(): string {
