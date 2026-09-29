@@ -7,6 +7,9 @@ interface Window {
     request<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>;
     confirm(message: string): Promise<boolean>;
     chooseFolder(title: string): Promise<string | null>;
+    recentProjects(): Promise<Array<{ root: string; title: string; openedAt: string }>>;
+    rememberRecentProject(root: string, title: string): Promise<Array<{ root: string; title: string; openedAt: string }>>;
+    forgetRecentProject(root: string): Promise<Array<{ root: string; title: string; openedAt: string }>>;
     trashProject(root: string): Promise<{ root: string; recoverable: boolean }>;
     moveProject(root: string, targetParent: string): Promise<{ source: string; destination: string }>;
     chooseFile(title: string): Promise<string | null>;

@@ -382,7 +382,7 @@ function App() {
   const pendingChatRef = useRef<string[]>([]);
   const cancelRequestedRef = useRef(false);
   const [mascotMood, setMascotMood] = useState<MascotMood>("idle");
-  const [recentProjects, setRecentProjects] = useState<RecentProject[]>(loadRecentProjects);
+  const [recentProjects, setRecentProjects] = useState<RecentProject[]>([]);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [projectOpenFailure, setProjectOpenFailure] = useState<{ root: string; message: string } | null>(null);
@@ -453,6 +453,27 @@ function App() {
 
   useEffect(() => { activeRunIdRef.current = activeRunId; }, [activeRunId]);
   useEffect(() => { projectRootRef.current = projectRoot; }, [projectRoot]);
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      let saved = await window.inkflow.recentProjects();
+      if (!active) return;
+      const migrationKey = "inkflow.recentProjectsMigrated.v1";
+      let migrated = false;
+      try { migrated = localStorage.getItem(migrationKey) === "1"; } catch { /* Native list still works. */ }
+      if (!saved.length && !migrated) {
+        // Earlier builds kept this list in the page origin, which changes
+        // with the random development port. Import entries still visible here.
+        for (const item of loadRecentProjects().reverse()) {
+          if (!active) return;
+          try { saved = await window.inkflow.rememberRecentProject(item.root, item.title); } catch { /* Moved or deleted project. */ }
+        }
+      }
+      try { localStorage.setItem(migrationKey, "1"); } catch { /* Native list still works. */ }
+      if (active && !projectRootRef.current) setRecentProjects(saved);
+    })().catch(() => undefined);
+    return () => { active = false; };
+  }, []);
   useEffect(() => {
     if (!busy) { setCancelReady(false); return; }
     const timer = window.setTimeout(() => setCancelReady(true), 1200);
@@ -747,9 +768,14 @@ function App() {
       setReferenceDocument(null);
       contextSnapshotRef.current = null;
       setActiveTab("project");
-      localStorage.setItem("inkflow.lastProject", root);
       const projectTitle = String(opened.dashboard.brief.title || "未命名小说");
-      setRecentProjects((items) => rememberRecentProject(items, root, projectTitle));
+      let recentProjectWarning = "";
+      try {
+        setRecentProjects(await window.inkflow.rememberRecentProject(root, projectTitle));
+      } catch (cause) {
+        setRecentProjects((items) => rememberRecentProject(items, root, projectTitle));
+        recentProjectWarning = `最近项目记录未保存：${cause instanceof Error ? cause.message : String(cause)}`;
+      }
       const historyEntries = historyResult.status === "fulfilled" ? historyResult.value.entries : [];
       setConversationHistory(historyEntries);
       const restoredMessages = historyEntries.flatMap<Message>((entry) => [
@@ -764,6 +790,7 @@ function App() {
         ...(opened.dashboard.recovery_warnings || []),
         ...(historyResult.status === "rejected" ? [`对话历史：${errorMessage(historyResult.reason)}`] : []),
         ...(overviewResult.status === "rejected" ? [`协作面板：${errorMessage(overviewResult.reason)}`] : []),
+        ...(recentProjectWarning ? [recentProjectWarning] : []),
       ];
       if (panelWarnings.length) setNotice(`小说已打开，以下项目需要核对；墨流没有自动覆盖不一致的文件。\n${panelWarnings.join("\n")}`);
       setMascotMood("success");
@@ -774,7 +801,6 @@ function App() {
       setProjectOpenFailure({ root, message });
       setMascotMood("rest");
       if (optimistic) { setProjectRoot(""); projectRootRef.current = ""; }
-      localStorage.removeItem("inkflow.lastProject");
     } finally {
       if (requestId === projectOpenRequestRef.current) setProjectLoading(false);
     }
@@ -782,6 +808,7 @@ function App() {
 
   const forgetRecentProject = (root: string) => {
     setRecentProjects((items) => removeRecentProject(items, root));
+    void window.inkflow.forgetRecentProject(root).then(setRecentProjects).catch((cause) => setError(`最近项目记录未移除：${cause instanceof Error ? cause.message : String(cause)}`));
   };
 
   const trashRecentProject = async (project: RecentProject) => {
@@ -792,7 +819,6 @@ function App() {
     try {
       await window.inkflow.trashProject(project.root);
       forgetRecentProject(project.root);
-      if (localStorage.getItem("inkflow.lastProject")?.toLocaleLowerCase() === project.root.toLocaleLowerCase()) localStorage.removeItem("inkflow.lastProject");
       setNotice(`已将“${project.title}”移入系统回收站。`);
     } catch (cause) {
       setError(errorMessage(cause));
@@ -810,8 +836,7 @@ function App() {
     setProjectLoading(true);
     try {
       const result = await window.inkflow.moveProject(project.root, targetParent);
-      setRecentProjects((items) => rememberRecentProject(items, result.destination, project.title));
-      if (localStorage.getItem("inkflow.lastProject")?.toLocaleLowerCase() === project.root.toLocaleLowerCase()) localStorage.setItem("inkflow.lastProject", result.destination);
+      setRecentProjects(await window.inkflow.recentProjects());
       setNotice(`项目已转移到 ${result.destination}`);
     } catch (cause) {
       setError(errorMessage(cause));
@@ -3566,18 +3591,14 @@ function loadRecentProjects(): RecentProject[] {
 }
 
 function rememberRecentProject(items: RecentProject[], root: string, title: string): RecentProject[] {
-  const next = [
+  return [
     { root, title, openedAt: new Date().toISOString() },
     ...items.filter((item) => item.root.toLocaleLowerCase() !== root.toLocaleLowerCase()),
   ].slice(0, 5);
-  localStorage.setItem("inkflow.recentProjects.v1", JSON.stringify(next));
-  return next;
 }
 
 function removeRecentProject(items: RecentProject[], root: string): RecentProject[] {
-  const next = items.filter((item) => item.root.toLocaleLowerCase() !== root.toLocaleLowerCase());
-  localStorage.setItem("inkflow.recentProjects.v1", JSON.stringify(next));
-  return next;
+  return items.filter((item) => item.root.toLocaleLowerCase() !== root.toLocaleLowerCase());
 }
 
 export default App;

@@ -64,6 +64,51 @@ function pathContains(parent: string, child: string): boolean {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
+type RecentProject = { root: string; title: string; openedAt: string };
+
+function recentProjectsFile(): string {
+  return path.join(app.getPath("userData"), "recent-projects.json");
+}
+
+function recentProjects(): RecentProject[] {
+  try {
+    const saved: unknown = JSON.parse(readFileSync(recentProjectsFile(), "utf8"));
+    if (!Array.isArray(saved)) return [];
+    return saved.filter((item): item is RecentProject =>
+      item && typeof item.root === "string" && path.isAbsolute(item.root)
+      && typeof item.title === "string" && typeof item.openedAt === "string",
+    ).slice(0, 5);
+  } catch {
+    return [];
+  }
+}
+
+function saveRecentProjects(items: RecentProject[]): RecentProject[] {
+  const file = recentProjectsFile();
+  mkdirSync(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, JSON.stringify(items.slice(0, 5)), "utf8");
+  renameSync(temporary, file);
+  return items.slice(0, 5);
+}
+
+function sameProjectRoot(left: string, right: string): boolean {
+  return path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase();
+}
+
+function rememberRecentProject(rootValue: string, titleValue: string): RecentProject[] {
+  const root = resolveInkFlowProject(rootValue);
+  const title = String(titleValue || "未命名小说").trim().slice(0, 160) || "未命名小说";
+  return saveRecentProjects([
+    { root, title, openedAt: new Date().toISOString() },
+    ...recentProjects().filter((item) => !sameProjectRoot(item.root, root)),
+  ]);
+}
+
+function forgetRecentProject(root: string): RecentProject[] {
+  return saveRecentProjects(recentProjects().filter((item) => !sameProjectRoot(item.root, root)));
+}
+
 class UpdateManager {
   private updater: AppUpdater | null = null;
   private state: UpdateState;
@@ -793,9 +838,13 @@ function createWindow(): void {
     });
     return result.canceled ? null : result.filePaths[0];
   });
+  ipcMain.handle("project:recent-list", () => recentProjects());
+  ipcMain.handle("project:recent-remember", (_event, root: string, title: string) => rememberRecentProject(root, title));
+  ipcMain.handle("project:recent-forget", (_event, root: string) => forgetRecentProject(root));
   ipcMain.handle("project:trash", async (_event, rootValue: string) => {
     const root = resolveInkFlowProject(rootValue);
     await shell.trashItem(root);
+    try { forgetRecentProject(root); } catch { logLifecycle("recent-projects.write.failed", { action: "trash" }); }
     return { root, recoverable: true };
   });
   ipcMain.handle("project:move", async (_event, rootValue: string, targetParentValue: string) => {
@@ -813,6 +862,14 @@ function createWindow(): void {
       cpSync(source, destination, { recursive: true, errorOnExist: true, force: false });
       rmSync(source, { recursive: true, force: true });
     }
+    try {
+      const current = recentProjects();
+      const entry = current.find((item) => sameProjectRoot(item.root, source));
+      saveRecentProjects([
+        { root: destination, title: entry?.title || path.basename(destination), openedAt: new Date().toISOString() },
+        ...current.filter((item) => !sameProjectRoot(item.root, source) && !sameProjectRoot(item.root, destination)),
+      ]);
+    } catch { logLifecycle("recent-projects.write.failed", { action: "move" }); }
     return { source, destination };
   });
   ipcMain.handle("dialog:choose-file", async (_event, title: string) => {

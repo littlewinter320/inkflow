@@ -209,7 +209,7 @@ flowchart LR
 
 墨流桌面架构可以用一句话概括：界面负责表达作者意图和显示可编辑结果，应用服务把操作变成受控任务，Python 引擎执行创作和校验，SQLite 保存权威状态，Markdown 为作者提供可读文件。这几层各有自己的失败形式，不能把一次界面报错笼统归为“模型失败”。例如用户点“继续写”，界面可能没有正确传递项目路径；服务可能在路由时认为范围不清；引擎可能发现缺章节卡；Provider 可能限流；模型可能交回不符合结构的内容；数据库可能拒绝过期版本。只有沿实际链路定位，才能避免重复调用昂贵的 Writer。总体设计关系见[架构文档的组件图](#inkflow-02)，可运行代码的入口见[应用服务](../agent/src/inkflow/app_server.py)。
 
-桌面侧使用 Electron 容纳 React 与 TypeScript 界面。[桌面主界面](../desktop/src/App.tsx)呈现项目、对话、编辑与任务进度；Electron 进程负责启动和连接后台。Python 侧的 [JsonLineServer](../agent/src/inkflow/app_server.py)读入逐行 JSON 请求，按请求 ID 和运行 ID 分派；[process](../agent/src/inkflow/app_server.py)负责处理异步任务及结果事件。这里的“异步”意味着独立请求可以建立不同执行任务，不保证所有写入没有冲突。共享章节、正史指针或文件投影仍要靠版本检查和短暂写锁协调。界面响应与后台流程分离后，作者可以看到阶段信息，也可能中途补充指令；因此任务记录必须保留原话和新增指导究竟作用于哪个节点。
+桌面侧使用 Electron 容纳 React 与 TypeScript 界面。[桌面主界面](../desktop/src/App.tsx)呈现项目、对话、编辑与任务进度；Electron 进程负责启动和连接后台。首页的“最近打开”只记录成功打开过的项目标题、路径和时间，写到 Electron 固定的 `userData/recent-projects.json`，因此开发版 Vite 端口变化不会让列表消失；旧网页域里可见的记录会尝试迁入，项目正文仍留在原文件夹。“移除记录”只移除快捷入口，删除项目文件另走确认及系统回收站。Python 侧的 [JsonLineServer](../agent/src/inkflow/app_server.py)读入逐行 JSON 请求，按请求 ID 和运行 ID 分派；[process](../agent/src/inkflow/app_server.py)负责处理异步任务及结果事件。这里的“异步”意味着独立请求可以建立不同执行任务，不保证所有写入没有冲突。共享章节、正史指针或文件投影仍要靠版本检查和短暂写锁协调。界面响应与后台流程分离后，作者可以看到阶段信息，也可能中途补充指令；因此任务记录必须保留原话和新增指导究竟作用于哪个节点。
 
 进入创作域后，自然语言会话由 [TerminalSession.handle](../agent/src/inkflow/terminal_session.py)判断可确定的只读回应、直接任务与需要模型理解的表达；桌面明确触发的 `workflow.run` 则由应用服务构造意图并编译计划，不能一概画成先经过 TerminalSession。[直接工作流入口](../agent/src/inkflow/app_server.py)与[Coordinator.validate](../agent/src/inkflow/coordinator.py)分别承担入口组装和白名单模板比对。引擎服务并不听任模型自由调用任意方法：任务要带来源范围、角色模式、依赖条件和授权状态。这样做的实际价值是在“我想改一下后面十章”一类表达中，把规划、正文和设定编辑拆开，先检查已接受章节的边界，再决定能运行哪些步骤。若说“先别写”，模型产生写作意愿也不能越过当前授权。
 
