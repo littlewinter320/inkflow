@@ -9,6 +9,16 @@ from .role_protocol import CollaborationMode, check_owners_for_mode, normalize_r
 from .schemas import BookBrief, DispatchPlan, DispatchStep, RoleCapability, TaskTicket, TerminalIntent
 
 
+NO_ACCEPTANCE_PATTERN = re.compile(
+    r"(?:只|仅)(?:要|做|生成|给我看)?(?:草稿|审查|初稿)|"
+    r"(?:不要|暂不|暂时不|暂时别|先别|别|先不|不必|无需|不能|不可)"
+    r"(?:再|先|自动|直接|立即|马上|现在|擅自|默认|替我|帮我)*"
+    r"(?:验收|接收|接受|入正史|进入正史|写入正史|写进正史|提交正史|收进正史|收进正文|收进去|定稿|收(?=[，,。！？；\s]|$))|"
+    r"草稿(?:即可|就好|先看)|"
+    r"(?:我想|让我|我)先(?:看|看看|过目)(?:一下)?|先给我看"
+)
+
+
 ROLE_CAPABILITIES: tuple[RoleCapability, ...] = (
     RoleCapability(
         role="coordinator",
@@ -57,6 +67,9 @@ _WORKFLOWS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
     "help": (("engine", "help.read", "", "使用说明"),),
     "plan": (("writer", "plan.generate", "", "四级规划"),),
     "plan_preview": (("engine", "plan.preview", "", "规划预览"),),
+    "planning_history_view": (("engine", "planning.history.read", "", "按用户指令查看旧版"),),
+    "planning_history_restore": (("engine", "planning.history.restore", "", "恢复为新生效版本"),),
+    "planning_publish_reviewed": (("engine", "planning.reviewed.publish", "", "按用户确认发布审核通过的规划"),),
     "outline": (("writer", "plan.outline", "", "独立章节大纲"),),
     "redesign_story": (
         ("writer", "planning.book_outline", "", "全书大纲候选"),
@@ -161,12 +174,12 @@ class Coordinator:
             r"(?:有|发现|如果|若).{0,10}(?:问题|错误|不通过|没过).{0,8}(?:改|修)", text
         ) and re.search(r"审|检查|核对", text):
             action = "review_accept" if action.endswith("_accept") else "revise_review"
-        no_accept = re.search(r"(?:别|不要|先不|不必|无需).{0,8}(?:接收|接受|验收|入正史|进入正史|收进正史|收进正文|收进去|定稿)", text)
-        no_review = re.search(r"(?:别|不要|先不|不必|无需).{0,8}(?:审查|审核|复审)", text)
+        no_accept = NO_ACCEPTANCE_PATTERN.search(text)
+        no_review = re.search(r"(?:别|不要|先不|暂不|暂时不|暂时别|不必|无需).{0,8}(?:审查|审核|复审)", text)
         # Negation must govern the writing task itself. "别把丢失的原件写回来"
         # constrains story content; it does not mean "别写这一章".
         no_write = re.search(
-            r"(?:别|不要|先不|不必|无需|暂不)(?:现在|先|自动)?(?:写|起草|生成)"
+            r"(?:别|不要|先不|不必|无需|暂不|暂时不|暂时别)(?:现在|先|自动)?(?:写|起草|生成)"
             r"(?:第\s*\d+\s*章|正文|章节|草稿|新章)?(?=[，,。！？\s]|$)",
             text,
         )
@@ -202,7 +215,13 @@ class Coordinator:
             updates["edit_scope"] = "selection"
             updates["narrative_scope"] = "none"
             updates["preserve_constraints"] = list(dict.fromkeys([*intent.preserve_constraints, "保留未选中的原文与剧情"]))
-        if (discuss_first or (no_write and action in {"write_draft", "write_review", "write_review_accept", "scene_draft"})):
+        if no_write and not discuss_first and action in {"write_draft", "write_review", "write_review_accept", "scene_draft"} and re.search(
+            r"(?:先|请|只)?(?:审|审查|审核|复审|核对)\s*第\s*\d+\s*章", text
+        ):
+            forbidden.append("write")
+            action = "review"
+            updates["narrative_scope"] = "chapter"
+        elif discuss_first or (no_write and action in {"write_draft", "write_review", "write_review_accept", "scene_draft"}):
             forbidden.append("write")
             action = "discuss"
             updates["authorization"] = "none"
@@ -445,11 +464,13 @@ class Coordinator:
             sources.extend([f"chapter:{intent.chapter_no:05d}", f"review:{intent.chapter_no:05d}"])
         if intent.batch_id:
             sources.append(f"batch:{intent.batch_id}")
+        if intent.planning_revision_no is not None:
+            sources.append(f"planning_history:revision:{intent.planning_revision_no}:{intent.planning_part}")
         return sources
 
     @staticmethod
     def _model_call_budget(intent: TerminalIntent, chapter_count: int) -> int:
-        if intent.action in {"status", "help", "plan_preview", "checkpoint_list", "rollback_preview", "exit"}:
+        if intent.action in {"status", "help", "plan_preview", "planning_history_view", "planning_history_restore", "planning_publish_reviewed", "checkpoint_list", "rollback_preview", "exit"}:
             return 0
         if intent.action in {"discuss", "chat"}:
             return 1

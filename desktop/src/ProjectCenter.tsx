@@ -12,6 +12,7 @@ type DashboardLike = {
   };
   accepted_characters: number;
   planning_impact?: { changed_sources: string[]; affected: string[]; accepted_chapters_preserved: number; next_step: string };
+  pending_planning_publication?: { run_id: string; anchor: number; end: number } | null;
   quality_hold?: { chapter_no: number; source_hash: string; stage?: "legacy_review" | "repair_confirmation"; reason: string; detail?: string; first_evidence: string; second_evidence: string } | null;
 };
 
@@ -81,7 +82,8 @@ type ProjectTreeItemLike = {
 };
 
 type PlanningCleanupPreview = {
-  candidates: Array<{ path: string; content_hash: string; reason: string; blocked: string; action: string }>;
+  candidates: Array<{ path: string; content_hash: string; reason: string; blocked: string; action: string; revision_id: string }>;
+  revisions: Array<{ run_id: string; revision_no: number; status: string; created_at: string; paths: string[] }>;
   confirmation_token: string;
   impact: string;
 };
@@ -121,6 +123,7 @@ export function ProjectCenter({
   const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
   const [pendingRecovery, setPendingRecovery] = useState<PendingRecovery | null>(null);
   const [planningPublication, setPlanningPublication] = useState<"checking" | "active" | "changed" | "unknown">("checking");
+  const [planningRevisionNo, setPlanningRevisionNo] = useState<number | null>(null);
   const [planningCleanup, setPlanningCleanup] = useState<PlanningCleanupPreview | null>(null);
   const [trashItems, setTrashItems] = useState<TrashItem[] | null>(null);
   const [preview, setPreview] = useState<RollbackPreview | null>(null);
@@ -342,7 +345,7 @@ export function ProjectCenter({
   const deletePlanningCandidates = async (paths: string[]) => {
     if (!planningCleanup || paths.length === 0) return;
     const confirmed = await window.inkflow.confirm(
-      `确认永久删除以下 ${paths.length} 个旧大纲候选文件吗？\n\n${paths.join("\n")}\n\n${planningCleanup.impact}\n\n此操作不会修改生效规划或正文，但被删除的候选无法在软件中恢复。`,
+      `确认永久删除以下 ${paths.length} 个旧版规划文件吗？\n\n${paths.join("\n")}\n\n${planningCleanup.impact}\n\n删除后无法用这些旧版内容恢复、参考或融合。`,
     );
     if (!confirmed) return;
     setWorking(true);
@@ -359,10 +362,27 @@ export function ProjectCenter({
     finally { setWorking(false); }
   };
 
+  const keepPlanningRevision = async (revisionId: string) => {
+    if (!planningCleanup) return;
+    setWorking(true);
+    try {
+      const result = await request<{ next_action: string }>("planning.cleanup.keep", {
+        confirmation_token: planningCleanup.confirmation_token, revision_id: revisionId,
+      });
+      setPlanningCleanup(await request<PlanningCleanupPreview>("planning.cleanup.preview"));
+      onNotice(result.next_action);
+    } catch (cause) { onError(errorMessage(cause)); }
+    finally { setWorking(false); }
+  };
+
   const chapterStatus = dashboard?.status.chapters || {};
   const currentWorkspace = workspace as ChapterWorkspaceLike | null;
   const documentItems = tree?.items || [];
   const hasRecentPlan = documentItems.some((item) => item.relative_path === "RECENT_PLAN.md");
+  useEffect(() => {
+    if (planningPublication !== "active") return;
+    void request<PlanningCleanupPreview>("planning.cleanup.preview").then(setPlanningCleanup).catch(() => undefined);
+  }, [planningPublication, request]);
   useEffect(() => {
     if (!hasRecentPlan || !dashboard?.root) return;
     let cancelled = false;
@@ -375,6 +395,7 @@ export function ProjectCenter({
     ]).then(([manifestDocument, outline, detail, recent]) => {
       if (cancelled) return;
       const manifest = JSON.parse(manifestDocument.content) as Record<string, unknown>;
+      setPlanningRevisionNo(typeof manifest.revision_no === "number" ? manifest.revision_no : 1);
       setPlanningPublication(manifest.protocol_version === 2 && manifest.status === "active"
         && manifest.outline_hash === outline.content_hash
         && manifest.volume_detail_hash === detail.content_hash
@@ -456,13 +477,14 @@ export function ProjectCenter({
 
       <section className="project-section plan-overview">
         <div className="project-section-title"><div><h3>故事依据</h3><p>先定方向，再安排近期章节；任何一层都能单独修改。</p></div>{nextFoundation && <button onClick={() => onPrompt(foundationPrompt)}>继续：{nextFoundation.label}</button>}</div>
+        {dashboard?.pending_planning_publication && <div className="planning-impact"><strong>新版三层规划已审核通过，等待你确认</strong><p>候选范围：第 {dashboard.pending_planning_publication.anchor + 1}～{dashboard.pending_planning_publication.end} 章；候选编号：{dashboard.pending_planning_publication.run_id}。当前正式版及其编号尚未改变。</p><button onClick={() => onPrompt(`确认采用候选 ${dashboard.pending_planning_publication?.run_id} 的三层规划，正式发布新版。`)}>把确认指令放入对话框</button></div>}
         <div className="foundation-flow" aria-label="故事资料层级">{foundation.map((item) => {
           const documentItem = documentItems.find((doc) => doc.relative_path === item.path);
           return <button key={item.path} type="button" disabled={!documentItem} className={documentItem ? "ready" : "missing"} onClick={() => documentItem && onOpen(documentItem)}><strong>{item.label}</strong><small>{documentItem ? item.note : "待建立"}</small></button>;
         })}</div>
         {!hasRecentPlan && !!dashboard?.planning_impact?.affected.length && <div className="planning-impact"><strong>依据已有变化</strong><p>{dashboard.planning_impact.affected.join("；")}。{dashboard.planning_impact.next_step}</p><button onClick={() => onPrompt("大纲或设定改过了，请先核对细纲与还没写的章节安排，指出影响范围；保留已接受的正文。")}>让墨流核对未来安排</button></div>}
-        {hasRecentPlan && <div className={`current-planning-note ${planningPublication}`}><strong>{planningPublication === "active" ? "三层规划已生效" : planningPublication === "changed" ? "规划文档与生效记录不一致" : planningPublication === "unknown" ? "规划文档已存在，生效状态待核对" : "正在核对规划状态"}</strong><p>点击上方卡片查看大纲、卷细纲与近期章节规划。已有正文仍以正史为准；旧版数据库章节卡只作历史参考。</p></div>}
-        {planningPublication === "active" && <details className="project-disclosure"><summary>删除旧规划候选</summary><p>只列出旧大纲候选；实际删除前逐项核对路径、引用和影响，再明确确认。生效规划与正文不在删除范围。</p><button disabled={working} onClick={() => void previewPlanningCleanup()}>查看候选和影响</button>{planningCleanup && <div className="planning-cleanup-list"><p>{planningCleanup.impact}</p>{planningCleanup.candidates.length === 0 && <p>目前没有待删除候选。</p>}{planningCleanup.candidates.some((item) => !item.blocked) && <button disabled={working} onClick={() => void deletePlanningCandidates(planningCleanup.candidates.filter((item) => !item.blocked).map((item) => item.path))}>删除全部可删除项（{planningCleanup.candidates.filter((item) => !item.blocked).length}）</button>}{planningCleanup.candidates.map((item) => <article key={item.path}><code>{item.path}</code><p>{item.blocked || item.reason}</p><button disabled={working || !!item.blocked} onClick={() => void deletePlanningCandidates([item.path])}>{item.blocked ? "不可删除" : "删除这个文件"}</button></article>)}</div>}</details>}
+        {hasRecentPlan && <div className={`current-planning-note ${planningPublication}`}><strong>{planningPublication === "active" ? `三层规划第 ${planningRevisionNo || 1} 版已生效` : planningPublication === "changed" ? "规划文档与生效记录不一致" : planningPublication === "unknown" ? "规划文档已存在，生效状态待核对" : "正在核对规划状态"}</strong><p>点击上方卡片查看当前大纲、卷细纲与近期章节规划。已接受正文仍以正史为准；旧版未来章节卡已退出当前数据库规划。</p></div>}
+        {planningPublication === "active" && <details className="project-disclosure" open={!!planningCleanup?.revisions.some((item) => item.status === "pending")}><summary>旧版规划处置{planningCleanup?.revisions.some((item) => item.status === "pending") ? " · 等待你的选择" : ""}</summary><p>每次规划修订都会形成独立版本。新版按发布设置完成审核及必要确认后生效；旧版不会自动进入写作依据。请选择保留历史，或逐项确认后删除。正史所需的恢复依赖不可删除。</p><button disabled={working} onClick={() => void previewPlanningCleanup()}>刷新旧版和引用检查</button>{planningCleanup && <div className="planning-cleanup-list"><p>{planningCleanup.impact}</p>{planningCleanup.revisions.filter((item) => item.status === "pending").map((item) => <article key={item.run_id}><strong>{item.revision_no ? `第 ${item.revision_no} 版` : "迁移前旧版"} · {item.created_at}</strong><p>{item.paths.join("；")}</p><button disabled={working} onClick={() => void keepPlanningRevision(item.run_id)}>保留到历史，不再作为写作依据</button></article>)}{planningCleanup.candidates.length === 0 && <p>目前没有待处理的旧版文件。</p>}{planningCleanup.candidates.map((item) => <article key={item.path}><code>{item.path}</code><p>{item.blocked || item.reason}</p><button disabled={working || !!item.blocked} onClick={() => void deletePlanningCandidates([item.path])}>{item.blocked ? "有依赖，不能删除" : "确认删除此文件"}</button></article>)}</div>}</details>}
         {!hasRecentPlan && !currentPlan && <div className="plan-empty"><strong>还没有近期章节规划</strong><p>先确定大纲与细纲，再安排接下来的章节。</p></div>}
         {currentPlan && <>
           <p className="legacy-plan-note">以下卷、篇章及章节卡来自旧版规划记录，仅供核对。当前三层规划完成后，请查看上方文档。</p>

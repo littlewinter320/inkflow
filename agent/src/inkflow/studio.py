@@ -1183,6 +1183,10 @@ class StudioService:
             "accepted_characters": total_characters,
             "quality_hold": self.project.latest_accepted_quality_hold(),
             "planning_impact": self.project.db.planning_source_impact(),
+            "pending_planning_publication": {
+                key: pending.get(key) for key in ("run_id", "anchor", "end")
+            } if isinstance((pending := self.project.db.get_metadata("pending_planning_publication", {})), dict)
+            and pending.get("run_id") else None,
         }
 
     def tree(self) -> dict[str, Any]:
@@ -1512,7 +1516,7 @@ class StudioService:
                 and review["matches_current_version"]
                 and review["report"].get("verdict") == "pass"
             ),
-            "active_preferences": self.project.db.list_preferences(),
+            "active_preferences": self.project.db.effective_preferences(),
             "scene_notes": self.db.scene_notes(chapter_no),
             "inherited_facts": self.project.db.current_facts(),
             "open_threads": self.project.db.open_threads(),

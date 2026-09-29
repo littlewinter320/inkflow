@@ -26,6 +26,7 @@ from .project import InkFlowProject
 from .project_lock import project_lock_wait_policy, project_write_lock, project_write_lock_sync
 from .provider import create_provider
 from .references import ReferenceService
+from .role_protocol import normalize_role
 from .schemas import BookBrief, CollaborationReply, ContextPacket, ContextSection, MemoryPatch, NovelIdeaBundle, NovelIdeaCandidate, PrefillSuggestion, PromptOptimization, ProviderProbe, ReviewReport, SuggestedPrompt, TerminalIntent, WriterDirectionSet
 from .review_verifier import verify_review
 from .studio import StudioDatabase, StudioService, chapter_retry_state, text_statistics
@@ -33,7 +34,7 @@ from .terminal_session import TerminalSession
 from .trace import TraceRecorder, recent_trace_runs
 from .runtime import RunRuntime, active_runtime
 from .model_usage import UsageLedger, ValidationQuotaExceeded
-from .planning_cleanup import cleanup_apply, cleanup_preview
+from .planning_cleanup import cleanup_apply, cleanup_keep, cleanup_preview
 from .task_settings import active_task_settings
 from .utils import content_hash, estimate_tokens, project_source_revision, workflow_failure_reason, workflow_result_status
 from .voice import VOICE_SETTING_NAMES, VoiceRuntime, _project_key
@@ -263,6 +264,43 @@ class InkFlowAppService:
         emit: EventSink,
         consume_steering: Callable[[], Awaitable[list[str]]] | None = None,
     ) -> Any:
+        if method == "memory.audit":
+            from .memory_records import memory_overview
+            project = InkFlowProject(self._validated_project_root(params), recover_on_open=False)
+            return memory_overview(project.db)
+        if method == "preferences.manage":
+            from .preferences import author_connection, change_item, history, list_items
+            level = str(params.get("level", "author"))
+            action = str(params.get("action", "list"))
+            if level not in {"author", "project"}:
+                raise ValueError("请选择作者默认习惯或本书偏好")
+            preference_db = None
+            if level == "project" or action in {"override", "usage"}:
+                preference_db = InkFlowProject(self._validated_project_root(params), recover_on_open=False).db
+            if action == "override":
+                with project_write_lock_sync(self._validated_project_root(params)):
+                    disabled = set(preference_db.get_metadata("author_preferences_disabled", []))
+                    item_id = str(params["preference_id"])
+                    if bool(params.get("disabled", True)):
+                        disabled.add(item_id)
+                    else:
+                        disabled.discard(item_id)
+                    preference_db.set_metadata("author_preferences_disabled", sorted(disabled))
+                return {"disabled": sorted(disabled)}
+            if action == "usage":
+                return {"selection": preference_db.get_metadata("preference.selection", {}),
+                        "disabled": preference_db.get_metadata("author_preferences_disabled", [])}
+            with (author_connection() if level == "author" else preference_db.connect()) as connection:
+                if action == "list":
+                    return {"preferences": list_items(connection, active_only=False, level=level)}
+                if action == "history":
+                    return {"events": history(connection, str(params.get("preference_id", "")))}
+                if action == "save":
+                    return change_item(connection, level=level, **{key: params[key] for key in (
+                        "preference_id", "text", "strength", "scope", "status", "source_quote",
+                        "source_ref", "reason", "topic", "supersedes", "expected_revision"
+                    ) if key in params})
+            raise ValueError("未知的偏好管理操作")
         if method == "app.initialize":
             return {
                 "product": "墨流（InkFlow）",
@@ -311,6 +349,7 @@ class InkFlowAppService:
                 "chapter_length_tolerance": settings.chapter_length_tolerance,
                 "review_min_confidence": settings.review_min_confidence,
                 "acceptance_confirmation_mode": settings.acceptance_confirmation_mode,
+                "planning_publication_mode": settings.planning_publication_mode,
                 "planning_window_chapters": settings.planning_window_chapters,
                 "dialogue_history_mode": settings.dialogue_history_mode,
                 "dialogue_history_interval": settings.dialogue_history_interval,
@@ -358,6 +397,7 @@ class InkFlowAppService:
                     "chapter_length_tolerance",
                     "review_min_confidence",
                     "acceptance_confirmation_mode",
+                    "planning_publication_mode",
                     "planning_window_chapters",
                     "dialogue_history_mode",
                     "dialogue_history_interval",
@@ -514,8 +554,9 @@ class InkFlowAppService:
                 "model": "", "fallback": False, "source": "local",
             }
         if method == "project.ideate":
+            from .preferences import preference_prompt
             settings = Settings.from_env(params.get("workspace_root"))
-            preferences = str(params.get("preferences") or "").strip()
+            preferences = str(params.get("preferences") or "").strip() + preference_prompt()
             fast = bool(params.get("fast", True))
             requested_count = 1 if fast else 3
             await emit(
@@ -869,6 +910,10 @@ class InkFlowAppService:
             return studio.tree()
         if method == "planning.cleanup.preview":
             return cleanup_preview(project)
+        if method == "planning.cleanup.keep":
+            async with project_write_lock(project.root):
+                return cleanup_keep(project, confirmation_token=str(params.get("confirmation_token") or ""),
+                                    revision_id=str(params.get("revision_id") or ""))
         if method == "planning.cleanup.apply":
             paths = params.get("selected_paths")
             if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
@@ -1901,11 +1946,10 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
             if not usage:
                 continue
             raw_role = str(metadata.get("agent_role") or "unknown")
-            role = (
-                "reviewer" if raw_role.startswith("reviewer")
-                else raw_role if raw_role in {"coordinator", "writer"}
-                else "unknown"
-            )
+            try:
+                role = normalize_role(raw_role, event.get("role_protocol_version", 1))
+            except ValueError:
+                role = "unknown"
             bucket = by_agent_role.setdefault(role, empty_bucket())
             # Keep repair/retry stages separate; an agent-wide average hides their cost.
             stage_key = f"{metadata.get('model') or 'unknown'}:{role}:{event.get('stage') or 'unknown'}"
@@ -2735,15 +2779,20 @@ def _workflow_next_step(action: str, result: dict[str, Any]) -> dict[str, str] |
     """给桌面按钮触发的固定工作流也提供同一套用户可控引导。"""
 
     if action == "review" and result.get("automatic_acceptance"):
-        return {"label": "继续下一章", "reason": "Editor 审查已通过且当前设置已自动验收，可以继续安排下一章。", "prompt": "推荐下一章安排"}
+        return {"label": "继续下一章", "reason": "本次审查已通过且当前设置已自动验收，可以继续安排下一章。", "prompt": "推荐下一章安排"}
+    if action == "review":
+        if result.get("verdict") == "pass":
+            return {"label": "查看审查报告", "reason": "本次审查已通过；是否入正史仍按接受授权和引擎门禁决定。", "prompt": "打开当前审查报告"}
+        if result.get("verdict") == "unknown":
+            return {"label": "补足审查依据", "reason": "本次审查资料不足，先核对缺失来源，不改动已保存草稿。", "prompt": "查看当前审查缺口"}
+        return {"label": "查看需修问题", "reason": "先核对审查指出的原文问题，再决定定向修订。", "prompt": "打开当前审查报告"}
     if action == "batch_draft" and result.get("authorization_source") in {"batch_preapproval", "settings_auto_accept"}:
         return {"label": "查看已提交批次", "reason": "本批次已按当前确认策略处理，先查看提交结果再继续。", "prompt": "查看当前项目状态"}
 
     suggestions = {
         "plan": ("查看章节规划", "先核对章节卡，再决定从哪一章开始写。", "查看当前规划"),
         "outline": ("从大纲开始写", "独立大纲已保存，选择起点后再生成草稿。", "根据大纲生成草稿"),
-        "write": ("审查当前章节", "草稿已生成，先让 Editor 检查当前版本。", "审查当前章"),
-        "review": ("处理审查结果", "先查看 Editor 的证据，再决定修订或验收。", "打开当前审查报告"),
+        "write": ("审查当前章节", "草稿已生成，下一步按当前模式检查这一版本。", "审查当前章"),
         "revise": ("重新审查", "修订产生了新版本，旧报告不能替代新版本审查。", "重新审查当前章"),
         "accept": ("继续下一章", "当前章节已经完成正史提交，可以继续安排下一章。", "推荐下一章安排"),
         "batch_draft": ("查看批次进度", "批量草稿仍在临时区，先查看逐章结果再决定是否验收。", "查看批次进度"),

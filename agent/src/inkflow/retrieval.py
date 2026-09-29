@@ -55,6 +55,12 @@ class HybridRetriever:
         top_k: int | None = None,
     ) -> list[dict[str, Any]]:
         candidates = self._candidates(role=role, chapter_no=chapter_no, chapter_version=chapter_version)
+        from .preferences import applicable_preferences
+        preferences = applicable_preferences(self.project.db.effective_preferences(), query,
+            {"chapter_no": chapter_no, "genre": self.project.db.get_brief().genre})
+        allowed_preferences = {item["preference_id"] for item in preferences}
+        candidates = [item for item in candidates if item.get("source_type") != "user_preference"
+                      or item["source_id"] in allowed_preferences]
         self._embedding_cache_hits = 0
         self._embedding_cache_misses = 0
         if not candidates:
@@ -163,11 +169,11 @@ class HybridRetriever:
                     "version": int(chapter["version"]), "authority_rank": 2,
                     "authority": "已验收正史", "entities": _entities(str(chapter["title"]) + body),
                 })
-        for preference in self.project.db.list_preferences():
+        for preference in self.project.db.effective_preferences():
             hard = preference["strength"] == "hard"
             items.append({
                 "source_id": str(preference["preference_id"]), "source_type": "user_preference",
-                "title": f"{preference['scope']} 用户偏好", "body": str(preference["text"]),
+                "title": f"{preference['scope']} 用户偏好", "body": f"范围：{preference['scope']}；层级：{preference.get('level', 'project')}；{preference['text']}",
                 "chapter_no": None, "version": None, "authority_rank": 3 if hard else 6,
                 "authority": "用户长期硬规则" if hard else "用户弱偏好", "entities": _entities(str(preference["text"])),
             })

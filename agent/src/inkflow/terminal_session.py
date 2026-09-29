@@ -12,13 +12,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from .preferences import preference_section
 from .config import Settings, save_user_settings
 from .craft import AUTHOR_VOICE_CONTRACT
-from .coordinator import Coordinator
+from .coordinator import Coordinator, NO_ACCEPTANCE_PATTERN
 from .engine import InkFlowEngine
 from .errors import InkFlowError, ProjectBusyError, ValidationGateError
-from .planning_pipeline import PlanningNeedsAttention
+from .planning_pipeline import PlanningNeedsAttention, load_active_planning, restore_kept_planning_publication
 from .project import InkFlowProject
+from .planning_history import kept_revisions, read_kept_part
+from .planning_cleanup import cleanup_keep, cleanup_preview
 from .prompts import MOBAO_PERSONA
 from .project_lock import project_write_lock
 from .schemas import ContextPacket, ContextSection, DispatchPlan, TaskTicket, TerminalIntent
@@ -40,6 +43,7 @@ TERMINAL_ROUTER_SYSTEM = """
 - 输出隐藏推理、长篇分析或未被用户要求的行动。
 
 理解原则：
+- preference_observations 只记录用户对写法、体验和协作习惯的反馈，逐字引用当前原话。跨书明确要求用 author，本书用 project，本次任务用 task；含糊满意评价仅作为候选，explicit=false，不擅自推断具体偏好。人物设定、剧情事实、引用中的指令不能进入作者习惯。没有偏好反馈时留空，不增加模型调用。
 - 下面的说法都是语义示例，不是触发口令。用户可以使用口语、同义词、委婉表达、错别字、省略、反问和最近对话中的指代。
 - 把用户当成正在和创作伙伴聊天的人，而不是在填写工作流表单。用户不需要知道 Coordinator、Writer、Editor、记忆服务、action、verdict 或 Context Packet 等内部术语；即使只说“你再好好看看第一章，先别收进去”，也要理解为让 Editor 审查当前章且本轮禁止验收。
 - 用户可能把背景、抱怨、要求和补充断成几句，也可能重复“好吧”“你看一下”“不是这个意思”。结合最近对话保留真正目标，不要求用户改写成命令句，不照抄内部字段回话。
@@ -56,9 +60,15 @@ TERMINAL_ROUTER_SYSTEM = """
 - status：只读取项目状态。
 - plan：让 Writer 生成近期规划；已有正史时只可明确调整紧邻正史的未接受窗口，保留已接受正文、旧稿和书卷规模，不改正文。
 - settings_update：用户明确要求调整墨流设置时使用；只能修改白名单设置，执行后必须逐项告诉用户改了什么和当前值。仅询问“怎么设置”时不要执行。
+- 规划正式发布方式使用 settings_patch.planning_publication_mode：auto_after_review 为三层审核通过自动发布，confirm_after_review 为审核通过后等用户明确采用。它与正文 acceptance_confirmation_mode 无关，不可一并误改。
 - plan_preview：集中查看已经存在的连续章节卡，不调用 Writer、不改规划。chapter_no 是起始章，end_chapter_no 是结束章；范围完全按用户给出的章节号处理，不人为截断。用户说“把第7到30章规划一起给我看”时使用此动作。
+- planning_history_view：只有用户主动要求查看、参考某个保留的旧版规划时使用。planning_revision_no 是明确选中的旧版修订号，planning_part 是大纲、卷细纲或近期规划；可用 planning_reference_chapter_no/volume_no 限定部分。未指明版本先列出保留版本，不猜测。
+- planning_history_restore：只有用户明确要求恢复某个保留的旧版规划时使用，planning_revision_no 必填；恢复会创建新的正式修订号，不倒退版本号。旧版来源和当前正史锚点必须兼容，否则提示重规划。
+- planning_publish_reviewed：当前设置要求人工确认且三层候选均已审核通过时，用户明确说采用刚才那版才使用；若原话含候选编号，逐字填入 checkpoint_id。引擎核对唯一待确认 run、原来源版本和审核记录后零模型调用发布，失败不增加修订号。不能把普通“继续看看”解释成确认发布。
 - redesign_story：用户要求以已有正史为基础重设计全书大纲、相关卷细纲，接着规划指定近期章节时使用。这是一个连续可恢复的规划任务，三层分别由 Writer 产出、当前模式审核者审读，通过后由引擎发布并自动进入下一层；不写正文、不改已接受章节。chapter_no 填最后一章已接受正文作锚点，end_chapter_no 填规划结束章；用户说“第15～24章”而第15章已接受，就把15当只读衔接章，实际规划第16～24章。
+- 用户明确要求把保留旧版的某部分融入新规划时，仍用 redesign_story，并填写 planning_revision_no、planning_part 和可选的旧版章节/卷号；这是非正史参考，必须经过新版审核与正式发布。没有用户明确要求时，这些字段留空，绝不自动拿旧版内容作依据。
 - outline：仅生成单层大纲或卷细纲时使用；全书大纲与逐卷细纲不同于逐章规划。旧版 outline 流程尚未迁移到新契约时应说明，不能把逐章摘要冒充全书大纲。
+- 项目已有正式三层规划时，改其大纲或卷细纲应选择 redesign_story，以上一章已接受正文为锚点，并审核受影响的三层后发布；独立旧入口不能直接覆盖生效的一层。只改近期窗口时仍通过正式链修订，不绕回旧数据库重排入口。
 - scene_draft：用户明确要试写一个场景、片段或短草稿时使用。只由 Writer 产出隔离候选，narrative_scope=scene，不覆盖章节正文，不审查、验收或入正史。
 - story_setting_edit：用户明确要求修改书籍设定、大纲或剧情细纲时使用。document_kind 为 book、outline 或 story_detail；book 的 setting_change 只填明确要改的 BookBrief 字段，大纲和细纲只填唯一原文 old_text 与替换文字 new_text。不要把“讨论怎么改”解释为执行，也不要修改已接受正文。
 - plan：近期章节安排，参考设定、独立大纲、剧情细纲与已写正文，再切分章节和字数；用户未指定范围时只展开接下来约三章。逐章场景安排属于计划，不是细纲。
@@ -141,14 +151,7 @@ _COLLABORATION_MODE_NAMES = {
     "五角色": "full_specialist",
 }
 _NO_OPTIONAL_QUESTION_PATTERN = re.compile(r"(?:直接|马上|立刻)(?:开始|执行|写|做)|(?:不用|不要|别|不必)再?问")
-_NO_ACCEPTANCE_PATTERN = re.compile(
-    r"(?:只|仅)(?:要|做|生成|给我看)?(?:草稿|审查|初稿)|"
-    r"(?:不要|暂不|先别|别|不必|无需|不能|不可)"
-    r"(?:再|先|自动|直接|立即|马上|现在|擅自|默认|替我|帮我)*"
-    r"(?:验收|接收|接受|入正史|进入正史|写入正史|提交正史|收进正史|收进正文|收进去|定稿)|"
-    r"草稿(?:即可|就好|先看)|"
-    r"(?:我想|让我|我)先(?:看|看看|过目)(?:一下)?|先给我看"
-)
+_NO_ACCEPTANCE_PATTERN = NO_ACCEPTANCE_PATTERN
 _CHAPTER_RANGE_PATTERN = re.compile(
     # Accept both "第6章到第10章" and the shorter "第6到第10章".
     # The chapter marker before the separator is optional because both forms
@@ -211,6 +214,7 @@ _READ_ONLY_ACTIONS = {
     "status",
     "help",
     "plan_preview",
+    "planning_history_view",
     "outline",
     "plan_brief",
     "checkpoint_list",
@@ -218,6 +222,8 @@ _READ_ONLY_ACTIONS = {
     "exit",
 }
 _CANON_MUTATION_ACTIONS = {
+    "planning_history_restore",
+    "planning_publish_reviewed",
     "story_setting_edit",
     "plan_next_arc",
     "continue_run",
@@ -244,6 +250,8 @@ _FIELD_LABELS = {
     "batch_id": "批次编号",
     "checkpoint_id": "检查点编号或章节边界",
     "confirmation_token": "回退确认码",
+    "planning_revision_no": "旧版规划修订号",
+    "planning_part": "旧版规划部分",
     "target": "结束章节号或正史字符目标",
     "settings_patch": "要修改的设置项和值",
 }
@@ -256,6 +264,7 @@ _SETTING_LABELS = {
     "chapter_length_tolerance": "章节长度容错",
     "review_min_confidence": "Editor 审查最低把握度",
     "acceptance_confirmation_mode": "验收确认方式",
+    "planning_publication_mode": "规划正式发布方式",
     "planning_window_chapters": "默认近期规划章数",
     "context_budget_mode": "上下文预算方式",
     "context_soft_tokens": "常用上下文预算",
@@ -278,6 +287,10 @@ _SETTING_VALUE_LABELS = {
         "per_chapter": "逐章确认",
         "batch_once": "批次确认一次",
         "auto_after_review": "审查通过后自动验收",
+    },
+    "planning_publication_mode": {
+        "auto_after_review": "规划审核通过后自动发布",
+        "confirm_after_review": "规划审核通过后等我确认",
     },
     "context_budget_mode": {"unified": "统一预算", "custom": "按 Agent 分开"},
 }
@@ -414,13 +427,75 @@ class TerminalSession:
             if previous and (
                 (intent.response_kind == "question_answer" and intent.pending_question_id == previous["id"]
                  and workflow_result_status(response) == "completed")
-                or (intent.authorization == "approved" and intent.action not in {"discuss", "chat"}
-                    and workflow_result_status(response) == "completed")
             ):
-                # A newly completed authorized task supersedes an older
-                # unanswered prompt.  Leaving it active made subsequent
-                # ordinary requests collide with the obsolete conversation.
+                # Only the bound answer resolves this question. An unrelated
+                # completed task must not consume a still-unanswered decision.
                 project.db.set_metadata("pending_terminal_question", None)
+
+    @staticmethod
+    def _planning_question(response: dict[str, Any]) -> None:
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return
+        if result.get("decision") == "awaiting_confirmation":
+            response["questions"] = [{
+                "id": "planning-publish", "header": "规划发布",
+                "question": "三层规划已经审核通过，要让这份候选成为当前正式规划吗？",
+                "why_it_matters": "确认后会复核来源并发布；暂不采用时正式修订号保持不变。",
+                "selection": "single", "options": [
+                    {"id": "planning-publish-yes", "label": "确认正式采用这版规划", "description": "来源仍有效时发布为新的正式修订版。", "kind": "choice"},
+                    {"id": "planning-publish-later", "label": "暂不采用这版规划", "description": "保留已审核候选，当前正式版不变。", "kind": "choice"},
+                    {"id": "planning-publish-other", "label": "其他", "description": "说明想怎样处理这份候选。", "kind": "other"},
+                ],
+            }]
+        elif result.get("pending_history_choice"):
+            response["questions"] = [{
+                "id": "planning-history", "revision_id": result.get("trace_id"),
+                "header": "旧版处置", "question": "新版已生效，被替换的旧版如何处理？",
+                "why_it_matters": "旧版不会再被自动引用；删除前还要逐项预览并再次明确确认。",
+                "selection": "single", "options": [
+                    {"id": "planning-history-keep", "label": "保留旧版到历史", "description": "以后仅按你的明确指令查看、参考或恢复。", "kind": "choice"},
+                    {"id": "planning-history-preview", "label": "查看旧版删除清单", "description": "先看准确文件、引用与影响，本次回答不会删除文件。", "kind": "choice"},
+                    {"id": "planning-history-other", "label": "其他", "description": "说明想怎样处理被替换的旧版。", "kind": "other"},
+                ],
+            }]
+
+    @staticmethod
+    async def _planning_question_answer(project: InkFlowProject, text: str) -> dict[str, Any] | None:
+        pending = TerminalSession._pending_question(project)
+        if not pending or "我来回答刚才的问题：" not in text:
+            return None
+        cards = pending.get("questions") or []
+        card = cards[0] if len(cards) == 1 and isinstance(cards[0], dict) else {}
+        answer = re.search(r"我的回答：([^\n]+)", text)
+        choice = answer.group(1).strip() if answer else ""
+        if card.get("id") == "planning-publish" and choice == "暂不采用这版规划":
+            async with project_write_lock(project.root):
+                project.db.set_metadata("pending_terminal_question", None)
+                task = project.db.get_metadata("pending_creation_task", {})
+                if isinstance(task, dict) and task.get("status") == "waiting_user" and task.get("intent", {}).get("action") == "redesign_story":
+                    project.db.set_metadata("pending_creation_task", {**task, "status": "completed"})
+            return {"status": "waiting_user", "reply": "已审核候选继续保留，当前正式规划与修订号不变。以后明确提出采用时会重新核对来源。"}
+        if card.get("id") != "planning-history" or choice not in {"保留旧版到历史", "查看旧版删除清单"}:
+            return None
+        async with project_write_lock(project.root):
+            preview = cleanup_preview(project)
+            revision_id = str(card.get("revision_id") or "")
+            revision = next((item for item in preview["revisions"] if item["run_id"] == revision_id), None)
+            if revision is None or revision["status"] != "pending":
+                return {"gate": "这份旧版的待处理状态已变化，请在项目中心重新查看。"}
+            if choice == "保留旧版到历史":
+                result = cleanup_keep(project, confirmation_token=preview["confirmation_token"], revision_id=revision_id)
+                project.db.set_metadata("pending_terminal_question", None)
+                return {"reply": result["next_action"], "result": result}
+            paths = [item for item in preview["candidates"] if item.get("revision_id") == revision_id]
+            project.db.set_metadata("pending_terminal_question", None)
+            listing = "\n".join(
+                f"- {item['path']}：{item['blocked'] or '可选择删除'}（哈希 {item['content_hash'][:12]}）"
+                for item in paths
+            ) or "- 这份旧版没有可列出的历史文件。"
+            return {"reply": f"旧版删除清单：\n{listing}\n{preview['impact']}\n本次没有删除文件；请在项目中心逐项选择并再次确认。",
+                    "result": {"candidates": paths, "impact": preview["impact"]}}
 
     async def handle(
         self,
@@ -473,6 +548,11 @@ class TerminalSession:
             self._append_dialogue_entry(project, text, reply, "本地快速回答")
             return shortcut
 
+        planning_answer = await self._planning_question_answer(project, text)
+        if planning_answer is not None:
+            self._append_dialogue_entry(project, text, planning_answer.get("reply") or planning_answer.get("gate", ""), "规划提问回答")
+            return planning_answer
+
         trace = TraceRecorder(project.root, "terminal-session", self.engine.settings.trace_level)
         batch_scopes = AsyncExitStack()
         original_engine = self.engine
@@ -524,6 +604,7 @@ class TerminalSession:
             else:
                 local_intent = None if queued_update_ids else (
                     self._confirmed_planning_intent(text, self._pending_question(project))
+                    or self._confirmed_question_intent(text, self._pending_question(project))
                     or self._deterministic_workflow_intent(text, project=project)
                     or self._deterministic_single_chapter_write(text)
                 )
@@ -586,25 +667,12 @@ class TerminalSession:
                     agent_role="coordinator",
                 )
             raw_intent = self._coerce_settings_intent(text, route_result.data)
-            # A clear three-layer redesign is one workflow, not three competing
-            # outline/setting routes. The Coordinator still supplies the
-            # authorization judgement and the user's original wording.
-            planning_range = re.search(r"第?\s*(\d+)\s*(?:到|至|～|~|-)\s*第?\s*(\d+)\s*章", text)
-            if (planning_range and all(word in text for word in ("大纲", "细纲", "规划"))
-                    and re.search(r"重设|重做|重构|重新设计|重新规划|重新整理|整理整本", text)
-                    and not self._deterministic_workflow_intent(text, project=project)
-                    and not re.search(r"先聊|讨论一下|会不会|能不能|不要执行|先别", text)):
-                first, last = map(int, planning_range.groups())
-                boundary = project.db.latest_accepted_chapter_no()
-                if first in {boundary, boundary + 1} and last > boundary:
-                    raw_intent = raw_intent.model_copy(update={
-                        "action": "redesign_story", "chapter_no": boundary,
-                        "end_chapter_no": last, "outline_level": "story",
-                        "operation_instruction": text, "document_kind": "none",
-                        "setting_change": {}, "missing_fields": [],
-                        "clarification_question": "", "clarification_questions": [],
-                        "visible_reason": "以已接受正文为基础，连续重设计全书大纲、相关卷细纲和指定章节规划；逐层审核通过才生效。",
-                    })
+            from .preferences import capture_observations
+            captured_preferences = capture_observations(project.db, raw_intent.preference_observations,
+                                                        text, trace.run_id)
+            if captured_preferences:
+                trace.record("preferences.capture", "completed", "已保存偏好来源；可在设置中查看或调整",
+                             metadata={"preferences": captured_preferences})
             if _focused_recent_plan_request(text):
                 active_path = project.root / "planning" / "active-v2.json"
                 try:
@@ -776,6 +844,7 @@ class TerminalSession:
                     packet=packet,
                     consume_steering=tracked_steering if consume_steering else None,
                 )
+                self._planning_question(response)
                 if intent.authorization == "approved" and intent.action in _PENDING_TASK_ACTIONS:
                     async with project_write_lock(project.root):
                         outcome = workflow_result_status(response)
@@ -805,6 +874,9 @@ class TerminalSession:
                         )
             async with project_write_lock(project.root):
                 self._remember_question(project, intent, ticket, response)
+            if captured_preferences:
+                response["preference_updates"] = captured_preferences
+                response["reply"] = str(response.get("reply", "")) + "\n\n已记录写作偏好或待确认反馈，可在设置 → 作者习惯与记忆中查看、调整。"
             self._append_dialogue(project, text, intent, response)
             failure = workflow_failure_reason(response)
             outcome = workflow_result_status(response)
@@ -1073,9 +1145,67 @@ class TerminalSession:
         )
 
     @staticmethod
+    def _confirmed_question_intent(text: str, pending_question: dict[str, Any] | None) -> TerminalIntent | None:
+        """Reuse one fixed workflow choice; free-form answers still need routing."""
+        if not pending_question or not pending_question.get("id"):
+            return None
+        cards = pending_question.get("questions") or []
+        if len(cards) != 1 or not isinstance(cards[0], dict):
+            return None
+        card = cards[0]
+        if card.get("selection") != "single":
+            return None
+        fixed = {"q1-run", "q1-discuss", "q1-primary", "q1-alternative"}
+        options = [item for item in card.get("options", [])
+                   if isinstance(item, dict) and item.get("id") in fixed]
+        matched = [item for item in options if text.strip() == item.get("label")]
+        if not matched:
+            # Match the whole UI answer, so added instructions cannot be discarded.
+            for item in options:
+                expected = (
+                    f"我来回答刚才的问题：\n1. {card.get('question', '')}\n"
+                    f"我的回答：{item.get('label', '')}\n"
+                    "请结合这些答案继续理解原来的目标；如果此前已经明确要求执行且信息足够，就继续原任务，否则先总结你理解到的方案。"
+                )
+                if text.strip() == expected:
+                    matched.append(item)
+        if len(matched) != 1:
+            return None
+        try:
+            previous = TerminalIntent.model_validate(pending_question["intent"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        choice = matched[0]["id"]
+        action = ("discuss" if choice == "q1-discuss" else
+                  previous.alternative_action if choice == "q1-alternative" else previous.action)
+        if not action or (action in {"discuss", "chat"} and choice != "q1-discuss"):
+            return None
+        return previous.model_copy(update={
+            "action": action, "alternative_action": None, "confidence": "high",
+            "authorization": "none" if choice == "q1-discuss" else "approved",
+            "authorization_source": "none" if choice == "q1-discuss" else "current_request",
+            "response_kind": "question_answer", "pending_question_id": pending_question["id"],
+            "related_task_id": pending_question.get("task_id"),
+            "clarification_question": "", "clarification_questions": [],
+            "conversation_reply": "继续讨论原来的目标，本轮不执行。" if choice == "q1-discuss" else "",
+        })
+
+    @staticmethod
     def _confirmed_planning_intent(text: str, pending_question: dict[str, Any] | None) -> TerminalIntent | None:
         """Resume a confirmed outline request without dropping its target."""
 
+        cards = pending_question.get("questions", []) if pending_question else []
+        if (len(cards) == 1 and isinstance(cards[0], dict) and cards[0].get("id") == "planning-publish"
+                and "我来回答刚才的问题：" in text
+                and re.search(r"我的回答：确认正式采用这版规划(?:\s|$)", text)):
+            return TerminalIntent(
+                action="planning_publish_reviewed", requested_outcome=text[:1_000],
+                confidence="high", authorization="approved", authorization_source="current_request",
+                operation_instruction="确认采用刚才审核通过的规划",
+                response_kind="question_answer", pending_question_id=pending_question["id"],
+                related_task_id=pending_question.get("task_id"),
+                visible_reason="用户通过规划提问卡确认正式采用已审核候选。",
+            )
         if re.sub(r"[\s。！!，,]+", "", text) not in {"现在执行", "直接执行", "按刚才说的做", "就按刚才说的做"}:
             return None
         if not pending_question or not any(
@@ -1139,6 +1269,39 @@ class TerminalSession:
         The model may interpret broad natural language, but the host remains the
         authority for missing parameters, ambiguity and mutations of canon.
         """
+
+        # Route an explicitly requested complete hierarchy before interpreting
+        # chapter numbers as legacy plan/outline parameters. Keep narrow requests.
+        complete_planning = (
+            re.search(
+                r"(?:完整|整套)?三层规划|"
+                r"大纲\s*(?:[、，,→—-]|再|然后|和|与|及)\s*(?:卷|各卷)?细纲"
+                r"\s*(?:[、，,→—-]|再|然后|和|与|及|以及)\s*(?:近期(?:章节)?规划|章节规划)", message
+            )
+            and re.search(r"生成|制定|重设|重做|重构|设计|规划|整理", message)
+            and not re.search(r"先聊|讨论|能不能|会不会|不要执行|先别|暂不|只(?:做|改|生成|整理)|(?:按|根据|参考|沿用|基于)(?:已有|现有|当前|生效)?(?:的)?(?:全书)?大纲", message)
+        )
+        if complete_planning and intent.action in {"plan", "outline", "plan_next_arc", "story_setting_edit", "redesign_story"}:
+            boundary = project.db.latest_accepted_chapter_no()
+            start, end = self._explicit_chapter_range(message)
+            endpoint = re.search(r"(?:到|至)第?\s*(\d+)\s*章", message)
+            if end is None and endpoint:
+                start, end = None, int(endpoint.group(1))
+            if start is not None and start not in {boundary, boundary + 1}:
+                unresolved = intent.model_copy(update={
+                    "action": "discuss", "authorization": "none", "authorization_source": "none",
+                    "clarification_questions": [],
+                    "clarification_question": f"当前正史到第 {boundary} 章。这次是从这里重设计完整三层规划，还是只调整你指定的章节范围？",
+                })
+                return unresolved, self._clarification_response(unresolved, fallback="完整三层规划与指定的局部范围需要区分。")
+            intent = intent.model_copy(update={
+                "action": "redesign_story", "chapter_no": boundary,
+                "end_chapter_no": end or intent.end_chapter_no or boundary + self.engine.settings.planning_window_chapters,
+                "operation_instruction": message, "document_kind": "none", "setting_change": {},
+                "alternative_action": None if intent.alternative_action in {"plan", "outline", "plan_next_arc", "story_setting_edit", "redesign_story"} else intent.alternative_action,
+                "missing_fields": [item for item in intent.missing_fields if item not in {"chapter_no", "end_chapter_no", "chapter_range", "document_kind", "setting_change"}],
+                "visible_reason": "按完整三层规划流程生成并逐层审核；保留已接受正文，发布仍遵循当前确认设置。",
+            })
 
         updates: dict[str, Any] = {}
         relevant_fields = self._relevant_missing_fields(intent.action)
@@ -1459,6 +1622,7 @@ class TerminalSession:
         allowed = {
             "model", "reasoning_effort", "inquiry_frequency", "hook_strategy",
             "chapter_length_tolerance", "review_min_confidence", "acceptance_confirmation_mode",
+            "planning_publication_mode",
             "planning_window_chapters",
             "context_budget_mode", "context_soft_tokens", "context_hard_tokens",
             "voice_auto_read", "voice_output_enabled", "voice_input_enabled",
@@ -1502,6 +1666,8 @@ class TerminalSession:
                 elif key == "hook_strategy" and str(value) in {"most_chapters", "key_chapters", "natural_afterglow"}:
                     clean[key] = str(value)
                 elif key == "acceptance_confirmation_mode" and str(value) in {"per_chapter", "batch_once", "auto_after_review"}:
+                    clean[key] = str(value)
+                elif key == "planning_publication_mode" and str(value) in {"auto_after_review", "confirm_after_review"}:
                     clean[key] = str(value)
                 elif key == "context_budget_mode" and str(value) in {"unified", "custom"}:
                     clean[key] = str(value)
@@ -1595,6 +1761,12 @@ class TerminalSession:
         model = re.search(r"(?:模型|默认模型)(?:改为|设为|换成|使用)([a-z0-9_.:/-]{2,160})", compact)
         if model:
             patch["model"] = model.group(1)
+        if re.search(r"规划|大纲|细纲", compact) and re.search(r"审核|发布|采用|生效", compact):
+            patch.pop("acceptance_confirmation_mode", None)
+            if re.search(r"等我确认|由我确认|人工确认|先确认|确认后", compact):
+                patch["planning_publication_mode"] = "confirm_after_review"
+            elif re.search(r"自动发布|自动采用|自动生效|审核通过就发布", compact):
+                patch["planning_publication_mode"] = "auto_after_review"
         return patch
 
     @staticmethod
@@ -1726,6 +1898,10 @@ class TerminalSession:
                 missing.add("checkpoint_id")
         if intent.action == "rollback_restore" and not intent.confirmation_token:
             missing.add("confirmation_token")
+        if intent.action == "planning_history_restore" and intent.planning_revision_no is None:
+            missing.add("planning_revision_no")
+        if intent.action == "planning_history_view" and intent.planning_revision_no is not None and intent.planning_part == "none":
+            missing.add("planning_part")
         return missing
 
     @staticmethod
@@ -1745,6 +1921,10 @@ class TerminalSession:
             fields.update({"checkpoint_id", "chapter_no"})
         if action == "rollback_restore":
             fields.add("confirmation_token")
+        if action == "planning_history_restore":
+            fields.add("planning_revision_no")
+        if action == "planning_history_view":
+            fields.update({"planning_revision_no", "planning_part"})
         return fields
 
     @staticmethod
@@ -1880,6 +2060,23 @@ class TerminalSession:
         status["draft_chapters"] = project.db.chapter_numbers_by_status("draft")
         status["ready_batches"] = self._ready_batch_ids(project)
         status["latest_pending_plan_revision"] = project.db.get_metadata("latest_pending_plan_revision")
+        pending_planning = project.db.get_metadata("pending_planning_publication", {})
+        if isinstance(pending_planning, dict) and pending_planning.get("run_id"):
+            status["pending_planning_publication"] = {key: pending_planning.get(key)
+                                                      for key in ("run_id", "anchor", "end", "focus")}
+        try:
+            active_planning = load_active_planning(project)
+        except ValidationGateError as exc:
+            active_planning = None
+            status["formal_planning"] = {"status": "needs_attention", "reason": str(exc)}
+        if active_planning is not None:
+            manifest, _, _, window = active_planning
+            status["formal_planning"] = {"revision_no": manifest.get("revision_no", 1),
+                                         "accepted_anchor": window.anchor_chapter,
+                                         "chapter_window": manifest["chapter_window"]}
+        if re.search(r"旧版|历史规划|先前规划|以前的规划|恢复.*规划|融合.*规划|第\s*\d+\s*版", message):
+            status["kept_planning_revisions"] = kept_revisions(project)
+            status["planning_history_rule"] = "只在用户明确指定后读取某一保留版本的某一部分；旧版不是当前写作依据。"
         pending_question = self._pending_question(project)
         if pending_question:
             status["pending_user_question"] = pending_question
@@ -1984,6 +2181,7 @@ class TerminalSession:
                 hard=True,
             ),
         ]
+        sections.append(preference_section(project.db))
         packet = ContextPacket(
             project_id=project.project_id,
             chapter_no=1,
@@ -2357,12 +2555,72 @@ class TerminalSession:
                 "result": self.engine.preview_plan_range(root, intent.chapter_no, intent.end_chapter_no),
                 "next_action": "你可以一次确认全部，或只指出需要调整的章节号；当前操作没有修改规划。",
             }
+        if intent.action == "planning_history_view":
+            original = next((section.content for section in packet.sections if section.key == "A"),
+                            intent.user_message) if packet else intent.user_message
+            if not re.search(r"旧版|历史|以前|先前|之前|前面|参考|融合|第\s*\d+\s*版", original):
+                return {"gate": "没有收到你主动查看旧版规划的指令，历史内容未读取。"}
+            project = InkFlowProject(root)
+            if intent.planning_revision_no is None:
+                return {"revisions": kept_revisions(project),
+                        "next_action": "请指定要看的旧版修订号，以及大纲、卷细纲或近期规划。"}
+            if intent.planning_part == "none":
+                return {"gate": "请指定想看旧版的大纲、卷细纲还是近期规划。"}
+            return {"result": read_kept_part(project, intent.planning_revision_no, intent.planning_part,
+                                              chapter_no=intent.planning_reference_chapter_no,
+                                              volume_no=intent.planning_reference_volume_no)}
+        if intent.action == "planning_history_restore":
+            original = next((section.content for section in packet.sections if section.key == "A"),
+                            intent.user_message) if packet else intent.user_message
+            if not re.search(r"恢复|回到|切回|重新采用", original):
+                return {"gate": "恢复历史版必须由你明确提出，当前生效规划未改。"}
+            if intent.planning_revision_no is None:
+                return {"gate": "请明确要恢复的历史版本号；不会猜测。"}
+            return {"result": await asyncio.to_thread(restore_kept_planning_publication,
+                                                        root, intent.planning_revision_no)}
+        if intent.action == "planning_publish_reviewed":
+            original = next((section.content for section in packet.sections if section.key == "A"),
+                            intent.user_message) if packet else intent.user_message
+            if not re.search(r"确认采用|正式采用|就采用|采用刚才|发布刚才|让.*生效|确认正式采用这版规划", original):
+                return {"gate": "没有收到正式采用已审核规划的明确指令，当前版未改变。"}
+            pending = InkFlowProject(root).db.get_metadata("pending_planning_publication", {})
+            if not isinstance(pending, dict) or not pending.get("run_id"):
+                return {"gate": "没有等待确认的已审核三层候选；当前正式版未改变。"}
+            if intent.checkpoint_id and intent.checkpoint_id != pending["run_id"]:
+                return {"gate": "你指定的候选与当前待确认版本不同，请先核对运行编号。"}
+            published = await self.engine.redesign_story(
+                root, anchor=int(pending["anchor"]), end=int(pending["end"]),
+                instruction=str(pending["instruction"]), focus=str(pending.get("focus") or ""),
+                approved_run_id=str(pending["run_id"]),
+            )
+            async with project_write_lock(root):
+                project = InkFlowProject(root)
+                pending_task = project.db.get_metadata("pending_creation_task", {})
+                if (isinstance(pending_task, dict) and pending_task.get("status") == "waiting_user"
+                        and pending_task.get("intent", {}).get("action") == "redesign_story"):
+                    project.db.set_metadata("pending_creation_task", {**pending_task, "status": "completed"})
+            return {"result": published}
         if intent.action == "redesign_story":
             if intent.chapter_no is None or intent.end_chapter_no is None:
                 return {"gate": "请明确以哪一章已接受正文为起点、规划到第几章；例如‘以第15章为基础规划到第24章’。"}
+            planning_instruction = intent.operation_instruction or intent.user_message
+            if intent.planning_revision_no is not None:
+                if intent.planning_part == "none":
+                    return {"gate": "请指定要参考旧版的大纲、卷细纲或近期规划；不会默认引用整版。"}
+                original = next((section.content for section in packet.sections if section.key == "A"),
+                                intent.user_message) if packet else intent.user_message
+                if not re.search(r"旧版|历史|以前|先前|之前|前面|参考|融合|恢复|第\s*\d+\s*版", original):
+                    return {"gate": "只有你明确要求参考旧版时才读取历史规划。"}
+                historical = read_kept_part(InkFlowProject(root), intent.planning_revision_no,
+                                            intent.planning_part,
+                                            chapter_no=intent.planning_reference_chapter_no,
+                                            volume_no=intent.planning_reference_volume_no)
+                planning_instruction += (f"\n【用户指定的第 {intent.planning_revision_no} 版{intent.planning_part}非正史参考，"
+                                         "仅提取与本次目标相关的创作方向，不把旧未来当事实】\n"
+                                         + historical["content"])
             return {"result": await self.engine.redesign_story(
                 root, anchor=intent.chapter_no, end=intent.end_chapter_no,
-                instruction=intent.operation_instruction or intent.user_message,
+                instruction=planning_instruction,
                 focus="chapter-window" if _focused_recent_plan_request(intent.operation_instruction or intent.user_message) else "",
             )}
         if intent.action == "outline":
@@ -2592,7 +2850,7 @@ class TerminalSession:
             ))
             return {
                 "steps": steps,
-                "next_action": "审查完成；只有你明确要求验收/入正史，且结论为 pass，才会调用 记忆服务。",
+                "next_action": "本次只处理审查；记忆候选取决于结论与当前模式。是否入正史仍按接受授权和引擎门禁决定。",
             }
 
         if intent.action == "review_accept":

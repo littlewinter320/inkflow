@@ -1,3 +1,4 @@
+import { AuthorPreferences } from "./AuthorPreferences";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { FormEvent, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MutableRefObject, PointerEvent as ReactPointerEvent, ReactNode } from "react";
@@ -87,6 +88,7 @@ type TaskStatusResponse = {
 type PendingComputerAction = { request_id: string; command: string; command_hash: string; action_kind: string; created_at: string; expires_at: string };
 type EngineEvent = {
   run_id?: string;
+  role_protocol_version?: number;
   type?: string;
   stage?: string;
   status?: string;
@@ -2289,14 +2291,14 @@ function CacheSummary({ usage }: { usage?: CollaborationOverview["usage"] }) {
   const recent = usage?.recent_deepseek_cache;
   const recentRate = recent?.hit_rate == null ? null : Math.round(recent.hit_rate * 100);
   const draftFamilies = Object.entries(recent?.by_family || {}).filter(([name]) => name.endsWith(":writer:DraftOutput"));
-  const labels: Record<string, string> = { coordinator: "Coordinator", writer: "Writer", reviewer: "Editor", legacy: "旧版调用", unknown: "历史记录" };
+  const labels: Record<string, string> = { coordinator: "Coordinator", writer: "Writer", editor: "Editor", reviewer: "专项 Reviewer", memory_keeper: "Memory Keeper", legacy: "旧版调用", unknown: "角色未标明" };
   const roleUsage = usage.by_agent_role || {};
-  const roleKeys = ["coordinator", "writer", "reviewer", ...(roleUsage.unknown?.calls ? ["unknown"] : [])];
+  const roleKeys = ["coordinator", "writer", "editor", "reviewer", "memory_keeper", ...(roleUsage.unknown?.calls ? ["unknown"] : [])];
   const roles = roleKeys.map((role) => [role, roleUsage[role] || { calls: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }] as const);
   return <article className="cache-summary">
     <header><strong>DeepSeek 输入缓存</strong><span>{recentRate === null ? "最近调用暂无报告" : `最近全部调用 ${recent?.reported_calls} 次 · ${recentRate}% 命中`}</span></header>
     <p>{recentRate === null ? "最近请求没有可计算的缓存用量。" : `最近取样已复用 ${recent!.hit_tokens.toLocaleString()} tokens，未命中 ${recent!.miss_tokens.toLocaleString()} tokens。`}{recent?.unknown_calls ? `另有 ${recent.unknown_calls} 次用量未知。` : ""}{draftFamilies.length === 1 && draftFamilies[0][1].hit_rate != null ? ` 正文 Writer 同类请求 ${draftFamilies[0][1].calls} 次、命中 ${Math.round(draftFamilies[0][1].hit_rate! * 100)}%。` : ""} 全部调用混合规划、正文和审核，不能直接当作连续正文 Writer 命中率。</p>
-    <details><summary>查看最近分角色与历史累计</summary><p>{rate === null ? "旧记录没有完整缓存字段。" : `已记录模型结果累计命中 ${rate}%，复用 ${hit.toLocaleString()} tokens，未命中 ${miss.toLocaleString()} tokens。`} 稳定资料会放在变化的章节要求之前；实际命中由 DeepSeek 返回值确认。</p><div className="cache-role-list">{roles.map(([role, value]) => { const roleHit = Number(value.prompt_cache_hit_tokens || 0); const roleMiss = Number(value.prompt_cache_miss_tokens || 0); const roleTotal = roleHit + roleMiss; const roleRate = roleTotal ? Math.round((roleHit / roleTotal) * 100) : null; const recentRole = recent?.by_role?.[role]; return <div key={role}><strong>{labels[role] || role}</strong><span>{recentRole?.hit_rate != null ? `最近 ${Math.round(recentRole.hit_rate * 100)}% · ${recentRole.calls} 次` : recentRole?.calls ? `最近未知 · ${recentRole.calls} 次` : "最近无调用"}；累计 {value.calls ? roleRate === null ? `未知 · ${value.calls} 次` : `${roleRate}% · ${value.calls} 次` : "暂无调用"}</span></div>; })}</div></details>
+    <details><summary>查看最近分角色与历史累计</summary><p>{rate === null ? "旧记录没有完整缓存字段。" : `已记录模型结果累计命中 ${rate}%，复用 ${hit.toLocaleString()} tokens，未命中 ${miss.toLocaleString()} tokens。`} 稳定资料会放在变化的章节要求之前；实际命中由 DeepSeek 返回值确认。</p><div className="cache-role-list">{roles.map(([role, value]) => { const roleHit = Number(value.prompt_cache_hit_tokens || 0); const roleMiss = Number(value.prompt_cache_miss_tokens || 0); const roleTotal = roleHit + roleMiss; const roleRate = roleTotal ? Math.round((roleHit / roleTotal) * 100) : null; const versionedRecent = role !== "editor" && role !== "reviewer"; const recentRole = versionedRecent ? recent?.by_role?.[role] : null; return <div key={role}><strong>{labels[role] || role}</strong><span>{versionedRecent ? recentRole?.hit_rate != null ? `最近 ${Math.round(recentRole.hit_rate * 100)}% · ${recentRole.calls} 次` : recentRole?.calls ? `最近未知 · ${recentRole.calls} 次` : "最近无调用" : "最近账本未分协议"}；累计 {value.calls ? roleRate === null ? `未知 · ${value.calls} 次` : `${roleRate}% · ${value.calls} 次` : "暂无调用"}</span></div>; })}</div></details>
   </article>;
 }
 
@@ -2304,7 +2306,7 @@ type LiveRun = { id: string; steps: EngineEvent[]; method?: string; status: stri
 
 function LiveRunTimeline({ runs, onOpenReference }: { runs: LiveRun[]; onOpenReference: (reference: TraceReference) => void | Promise<void> }) {
   if (!runs.length) return null;
-  return <div className="run-list live-runs"><h3>实时运行过程</h3><p className="process-hint">这里展示公开的步骤、角色、模型、等待参数和文件引用；不会展示模型原始思考内容。</p>{runs.slice(0, 8).map((run) => <details className={`run-card live-run ${run.status}`} open={run.status === "running" || run.status === "waiting"} key={`live-${run.id}`}><summary><strong>{String(run.method ? methodLabel(run.method) : "墨流任务")}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : run.status === "waiting" ? "等待处理" : "进行中"}</span></summary><p>{run.summary}</p><ol className="live-timeline">{run.steps.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; const stepStatus = step.status || "info"; const role = String(step.role || metadata.agent_role || ""); const model = String(step.model || metadata.model || ""); const refs = step.references || []; const publicMetadata = Object.fromEntries(Object.entries(metadata).filter(([key]) => !isSensitivePresentationKey(key))); return <li className={`live-step ${stepStatus}`} key={`${step.timestamp || index}-${index}`}><div className="live-step-main"><span className="live-step-marker">{stepStatus === "completed" ? "✓" : stepStatus === "failed" ? "!" : stepStatus === "started" ? "…" : "·"}</span><div><strong>{eventLabel(step.type || step.stage)}</strong><p>{step.summary || step.stage || "过程"}</p><small>{step.timestamp ? formatTime(step.timestamp) : "刚刚"}{role ? ` · ${agentRoleLabel(role)}` : ""}{model ? ` · ${model}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small></div></div>{step.details && <p className="live-step-details">{step.details}</p>}{(metadata.timeout_seconds || metadata.max_tokens || typeof metadata.thinking === "boolean") && <small className="live-step-meta">请求参数：{metadata.timeout_seconds ? `超时 ${String(metadata.timeout_seconds)} 秒` : ""}{metadata.max_tokens ? ` · 输出上限 ${Number(metadata.max_tokens).toLocaleString()} tokens` : ""}{typeof metadata.thinking === "boolean" ? ` · 深度推理 ${metadata.thinking ? "开启" : "关闭"}` : ""}</small>}{refs.length > 0 && <div className="settings-inline-actions">{refs.map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {reference.relative_path}</button>)}</div>}{Object.keys(publicMetadata).length > 0 && <details><summary>查看本步公开记录</summary><pre className="compact-json">{JSON.stringify(publicMetadata, null, 2)}</pre></details>}</li>; })}</ol><small className="live-run-footnote">可复核文件由运行记录自动发现；点击文件按钮可在本地打开。</small></details>)}</div>;
+  return <div className="run-list live-runs"><h3>实时运行过程</h3><p className="process-hint">这里展示公开的步骤、角色、模型、等待参数和文件引用；不会展示模型原始思考内容。</p>{runs.slice(0, 8).map((run) => <details className={`run-card live-run ${run.status}`} open={run.status === "running" || run.status === "waiting"} key={`live-${run.id}`}><summary><strong>{String(run.method ? methodLabel(run.method) : "墨流任务")}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : run.status === "waiting" ? "等待处理" : "进行中"}</span></summary><p>{run.summary}</p><ol className="live-timeline">{run.steps.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; const stepStatus = step.status || "info"; const role = String(step.role || metadata.agent_role || ""); const model = String(step.model || metadata.model || ""); const refs = step.references || []; const publicMetadata = Object.fromEntries(Object.entries(metadata).filter(([key]) => !isSensitivePresentationKey(key))); return <li className={`live-step ${stepStatus}`} key={`${step.timestamp || index}-${index}`}><div className="live-step-main"><span className="live-step-marker">{stepStatus === "completed" ? "✓" : stepStatus === "failed" ? "!" : stepStatus === "started" ? "…" : "·"}</span><div><strong>{eventLabel(step.type || step.stage)}</strong><p>{step.summary || step.stage || "过程"}</p><small>{step.timestamp ? formatTime(step.timestamp) : "刚刚"}{role ? ` · ${agentRoleLabel(role, step.role_protocol_version || 1)}` : ""}{model ? ` · ${model}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small></div></div>{step.details && <p className="live-step-details">{step.details}</p>}{(metadata.timeout_seconds || metadata.max_tokens || typeof metadata.thinking === "boolean") && <small className="live-step-meta">请求参数：{metadata.timeout_seconds ? `超时 ${String(metadata.timeout_seconds)} 秒` : ""}{metadata.max_tokens ? ` · 输出上限 ${Number(metadata.max_tokens).toLocaleString()} tokens` : ""}{typeof metadata.thinking === "boolean" ? ` · 深度推理 ${metadata.thinking ? "开启" : "关闭"}` : ""}</small>}{refs.length > 0 && <div className="settings-inline-actions">{refs.map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {reference.relative_path}</button>)}</div>}{Object.keys(publicMetadata).length > 0 && <details><summary>查看本步公开记录</summary><pre className="compact-json">{JSON.stringify(publicMetadata, null, 2)}</pre></details>}</li>; })}</ol><small className="live-run-footnote">可复核文件由运行记录自动发现；点击文件按钮可在本地打开。</small></details>)}</div>;
 }
 
 function ReferenceDocumentViewer({ document, onClose }: { document: DocumentData; onClose: () => void }) {
@@ -2324,12 +2326,13 @@ function WorkflowProgressStrip({ runs }: { runs: LiveRun[] }) {
   const steps = [
     { key: "plan", label: "任务规划", match: ["controller.routing", "workflow.started"] },
     { key: "write", label: "Writer 写作", match: ["writer.started", "writer.completed"] },
-    { key: "review", label: "Editor · 审查模式", match: ["reviewer.started", "reviewer.completed"] },
+    { key: "review", label: "正文审查", match: ["reviewer.started", "reviewer.completed", "review.mode"] },
     { key: "accept", label: "用户验收", match: ["chapter.accepted", "chapter.accept"] },
     { key: "memory", label: "记忆服务", match: ["memory.started", "memory.completed"] },
   ];
   const events = latest?.steps || [];
-  const matched = steps.map((step) => events.some((event) => step.match.some((value) => String(event.type || "").includes(value))));
+  const matched = steps.map((step) => events.some((event) => step.match.some((value) =>
+    String(event.type || "").includes(value) || String(event.stage || "").includes(value))));
   const current = latest?.status === "running" ? Math.max(0, matched.lastIndexOf(true)) : -1;
   return <section className="workflow-progress"><header><div><h3>本次工作流</h3><p>只显示公开阶段和可复核结论，原始思考不会进入界面。</p></div><strong>{latest ? (latest.status === "done" ? "已完成" : latest.status === "failed" ? "需处理" : latest.status === "waiting" ? "等待处理" : "进行中") : "等待任务"}</strong></header><ol>{steps.map((step, stepIndex) => { const state = matched[stepIndex] ? (stepIndex === current ? "active" : "done") : "skip"; return <li className={`progress-stage ${state}`} key={step.key}><span className="progress-stage-icon">{workflowIcon(step.label)}</span><div><strong>{step.label}</strong><small>{state === "done" ? "已完成" : state === "active" ? "正在处理" : latest?.status === "done" ? "本轮未参与" : "等待条件"}</small></div></li>; })}</ol><p className="workflow-progress-note">每个阶段都绑定任务单、版本和文件证据；未被当前任务使用的 Agent 会保持等待，不会生成无效待处理项。</p></section>;
 }
@@ -2756,8 +2759,9 @@ const PROVIDER_OPTIONS = [
   { id: "custom", name: "自定义", note: "其他 OpenAI 兼容服务", baseUrl: "", models: [] },
 ] as const;
 
-type SettingsSection = "appearance" | "layout" | "models" | "creation" | "voice" | "context" | "review" | "learning" | "advanced";
+type SettingsSection = "author" | "appearance" | "layout" | "models" | "creation" | "voice" | "context" | "review" | "learning" | "advanced";
 const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string; note: string }> = [
+  { id: "author", label: "作者习惯与记忆", note: "跨书习惯、本书偏好和来源历史" },
   { id: "appearance", label: "外观", note: "主题、配色与密度" },
   { id: "layout", label: "布局", note: "面板、位置与宽度" },
   { id: "models", label: "模型", note: "连接、参数与效率" },
@@ -2802,14 +2806,6 @@ function agentContextBudgetsFromProvider(value: unknown): AgentContextBudgets {
   })) as AgentContextBudgets;
 }
 
-function usageForRoleSettings(value: CollaborationOverview["usage"] | null): CollaborationOverview["usage"] | null {
-  if (!value) return null;
-  const { reviewer: legacyEditor, ...others } = value.by_agent_role || {};
-  // Current usage events still name the combined v1 Editor "reviewer".
-  // Do not present those calls as specialist Reviewer activity.
-  return { ...value, by_agent_role: { ...others, ...(legacyEditor ? { editor: others.editor || legacyEditor } : {}) } };
-}
-
 function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, layout, preferences, onLayoutChange, onLayoutPreset, onPreferencesChange, onClose, onSaved, onVoiceSaved }: {
   projectRoot: string;
   provider: Record<string, unknown> | null;
@@ -2824,7 +2820,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   onSaved: (value: Record<string, unknown>) => void;
   onVoiceSaved: (settings: VoiceSettings, status: VoiceStatus) => void;
 }) {
-  const [form, setForm] = useState({ provider_kind: String(provider?.provider_kind || "deepseek"), api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), hook_strategy: String(provider?.hook_strategy || "most_chapters"), chapter_length_tolerance: Number(provider?.chapter_length_tolerance ?? 0.1), review_min_confidence: Number(provider?.review_min_confidence ?? 0.8), acceptance_confirmation_mode: String(provider?.acceptance_confirmation_mode || "auto_after_review"), planning_window_chapters: Number(provider?.planning_window_chapters ?? 10), dialogue_history_mode: String(provider?.dialogue_history_mode || "auto"), dialogue_history_interval: Number(provider?.dialogue_history_interval || 1), dialogue_history_limit: Number(provider?.dialogue_history_limit || 100), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), context_budget_mode: String(provider?.context_budget_mode || "unified"), agent_context_budgets: agentContextBudgetsFromProvider(provider?.agent_context_budgets), max_output_tokens: Number(provider?.max_output_tokens || 32000), input_price_per_million: Number(provider?.input_price_per_million || 0), output_price_per_million: Number(provider?.output_price_per_million || 0), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_experience_detail: String(provider?.review_experience_detail || "standard"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), agent_generation: agentGenerationFromProvider(provider?.agent_generation) });
+  const [form, setForm] = useState({ provider_kind: String(provider?.provider_kind || "deepseek"), api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), hook_strategy: String(provider?.hook_strategy || "most_chapters"), chapter_length_tolerance: Number(provider?.chapter_length_tolerance ?? 0.1), review_min_confidence: Number(provider?.review_min_confidence ?? 0.8), acceptance_confirmation_mode: String(provider?.acceptance_confirmation_mode || "auto_after_review"), planning_publication_mode: String(provider?.planning_publication_mode || "auto_after_review"), planning_window_chapters: Number(provider?.planning_window_chapters ?? 10), dialogue_history_mode: String(provider?.dialogue_history_mode || "auto"), dialogue_history_interval: Number(provider?.dialogue_history_interval || 1), dialogue_history_limit: Number(provider?.dialogue_history_limit || 100), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), context_budget_mode: String(provider?.context_budget_mode || "unified"), agent_context_budgets: agentContextBudgetsFromProvider(provider?.agent_context_budgets), max_output_tokens: Number(provider?.max_output_tokens || 32000), input_price_per_million: Number(provider?.input_price_per_million || 0), output_price_per_million: Number(provider?.output_price_per_million || 0), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_experience_detail: String(provider?.review_experience_detail || "standard"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), agent_generation: agentGenerationFromProvider(provider?.agent_generation) });
   const [voiceForm, setVoiceForm] = useState<VoiceSettings>(voiceSettings || {
     voice_enabled: false, voice_input_enabled: true, voice_output_enabled: true, voice_auto_read: false, voice_auto_send: false,
     voice_default_profile: "narrator_female", voice_speed: 1, voice_volume: 1, voice_pause_scale: 1, voice_input_device: "", voice_output_device: "",
@@ -2859,7 +2855,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   useEffect(() => {
     if (!projectRoot) { setUsageSummary(null); return; }
     void window.inkflow.request<CollaborationOverview["usage"]>("usage.overview", { project_root: projectRoot })
-      .then((value) => setUsageSummary(usageForRoleSettings(value || null)))
+      .then((value) => setUsageSummary(value || null))
       .catch(() => setUsageSummary(null));
   }, [projectRoot]);
   useEffect(() => {
@@ -3021,7 +3017,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   };
   const activePreset = SETTINGS_PRESETS.find((preset) => preset.reasoning_effort === form.reasoning_effort && preset.inquiry_frequency === form.inquiry_frequency && preset.context_soft_tokens === form.context_soft_tokens && preset.context_hard_tokens === form.context_hard_tokens)?.id;
   const inferredProvider = form.provider_kind;
-  const settingKeywords: Record<SettingsSection, string> = { appearance: "主题 黑白 系统 配色 颜色 密度", layout: "布局 面板 宽度 左右", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", learning: "学习 反馈 偏好 导出", advanced: "高级 temperature top p top k PowerShell" };
+  const settingKeywords: Record<SettingsSection, string> = { author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", layout: "布局 面板 宽度 左右", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", learning: "学习 反馈 偏好 导出", advanced: "高级 temperature top p top k PowerShell" };
   const visibleSections = SETTINGS_SECTIONS.filter((item) => `${item.label}${item.note}${settingKeywords[item.id]}`.toLowerCase().includes(search.trim().toLowerCase()));
   const chooseProvider = (id: string) => {
     const choice = PROVIDER_OPTIONS.find((item) => item.id === id);
@@ -3130,7 +3126,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   const refreshUsage = async () => {
     if (!projectRoot) return;
     try {
-      setUsageSummary(usageForRoleSettings(await window.inkflow.request<NonNullable<CollaborationOverview["usage"]>>("usage.overview", { project_root: projectRoot })));
+      setUsageSummary(await window.inkflow.request<NonNullable<CollaborationOverview["usage"]>>("usage.overview", { project_root: projectRoot }));
     } catch (cause) {
       setError(errorMessage(cause));
     }
@@ -3169,6 +3165,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
         {section === "creation" && <SettingsPane title="创作" note="预设会同时调整上下文、询问策略、审查模式和三个角色的生成参数。">
           <div className="preset-grid">{SETTINGS_PRESETS.map((preset) => <button type="button" key={preset.id} className={activePreset === preset.id ? "active" : ""} onClick={() => applyCreationPreset(preset)}><strong>{activePreset === preset.id ? "✓ " : ""}{preset.name}</strong><span>{preset.note}</span><small>{preset.context_soft_tokens / 10000} 万常用上下文</small></button>)}</div>
           <SettingGroup title="近期规划" note="未指定章节范围时，默认连续规划的未来章节数；已接受正文只作为衔接依据。"><label>默认近期规划章数<input type="number" min={1} max={50} step={1} value={form.planning_window_chapters} onChange={(event) => updateForm({ planning_window_chapters: Math.min(50, Math.max(1, Math.round(Number(event.target.value) || 1))) })} /></label></SettingGroup>
+          <SettingGroup title="规划正式发布" note="只影响三层规划审核通过后何时成为正式版；审核失败或候选中断始终保持原版。"><label>发布方式<select value={form.planning_publication_mode} onChange={(event) => updateForm({ planning_publication_mode: event.target.value })}><option value="auto_after_review">审核通过后自动发布</option><option value="confirm_after_review">审核通过后等我确认</option></select></label><p className="form-hint">旧版保留或删除始终另行选择；删除前还会展示准确对象并再次确认。</p></SettingGroup>
           <div className="settings-fields two"><label>思考强度<select value={form.reasoning_effort} onChange={(event) => updateForm({ reasoning_effort: event.target.value })}><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最高</option></select></label><label>主动询问<select value={form.inquiry_frequency} onChange={(event) => updateForm({ inquiry_frequency: event.target.value })}><option value="low">只问必需信息</option><option value="medium">把握较低时询问</option><option value="high">重要创作分岔也询问</option><option value="ultra">有明显未知项就询问</option></select></label></div>
           <SettingGroup title="章节检查"><div className="settings-fields two"><label>结尾钩子<select value={form.hook_strategy} onChange={(event) => updateForm({ hook_strategy: event.target.value })}><option value="most_chapters">大多数章节保留期待</option><option value="key_chapters">重点章节使用明确钩子</option><option value="natural_afterglow">自然余味优先</option></select></label><label>字数容差 <small>上下 {(form.chapter_length_tolerance * 100).toFixed(0)}%</small><input type="range" min={0.05} max={0.3} step={0.05} value={form.chapter_length_tolerance} onChange={(event) => updateForm({ chapter_length_tolerance: Number(event.target.value) })} /></label><label>自动通过最低审查符合度 <small>{(Math.max(0.8, form.review_min_confidence) * 100).toFixed(0)}%</small><input type="range" min={0.8} max={1} step={0.05} value={Math.max(0.8, form.review_min_confidence)} onChange={(event) => updateForm({ review_min_confidence: Number(event.target.value) })} /></label></div><p className="form-hint">默认字数±10%。自动通过须必需项无硬问题、来源证据齐全且加权符合度达到设置值（至少80%）。百分比不是正确概率；缺资料先补审，不让 Writer 为漏读改稿。</p></SettingGroup>
           <SettingGroup title="验收确认策略" note="只改变何时取得你的授权；Editor 审查通过、正文哈希和记忆服务事务门禁始终保留。"><label>确认方式<select value={form.acceptance_confirmation_mode} onChange={(event) => updateForm({ acceptance_confirmation_mode: event.target.value })}><option value="auto_after_review">Editor 审查通过后自动验收（默认）</option><option value="batch_once">批次提交前确认一次</option><option value="per_chapter">逐章确认</option></select></label><p className="form-hint">“自动验收”只在当前版本没有硬问题且 Editor 审查通过时生效；尚未完成的审查不会伪装成通过。切换设置只影响之后的操作。</p></SettingGroup>
@@ -3221,6 +3218,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
             {learningNotice && <p className="form-success">{learningNotice}</p>}
           </SettingGroup>
         </SettingsPane>}
+        {section === "author" && <SettingsPane title="作者习惯与记忆" note="管理长期习惯，保留每本书自己的声音。"><AuthorPreferences projectRoot={projectRoot} /></SettingsPane>}
         {section === "advanced" && <SettingsPane title="高级" note="普通创作不需要修改这里。模型参数已归到模型页，语音参数只在语音页出现一次。">
           <SettingGroup title="高级电脑操作" note="默认关闭。开启后每条命令仍会弹窗展示并等待你单独确认；命令使用当前 Windows 账户权限，可能读写项目目录以外的文件、联网或启动应用。"><label className="setting-check"><input type="checkbox" checked={form.powershell_enabled} onChange={(event) => updateForm({ powershell_enabled: event.target.checked })} />允许墨流提出 PowerShell 操作请求</label></SettingGroup>
         </SettingsPane>}

@@ -784,6 +784,20 @@ class ArcAuditReport(StrictModel):
     source_hash: str = ""
 
 
+class MemoryEvidence(StrictModel):
+    source_chapter: int = Field(ge=1)
+    quote: str = Field(min_length=2, max_length=2000)
+    relation: Literal["support", "counter", "belief", "reference"] = "support"
+
+
+class MemoryOperation(StrictModel):
+    action: Literal["supplement", "retract", "replace_evidence", "retire_evidence"]
+    target_fact_id: str = Field(min_length=1)
+    target_evidence_id: str = ""
+    reason: str = Field(min_length=2, max_length=1000)
+    evidence: list[MemoryEvidence] = Field(min_length=1, max_length=12)
+
+
 class FactMutation(StrictModel):
     fact_id: str
     subject: str
@@ -792,6 +806,7 @@ class FactMutation(StrictModel):
     valid_from_chapter: int = Field(ge=1)
     confidence: float = Field(default=1.0, ge=0, le=1)
     evidence: str = Field(min_length=2)
+    evidence_refs: list[MemoryEvidence] = Field(default_factory=list, max_length=12)
     epistemic_kind: Literal["objective", "belief", "rumor"] = "objective"
     event_time: str | None = None
     narrative_time: str | None = None
@@ -814,6 +829,7 @@ class MemoryPatch(StrictModel):
     facts: list[FactMutation] = Field(default_factory=list)
     threads: list[ThreadMutation] = Field(default_factory=list)
     unresolved_conflicts: list[str] = Field(default_factory=list)
+    operations: list[MemoryOperation] = Field(default_factory=list, max_length=20)
 
     @field_validator("facts")
     @classmethod
@@ -1169,6 +1185,8 @@ class ReviewerResult(ReviewResultBase):
 
 
 class MemoryResult(StrictModel):
+    """Design-level envelope; current v2 model calls use ModeCheckOutput."""
+
     role_protocol_version: Literal[2] = 2
     role: Literal["memory_keeper"] = "memory_keeper"
     sources: ResultSources
@@ -1195,6 +1213,9 @@ TerminalAction = Literal[
     "status",
     "plan",
     "plan_preview",
+    "planning_history_view",
+    "planning_history_restore",
+    "planning_publish_reviewed",
     "outline",
     "redesign_story",
     "plan_brief",
@@ -1229,10 +1250,20 @@ TerminalAction = Literal[
 ]
 
 
+class PreferenceObservation(StrictModel):
+    text: str = Field(min_length=1, max_length=1000)
+    source_quote: str = Field(min_length=1, max_length=2000)
+    level: Literal["author", "project", "task"] = "task"
+    scope: str = "project"
+    topic: str = ""
+    explicit: bool = False
+
+
 class TerminalIntent(StrictModel):
     """Coordinator 的受限路由输出；不能发明工作流、写正文或强制验收。"""
 
     action: TerminalAction
+    preference_observations: list[PreferenceObservation] = Field(default_factory=list, max_length=3)
     outline_level: Literal["story", "detail"] = "story"
     requested_outcome: str = Field(default="", max_length=1_000)
     user_message: str = Field(default="", max_length=4_000)
@@ -1265,6 +1296,10 @@ class TerminalIntent(StrictModel):
     confirmation_token: str | None = Field(default=None, max_length=120)
     batch_id: str | None = Field(default=None, max_length=180)
     plan_change_confirmed: bool = False
+    planning_revision_no: int | None = Field(default=None, ge=0)
+    planning_part: Literal["none", "outline", "detail", "recent"] = "none"
+    planning_reference_chapter_no: int | None = Field(default=None, ge=1)
+    planning_reference_volume_no: int | None = Field(default=None, ge=1)
     target_characters: int | None = Field(default=None, ge=1_000, le=5_000_000)
     max_revision_rounds: int = Field(default=2, ge=0, le=6)
     operation_instruction: str = Field(default="", max_length=4_000)

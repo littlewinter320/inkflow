@@ -9,6 +9,7 @@ from typing import Any, Literal
 from .craft import select_craft_guides
 from .errors import ValidationGateError
 from .project import InkFlowProject
+from .planning_pipeline import load_active_planning
 from .outline_context import outline_sections
 from .retrieval import HybridRetriever
 from .schemas import ArcPlan, ContextPacket, ContextSection, PlanBundle, VolumePlan
@@ -22,6 +23,11 @@ _COMPRESSED_NOTE = "（已按完整条目压缩；完整资料仍保存在本地
 def planning_bundle_for_chapter(project: InkFlowProject, chapter_no: int) -> PlanBundle | None:
     """Resolve the card's persisted plan, not whichever window was opened last."""
     current = project.db.get_current_plan_bundle()
+    active_v2 = load_active_planning(project)
+    if active_v2 is not None and chapter_no > active_v2[3].anchor_chapter:
+        expected_prefix = f"v2:{active_v2[0]['trace_id']}:"
+        if current is None or not current.current_arc.arc_id.startswith(expected_prefix):
+            raise ValidationGateError("当前规划文档已生效，但数据库章节卡仍是旧版；请先重新发布规划，不能引用旧卡写作。")
     if current is None:
         return None
     with project.db.connect() as connection:
@@ -36,6 +42,29 @@ def planning_bundle_for_chapter(project: InkFlowProject, chapter_no: int) -> Pla
     if supplement is not None:
         bundle = PlanBundle.model_validate(supplement)
     elif parent and parent != current.current_arc.arc_id:
+        if active_v2 is not None and chapter_no <= active_v2[3].anchor_chapter:
+            # Accepted chapters may still depend on the plan that was active
+            # when they entered canon. The new volume key is reused, so read
+            # that exact preserved database snapshot instead of mixing eras.
+            history = project.root / "planning" / "history"
+            for snapshot in sorted(history.glob("database-*.json"), key=lambda path: path.stat().st_mtime):
+                try:
+                    rows = json.loads(snapshot.read_text(encoding="utf-8"))["plans"]
+                    values = {(row["kind"], row["plan_key"]): json.loads(row["data_json"])
+                              for row in rows}
+                    card_before = values.get(("chapter", f"chapter:{chapter_no:05d}"))
+                    arc_before = values.get(("arc", parent))
+                    if card_before != project.db.get_chapter_card(chapter_no) or arc_before is None:
+                        continue
+                    old_volume = values.get(("volume", f"volume:{arc_before['volume_no']:03d}"))
+                    old_book = values.get(("book", "book"))
+                    if old_volume and old_book:
+                        return PlanBundle.model_validate({"book": old_book,
+                                                          "current_volume": old_volume,
+                                                          "current_arc": arc_before})
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+            raise ValidationGateError(f"第 {chapter_no} 章所依赖的旧版规划快照缺失，不能用新版卷纲冒充其来源。")
         arc_data = project.db.get_plan("arc", parent)
         if arc_data is None:
             raise ValidationGateError(f"第 {chapter_no} 章章节卡关联的近期计划缺失，不能混用其他篇章。")
@@ -124,7 +153,7 @@ def _fit_soft_content(content: str, limit: int, *, keep_tail: bool = False) -> s
 
 
 def _voice_preferences_for_context(
-    preferences: list[dict[str, Any]], task: str, card: dict[str, Any], limit: int = 12
+    preferences: list[dict[str, Any]], task: str, card: dict[str, Any], limit: int | None = None
 ) -> list[dict[str, Any]]:
     haystack = (task + "\n" + json.dumps(card, ensure_ascii=False)).casefold()
     ranked: list[tuple[int, int, dict[str, Any]]] = []
@@ -143,7 +172,17 @@ def _voice_preferences_for_context(
             continue
         ranked.append((score, -index, item))
     ranked.sort(key=lambda row: (-row[0], -row[1]))
-    return [item for _, _, item in ranked[:limit]]
+    selected = []
+    remaining = 3000
+    for _, _, item in ranked:
+        cost = estimate_tokens(str(item["text"]))
+        if cost > remaining:
+            continue
+        selected.append(item)
+        remaining -= cost
+        if limit is not None and len(selected) >= limit:
+            break
+    return selected
 
 
 class ContextBuilder:
@@ -205,10 +244,12 @@ class ContextBuilder:
 
         facts = database.facts_as_of(chapter_no - 1)
         threads = database.threads_as_of(chapter_no - 1)
-        preferences = database.list_preferences()
+        preferences = database.effective_preferences()
+        from .preferences import applicable_preferences
+        preferences = applicable_preferences(preferences, task, {**card, "genre": brief.genre, "chapter_no": chapter_no})
         forced_preferences = [item for item in preferences if item["strength"] == "hard"]
         forced_texts = list(dict.fromkeys(str(item["text"]).strip() for item in forced_preferences if str(item["text"]).strip()))
-        voice_preferences = _voice_preferences_for_context(preferences, task, card)
+        voice_preferences = _voice_preferences_for_context(preferences, task, {**card, "genre": brief.genre})
         studio_context = self._studio_context(chapter_no, task, card)
         pinned_sources = {str(item["source_id"]) for item in studio_context["pins"]}
         effective_recent_limit = recent_limit if recent_limit is not None else {
@@ -273,6 +314,7 @@ class ContextBuilder:
                     "summary": memory_patch.get("chapter_summary", ""),
                     "scene_summaries": memory_patch.get("scene_summaries", []),
                     "facts": memory_patch.get("facts", []),
+                    "operations": memory_patch.get("operations", []),
                     "threads": memory_patch.get("threads", []),
                 }
             )
@@ -317,7 +359,7 @@ class ContextBuilder:
         already_loaded = {
             *[str(item["fact_id"]) for item in mandatory_facts],
             *[str(item["thread_id"]) for item in threads],
-            *[str(item["preference_id"]) for item in preferences],
+            *[str(item["preference_id"]) for item in [*forced_preferences, *voice_preferences]],
         }
         duplicate_retrieval_ids = sorted(
             str(item["source_id"]) for item in retrieval_hits
@@ -522,10 +564,10 @@ class ContextBuilder:
                 content=json.dumps(
                     {
                         "本章可用偏好": [
-                            {"范围": item["scope"], "要求": item["text"]}
+                            {"编号": item["preference_id"], "范围": item["scope"], "层级": item.get("level", "project"), "要求": item["text"]}
                             for item in voice_preferences
                         ],
-                        "使用边界": "当前用户指令和已验收正史优先；只采用与本章视角、人物或场景相符的偏好。",
+                        "使用边界": "当前指令和本书要求优先于作者默认；仅采用适用偏好，普通偏好不是硬门禁，不移植其他书剧情。",
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -601,6 +643,14 @@ class ContextBuilder:
                 "硬约束本身已超过最大上下文容量，墨流没有静默删除正史或用户指令；"
                 "请在上下文面板查看占用并缩小任务范围。"
             )
+        selected_ids = {ref for section in packet.sections for ref in section.source_ids}
+        database.set_metadata("preference.selection", {
+            "chapter_no": chapter_no, "task": task,
+            "selected": [item for item in preferences if item["preference_id"] in selected_ids],
+            "omitted": [{"preference_id": item["preference_id"], "text": item["text"],
+                         "reason": "范围不适用或本次相关性与上下文预算未选中"}
+                        for item in database.effective_preferences() if item["preference_id"] not in selected_ids],
+        })
         return packet
 
     def _load_reference_cards(self, limit: int) -> list[dict]:
@@ -1036,6 +1086,7 @@ def _fact_for_model(item: dict[str, Any]) -> dict[str, Any]:
         "内容": item["value"],
         "生效章节": item["valid_from_chapter"],
         "正文证据": item.get("evidence", ""),
+        "关联证据": item.get("evidence_refs", []),
         "认识类型": item.get("epistemic_kind", "objective"),
         "事件时间": item.get("event_time"),
         "叙述时间": item.get("narrative_time"),

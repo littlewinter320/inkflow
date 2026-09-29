@@ -423,7 +423,7 @@ class ProjectDatabase:
             "next_step": "只核对受影响的细纲和未来安排；已接受正文不自动改写。" if affected else "依据与当前计划一致。",
         }
 
-    def save_plan_bundle(self, bundle: PlanBundle) -> None:
+    def save_plan_bundle(self, bundle: PlanBundle, *, supersede_after_chapter: int | None = None) -> None:
         now = utc_now()
         volume_key = f"volume:{bundle.current_volume.volume_no:03d}"
         rows: list[tuple[str, str, str | None, str]] = [
@@ -452,6 +452,23 @@ class ProjectDatabase:
         )
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if supersede_after_chapter is not None:
+                # A reviewed v2 publication replaces every unaccepted legacy
+                # execution card. Accepted chapters keep their source cards.
+                connection.execute(
+                    "DELETE FROM plans WHERE kind='chapter' AND CAST(SUBSTR(plan_key, 9) AS INTEGER)>?",
+                    (supersede_after_chapter,),
+                )
+                connection.execute(
+                    "DELETE FROM plans WHERE kind IN ('arc','supplement') "
+                    "AND NOT EXISTS (SELECT 1 FROM plans child WHERE child.kind='chapter' "
+                    "AND child.parent_key=plans.plan_key)"
+                )
+                connection.execute(
+                    "DELETE FROM plans WHERE kind='volume' AND NOT EXISTS ("
+                    "SELECT 1 FROM plans arc WHERE arc.kind='arc' "
+                    "AND arc.parent_key=plans.plan_key)"
+                )
             for kind, key, parent, data in rows:
                 connection.execute(
                     """
@@ -466,6 +483,22 @@ class ProjectDatabase:
                     """,
                     (kind, key, parent, data, now),
                 )
+            if supersede_after_chapter is not None:
+                for card in bundle.current_arc.chapter_cards:
+                    draft = connection.execute(
+                        "SELECT version,content_hash FROM chapters WHERE chapter_no=? AND status='draft'",
+                        (card.chapter_no,),
+                    ).fetchone()
+                    if draft:
+                        marker = {"revision_id": bundle.current_arc.arc_id, "status": "needs_writer",
+                                  "draft_version": draft["version"], "draft_hash": draft["content_hash"],
+                                  "card_hash": content_hash(json_dumps(card.model_dump(mode="json"))),
+                                  "instruction": "生效规划已更新，须按新版章节卡定向修订"}
+                        connection.execute(
+                            "INSERT INTO metadata(key,value_json,updated_at) VALUES (?,?,?) "
+                            "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                            (f"pending_plan_revision:{card.chapter_no}", json_dumps(marker), now),
+                        )
             # A pointer is safer than `ORDER BY updated_at`: several planning
             # commits can legitimately happen inside the same clock second.
             pointer = {
@@ -878,7 +911,8 @@ class ProjectDatabase:
             item = dict(row)
             item["value"] = json.loads(item.pop("value_json"))
             result.append(item)
-        return result
+        from .memory_records import attach_evidence
+        return attach_evidence(self, result)
 
     def facts_as_of(self, chapter_no: int) -> list[dict[str, Any]]:
         """Facts available after an accepted chapter, including later-superseded facts.
@@ -933,7 +967,8 @@ class ProjectDatabase:
             item = dict(row)
             item["value"] = json.loads(item.pop("value_json"))
             result.append(item)
-        return result
+        from .memory_records import attach_evidence
+        return attach_evidence(self, result, boundary=chapter_no)
 
     def open_threads(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -1119,7 +1154,7 @@ class ProjectDatabase:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
-                "SELECT status,version,content_hash FROM chapters WHERE chapter_no=?", (chapter_no,)
+                "SELECT status,version,content_hash,content_text FROM chapters WHERE chapter_no=?", (chapter_no,)
             ).fetchone()
             latest = connection.execute(
                 "SELECT COALESCE(MAX(chapter_no),0) FROM chapters WHERE status='accepted'"
@@ -1156,14 +1191,16 @@ class ProjectDatabase:
                 raise ValueError("修订期间本章记忆已变化；候选未覆盖当前版本。")
             if current_memory_json:
                 previous_memory = MemoryPatch.model_validate_json(current_memory_json)
-                if revised_memory is None and any(fact.evidence not in content for fact in previous_memory.facts):
+                from .memory_records import affected_fact_ids
+                affected_ids = affected_fact_ids(previous_memory.facts, current["content_text"] or "", content)
+                if revised_memory is None and bool(affected_ids):
                     raise ValueError("局部修订使记忆证据失效，但没有可核对的记忆更新。")
             if revised_memory is not None:
                 if not current_memory_json or revised_memory.chapter_no != chapter_no or revised_memory.unresolved_conflicts:
                     raise ValueError("记忆更新缺少有效旧版本或仍有冲突。")
                 old_facts = {fact.fact_id: fact for fact in previous_memory.facts}
                 new_facts = {fact.fact_id: fact for fact in revised_memory.facts}
-                if (set(old_facts) != set(new_facts)
+                if (revised_memory.operations != previous_memory.operations or set(old_facts) != set(new_facts)
                         or {thread.thread_id for thread in previous_memory.threads}
                         != {thread.thread_id for thread in revised_memory.threads}):
                     raise ValueError("记忆更新擅自增删了事实或线索编号。")
@@ -1171,7 +1208,7 @@ class ProjectDatabase:
                     old = old_facts[fact_id]
                     if (fact.evidence not in content or fact.subject != old.subject
                             or fact.valid_from_chapter != old.valid_from_chapter
-                            or (old.evidence in content and fact != old)):
+                            or (old.fact_id not in affected_ids and fact != old)):
                         raise ValueError("记忆更新改变了未受影响事实，或证据不在候选正文。")
             new_version = expected_version + 1
             connection.execute(
@@ -1242,6 +1279,9 @@ class ProjectDatabase:
                              "old_hash": expected_hash, "new_hash": new_hash,
                              "diagnosis": diagnosis, "verification": verification}, indent=None), now),
             )
+            if revised_memory is not None:
+                from .memory_records import commit_evidence
+                commit_evidence(connection, revised_memory.model_copy(update={"operations": []}), chapter_no, new_version, content)
             connection.commit()
         return new_version
 
@@ -1302,13 +1342,18 @@ class ProjectDatabase:
                 if staged_patch.model_dump(mode="json") != patch.model_dump(mode="json"):
                     raise ValueError(f"第 {chapter_no} 章待提升补丁与临时记忆不一致")
             for fact in patch.facts:
+                from .memory_records import journal
+                previous_facts = [dict(row) for row in connection.execute(
+                    "SELECT * FROM facts WHERE subject=? AND predicate=? AND status='active'",
+                    (fact.subject, fact.predicate))]
                 existing_identity = connection.execute(
-                    "SELECT subject, predicate FROM facts WHERE fact_id=?",
+                    "SELECT subject, predicate, source_chapter FROM facts WHERE fact_id=?",
                     (fact.fact_id,),
                 ).fetchone()
                 if existing_identity and (
                     existing_identity["subject"] != fact.subject
                     or existing_identity["predicate"] != fact.predicate
+                    or existing_identity["source_chapter"] != chapter_no
                 ):
                     raise ValueError(f"fact_id {fact.fact_id} 已属于其他主体关系，不能覆盖")
                 connection.execute(
@@ -1344,6 +1389,10 @@ class ProjectDatabase:
                         now,
                     ),
                 )
+                journal(connection, "replace" if previous_facts else "add", fact.fact_id,
+                        previous_facts, fact.model_dump(mode="json"), "已审核正文中的事实演变", chapter_no)
+            from .memory_records import commit_evidence
+            commit_evidence(connection, patch, chapter_no, int(current["version"]), content)
             for thread in patch.threads:
                 connection.execute(
                     """
@@ -1807,73 +1856,34 @@ class ProjectDatabase:
             connection.commit()
         return int(cursor.rowcount)
 
-    def upsert_preference(
-        self,
-        *,
-        text: str,
-        strength: str = "weak",
-        scope: str = "project",
-        source: str = "user",
-        preference_id: str | None = None,
-    ) -> dict[str, Any]:
-        if strength not in {"hard", "weak"}:
-            raise ValueError("偏好强度只能是 hard 或 weak")
-        clean = text.strip()
-        if not clean:
-            raise ValueError("偏好内容不能为空")
-        item_id = preference_id or f"preference-{content_hash(scope + clean)[:16]}"
-        now = utc_now()
+    def upsert_preference(self, *, text: str, strength: str = "weak", scope: str = "project",
+                          source: str = "user", preference_id: str | None = None, **details) -> dict[str, Any]:
+        from .preferences import change_item
         with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO user_preferences(preference_id, strength, scope, text, source, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
-                ON CONFLICT(preference_id) DO UPDATE SET strength=excluded.strength, scope=excluded.scope,
-                    text=excluded.text, source=excluded.source, status='active', updated_at=excluded.updated_at
-                """,
-                (item_id, strength, scope, clean, source, now, now),
-            )
-            connection.commit()
-        return {"preference_id": item_id, "strength": strength, "scope": scope, "text": clean, "source": source, "status": "active", "updated_at": now}
+            return change_item(connection, text=text, strength=strength, scope=scope, source=source,
+                               preference_id=preference_id, **details)
 
     def list_preferences(self, *, active_only: bool = True) -> list[dict[str, Any]]:
-        where = " WHERE status='active'" if active_only else ""
+        from .preferences import list_items
         with self.connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM user_preferences" + where + " ORDER BY CASE strength WHEN 'hard' THEN 0 ELSE 1 END, updated_at DESC"
-            ).fetchall()
-        return [dict(row) for row in rows]
+            return list_items(connection, active_only=active_only)
+
+    def effective_preferences(self) -> list[dict[str, Any]]:
+        from .preferences import effective_preferences
+        return effective_preferences(self)
 
     def set_preference_status(self, preference_id: str, status: str) -> dict[str, Any]:
-        if status not in {"active", "paused"}:
-            raise ValueError("偏好状态只能是 active 或 paused")
-        with self.connect() as connection:
-            cursor = connection.execute(
-                "UPDATE user_preferences SET status=?, updated_at=? WHERE preference_id=?",
-                (status, utc_now(), preference_id),
-            )
-            connection.commit()
-        if not cursor.rowcount:
+        item = next((item for item in self.list_preferences(active_only=False)
+                     if item["preference_id"] == preference_id), None)
+        if item is None:
             raise ValueError("作品声音偏好不存在")
-        return next(
-            item for item in self.list_preferences(active_only=False) if item["preference_id"] == preference_id
-        )
+        return self.upsert_preference(text=item["text"], strength=item["strength"], scope=item["scope"],
+            source=item["source"], preference_id=preference_id, status=status,
+            expected_revision=item.get("revision", 0), reason="用户修改使用状态")
 
     def delete_preference(self, preference_id: str) -> dict[str, Any]:
-        existing = next(
-            (
-                item
-                for item in self.list_preferences(active_only=False)
-                if item["preference_id"] == preference_id
-            ),
-            None,
-        )
-        if existing is None:
-            raise ValueError("作品声音偏好不存在")
-        with self.connect() as connection:
-            connection.execute("DELETE FROM user_preferences WHERE preference_id=?", (preference_id,))
-            connection.commit()
-        return {**existing, "status": "deleted", "updated_at": utc_now()}
+        # Removal from use retains the audit trail; it is not physical erasure.
+        return self.set_preference_status(preference_id, "deleted")
 
     def record_learning_event(
         self,

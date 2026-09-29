@@ -4,7 +4,7 @@
 
 墨流把故事讨论、分层规划、正文写作、证据审查和记忆维护组织在同一个小说项目中。作者用日常中文表达目标，Coordinator 理解并安排任务，Writer 产出规划或正文，当前模式下的编辑与专项角色提供审查和记忆提案，再由 Novel Engine 核对权限、依赖与版本，决定哪些结果可以进入下一步。
 
-**当前版本：0.7.0** · [下载安装包与扩展](https://github.com/littlewinter320/inkflow/releases/latest) · [本版更新](CHANGELOG.md) · [反馈问题](https://github.com/littlewinter320/inkflow/issues) · [许可证](LICENSE)
+**已发布版本：0.7.0** · [下载安装包与扩展](https://github.com/littlewinter320/inkflow/releases/latest) · [本版更新](CHANGELOG.md) · [反馈问题](https://github.com/littlewinter320/inkflow/issues) · [许可证](LICENSE)
 
 桌面工作台面向 Windows，另有 VS Code 扩展、CLI 和 MCP 入口。小说资料保存在本地，云端模型按任务接收所需上下文。安装包包含创作引擎与 Edge 朗读组件；写作服务需要按所选供应商配置，Edge 朗读需要联网。
 
@@ -332,7 +332,7 @@ graph TD
 
 比较性能需要同时看原始输入、缓存命中输入、输出 Token、调用次数、耗时和合格产物。一份草稿生成很快，后续却反复修订，总成本可能更高；省略必要审查也不等于以更低成本完成同等任务。
 
-墨流提供稳定输入组织、用量统计和并发限制，但缓存命中取决于供应商及实际输入。单次波动不足以证明优化有效，配置价格形成的估算也需要与实际账单区分。相关方法见 [DeepSeek 缓存专题](docs/deepseek-cache-optimization.md)，调用实现见 [Provider 与用量记录](#source-provider)。
+墨流提供稳定输入组织、用量统计和并发限制，但缓存命中取决于供应商及实际输入。单次波动不足以证明优化有效，配置价格形成的估算也需要与实际账单区分。相关方法见 [DeepSeek 缓存专题](docs/INKFLOW_COMPLETE_ANALYSIS.md#inkflow-34)，调用实现见 [Provider 与用量记录](#source-provider)。
 
 独立请求可以并发，实际数量受供应商限制和软件配置约束。共享正史提交及同章依赖需要版本协调；远端生成期间原则上不占用项目写锁，结果返回后仍需核对来源有效才能写回。
 
@@ -416,9 +416,9 @@ MOSS 本地朗读与本地普通话识别是按需安装选项。下载完成只
 | 可选本地模型 | 按需安装并选择，不会自动替代全部功能 |
 | 调用轨迹 | 可能包含正文与任务信息，分享前应脱敏 |
 
-作者样稿与 Humanizer 小说适配提供表达引导，当前用户要求和本书声音优先。它们不会把样稿剧情搬入正史，也不等于修改远端模型权重。规则详见[作者文风说明](docs/INKFLOW_AUTHOR_STYLE.md)。
+作者样稿与 Humanizer 小说适配提供表达引导，当前用户要求和本书声音优先。它们不会把样稿剧情搬入正史，也不等于修改远端模型权重。规则详见[作者文风说明](docs/INKFLOW_COMPLETE_ANALYSIS.md#inkflow-36)。
 
-**素材整理、提示词学习和参数训练是不同工作。** 当前仓库包含素材处理与条件训练入口，但参数训练及其产物接入实际 Writer 尚未完成。独立 Qwen 本地写作试验已取消，不属于默认安装步骤。训练前必须确认目标模型可训练、产物可部署、实际 Writer 能调用；状态见 [Writer 训练流程](docs/INKFLOW_WRITER_TRAINING_WORKFLOW.md)。
+**素材整理、提示词学习和参数训练是不同工作。** 当前仓库包含素材处理与条件训练入口，但参数训练及其产物接入实际 Writer 尚未完成。独立 Qwen 本地写作试验已取消，不属于默认安装步骤。训练前必须确认目标模型可训练、产物可部署、实际 Writer 能调用；状态见 [Writer 训练流程](docs/INKFLOW_COMPLETE_ANALYSIS.md#inkflow-36)。
 
 <a id="recovery"></a>
 ## 14. 状态、恢复与常见问题
@@ -519,7 +519,7 @@ VS Code 扩展要求 1.100.0 或以上版本，可通过 `inkflow.enginePath` �
 
 ### 15.5 构建安装包
 
-从仓库根目录运行 `scripts/build-release.ps1`，同时打包扩展时加 `-IncludeExtension`。脚本会安装构建依赖、核对组件版本并生成产物，0.7.0 目录为 `D:\墨流\release\0.7.0`。这是发布准备步骤，不是日常启动步骤。
+从仓库根目录运行 `scripts/build-release.ps1`，同时打包扩展时加 `-IncludeExtension`。脚本会安装构建依赖、核对组件版本并将产物写入 D 盘当前源码版本的专用目录。这是发布准备步骤，不是日常启动步骤。
 
 `-Publish` 会进入外部发布流程，只在明确需要发布时使用。正式发布要求标签、桌面、引擎、扩展和安装包版本一致。构建成功证明产物已生成，不替代真实创作流程与模型效果验证。[S1](#source-release)
 
@@ -562,16 +562,11 @@ graph TD
 
 完整追踪应保留五个关联点：**用户原话 → 实际任务范围 → 角色输入输出 → 文件与版本 → 界面状态**。这样可以区分路由错误、资料漏读、结论失效与文件同步故障，避免只处理最后显示错误的地方。
 
-### 16.2 独立文档阅读路径
+### 16.2 完整分析阅读路径
 
 | 文档 | 继续了解什么 | 与本文的关系 |
 | --- | --- | --- |
-| [架构与实现说明](docs/INKFLOW_ARCHITECTURE_REDESIGN.md) | 角色权限、运行模式、规划、审查、记忆和恢复 | 深入技术入口，设计目标和已实现部分需要分别看待 |
-| [作者文风说明](docs/INKFLOW_AUTHOR_STYLE.md) | 样稿表达偏好与 Humanizer 小说适配 | 对应个性化边界 |
-| [Writer 训练流程](docs/INKFLOW_WRITER_TRAINING_WORKFLOW.md) | 样本整理、训练条件与实际接入前提 | 核对训练状态，不是默认启动步骤 |
-| [DeepSeek 缓存专题](docs/deepseek-cache-optimization.md) | 输入组织、缓存观察和成本定位 | 对应模型调用与性能 |
-| [故事基础资料](docs/story-foundations.md) | 创作相关参考 | 辅助创作依据，不替代本书要求 |
-| [标点与表达指导](docs/punctuation-style-guidance.md) | 表达层参考规则 | 不单独升级为机械放行门禁 |
+| [完整项目分析](docs/INKFLOW_COMPLETE_ANALYSIS.md) | 项目结构、角色工作流、规划、记忆、检索、训练边界与源码依据 | 按对应章节定位实现与后续修改入口 |
 | [本版更新](CHANGELOG.md) | 0.7.0 用户可见变更 | 核对当前发布变化 |
 
 这里只链接已经存在的资料，不把待撰写的独立拆解列为完成文档。阅读历史配置和计划章节时，应结合现行协议、源码与实现状态；路线图中的目标不等于已经运行的能力。
@@ -589,7 +584,7 @@ graph TD
 | <a id="source-planning"></a>S4 | [planning_pipeline.py](agent/src/inkflow/planning_pipeline.py)、[schemas.py](agent/src/inkflow/schemas.py) | 分层规划、审核、生效与来源绑定 |
 | <a id="source-engine"></a>S5 | [engine.py](agent/src/inkflow/engine.py)、[coordinator.py](agent/src/inkflow/coordinator.py) | 请求路由、创作编排、门禁和修订 |
 | <a id="source-review"></a>S6 | [review_rubric.py](agent/src/inkflow/review_rubric.py)、[review_verifier.py](agent/src/inkflow/review_verifier.py) | 证据量表、权重及引文核对 |
-| <a id="source-memory"></a>S7 | [database.py](agent/src/inkflow/database.py)、[架构说明](docs/INKFLOW_ARCHITECTURE_REDESIGN.md) | 正史、临时记忆、偏好与历史状态 |
+| <a id="source-memory"></a>S7 | [database.py](agent/src/inkflow/database.py)、[架构说明](docs/INKFLOW_COMPLETE_ANALYSIS.md) | 正史、临时记忆、偏好与历史状态 |
 | <a id="source-context"></a>S8 | [context.py](agent/src/inkflow/context.py)、[retrieval.py](agent/src/inkflow/retrieval.py) | 上下文组织、检索与来源追踪 |
 | <a id="source-project"></a>S9 | [project.py](agent/src/inkflow/project.py)、[database.py](agent/src/inkflow/database.py) | 项目目录、权威正文、恢复与同步 |
 | <a id="source-runtime"></a>S10 | [runtime.py](agent/src/inkflow/runtime.py)、[checkpoints.py](agent/src/inkflow/checkpoints.py)、[project_lock.py](agent/src/inkflow/project_lock.py) | 预算、检查点和共享写入协调 |
@@ -605,4 +600,4 @@ graph TD
 
 项目许可见 [LICENSE](LICENSE)，第三方组件与语音依赖声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。模型供应商和在线语音服务另有使用条件，选择服务时请核对对应约定。
 
-[返回阅读导航](#guide) · [开始第一次创作](#first-story) · [独立架构文档](docs/INKFLOW_ARCHITECTURE_REDESIGN.md)
+[返回阅读导航](#guide) · [开始第一次创作](#first-story) · [完整项目分析](docs/INKFLOW_COMPLETE_ANALYSIS.md)

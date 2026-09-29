@@ -6,7 +6,7 @@
 $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
-$releaseRoot = 'D:\墨流\release\0.7.0'
+$releaseRoot = 'D:\墨流\release\0.7.1'
 $python = Join-Path $releaseRoot 'venv\Scripts\python.exe'
 $pyinstaller = Join-Path $releaseRoot 'venv\Scripts\pyinstaller.exe'
 $engineOutput = Join-Path $releaseRoot 'engine'

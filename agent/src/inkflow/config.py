@@ -52,6 +52,7 @@ PERSISTED_SETTING_NAMES = {
     "chapter_length_tolerance",
     "review_min_confidence",
     "acceptance_confirmation_mode",
+    "planning_publication_mode",
     "planning_window_chapters",
     "dialogue_history_mode",
     "dialogue_history_interval",
@@ -215,6 +216,7 @@ class Settings:
     chapter_length_tolerance: float = 0.10
     review_min_confidence: float = 0.80
     acceptance_confirmation_mode: str = "auto_after_review"
+    planning_publication_mode: str = "auto_after_review"
     planning_window_chapters: int = 10
     dialogue_history_mode: str = "auto"
     dialogue_history_interval: int = 1
@@ -396,6 +398,10 @@ class Settings:
             "验收确认策略",
             {"per_chapter", "batch_once", "auto_after_review"},
         )
+        planning_publication_mode = _choice(
+            value.get("planning_publication_mode", defaults.planning_publication_mode),
+            "规划正式发布方式", {"auto_after_review", "confirm_after_review"},
+        )
         planning_window_chapters = _bounded_int_range(
             value.get("planning_window_chapters", defaults.planning_window_chapters),
             "默认近期规划章数", 1, 50,
@@ -454,6 +460,7 @@ class Settings:
             chapter_length_tolerance=chapter_length_tolerance,
             review_min_confidence=review_min_confidence,
             acceptance_confirmation_mode=acceptance_confirmation_mode,
+            planning_publication_mode=planning_publication_mode,
             planning_window_chapters=planning_window_chapters,
             dialogue_history_mode=dialogue_history_mode,
             dialogue_history_interval=dialogue_history_interval,
@@ -551,6 +558,7 @@ class Settings:
             "chapter_length_tolerance": "INKFLOW_CHAPTER_LENGTH_TOLERANCE",
             "review_min_confidence": "INKFLOW_REVIEW_MIN_CONFIDENCE",
             "acceptance_confirmation_mode": "INKFLOW_ACCEPTANCE_CONFIRMATION_MODE",
+            "planning_publication_mode": "INKFLOW_PLANNING_PUBLICATION_MODE",
             "planning_window_chapters": "INKFLOW_PLANNING_WINDOW_CHAPTERS",
             "review_verification_mode": "INKFLOW_REVIEW_VERIFICATION_MODE",
             "review_experience_detail": "INKFLOW_REVIEW_EXPERIENCE_DETAIL",

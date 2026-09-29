@@ -162,7 +162,8 @@ def validate_task_settings_snapshot(
     if not isinstance(snapshot["source"], str) or snapshot["source"] not in _SOURCES:
         raise TaskSettingsError("任务配置来源无效。")
     values = snapshot["settings"]
-    if not isinstance(values, dict) or set(values) != TASK_SETTINGS_FIELDS:
+    legacy_fields = TASK_SETTINGS_FIELDS - {"planning_publication_mode"}
+    if not isinstance(values, dict) or (set(values) != TASK_SETTINGS_FIELDS and set(values) != legacy_fields):
         raise TaskSettingsError("任务配置字段与快照版本不一致，不能补入当前默认值。")
     _check_endpoint(values)
     expected = content_hash(_canonical({key: value for key, value in snapshot.items() if key != "snapshot_hash"}))
@@ -184,7 +185,7 @@ def restore_task_settings(
         raise TaskSettingsError("任务配置快照包含无效设置，无法恢复。") from exc
     # The configuration parser may evolve; silently migrating an existing
     # snapshot would make its hash no longer describe the actual execution.
-    restored = {key: value for key, value in settings.to_mapping().items() if key in TASK_SETTINGS_FIELDS}
+    restored = {key: value for key, value in settings.to_mapping().items() if key in snapshot["settings"]}
     if _canonical(restored) != _canonical(snapshot["settings"]):
         raise TaskSettingsError("当前程序会改变已有任务配置，请显式迁移任务后再恢复。")
     return TaskSettingsScope(

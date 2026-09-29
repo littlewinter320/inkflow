@@ -12,10 +12,11 @@ from typing import Any, Awaitable, Callable, Iterator
 from uuid import uuid4
 
 from .checkpoints import CheckpointService
+from .preferences import preference_section
 from .config import Settings
 from .context import ContextBuilder, planning_bundle_for_chapter
 from .outline_context import outline_neighbor_boundaries, outline_sections, replace_outline_range, replace_story_detail_volume
-from .planning_pipeline import load_active_planning, redesign_existing_story
+from .planning_pipeline import load_active_planning, redesign_existing_story, synchronize_v2_projection
 from .errors import ProjectError, ProviderError, ValidationGateError
 from .project import InkFlowProject, render_book_brief
 from .project_lock import batch_workflow_lock, chapter_operation_locked, project_mutation_locked, project_mutation_locked_sync, project_write_lock, project_write_lock_sync
@@ -492,9 +493,13 @@ class InkFlowEngine:
             raise ValidationGateError("补齐近期计划需要有效的起止章节，不会自行扩大写作范围。")
         async with project_write_lock(root):
             project = InkFlowProject(root)
+            synchronize_v2_projection(project)
         active_v2 = load_active_planning(project)
         if active_v2 is not None:
-            _, _, _, window = active_v2
+            manifest, _, _, window = active_v2
+            current_bundle = project.db.get_current_plan_bundle()
+            if current_bundle is None or not current_bundle.current_arc.arc_id.startswith(f"v2:{manifest['trace_id']}:"):
+                raise ValidationGateError("生效规划与数据库执行卡尚未同步；请重新发布当前规划后继续，不能沿用旧版章节卡。")
             first_future = window.anchor_chapter + 1
             last_future = window.chapters[-1].chapter_no
             if start_chapter_no >= first_future and end_chapter_no > last_future:
@@ -734,6 +739,7 @@ class InkFlowEngine:
                         + f"当前篇章范围必须恰好是 {begin}～{end}，逐章给出目标、阻力、决定、后果和场景。"
                         + _hook_planning_instruction(self.settings.hook_strategy)), hard=True),
                 ]
+                sections.append(preference_section(project.db))
                 packet = ContextPacket(project_id=project.project_id, chapter_no=begin, task=task,
                                        sections=sections, estimated_tokens=estimate_tokens("\n".join(item.content for item in sections)))
                 atomic_write_text(trace.run_dir / "context-packet.md", packet.to_markdown())
@@ -1138,6 +1144,7 @@ class InkFlowEngine:
             ContextSection(key="A0", title="本次授权与事实优先级", content=task,
                            hard=True, cache_scope="request"),
         ]
+        sections.append(preference_section(project.db))
         packet = ContextPacket(project_id=project.project_id, chapter_no=start, task=task, sections=sections,
                                estimated_tokens=estimate_tokens("\n".join(item.content for item in sections)))
         try:
@@ -1210,7 +1217,7 @@ class InkFlowEngine:
             "plan": bundle.model_dump(mode="json") if bundle else None,
             "cards": [project.db.get_chapter_card(n) for n in range(max(1, begin - 1), end + 2)],
             "accepted": [{key: item.get(key) for key in ("chapter_no", "version", "content_hash", "summary")} for item in accepted],
-            "prose": prose, "facts": project.db.current_facts(), "threads": project.db.open_threads(),
+            "preferences": project.db.effective_preferences(), "prose": prose, "facts": project.db.current_facts(), "threads": project.db.open_threads(),
             "foundations": {name: (project.root / name).read_text(encoding="utf-8") if (project.root / name).is_file() else None
                             for name in ("BOOK.md", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md",
                                          "planning/active-v2.json", "PLAN.md")},
@@ -1223,7 +1230,7 @@ class InkFlowEngine:
         return content_hash(json_dumps({
             "story": InkFlowEngine._planning_source_fingerprint(project, chapter_no, chapter_no),
             "target": chapter_retry_state(project, chapter_no),
-            "preferences": project.db.list_preferences(),
+            "preferences": project.db.effective_preferences(),
         }))
 
     @staticmethod
@@ -1267,6 +1274,16 @@ class InkFlowEngine:
         if project.db.latest_accepted_chapter_no():
             if chapter_range is None:
                 raise ValidationGateError("已有正史，请明确要调整的未接受章节范围；不会重新生成整书规划。")
+            active_v2 = load_active_planning(project)
+            if active_v2 is not None:
+                window = active_v2[3]
+                if chapter_range != (window.anchor_chapter + 1, window.chapters[-1].chapter_no):
+                    raise ValidationGateError("当前使用正式三层规划；请明确重排整个生效近期窗口或发起新的三层规划，不会用旧版章节卡局部覆盖。")
+                return await self.redesign_story(
+                    root, anchor=window.anchor_chapter, end=window.chapters[-1].chapter_no,
+                    instruction=f"{instruction.strip()}\n重排第 {chapter_range[0]} 到 {chapter_range[1]} 章的生效近期规划。",
+                    focus="chapter-window",
+                )
             return await self.replan_pending(root, *chapter_range, instruction=instruction)
         trace = TraceRecorder(project.root, "plan", self.settings.trace_level)
         try:
@@ -1338,6 +1355,7 @@ class InkFlowEngine:
                     hard=True,
                 ),
             ]
+            sections.append(preference_section(project.db))
             packet = ContextPacket(
                 project_id=project.project_id,
                 chapter_no=1,
@@ -1450,9 +1468,10 @@ class InkFlowEngine:
             raise
 
     async def redesign_story(self, root: str | Path, *, anchor: int, end: int,
-                             instruction: str, focus: str = "") -> dict[str, Any]:
+                             instruction: str, focus: str = "", approved_run_id: str = "") -> dict[str, Any]:
         return await redesign_existing_story(self, root, anchor=anchor, end=end,
-                                             instruction=instruction, focus=focus)
+                                             instruction=instruction, focus=focus,
+                                             approved_run_id=approved_run_id)
 
     async def generate_outline(
         self,
@@ -1476,6 +1495,8 @@ class InkFlowEngine:
         project = InkFlowProject(root)
         if outline_level != "story":
             raise ValidationGateError("剧情细纲使用独立细纲流程，不接受章节范围。")
+        if load_active_planning(project) is not None:
+            raise ValidationGateError("当前已有正式三层规划。修改生效大纲须从当前正史重设计并审核三层，不能由独立旧入口覆盖其中一层。")
         trace = TraceRecorder(project.root, "outline", self.settings.trace_level)
         try:
             source_fingerprint = self._planning_source_fingerprint(project, start_chapter, end_chapter)
@@ -1584,6 +1605,7 @@ class InkFlowEngine:
                     hard=True,
                 ),
             ]
+            sections.append(preference_section(project.db))
             packet = ContextPacket(
                 project_id=project.project_id,
                 chapter_no=start_chapter,
@@ -1700,6 +1722,8 @@ class InkFlowEngine:
         project = InkFlowProject(root)
         if not (project.root / "OUTLINE.md").is_file():
             raise ValidationGateError("请先整理故事大纲，再展开细纲。")
+        if load_active_planning(project) is not None:
+            raise ValidationGateError("当前已有正式三层规划。修改生效卷细纲须在三层规划链中核对后续窗口，不能由独立旧入口覆盖其中一层。")
         trace = TraceRecorder(project.root, "story-detail", self.settings.trace_level)
         try:
             scope_volume = 2 if re.search(r"第二卷|第\s*2\s*卷", instruction) else None
@@ -1891,6 +1915,7 @@ class InkFlowEngine:
                     hard=True,
                 ),
             ]
+            sections.append(preference_section(project.db))
             packet = ContextPacket(
                 project_id=project.project_id,
                 chapter_no=next_start,
@@ -2133,6 +2158,7 @@ class InkFlowEngine:
                     hard=True,
                 ),
             ]
+            sections.append(preference_section(project.db))
             packet = ContextPacket(
                 project_id=project.project_id,
                 chapter_no=next_start,
@@ -4226,7 +4252,9 @@ class InkFlowEngine:
             if stored_patch:
                 previous_memory_json = str(stored_patch["data_json"])
                 memory = MemoryPatch.model_validate_json(previous_memory_json)
-                invalidated_facts = [fact for fact in memory.facts if fact.evidence not in candidate]
+                from .memory_records import affected_fact_ids
+                affected_ids = affected_fact_ids(memory.facts, project.db.canonical_chapter_content(chapter_no) or "", candidate)
+                invalidated_facts = [fact for fact in memory.facts if fact.fact_id in affected_ids]
                 stale_summary = any(
                     phrase in (memory.chapter_summary + "\n" + "\n".join(memory.scene_summaries))
                     for phrase in ("封回夹层", "塞回铁皮后头")
@@ -4264,7 +4292,7 @@ class InkFlowEngine:
                         if (revised_fact.evidence not in candidate
                                 or revised_fact.subject != previous_fact.subject
                                 or revised_fact.valid_from_chapter != previous_fact.valid_from_chapter
-                                or (previous_fact.evidence in candidate and revised_fact != previous_fact)):
+                                or (previous_fact.fact_id not in affected_ids and revised_fact != previous_fact)):
                             raise ValidationGateError("记忆重核改变了未受影响事实，或新证据无法在正文定位；候选保留，正史未改。")
             async with project_write_lock(project.root):
                 fresh = project.db.get_chapter(chapter_no)
@@ -6094,7 +6122,7 @@ class InkFlowEngine:
             "brief": project.db.get_brief().model_dump(mode="json"),
             "plan": (bundle.model_dump(mode="json") if (bundle := project.db.get_current_plan_bundle()) else None),
             "cards": [project.db.get_chapter_card(no) for no in range(start, end + 1)],
-            "preferences": project.db.list_preferences(),
+            "preferences": project.db.effective_preferences(),
             "files": {name: (content_hash(path.read_bytes()) if path.is_file() else None)
                       for name in files for path in [project.root / name]},
         }))
@@ -7700,7 +7728,7 @@ def _validate_memory_patch_scope(
         relation = (fact.subject, fact.predicate)
         known_identity = identities.get(fact.fact_id)
         if known_identity and (
-            known_identity[:2] != relation or known_identity[2] > chapter_no
+            known_identity[:2] != relation or known_identity[2] != chapter_no
         ):
             # Preserve the old canon row and give this chapter its own stable id.
             fact = fact.model_copy(update={"fact_id": collision_id(fact.fact_id)})
