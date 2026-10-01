@@ -4,7 +4,7 @@
 
 墨流把故事讨论、分层规划、正文写作、证据审查和记忆维护组织在同一个小说项目中。作者用日常中文表达目标，Coordinator 理解并安排任务，Writer 产出规划或正文，当前模式下的编辑与专项角色提供审查和记忆提案，再由 Novel Engine 核对权限、依赖与版本，决定哪些结果可以进入下一步。
 
-**当前版本：0.7.2** · [下载安装包与扩展](https://github.com/littlewinter320/inkflow/releases/latest) · [本版更新](CHANGELOG.md) · [反馈问题](https://github.com/littlewinter320/inkflow/issues) · [许可证](LICENSE)
+**已发布版本：0.7.2** · [下载安装包与扩展](https://github.com/littlewinter320/inkflow/releases/tag/v0.7.2) · [本版更新](CHANGELOG.md) · [反馈问题](https://github.com/littlewinter320/inkflow/issues) · [许可证](LICENSE)
 
 桌面工作台面向 Windows，另有 VS Code 扩展、CLI 和 MCP 入口。小说资料保存在本地，云端模型按任务接收所需上下文。安装包包含创作引擎与 Edge 朗读组件；写作服务需要按所选供应商配置，Edge 朗读需要联网。
 
@@ -76,6 +76,8 @@ graph LR
 
 这些更新涉及共享引擎和桌面工作台。VS Code 扩展继续使用其已有界面，桌面新增的设定管理页、上传差异预览和独立窗口不是扩展里的同名新页面。安装包、扩展产物与本次验证状态以正式发布记录为准。
 
+**发布完成：** 0.7.2 于 2026 年 10 月 1 日北京时间 20:52 正式发布，Windows 安装包、VS Code 扩展、安装包增量映射及更新清单四个附件已上传，远端大小和 SHA256 与构建回执一致。[打开 0.7.2 Release](https://github.com/littlewinter320/inkflow/releases/tag/v0.7.2)。引擎现有测试 291 项通过，桌面与扩展类型检查及本地模拟后台的指定页面操作已完成；原生 Electron 多窗口完整流程、真实模型质量和长篇性能不包含在这次通过结论里。
+
 **下一步：**首次使用进入[安装与配置](#quickstart)；想先理解创作过程，可以直接看[完整章节流程](#chapter-flow)。
 
 <a id="quickstart"></a>
@@ -83,7 +85,7 @@ graph LR
 
 ### 2.1 使用 Windows 安装包
 
-1. 打开 [Releases 下载入口](https://github.com/littlewinter320/inkflow/releases/latest)，选择目标版本的 Windows 安装包；0.7.2 对应 `InkFlow-Setup-0.7.2.exe`，下载前核对版本号。
+1. 打开 [0.7.2 下载入口](https://github.com/littlewinter320/inkflow/releases/tag/v0.7.2)，选择 Windows 安装包 `InkFlow-Setup-0.7.2.exe`；使用其他版本时核对相应 Release。
 2. 运行安装程序，选择安装位置并启动墨流。使用安装包无需另外搭建 Python 开发环境。
 3. 在模型设置中填写服务连接信息和密钥，核对模型名称。安装软件不会为你创建供应商账号或开通模型额度。
 4. 创建小说项目，或打开包含 `.inkflow/project.json` 的已有项目目录。
@@ -91,7 +93,7 @@ graph LR
 
 当前源码桌面端成功打开项目后，会把项目标题和文件夹路径记到这台电脑的“最近打开”列表。下次启动可在首页直接点项目，不必重新选择文件夹；小说正文仍保存在原项目目录。“移除记录”只移除首页快捷入口，不删除小说；“删除文件”会单独确认并把项目移入系统回收站。开发版即使每次使用不同的本地端口，最近项目记录也保存在 Electron 的固定本机数据目录，不再跟随网页地址变化。
 
-下载入口可能指向比本文更新的版本；使用其他版本时，应阅读对应发布说明。同一发布版本内的桌面端、引擎和扩展保持一致，旧项目是否需要升级以软件提示为准。[S1](#source-release)
+使用其他版本时，应阅读对应发布说明。同一发布版本内的桌面端、引擎和扩展保持一致，旧项目是否需要升级以软件提示为准。[S1](#source-release)
 
 ### 2.2 首次需要核对的设置
 
