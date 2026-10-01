@@ -29,6 +29,7 @@ type Pending = {
   child: ChildProcessWithoutNullStreams;
   method: string;
   runId: string;
+  conversationId: string;
   action: string;
   settled: Promise<void>;
   markSettled: () => void;
@@ -199,14 +200,9 @@ class UpdateManager {
 class EngineBridge {
   private process: ChildProcessWithoutNullStreams | null = null;
   private pending = new Map<string, Pending>();
-  private window: BrowserWindow;
   private compatibilityCheck: Promise<void> | null = null;
   private shuttingDown = false;
   private shutdownPromise: Promise<void> | null = null;
-
-  constructor(window: BrowserWindow) {
-    this.window = window;
-  }
 
   start(): void {
     if (this.shuttingDown) return;
@@ -224,6 +220,7 @@ class EngineBridge {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.process = child;
+    child.stdin.on("error", (cause) => this.failChild(child, new Error(`墨流本地引擎通信中断：${cause.message}`)));
     const lines = readline.createInterface({ input: child.stdout });
     lines.on("line", (line) => this.receive(line));
     let stderrTail = "";
@@ -296,6 +293,7 @@ class EngineBridge {
         child,
         method,
         runId: typeof params.run_id === "string" ? params.run_id.trim() : "",
+        conversationId: typeof params.conversation_id === "string" ? params.conversation_id : "main",
         action: typeof params.action === "string" ? params.action.trim() : "",
         settled,
         markSettled,
@@ -465,8 +463,8 @@ class EngineBridge {
     });
   }
 
-  pendingCount(): number {
-    return this.pending.size;
+  pendingCount(conversationId?: string): number {
+    return conversationId ? [...this.pending.values()].filter(item => item.conversationId === conversationId).length : this.pending.size;
   }
 
   pendingMethods(): string[] {
@@ -540,8 +538,9 @@ class EngineBridge {
   }
 
   private send(channel: string, payload: unknown): void {
-    if (this.window.isDestroyed() || this.window.webContents.isDestroyed()) return;
-    this.window.webContents.send(channel, payload);
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, payload);
+    }
   }
 
   private command(): { executable: string; args: string[]; cwd: string; env?: Record<string, string> } {
@@ -566,6 +565,7 @@ class EngineBridge {
 }
 
 let mainWindow: BrowserWindow | null = null;
+const conversationWindows = new Map<number, { projectRoot: string; conversationId: string }>();
 let bridge: EngineBridge | null = null;
 let updates: UpdateManager | null = null;
 let confirmationPending = false;
@@ -617,6 +617,58 @@ function updateDevelopmentShortcut(): void {
 function projectArgument(argv = process.argv): string | null {
   const index = argv.indexOf("--project");
   return index >= 0 && argv[index + 1] ? path.resolve(argv[index + 1]) : null;
+}
+
+type ConversationWindow = { conversationId: string; projectRoot: string; openedAt: string };
+function recentConversationWindows(projectRoot?: string): ConversationWindow[] {
+  try {
+    const value: unknown = JSON.parse(readFileSync(path.join(app.getPath("userData"), "conversation-windows.json"), "utf8"));
+    if (!Array.isArray(value)) return [];
+    return value.filter((item): item is ConversationWindow => item && /^chat-[0-9a-f-]{36}$/.test(item.conversationId)
+      && typeof item.projectRoot === "string" && typeof item.openedAt === "string"
+      && (!projectRoot || sameProjectRoot(item.projectRoot, projectRoot))).slice(0, 40);
+  } catch { return []; }
+}
+function rememberConversationWindow(projectRoot: string, conversationId: string): void {
+  const file = path.join(app.getPath("userData"), "conversation-windows.json");
+  mkdirSync(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, JSON.stringify([{ conversationId, projectRoot, openedAt: new Date().toISOString() }, ...recentConversationWindows().filter(item => item.conversationId !== conversationId || !sameProjectRoot(item.projectRoot, projectRoot))].slice(0, 40)), "utf8");
+  renameSync(temporary, file);
+}
+function createConversationWindow(projectRoot: string, requestedId?: string): { conversationId: string } {
+  if (!mainWindow || mainWindow.isDestroyed()) throw new Error("主工作区已关闭，请重新打开墨流。");
+  if (requestedId && !recentConversationWindows(projectRoot).some(item => item.conversationId === requestedId)) throw new Error("这份对话不在当前小说的窗口记录中。");
+  const conversationId = requestedId || `chat-${randomUUID()}`;
+  const existing = [...conversationWindows.entries()].find(([, item]) => item.conversationId === conversationId);
+  const open = existing ? BrowserWindow.fromId(existing[0]) : null;
+  if (open && !open.isDestroyed()) {
+    if (existing && conversationWindows.get(existing[0])?.projectRoot !== projectRoot) open.webContents.send("app:open-project", projectRoot);
+    if (open.isMinimized()) open.restore(); open.focus(); return { conversationId };
+  }
+  rememberConversationWindow(projectRoot, conversationId);
+  const window = new BrowserWindow({
+    width: 1160, height: 820, minWidth: 960, minHeight: 650,
+    title: "墨流 · 独立对话", icon: applicationIconPath(), backgroundColor: "#11110f", show: false, autoHideMenuBar: true,
+    webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true },
+  });
+  conversationWindows.set(window.id, { projectRoot, conversationId });
+  let closeConfirmed = false; let asking = false;
+  window.on("close", event => {
+    if (closeConfirmed || !bridge?.pendingCount(conversationId)) return;
+    event.preventDefault();
+    if (asking) return;
+    asking = true;
+    void dialog.showMessageBox(window, { type: "question", title: "这份对话还有请求未返回", message: "关闭窗口后，当前任务仍会在后台继续，已保存的记录保留。", detail: "重新打开对话历史可核对结果；关闭主工作区会按全应用退出流程处理所有任务。", buttons: ["继续查看", "关闭这份窗口"], defaultId: 0, cancelId: 0, noLink: true }).then(result => { if (result.response === 1 && !window.isDestroyed()) { closeConfirmed = true; window.close(); } }).finally(() => { asking = false; });
+  });
+  window.once("closed", () => conversationWindows.delete(window.id));
+  window.once("ready-to-show", () => window.show());
+  const developmentUrl = process.env.VITE_DEV_SERVER_URL;
+  if (developmentUrl) {
+    const url = new URL(developmentUrl); url.searchParams.set("conversation_id", conversationId);
+    void window.loadURL(url.toString());
+  } else void window.loadFile(path.join(__dirname, "..", "dist", "index.html"), { query: { conversation_id: conversationId } });
+  return { conversationId };
 }
 
 function createWindow(): void {
@@ -790,7 +842,7 @@ function createWindow(): void {
       closeConfirmationPending = false;
     });
   });
-  bridge = new EngineBridge(mainWindow);
+  bridge = new EngineBridge();
   try {
     updates = new UpdateManager(mainWindow);
   } catch (cause) {
@@ -808,12 +860,28 @@ function createWindow(): void {
       }
     });
   }
-  ipcMain.handle("engine:request", (_event, method: string, params: Record<string, unknown>) =>
-    bridge?.request(method, params),
-  );
+  ipcMain.handle("engine:request", async (event, method: string, params: Record<string, unknown>) => {
+    const source = BrowserWindow.fromWebContents(event.sender);
+    if (!source || (source !== mainWindow && !conversationWindows.has(source.id))) throw new Error("这个窗口没有本地引擎访问权限。");
+    const conversationId = conversationWindows.get(source.id)?.conversationId || "main";
+    const result = await bridge?.request(method, { ...params, conversation_id: conversationId });
+    const context = conversationWindows.get(source.id);
+    if (context && method === "project.open" && typeof params.project_root === "string" && context.projectRoot !== params.project_root) {
+      context.projectRoot = params.project_root;
+      try { rememberConversationWindow(context.projectRoot, context.conversationId); }
+      catch { logLifecycle("conversation-windows.write.failed"); }
+    }
+    return result;
+  });
+  ipcMain.handle("app:conversation-window", (event, projectRoot: string, conversationId?: string) => {
+    const source = BrowserWindow.fromWebContents(event.sender);
+    if (!source || (source !== mainWindow && !conversationWindows.has(source.id))) throw new Error("无法从这个窗口创建对话。");
+    return createConversationWindow(projectRoot ? resolveInkFlowProject(projectRoot) : "", conversationId);
+  });
+  ipcMain.handle("app:conversation-windows", (_event, projectRoot: string) => recentConversationWindows(projectRoot));
   ipcMain.handle("dialog:confirm", async (event, message: string) => {
-    const window = mainWindow;
-    if (!window || window.isDestroyed() || event.sender !== window.webContents || confirmationPending || typeof message !== "string" || !message.trim()) return false;
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (!window || window.isDestroyed() || (window !== mainWindow && !conversationWindows.has(window.id)) || confirmationPending || typeof message !== "string" || !message.trim()) return false;
     confirmationPending = true;
     try {
       // Keep app.getName/userData/update identity unchanged; only brand the dialog.
@@ -927,7 +995,11 @@ function createWindow(): void {
   });
   ipcMain.handle("shell:open-path", (_event, target: string) => shell.openPath(target));
   ipcMain.handle("shell:show-item", (_event, target: string) => shell.showItemInFolder(target));
-  ipcMain.handle("app:launch-context", () => ({ projectRoot: projectArgument() }));
+  ipcMain.handle("app:launch-context", event => {
+    const source = BrowserWindow.fromWebContents(event.sender);
+    const context = source ? conversationWindows.get(source.id) : undefined;
+    return { projectRoot: context ? context.projectRoot || null : projectArgument(), conversationId: context?.conversationId || "main" };
+  });
   ipcMain.handle("app:update-status", () => updates?.status());
   ipcMain.handle("app:update-check", () => updates?.check());
   ipcMain.handle("app:update-download", () => updates?.download());
@@ -946,6 +1018,8 @@ function createWindow(): void {
       });
       unresponsiveSince = null;
     }
+    for (const id of conversationWindows.keys()) BrowserWindow.fromId(id)?.destroy();
+    conversationWindows.clear();
     bridge?.stop();
     bridge = null;
     updates = null;

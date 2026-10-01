@@ -26,7 +26,7 @@ from .project import InkFlowProject
 from .project_lock import project_lock_wait_policy, project_write_lock, project_write_lock_sync
 from .provider import create_provider
 from .references import ReferenceService
-from .role_protocol import normalize_role
+from .role_protocol import ACTIVE_COLLABORATION_MODES, new_task_mode, normalize_role
 from .schemas import BookBrief, CollaborationReply, ContextPacket, ContextSection, MemoryPatch, NovelIdeaBundle, NovelIdeaCandidate, PrefillSuggestion, PromptOptimization, ProviderProbe, ReviewReport, SuggestedPrompt, TerminalIntent, WriterDirectionSet
 from .review_verifier import verify_review
 from .studio import StudioDatabase, StudioService, chapter_retry_state, text_statistics
@@ -35,6 +35,7 @@ from .trace import TraceRecorder, recent_trace_runs
 from .runtime import RunRuntime, active_runtime
 from .model_usage import UsageLedger, ValidationQuotaExceeded
 from .planning_cleanup import cleanup_apply, cleanup_keep, cleanup_preview
+from .conversation_scope import active_conversation, conversation_id, conversation_key
 from .task_settings import active_task_settings
 from .utils import content_hash, estimate_tokens, project_source_revision, workflow_failure_reason, workflow_result_status
 from .voice import VOICE_SETTING_NAMES, VoiceRuntime, _project_key
@@ -78,6 +79,9 @@ def _requested_task_mode(method: str, params: dict[str, Any]) -> tuple[int, str]
     if raw_version is not None and type(raw_version) is not int:
         raise InkFlowError("角色协议版本必须是明确的整数；没有启动专项模型调用。")
     task_scope = active_task_settings.get()
+    # A fresh capture resolves deep; an already frozen deep task keeps its owner.
+    if task_scope is not None and task_scope.collaboration_mode != "deep":
+        mode = new_task_mode(mode)
     version = (
         task_scope.role_protocol_version
         if raw_version is None and mode == "everyday" and task_scope is not None
@@ -97,7 +101,7 @@ def _task_rows_with_history(project: InkFlowProject, limit: int, instance_id: st
     except sqlite3.OperationalError:
         reconciliation_pending = True
     tasks = studio.db.list_tasks(limit)
-    pending = project.db.get_metadata("pending_creation_task")
+    pending = project.db.get_metadata(conversation_key("pending_creation_task"))
     if isinstance(pending, dict) and pending.get("status") == "running" and pending.get("run_id"):
         # A process exit or an older error path may leave a stale "running"
         # marker.  Only the matching durable run can decide whether the task
@@ -116,13 +120,13 @@ def _task_rows_with_history(project: InkFlowProject, limit: int, instance_id: st
             recovered_pending = {**pending, "status": reconciled_status}
             try:
                 with project_write_lock_sync(project.root, timeout=0.25):
-                    current = project.db.get_metadata("pending_creation_task")
+                    current = project.db.get_metadata(conversation_key("pending_creation_task"))
                     if (
                         isinstance(current, dict)
                         and current.get("run_id") == pending.get("run_id")
                         and current.get("status") == "running"
                     ):
-                        project.db.set_metadata("pending_creation_task", recovered_pending)
+                        project.db.set_metadata(conversation_key("pending_creation_task"), recovered_pending)
             except (InkFlowError, sqlite3.OperationalError):
                 # A competing writer may still own the book. The matching
                 # interrupted run remains authoritative for this UI response.
@@ -256,6 +260,44 @@ class InkFlowAppService:
     def __init__(self, instance_id: str | None = None) -> None:
         self.instance_id = instance_id or f"server-{os.getpid()}-{uuid.uuid4().hex}"
         self.voice = VoiceRuntime()
+        self._manual_workers: dict[str, asyncio.Task] = {}
+
+    def _schedule_manual_reviews(self, project):
+        from .config import Settings
+        from .manual_edits import ManualEditsService
+        from .runtime import RunRuntime
+        from .task_settings import capture_task_settings, restore_task_settings
+        settings = Settings.from_env(project.root)
+        key = str(project.root)
+        if not settings.manual_edit_review_enabled or (key in self._manual_workers and not self._manual_workers[key].done()):
+            return
+        if any(task["status"] == "running" for task in StudioService(project).db.list_tasks(100)):
+            return
+        if not any(item["status"] == "pending" for item in ManualEditsService(project).jobs().values()):
+            return
+        async def work():
+            scope = StudioService(project).db.prepare_task_settings(f"manual-run-{uuid.uuid4().hex}",
+                novel_id=project.project_id, settings=settings, workspace_root=project.root, role_protocol_version=2)
+            settings_token = active_task_settings.set(scope)
+            runtime_token = active_runtime.set(RunRuntime(publish=lambda event: None,task_id=scope.task_id,run_id=scope.task_id))
+            conversation_token = active_conversation.set("manual-review")
+            try:
+                service = ManualEditsService(project)
+                for _ in range(4):
+                    pending = [job for job in service.jobs().values() if job["status"] == "pending"]
+                    if not pending or not Settings.from_env(project.root).manual_edit_review_enabled:
+                        break
+                    for job in pending:
+                        try:
+                            await service.review(job["job_id"], self._engine(project.root))
+                        except Exception:
+                            # Persistent job state contains the actionable error; do not regenerate text.
+                            continue
+            finally:
+                active_conversation.reset(conversation_token)
+                active_runtime.reset(runtime_token)
+                active_task_settings.reset(settings_token)
+        self._manual_workers[key] = asyncio.create_task(work())
 
     async def dispatch(
         self,
@@ -264,6 +306,9 @@ class InkFlowAppService:
         emit: EventSink,
         consume_steering: Callable[[], Awaitable[list[str]]] | None = None,
     ) -> Any:
+        if method == "story_settings.templates":
+            from .story_settings import StorySettingsService
+            return {"templates": StorySettingsService.templates()}
         if method == "memory.audit":
             from .memory_records import memory_overview
             project = InkFlowProject(self._validated_project_root(params), recover_on_open=False)
@@ -317,9 +362,7 @@ class InkFlowAppService:
                     "formal_agents": ["Coordinator", "Writer", "Editor"],
                     "novel_production_agents": ["Writer", "Editor"],
                     "role_pool": Coordinator.capabilities(protocol_version=2),
-                    "enabled_collaboration_modes": [
-                        "everyday", "review_boost", "memory_boost", "deep", "full_specialist",
-                    ],
+                    "enabled_collaboration_modes": list(ACTIVE_COLLABORATION_MODES),
                     "services": ["memory", "context", "runtime"],
                     "raw_chain_of_thought": False,
                     "voice_runtime": True,
@@ -359,6 +402,7 @@ class InkFlowAppService:
                 "review_experience_detail": settings.review_experience_detail,
                 "review_local_nli_model": settings.review_local_nli_model,
                 "review_judge_model": settings.review_judge_model,
+                "manual_edit_review_enabled": settings.manual_edit_review_enabled,
                 "retrieval_embedding_model": settings.retrieval_embedding_model,
                 "retrieval_reranker_model": settings.retrieval_reranker_model,
                 "powershell_enabled": settings.powershell_enabled,
@@ -367,9 +411,7 @@ class InkFlowAppService:
                 "capabilities": create_provider(settings).capabilities(),
                 "role_execution_version": 1,
                 "active_collaboration_mode": "everyday",
-                "enabled_collaboration_modes": [
-                    "everyday", "review_boost", "memory_boost", "deep", "full_specialist",
-                ],
+                "enabled_collaboration_modes": list(ACTIVE_COLLABORATION_MODES),
                 **settings.role_settings_view(params.get("role_settings_version", 1)),
                 "role_settings_warnings": list(settings.role_settings_warnings),
             }
@@ -403,6 +445,8 @@ class InkFlowAppService:
                     "dialogue_history_interval",
                     "dialogue_history_limit",
                     "agent_generation",
+                    "role_models",
+                    "manual_edit_review_enabled",
                     "role_settings_version",
                     "review_verification_mode",
                     "review_experience_detail",
@@ -428,6 +472,10 @@ class InkFlowAppService:
             }
             if allowed:
                 await asyncio.to_thread(save_user_settings, allowed)
+                if allowed.get("manual_edit_review_enabled") is False:
+                    for worker in self._manual_workers.values():
+                        if not worker.done():
+                            worker.cancel()
             current = await asyncio.to_thread(Settings.from_env, params.get("workspace_root"))
             return {"configured": True, **api_key_status(current.provider_kind), **allowed}
         if method == "provider.capabilities":
@@ -827,6 +875,70 @@ class InkFlowAppService:
         # Writer/Editor task can make progress and release its own lock.
         project = await asyncio.to_thread(self._project, params)
         studio = StudioService(project)
+        if method.startswith("manual_edits."):
+            from .manual_edits import ManualEditsService
+            manual = ManualEditsService(project)
+            if method == "manual_edits.status":
+                return manual.status()
+            if method == "manual_edits.scan":
+                result = await asyncio.to_thread(manual.scan)
+                self._schedule_manual_reviews(project)
+                return result
+            if method == "manual_edits.review":
+                return await manual.review(str(params["job_id"]), self._engine(project.root))
+            if method == "manual_edits.decide":
+                result = await asyncio.to_thread(manual.decide, str(params["job_id"]), str(params["decision"]),
+                    str(params.get("reason") or ""), str(params["expected_hash"]))
+                self._schedule_manual_reviews(project)
+                return result
+        if method.startswith("story_settings."):
+            from .story_settings import StorySettingsService
+            service = StorySettingsService(project)
+            if method == "story_settings.templates":
+                return {"templates": service.templates()}
+            if method == "story_settings.list":
+                return {"collections": service.list_collections(include_archived=bool(params.get("include_archived")))}
+            if method == "story_settings.records":
+                return {"records": service.records(str(params["collection_id"]),include_archived=bool(params.get("include_archived")))}
+            if method == "story_settings.save":
+                allowed = {"collection_id","template_id","name","category","instructions","fields","read_roles","write_roles","expected_revision"}
+                old = next((item for item in service.list_collections()
+                    if item["collection_id"] == params.get("collection_id")), None)
+                result = await asyncio.to_thread(service.save_collection, **{key:params[key] for key in allowed if key in params})
+                from .manual_edits import ManualEditsService
+                ManualEditsService(project).collection_changed(old, result)
+                self._schedule_manual_reviews(project)
+                return {"collection": result}
+            if method == "story_settings.archive":
+                ids=["story-setting:"+record["record_id"] for record in service.records(str(params["collection_id"]))]
+                result=await asyncio.to_thread(service.archive_collection,str(params["collection_id"]),expected_revision=params.get("expected_revision"))
+                from .manual_edits import ManualEditsService
+                ManualEditsService(project).supersede(ids)
+                return result
+            if method == "story_settings.record.save":
+                allowed = {"collection_id","record_id","name","title","values","evidence","evidence_refs","epistemic_status","chapter_no","expected_revision","operation"}
+                result = await asyncio.to_thread(service.save_record, **{key:params[key] for key in allowed if key in params})
+                if result.get("changed"):
+                    from .manual_edits import ManualEditsService
+                    ManualEditsService(project).enqueue("story-setting:"+result["record_id"], json.dumps(result,ensure_ascii=False),
+                        kind="setting_record", chapter_no=result.get("source_chapter"), record_revision=result["revision"])
+                    self._schedule_manual_reviews(project)
+                return {"record": result}
+            if method == "story_settings.record.archive":
+                result=await asyncio.to_thread(service.archive_record,str(params["record_id"]),expected_revision=params.get("expected_revision"))
+                from .manual_edits import ManualEditsService
+                ManualEditsService(project).supersede(["story-setting:"+str(params["record_id"])])
+                return result
+            if method == "story_settings.record.decide":
+                result = await asyncio.to_thread(service.record_decision,str(params["record_id"]),
+                    expected_revision=params.get("expected_revision"),decision=str(params["decision"]),reason=str(params.get("reason") or ""))
+                from .manual_edits import ManualEditsService
+                manual = ManualEditsService(project)
+                if str(params["decision"]) == "archive":
+                    manual.supersede(["story-setting:" + str(params["record_id"])])
+                else:
+                    manual.acknowledge_hypothesis(str(params["record_id"]), str(params.get("reason") or ""))
+                return result
 
         if method == "chapter.quality_hold.approve":
             return await asyncio.to_thread(
@@ -961,7 +1073,7 @@ class InkFlowAppService:
             length_limit = {"short": 80, "medium": 240, "long": 600}.get(length, 240)
             before = content[max(0, cursor_offset - 6_000):cursor_offset]
             after = content[cursor_offset:cursor_offset + 2_000]
-            settings = Settings.from_env(project.root)
+            settings = self._engine(project.root).settings
             prefill_trace = TraceRecorder(project.root, "prefill", settings.trace_level)
             packet = self._engine(project.root)._context_builder(project, "writer").build(
                 chapter_no, "在光标处生成一段可选续写；不得保存、审查或提交正史。", mode="draft"
@@ -993,17 +1105,22 @@ class InkFlowAppService:
                 "usage": result.usage,
             }
         if method == "document.save":
-            return studio.save_document(
+            result = studio.save_document(
                 str(params["relative_path"]),
                 str(params.get("content", "")),
                 expected_hash=params.get("expected_hash"),
-                source=str(params.get("source") or "desktop_manual"),
+                source="desktop_manual",
             )
+            self._schedule_manual_reviews(project)
+            return result
         if method == "document.delete":
-            return studio.delete_document(
+            result = studio.delete_document(
                 str(params["relative_path"]),
                 expected_hash=str(params.get("expected_hash") or ""),
             )
+            from .manual_edits import ManualEditsService
+            ManualEditsService(project).supersede([str(params["relative_path"])])
+            return result
         if method == "project.trash.list":
             return {"items": project.list_document_trash()}
         if method == "project.trash.restore":
@@ -1054,7 +1171,7 @@ class InkFlowAppService:
             chapter_no = int(params["chapter_no"])
             chapter = studio.chapter_workspace(chapter_no)
             count = max(2, min(5, int(params.get("count", 3))))
-            settings = Settings.from_env(project.root)
+            settings = self._engine(project.root).settings
             packet = self._engine(project.root)._context_builder(project, "writer").build(
                 chapter_no, "为本章提出互相有明显区别的写作方向；只提交方案，不写正文。", mode="draft"
             )
@@ -1102,7 +1219,7 @@ class InkFlowAppService:
             merged: dict[tuple[str, str, str], dict[str, Any]] = {}
             run_id = str(params.get("run_id") or uuid.uuid4().hex)
             for dimension in dimensions:
-                result = await create_provider(Settings.from_env(project.root)).generate_json(
+                result = await create_provider(self._engine(project.root).settings).generate_json(
                     system_prompt="你是墨流的 Editor，当前处于审查模式。只审查指定维度，逐条引用当前正文或 Context Packet；不直接修改正文，不以投票代替证据。",
                     user_prompt=packet.to_model_prompt() + f"\n\n# 审查维度\n{dimension}\n\n# 当前正文\n{content}",
                     output_model=ReviewReport, max_tokens=5_000, thinking=False, agent_role="reviewer",
@@ -1155,7 +1272,7 @@ class InkFlowAppService:
             if not review or review["chapter_version"] != int(chapter["version"]) or review["report"].verdict != "pass":
                 raise ValueError("当前草稿版本尚未通过 Editor 审查，不能准备正史预览")
             content = (project.root / chapter["path"]).read_text(encoding="utf-8")
-            trace = TraceRecorder(project.root, f"memory-preview-{chapter_no:05d}", Settings.from_env(project.root).trace_level)
+            trace = TraceRecorder(project.root, f"memory-preview-{chapter_no:05d}", self._engine(project.root).settings.trace_level)
             patch, _, _ = await self._engine(project.root)._extract_memory_patch(project, chapter_no, content, trace, source_status="accepted")
             artifact = project.db.save_agent_artifact(
                 artifact_type="memory_patch_preview", run_id=trace.run_id, role="engine",
@@ -1342,6 +1459,7 @@ class InkFlowAppService:
                 emit=emit,
                 opened_project=project,
             )
+            self._schedule_manual_reviews(project)
             session_result = result.get("session") if isinstance(result, dict) else None
             if isinstance(session_result, dict) and session_result.get("task_ticket"):
                 await emit(
@@ -2241,9 +2359,12 @@ class JsonLineServer:
             pass
 
     async def process(self, request_id: str, run_id: str, method: str, params: dict[str, Any]) -> None:
+        selected_conversation = conversation_id(params.get("conversation_id"))
+        conversation_token = active_conversation.set(selected_conversation)
         last_public_event: dict[str, Any] = {}
 
         async def emit(event: dict[str, Any]) -> None:
+            event = {**event, "conversation_id": selected_conversation}
             if event.get("type") == "session.steer":
                 self.steering_route_seen.add(run_id)
             if (event.get("type") == "workflow.planned" and run_id in self.steering_route_seen
@@ -2401,7 +2522,7 @@ class JsonLineServer:
                         suggested_title=suggested_title,
                     )
                     task_started = True
-                    if recorded_method in {"conversation.send", "workflow.run", "document.revise_selection"}:
+                    if recorded_method in _TASK_SETTINGS_METHODS:
                         requested_mode = _requested_task_mode(recorded_method, params)
                         scope = task_db.prepare_task_settings(
                             run_id,
@@ -2414,7 +2535,8 @@ class JsonLineServer:
                             **({
                                 "role_protocol_version": requested_mode[0],
                                 "collaboration_mode": requested_mode[1],
-                            } if requested_mode else {}),
+                            } if requested_mode else ({"role_protocol_version": 1}
+                                if recorded_method not in {"conversation.send", "workflow.run", "document.revise_selection"} else {})),
                         )
                         settings_token = active_task_settings.set(scope)
                         runtime.task_id = scope.task_id
@@ -2469,6 +2591,15 @@ class JsonLineServer:
                 error_code="workflow_result" if failure_guidance is not None else None,
                 retry_allowed=False if failure_guidance is not None else None,
             )
+            if task_db is not None and params.get("project_root"):
+                try:
+                    self.service._schedule_manual_reviews(InkFlowProject(params["project_root"], recover_on_open=False))
+                except Exception as exc:
+                    # Auxiliary scheduling cannot revoke a durable foreground result.
+                    warning = "后台手动核对尚未安排，请在核对窗口查看或重试：" + str(exc)[:1000]
+                    record_warning = "；".join(value for value in (record_warning, warning) if value)
+                    if isinstance(result, dict):
+                        result = {**result, "background_review_warning": warning}
             if record_warning and isinstance(result, dict):
                 result = {**result, "task_record_warning": record_warning}
             if delivery_error is None:
@@ -2584,6 +2715,7 @@ class JsonLineServer:
             if settings_token is not None:
                 active_task_settings.reset(settings_token)
             active_runtime.reset(runtime_token)
+            active_conversation.reset(conversation_token)
             public_events.put_nowait(None)
             await event_worker
             self.steering_messages.pop(run_id, None)
@@ -2973,6 +3105,11 @@ def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
             "role_protocol_version",
             "collaboration_mode",
         },
+        "document.prefill": {"relative_path", "chapter_no", "cursor_offset", "length", "expected_hash"},
+        "chapter.writer_candidates": {"chapter_no", "count"},
+        "chapter.review_panel": {"chapter_no", "dimensions"},
+        "memory.preview": {"chapter_no", "user_accepted"},
+        "manual_edits.review": {"job_id"},
         "reference.fetch": {"url"},
         "reference.search": {"query", "limit"},
         "reference.analyze": {"reference_id"},
@@ -2986,15 +3123,20 @@ def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
         "task.retry": {"task_id"},
     }
     allowed = allowed_by_method.get(method, set())
+    allowed = allowed | {"conversation_id"}
     return {key: params[key] for key in allowed if key in params}
+
+
+_TASK_SETTINGS_METHODS = frozenset({
+    "conversation.send", "workflow.run", "document.revise_selection",
+    "document.prefill", "chapter.writer_candidates", "chapter.review_panel", "memory.preview", "manual_edits.review",
+})
 
 
 def _should_track_task(method: str, params: dict[str, Any]) -> bool:
     if method == "workflow.run":
         return str(params.get("action") or "") not in {"checkpoint_list", "rollback_preview"}
-    return method in {
-        "conversation.send",
-        "document.revise_selection",
+    return method in _TASK_SETTINGS_METHODS or method in {
         "reference.search",
         "reference.fetch",
         "reference.analyze",

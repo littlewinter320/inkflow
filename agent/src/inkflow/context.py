@@ -15,6 +15,7 @@ from .retrieval import HybridRetriever
 from .schemas import ArcPlan, ContextPacket, ContextSection, PlanBundle, VolumePlan
 from .studio import StudioDatabase
 from .utils import atomic_write_text, content_hash, estimate_tokens, json_dumps, project_source_revision, utc_now
+from .writer_notes import recent_approved_notes
 
 
 _COMPRESSED_NOTE = "（已按完整条目压缩；完整资料仍保存在本地）"
@@ -22,6 +23,8 @@ _COMPRESSED_NOTE = "（已按完整条目压缩；完整资料仍保存在本地
 
 def planning_bundle_for_chapter(project: InkFlowProject, chapter_no: int) -> PlanBundle | None:
     """Resolve the card's persisted plan, not whichever window was opened last."""
+    from .manual_edits import ManualEditsService
+    ManualEditsService(project).assert_planning_ready(chapter_no)
     current = project.db.get_current_plan_bundle()
     active_v2 = load_active_planning(project)
     if active_v2 is not None and chapter_no > active_v2[3].anchor_chapter:
@@ -198,8 +201,10 @@ class ContextBuilder:
         reranker_model: str = "",
         hook_strategy: str = "most_chapters",
         review_experience_detail: str = "standard",
+        actor: str = "writer",
     ):
         self.project = project
+        self.actor = actor
         self.soft_token_limit = soft_token_limit
         self.hard_token_limit = hard_token_limit or max(soft_token_limit, 512_000)
         self.configured_soft_token_limit = self.soft_token_limit
@@ -279,6 +284,23 @@ class ContextBuilder:
         for item in recent:
             recent_parts.append(f"### 第 {item['chapter_no']} 章\n\n{item['content']}")
             recent_ids.append(f"chapter:{item['chapter_no']:05d}")
+        cited_chapters = []
+        for number in list(dict.fromkeys(int(value) for value in re.findall(r"第\s*(\d+)\s*章", task)))[:3]:
+            if number >= chapter_no or f"chapter:{number:05d}" in recent_ids:
+                continue
+            source = database.get_chapter(number)
+            if not source or source["status"] != "accepted":
+                continue
+            text = database.canonical_chapter_content(number)
+            if text is None:
+                path = self.project.root / source["path"]
+                text = path.read_text(encoding="utf-8") if path.is_file() else None
+            if text is None or content_hash(text) != source["content_hash"]:
+                raise ValidationGateError(f"第 {number} 章正史版本不符，不能用作本次明确指定的依据。")
+            cited_chapters.append(ContextSection(
+                key=f"E-cited-{number}", title=f"用户点名的第 {number} 章已接受正文",
+                content=text, source_ids=[f"chapter:{number:05d}"], hard=True, cache_scope="chapter",
+            ))
         ending_pattern_inputs = [*recent_for_patterns]
         ending_pattern_ids = [f"chapter:{item['chapter_no']:05d}" for item in recent_for_patterns]
         for item in (provisional_chapters or [])[-4:]:
@@ -353,7 +375,10 @@ class ContextBuilder:
                 or bool(subject and subject.casefold() in history_query.casefold())
             )
 
-        mandatory_facts = [item for item in facts if required_now(item)]
+        # Accepted facts arrive in subject order; chapter order keeps unchanged canon
+        # ahead of newly accepted facts in consecutive Writer cache prefixes.
+        ordered_facts = sorted(facts, key=lambda item: (int(item["source_chapter"]), str(item["fact_id"])))
+        mandatory_facts = ordered_facts[:256] + [item for item in ordered_facts[256:] if required_now(item)]
         state_facts = [item for item in mandatory_facts if item["predicate"].startswith(("state.", "knows.", "believes.")) or item.get("epistemic_kind") != "objective"]
         general_facts = [item for item in mandatory_facts if item not in state_facts]
         already_loaded = {
@@ -379,8 +404,13 @@ class ContextBuilder:
 
         reference_cards = self._load_reference_cards(limit=6)
         craft_guides = select_craft_guides(task=task, genre=brief.genre, card=card, limit=1)
+        plan_view = _plan_for_model(bundle, card)
+        from .story_settings import StorySettingsService
+        setting_context = StorySettingsService(self.project).context(chapter_no=chapter_no, query=task, actor=self.actor)
         sections = [
             ContextSection(key="A", title="当前任务与用户要求", content=task, hard=True),
+            ContextSection(key="CSET", title="用户定制设定：创作假设与证据参考（非正史）",
+                           content=setting_context, hard=False, cache_scope="chapter"),
             *outline_sections(self.project.root, chapter_no, chapter_no),
             ContextSection(
                 key="A0",
@@ -405,12 +435,17 @@ class ContextBuilder:
                 cache_scope="canon",
             ),
             ContextSection(
-                key="C",
-                title="书/卷/篇章/章节规划切片",
-                content=json.dumps(_plan_for_model(bundle, card), ensure_ascii=False, indent=2),
+                key="C0", title="书/卷/篇章规划",
+                content=json.dumps({key: value for key, value in plan_view.items()
+                                    if key not in {"本章卡", "相邻章节提醒"}}, ensure_ascii=False, indent=2),
                 source_ids=["plan:book", f"plan:volume:{bundle.current_volume.volume_no}", bundle.current_arc.arc_id],
-                hard=True,
-                cache_scope="chapter",
+                hard=True, cache_scope="book",
+            ),
+            ContextSection(
+                key="C", title="本章卡与相邻章节提醒",
+                content=json.dumps({key: value for key, value in plan_view.items()
+                                    if key in {"本章卡", "相邻章节提醒"}}, ensure_ascii=False, indent=2),
+                source_ids=[f"plan:chapter:{chapter_no:05d}"], hard=True, cache_scope="chapter",
             ),
             ContextSection(
                 key="D",
@@ -458,6 +493,11 @@ class ContextBuilder:
                 cache_scope="chapter",
             ),
             ContextSection(
+                key="WN", title="近期已接受章的创作意图参考（非正史）",
+                content=json_dumps(recent_approved_notes(self.project, chapter_no)),
+                source_ids=[], cache_scope="chapter",
+            ),
+            ContextSection(
                 key="E0",
                 title="本批次已审查通过的临时记忆",
                 content=(
@@ -476,6 +516,7 @@ class ContextBuilder:
                 source_ids=recent_ids,
                 cache_scope="chapter",
             ),
+            *cited_chapters,
             ContextSection(
                 key="E1",
                 title="近期章节结尾模式摘要",
@@ -518,7 +559,7 @@ class ContextBuilder:
                 else "当前无已提交未结线索。",
                 source_ids=[str(item["thread_id"]) for item in threads],
                 hard=True,
-                cache_scope="canon",
+                cache_scope="chapter",
             ),
             ContextSection(
                 key="H",
@@ -677,7 +718,8 @@ class ContextBuilder:
         """挑选相关人工条目；模型始终只看到编译后的单一 Packet。"""
 
         studio = StudioDatabase(self.project.internal / "studio.db")
-        entries = studio.list_bible_entries()
+        entries = [item for item in studio.list_bible_entries()
+                   if not item.get("data", {}).get("story_settings_type")]
         scene_notes = studio.scene_notes(chapter_no)
         pins = studio.list_context_pins(chapter_no)
         query = (task + "\n" + json.dumps(card, ensure_ascii=False)).casefold()
@@ -778,14 +820,17 @@ class ContextBuilder:
                 raise ValidationGateError(
                     f"第 {chapter_no} 章既非已接受正文，也未包含在当前临时批次，不能做可靠复审。"
                 )
-            path = self.project.root / item["path"]
-            if not path.is_file():
-                raise ValidationGateError(f"第 {chapter_no} 章正史文件缺失。")
-            chapter_parts.append(f"### 第 {chapter_no} 章（已接受正史）\n\n{path.read_text(encoding='utf-8')}")
+            text = database.canonical_chapter_content(chapter_no)
+            if text is None:
+                path = self.project.root / item["path"]
+                text = path.read_text(encoding="utf-8") if path.is_file() else ""
+            if not text or content_hash(text) != item["content_hash"]:
+                raise ValidationGateError(f"第 {chapter_no} 章正史原文缺失或版本不符，不能把投影改动当作已接受依据。")
+            chapter_parts.append(f"### 第 {chapter_no} 章（已接受正史）\n\n{text}")
             source_ids.append(f"chapter:{chapter_no:05d}")
 
-        facts = database.current_facts()
-        threads = database.open_threads()
+        facts = database.facts_as_of(end_chapter_no)
+        threads = database.threads_as_of(end_chapter_no)
         reference_cards = self._load_reference_cards(limit=6)
         task = f"复审第 {start_chapter_no}～{end_chapter_no} 章，并判断能否作为下一篇章可靠起点。"
         planning_documents = []
@@ -806,12 +851,15 @@ class ContextBuilder:
         for chapter_no in range(max(1, start_chapter_no - 2), start_chapter_no):
             item = accepted.get(chapter_no)
             if item:
-                path = self.project.root / item["path"]
-                if path.is_file():
+                text = database.canonical_chapter_content(chapter_no)
+                if text is None:
+                    path = self.project.root / item["path"]
+                    text = path.read_text(encoding="utf-8") if path.is_file() else ""
+                if text and content_hash(text) == item["content_hash"]:
                     prior_chapters.append(ContextSection(
                         key=f"C{len(planning_documents) + len(prior_chapters) + 1}",
                         title=f"已接受第 {chapter_no} 章正文",
-                        content=path.read_text(encoding="utf-8"),
+                        content=text,
                         source_ids=[f"chapter:{chapter_no:05d}"], hard=True, cache_scope="chapter",
                     ))
         sections = [
@@ -989,7 +1037,7 @@ class ContextBuilder:
         updated_at = utc_now()
         ordered = sorted(enumerate(packet.sections), key=lambda pair: (
             {"global": 0, "book": 1, "canon": 2, "chapter": 3, "request": 4}[pair[1].cache_scope],
-            {"J": 0, "B": 1, "O0": 2, "O1": 3}.get(pair[1].key, 10 + pair[0]) if pair[1].cache_scope == "book" else pair[0],
+            {"J": 0, "B": 1, "O0": 2, "O1": 3, "O2": 4, "C0": 5}.get(pair[1].key, 10 + pair[0]) if pair[1].cache_scope == "book" else pair[0],
         ))
         prefix_sections = [item for _, item in ordered if item.cache_scope in {"global", "book"}]
         prefix_hashes = {

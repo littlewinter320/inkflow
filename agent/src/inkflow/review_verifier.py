@@ -66,6 +66,10 @@ def resolve_packet_source_id(raw: str, sources: dict[str, str]) -> str | None:
 
     if raw in sources:
         return raw
+    if re.fullmatch(r"chapter:\d{5}", raw):
+        provisional = [source_id for source_id in sources if source_id.startswith("batch:") and source_id.endswith(":" + raw)]
+        if len(provisional) == 1:
+            return provisional[0]
     for source_id in sorted(sources, key=len, reverse=True):
         if raw.startswith(source_id) and raw[len(source_id):len(source_id) + 1] in {" ", "#", "·", "（"}:
             return source_id
@@ -110,7 +114,7 @@ def verify_review(report: ReviewReport, content: str, packet: ContextPacket) -> 
     # bounded full-evidence recheck can resolve uncertainty with a new report.
     # A model's failed patch/replan claim is not evidence that the chapter is
     # sound.  Recheck the claim instead of silently converting it to pass.
-    disputed = report.verdict in {"unknown", "patch", "replan"}
+    disputed = report.verdict == "unknown" or (report.verdict in {"patch", "replan"} and not report.findings)
     for finding in report.findings:
         key = (finding.category, finding.evidence, finding.explanation)
         if key in seen:
@@ -155,7 +159,7 @@ def verify_review(report: ReviewReport, content: str, packet: ContextPacket) -> 
             and "引用无法逐字定位到当前正文" not in reasons
             and (reasons or finding.rule_id == "internal_chapter_conflict")
         )
-        disputed = disputed or same_chapter_uncertain
+        disputed = disputed or same_chapter_uncertain or (hard and not editorial and bool(reasons))
         # Unsupported hard claims are demoted to visible informational notes
         # below. They must never edit prose or block a batch by themselves;
         # only a hard finding anchored to the current text can produce a patch
@@ -247,6 +251,24 @@ def legacy_accepted_conflict(
     return None
 
 
+def checked_claim_decisions(decisions: list[ReviewClaimDecision]) -> list[ReviewClaimDecision]:
+    """Classification/verdict disagreement is a review error, never a prose edit."""
+    counts: dict[int, int] = {}
+    for item in decisions:
+        counts[item.finding_index] = counts.get(item.finding_index, 0) + 1
+    result = []
+    for item in decisions:
+        invalid = (counts[item.finding_index] != 1
+            or (item.verdict == "supported" and item.conflict_type not in {"direct", "exclusive_conflict"})
+            or (item.verdict in {"not_blocking", "contradicted"}
+                and item.conflict_type in {"unchecked", "exclusive_conflict", "insufficient", "irrelevant"}))
+        if invalid:
+            item = item.model_copy(update={"verdict": "uncertain",
+                "reason": item.reason + "；冲突分类未完成、与结论矛盾或重复返回同一编号，保留待核。"})
+        result.append(item)
+    return result
+
+
 def apply_same_chapter_decisions(
     findings: list[ReviewFinding],
     decisions: list[ReviewClaimDecision],
@@ -255,7 +277,7 @@ def apply_same_chapter_decisions(
     """Resolve a two-quote dispute without trusting an unanchored model acquittal."""
 
     targets = {item["finding_index"]: item for item in same_chapter_disputes(findings, content)}
-    by_index = {item.finding_index: item for item in decisions}
+    by_index = {item.finding_index: item for item in checked_claim_decisions(decisions)}
     result: list[ReviewFinding] = []
     disputed = False
     for index, finding in enumerate(findings):
@@ -265,7 +287,7 @@ def apply_same_chapter_decisions(
             disputed = disputed or finding.verification_status == "uncertain"
             continue
         decision = by_index.get(index)
-        if decision and decision.verdict == "supported":
+        if decision and decision.verdict == "supported" and decision.conflict_type == "exclusive_conflict":
             result.append(finding.model_copy(update={
                 "severity": finding.proposed_severity or "major",
                 "rule_id": "internal_chapter_conflict",
@@ -273,6 +295,7 @@ def apply_same_chapter_decisions(
                 "reference_evidence": target["second_evidence"],
                 "verification_status": "anchored",
                 "semantic_status": "supported",
+                "conflict_type": decision.conflict_type,
                 "verification_confidence": decision.confidence,
                 "verification_note": f"同章两处原文已定位；局部复核：{decision.reason}",
                 "repair_instruction": "请补足或改正两处引文之间的时间、状态、认知或因果交代，再重新审查。",
@@ -298,6 +321,7 @@ def apply_same_chapter_decisions(
                 "reference_evidence": target["second_evidence"],
                 "verification_status": "anchored",
                 "semantic_status": "not_blocking",
+                "conflict_type": decision.conflict_type,
                 "verification_confidence": decision.confidence,
                 "verification_note": f"同章消解原文已定位：{resolution}；局部复核：{decision.reason}",
                 "repair_instruction": "已有正文交代，不需因这一项修改。",
@@ -306,6 +330,7 @@ def apply_same_chapter_decisions(
         disputed = True
         result.append(finding.model_copy(update={
             "semantic_status": "uncertain",
+            "conflict_type": decision.conflict_type if decision else "insufficient",
             "verification_note": (
                 f"{_SAME_CHAPTER_CONFLICT_NOTE}；"
                 + (f"局部复核：{decision.reason}" if decision else "局部复核没有返回该问题")
@@ -346,11 +371,12 @@ def carry_unresolved_same_chapter_recheck(
 
 
 def apply_semantic_decisions(findings: list[ReviewFinding], decisions: list[ReviewClaimDecision], *, source: str) -> tuple[list[ReviewFinding], str]:
-    by_index = {item.finding_index: item for item in decisions}
+    by_index = {item.finding_index: item for item in checked_claim_decisions(decisions)}
+    targets = {item["finding_index"] for item in findings_for_semantic_check(findings)}
     result: list[ReviewFinding] = []
     disputed = False
     for index, finding in enumerate(findings):
-        if finding.verification_status != "anchored" or finding.severity not in {"major", "blocking"}:
+        if index not in targets:
             result.append(finding)
             disputed = disputed or finding.verification_status == "uncertain"
             continue
@@ -364,6 +390,7 @@ def apply_semantic_decisions(findings: list[ReviewFinding], decisions: list[Revi
                 "severity": "info",
                 "verification_status": "uncertain" if unresolved else "anchored",
                 "semantic_status": "uncertain" if unresolved else status,
+                "conflict_type": decision.conflict_type if decision else "insufficient",
                 "verification_confidence": decision.confidence if decision else 0.0,
                 "verification_note": f"{source}：{reason}" + (f"；{_SAME_CHAPTER_CONFLICT_NOTE}" if unresolved and _SAME_CHAPTER_CONFLICT_NOTE in finding.verification_note else ""),
                 "repair_instruction": (
@@ -375,6 +402,7 @@ def apply_semantic_decisions(findings: list[ReviewFinding], decisions: list[Revi
         else:
             result.append(finding.model_copy(update={
                 "semantic_status": "supported",
+                "conflict_type": decision.conflict_type,
                 "verification_confidence": decision.confidence,
                 "verification_note": f"{source}：{decision.reason}",
             }))
@@ -382,7 +410,7 @@ def apply_semantic_decisions(findings: list[ReviewFinding], decisions: list[Revi
 
 
 def apply_dispute_decisions(findings: list[ReviewFinding], decisions: list[ReviewClaimDecision], *, source: str) -> tuple[list[ReviewFinding], str]:
-    by_index = {item.finding_index: item for item in decisions}
+    by_index = {item.finding_index: item for item in checked_claim_decisions(decisions)}
     result: list[ReviewFinding] = []
     disputed = False
     for index, finding in enumerate(findings):
@@ -395,6 +423,7 @@ def apply_dispute_decisions(findings: list[ReviewFinding], decisions: list[Revie
                 "severity": finding.proposed_severity,
                 "verification_status": "anchored",
                 "semantic_status": "supported",
+                "conflict_type": decision.conflict_type,
                 "verification_confidence": decision.confidence,
                 "verification_note": f"{source}：{decision.reason}",
             }))
@@ -403,6 +432,7 @@ def apply_dispute_decisions(findings: list[ReviewFinding], decisions: list[Revie
                 "severity": "info",
                 "verification_status": "anchored",
                 "semantic_status": decision.verdict,
+                "conflict_type": decision.conflict_type,
                 "verification_confidence": decision.confidence,
                 "verification_note": f"{source}：{decision.reason}",
                 "repair_instruction": "该指控不构成硬问题，无需据此强制修改正文。",

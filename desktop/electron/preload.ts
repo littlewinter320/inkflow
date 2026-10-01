@@ -1,8 +1,12 @@
 import { contextBridge, ipcRenderer } from "electron";
 
+const conversationId = new URLSearchParams(window.location.search).get("conversation_id") || "main";
+
 contextBridge.exposeInMainWorld("inkflow", {
   request: (method: string, params: Record<string, unknown> = {}) =>
-    ipcRenderer.invoke("engine:request", method, params),
+    ipcRenderer.invoke("engine:request", method, { ...params, conversation_id: conversationId }),
+  openConversationWindow: (projectRoot: string, conversationId?: string) => ipcRenderer.invoke("app:conversation-window", projectRoot, conversationId),
+  conversationWindows: (projectRoot: string) => ipcRenderer.invoke("app:conversation-windows", projectRoot),
   confirm: (message: string): Promise<boolean> => ipcRenderer.invoke("dialog:confirm", message),
   chooseFolder: (title: string) => ipcRenderer.invoke("dialog:choose-folder", title),
   recentProjects: () => ipcRenderer.invoke("project:recent-list"),
@@ -33,7 +37,10 @@ contextBridge.exposeInMainWorld("inkflow", {
     return () => ipcRenderer.removeListener("app:open-project", wrapped);
   },
   onEvent: (listener: (event: unknown) => void) => {
-    const wrapped = (_event: unknown, value: unknown) => listener(value);
+    const wrapped = (_event: unknown, value: unknown) => {
+      const origin = value && typeof value === "object" ? (value as Record<string, unknown>).conversation_id : null;
+      if (!origin || origin === conversationId) listener(value);
+    };
     ipcRenderer.on("engine:event", wrapped);
     return () => ipcRenderer.removeListener("engine:event", wrapped);
   },

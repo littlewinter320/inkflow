@@ -129,6 +129,59 @@ class HybridRetriever:
         values = factors or {}
         return max(4, min(40, 4 + int(math.log2(max(2, corpus_size))) + min(8, complexity // 6) + min(6, values.get("entity_count", 0) // 2) + min(6, values.get("open_thread_count", 0) // 2) + min(4, values.get("time_span", 0) // 20)))
 
+    def recover_review_sources(self, queries: list[str], *, chapter_no: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Search canon itself as well as its indexes; hits are leads, never proof.
+
+        # ponytail: lexical scan is linear in accepted text; reuse a versioned
+        # paragraph index only if large-book recovery becomes a measured bottleneck.
+        """
+        queries = list(dict.fromkeys(value.strip()[:160] for value in queries if value.strip()))[:4]
+        chapters: dict[int, dict[str, Any]] = {}
+        candidates: list[dict[str, Any]] = []
+        skipped: list[int] = []
+        for row in self.project.db.accepted_chapters():
+            number = int(row["chapter_no"])
+            if number >= chapter_no:
+                continue
+            try:
+                text = self.project.db.canonical_chapter_content(number)
+                if text is None:
+                    path = (self.project.root / row["path"]).resolve()
+                    text = path.read_text(encoding="utf-8") if path.is_relative_to(self.project.root.resolve()) and path.is_file() else ""
+            except (OSError, UnicodeError):
+                skipped.append(number)
+                continue
+            if not text or content_hash(text) != row["content_hash"]:
+                skipped.append(number)
+                continue
+            chapters[number] = {**row, "content": text}
+            # Overlap keeps nearby pronouns and transitions searchable. The
+            # selected chapter is subsequently read in full within the packet budget.
+            for offset in range(0, len(text), 1000):
+                candidates.append({"source_id": f"chapter:{number:05d}:offset:{offset}",
+                    "chapter_no": number, "title": str(row["title"]), "body": text[offset:offset + 1400]})
+        for item in self._candidates(role="reviewer", chapter_no=chapter_no, chapter_version=None):
+            if item["source_type"] in {"canon_fact", "canon_thread", "chapter_summary"} and item["chapter_no"] in chapters:
+                candidates.append(item)
+        by_id = {item["source_id"]: item for item in candidates}
+        scores: dict[int, float] = {}
+        matched: dict[int, list[str]] = {}
+        for query in queries:
+            ranking = self._bm25_ranking(query, candidates)
+            seen: set[int] = set()
+            for rank, (source_id, _) in enumerate(ranking):
+                number = int(by_id[source_id]["chapter_no"])
+                if number in seen:
+                    continue
+                seen.add(number)
+                scores[number] = scores.get(number, 0.0) + 1 / (rank + 1)
+                matched.setdefault(number, []).append(query)
+        selected = sorted(scores, key=lambda number: (-scores[number], -number))[:6]
+        hits = [{**chapters[number], "queries": matched[number]} for number in selected]
+        return hits, {"queries": queries, "searched_chapters": sorted(chapters),
+            "unreadable_chapters": skipped, "matched_chapters": selected,
+            "meaning": "词法相关性只用于定位；未命中或排名低均不能证明事实不存在，正文支持关系由责任角色复核。"}
+
     def _adaptive_factors(self, query: str, candidates: list[dict[str, Any]], chapter_no: int) -> dict[str, int]:
         query_entities = set(_entities(query))
         matched_entities = {entity for item in candidates for entity in item["entities"] if entity in query_entities}
@@ -154,7 +207,7 @@ class HybridRetriever:
             items.append({
                 "source_id": str(thread["thread_id"]), "source_type": "canon_thread",
                 "title": str(thread["title"]), "body": str(thread["description"]),
-                "chapter_no": int(thread.get("last_advanced_chapter") or 0), "version": thread.get("source_version"),
+                "chapter_no": int(thread.get("last_advanced_chapter") or thread.get("planted_chapter") or 0), "version": thread.get("source_version"),
                 "authority_rank": 2, "authority": "已验收正史", "entities": _entities(str(thread["title"]) + str(thread["description"])),
             })
         for chapter in self.project.db.accepted_chapters():

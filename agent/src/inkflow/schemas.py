@@ -432,6 +432,17 @@ class VolumeArcPlan(StrictModel):
         return self
 
 
+class WriterNoteClaim(StrictModel):
+    """公开创作说明；原文是定位线索，未来设想没有事实权威。"""
+
+    kind: Literal["new_fact", "interpretation", "future", "unknown"]
+    statement: str = Field(min_length=1, max_length=400)
+    quote: str = Field(default="", max_length=200)
+    prerequisites: list[str] = Field(default_factory=list, max_length=3)
+    causal_steps: list[str] = Field(default_factory=list, max_length=3)
+    followup_window: str = Field(default="", max_length=120)
+
+
 class HookNote(StrictModel):
     """Writer 对当前正文版本的公开钩子交付说明，不属于小说正文或正史。"""
 
@@ -445,6 +456,19 @@ class HookNote(StrictModel):
     planned_followup: str = ""
     # 兼容模型偶尔使用的更明确字段名；落盘时统一归并为 planned_followup。
     planned_followup_window: str = ""
+    annotations: list[WriterNoteClaim] = Field(default_factory=list, max_length=8)
+
+
+class WriterNoteClarification(StrictModel):
+    answers: list[str] = Field(min_length=1, max_length=3)
+    corrected_hook_note: HookNote | None = None
+
+    @field_validator("answers")
+    @classmethod
+    def short_public_answers(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() or len(value) > 600 for value in values):
+            raise ValueError("逐题说明须为1～600字的公开结论，不返回正文或隐藏推理")
+        return values
 
 
 class HookAssessment(StrictModel):
@@ -468,7 +492,22 @@ class SceneBlueprintItem(StrictModel):
     reading_promise: str = ""
 
 
+class SettingRecordProposal(StrictModel):
+    collection_id: str = Field(min_length=1, max_length=180)
+    record_id: str | None = Field(default=None, max_length=180)
+    expected_revision: int | None = Field(default=None, ge=1)
+    title: str = Field(min_length=1, max_length=160)
+    values: dict[str, Any] = Field(min_length=1, max_length=40)
+    evidence_refs: list[dict[str, Any]] = Field(default_factory=list, max_length=12)
+    epistemic_status: Literal["hypothesis", "objective", "belief", "rumor", "user_constraint"] = "hypothesis"
+
+
+class SettingRecordSet(StrictModel):
+    records: list[SettingRecordProposal] = Field(min_length=1, max_length=8)
+
+
 class DraftOutput(StrictModel):
+    setting_updates: list[SettingRecordProposal] = Field(default_factory=list, max_length=8)
     title: str
     content: str = Field(min_length=100)
     decision_summary: list[str] = Field(
@@ -512,7 +551,7 @@ class ParagraphInsertion(StrictModel):
 
 
 class ParagraphExpansionPlan(StrictModel):
-    insertions: list[ParagraphInsertion] = Field(min_length=1, max_length=12)
+    insertions: list[ParagraphInsertion] = Field(min_length=1)
     decision_summary: list[str] = Field(min_length=1, max_length=8)
 
 
@@ -573,6 +612,9 @@ FindingCategory = Literal[
 ]
 
 
+EvidenceRelation = Literal["unchecked", "direct", "state_change", "perspective", "plan_adaptation", "new_information", "exclusive_conflict", "irrelevant", "insufficient"]
+
+
 class ReviewFinding(StrictModel):
     category: FindingCategory
     severity: Literal["info", "minor", "major", "blocking"]
@@ -588,6 +630,12 @@ class ReviewFinding(StrictModel):
     semantic_status: Literal["unchecked", "supported", "contradicted", "not_blocking", "uncertain"] = "unchecked"
     verification_confidence: float = Field(default=0.0, ge=0, le=1)
     proposed_severity: Literal["info", "minor", "major", "blocking"] | None = None
+    conflict_type: EvidenceRelation = "unchecked"
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def normalize_continuity_category(cls, value: Any) -> Any:
+        return "knowledge" if value == "continuity" else value
 
 
 class PlanConflictAnchor(StrictModel):
@@ -650,28 +698,7 @@ class ReviewSourceComparison(StrictModel):
     chapter_evidence: str = Field(min_length=4, max_length=400)
     relation: Literal["aligned", "adapted", "tension", "conflict"]
     reason: str = Field(min_length=1, max_length=500)
-
-
-class ReviewEvidenceAnchor(StrictModel):
-    criterion: str
-    chapter_span: str = Field(pattern=r"^(?:body\.\d+)?$")
-    source_span: str = Field(default="", pattern=r"^(?:source\d+\.\d+)?$")
-
-
-class ReviewComparisonAnchor(StrictModel):
-    chapter_span: str = Field(pattern=r"^(?:body\.\d+)?$")
-    source_span: str = Field(pattern=r"^(?:source\d+\.\d+)?$")
-    relation: Literal["aligned", "adapted", "tension", "conflict"]
-    reason: str = Field(min_length=1, max_length=500)
-
-
-class ReviewEvidenceRepair(StrictModel):
-    """Select immutable source spans instead of asking models to transcribe quotes."""
-
-    goal_span: str = Field(pattern=r"^(?:body\.\d+)?$")
-    change_span: str = Field(pattern=r"^(?:body\.\d+)?$")
-    assessments: list[ReviewEvidenceAnchor] = Field(default_factory=list, max_length=6)
-    comparisons: list[ReviewComparisonAnchor] = Field(default_factory=list, max_length=8)
+    evidence_relation: EvidenceRelation = "unchecked"
 
 
 class ReviewAssessment(StrictModel):
@@ -685,6 +712,7 @@ class ReviewAssessment(StrictModel):
     source_evidence: str = Field(default="", max_length=400)
     reason: str = Field(min_length=1, max_length=600)
     alternative: str = Field(min_length=1, max_length=400)
+    evidence_relation: EvidenceRelation = "unchecked"
 
 
 class ReviewReport(StrictModel):
@@ -693,13 +721,18 @@ class ReviewReport(StrictModel):
     model_self_confidence: float | None = Field(default=None, ge=0, le=1)
     confidence_basis: list[str] = Field(default_factory=list)
     scoring_version: str = ""
+    evidence_policy_version: str = ""
+    evidence_recovery: dict[str, Any] = Field(default_factory=dict)
     assessments: list[ReviewAssessment] = Field(default_factory=list)
     missing_source_ids: list[str] = Field(default_factory=list)
+    source_queries: list[str] = Field(default_factory=list)
     summary: str
     strengths: list[str] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list)
     scorecard: list[ReviewScoreDimension] = Field(default_factory=list)
     source_hash: str = ""
+    writer_notes_hash: str = ""
+    approved_setting_proposals: list[int] = Field(default_factory=list, max_length=8)
     context_fingerprint: str = ""
     instruction_hash: str = ""
     hook_assessment: HookAssessment | None = None
@@ -716,6 +749,9 @@ class ReviewModelOutput(StrictModel):
     confidence: float = Field(ge=0, le=1)
     assessments: list[ReviewAssessment] = Field(default_factory=list, max_length=6)
     missing_source_ids: list[str] = Field(default_factory=list, max_length=6)
+    source_queries: list[str] = Field(default_factory=list, max_length=4)
+    writer_note_questions: list[str] = Field(default_factory=list, max_length=3)
+    approved_setting_proposals: list[int] = Field(default_factory=list, max_length=8)
     source_comparisons: list[ReviewSourceComparison] = Field(default_factory=list, max_length=8)
     summary: str = Field(min_length=1, max_length=2_000)
     strengths: list[str] = Field(default_factory=list, max_length=8)
@@ -741,7 +777,11 @@ class ModeCheckOutput(StrictModel):
     confidence: float = Field(ge=0, le=1)
     assessments: list[ReviewAssessment] = Field(default_factory=list, max_length=6)
     missing_source_ids: list[str] = Field(default_factory=list, max_length=6)
+    source_queries: list[str] = Field(default_factory=list, max_length=4)
+    writer_note_questions: list[str] = Field(default_factory=list, max_length=3)
+    setting_updates: list[SettingRecordProposal] = Field(default_factory=list, max_length=8)
     summary: str = Field(min_length=1, max_length=2_000)
+    approved_setting_proposals: list[int] = Field(default_factory=list, max_length=8)
     findings: list[ReviewFinding] = Field(default_factory=list, max_length=24)
     focus_observation: ReviewFocusObservation = Field(default_factory=ReviewFocusObservation)
     source_comparisons: list[ReviewSourceComparison] = Field(default_factory=list, max_length=8)
@@ -758,6 +798,7 @@ class ReviewClaimDecision(StrictModel):
     confidence: float = Field(ge=0, le=1)
     reason: str
     resolution_evidence: str = ""
+    conflict_type: EvidenceRelation = "unchecked"
 
 
 class ReviewClaimDecisionBatch(StrictModel):
@@ -770,8 +811,11 @@ class ArcAuditReport(StrictModel):
     model_self_confidence: float | None = Field(default=None, ge=0, le=1)
     confidence_basis: list[str] = Field(default_factory=list)
     scoring_version: str = ""
+    evidence_policy_version: str = ""
+    evidence_recovery: dict[str, Any] = Field(default_factory=dict)
     assessments: list[ReviewAssessment] = Field(default_factory=list, max_length=6)
     missing_source_ids: list[str] = Field(default_factory=list, max_length=6)
+    source_queries: list[str] = Field(default_factory=list, max_length=4)
     summary: str
     fulfilled_commitments: list[str] = Field(default_factory=list)
     deviations: list[ReviewFinding] = Field(default_factory=list)
@@ -823,6 +867,7 @@ class ThreadMutation(StrictModel):
 
 
 class MemoryPatch(StrictModel):
+    setting_updates: list[SettingRecordProposal] = Field(default_factory=list, max_length=8)
     chapter_no: int = Field(ge=1)
     chapter_summary: str
     scene_summaries: list[str] = Field(default_factory=list)
@@ -939,7 +984,7 @@ class ContextPacket(StrictModel):
             # The book contract is a longer-lived prefix than a revisable
             # outline boundary. Keep it ahead of O0 so a new outline draft
             # does not invalidate the book-level DeepSeek cache.
-            book_order = {"J": 0, "B": 1, "O0": 2, "O1": 3}
+            book_order = {"J": 0, "B": 1, "O0": 2, "O1": 3, "O2": 4, "C0": 5}
             order = book_order.get(section.key, 10 + index) if section.cache_scope == "book" else index
             return (scopes[section.cache_scope], order, index)
 
@@ -1233,6 +1278,7 @@ TerminalAction = Literal[
     "write_draft",
     "scene_draft",
     "story_setting_edit",
+    "story_settings_manage",
     "revise_selection",
     "write_review",
     "write_review_accept",

@@ -35,6 +35,8 @@ PERSISTED_SETTING_NAMES = {
     "provider_kind",
     "base_url",
     "model",
+    "role_models",
+    "manual_edit_review_enabled",
     "reasoning_effort",
     "context_soft_tokens",
     "context_hard_tokens",
@@ -172,6 +174,8 @@ def save_user_settings(updates: dict[str, Any]) -> dict[str, Any]:
                 migrated, _ = _migrate_settings_roles(value, updates.get("role_settings_version"))
                 for role, fields in migrated.items():
                     current[key].setdefault(role, {}).update(fields)
+            elif key == "role_models":
+                current[key].update(_role_models(value, updates.get("role_settings_version")))
             elif key != "role_settings_version":
                 current[key] = value
         validated = Settings.from_mapping(current)
@@ -198,6 +202,8 @@ class Settings:
     provider_kind: str = "deepseek"
     base_url: str = "https://api.deepseek.com"
     model: str = "deepseek-v4-flash"
+    role_models: dict[str, str] = field(default_factory=dict)
+    manual_edit_review_enabled: bool = True
     reasoning_effort: str = "high"
     context_soft_tokens: int = 256_000
     context_hard_tokens: int = 512_000
@@ -264,6 +270,7 @@ class Settings:
     def __post_init__(self) -> None:
         # Direct Settings(agent_generation=...) construction retains its legacy
         # meaning; from_mapping supplies canonical groups explicitly.
+        self.role_models = _role_models(self.role_models, ROLE_PROTOCOL_VERSION)
         warnings = list(self.role_settings_warnings)
         generation = self.role_generation
         if not generation:
@@ -278,6 +285,11 @@ class Settings:
         self.role_settings_warnings = tuple(dict.fromkeys(warnings))
         self.agent_generation = _legacy_role_view(self.role_generation)
         self.agent_context_budgets = _legacy_role_view(self.role_context_budgets)
+
+    def model_for(self, role: str | None, protocol_version: int = 1) -> str:
+        if role is None:
+            return self.model
+        return self.role_models.get(_settings_role(role, protocol_version), "") or self.model
 
     def generation_for(self, role: str, protocol_version: int = 1) -> dict[str, float | int | None]:
         canonical = _settings_role(role, protocol_version)
@@ -297,6 +309,10 @@ class Settings:
         legacy = version == LEGACY_ROLE_PROTOCOL_VERSION
         return {
             "role_settings_version": version,
+            "role_models": ({role: self.role_models["editor" if role == "reviewer" else role]
+                             for role in DEFAULT_AGENT_GENERATION
+                             if ("editor" if role == "reviewer" else role) in self.role_models}
+                            if legacy else dict(self.role_models)),
             "agent_generation": _legacy_role_view(self.role_generation) if legacy else {
                 role: dict(values) for role, values in self.role_generation.items()
             },
@@ -438,6 +454,8 @@ class Settings:
             {"concise", "standard", "detailed"},
         )
         return cls(
+            manual_edit_review_enabled=_as_bool(value.get("manual_edit_review_enabled", True)),
+            role_models=_role_models(value.get("role_models", {}), source_version),
             provider_kind=provider_kind,
             base_url=base_url,
             model=model,
@@ -810,3 +828,13 @@ def _agent_generation(value: Any) -> dict[str, dict[str, float | int | None]]:
             raise ConfigurationError(f"{role} 的 top_k 必须留空，或设为 1～200。")
         result[role] = {"temperature": temperature, "top_p": top_p, "top_k": top_k}
     return result
+
+
+def _role_models(value: Any, version: int | None) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ConfigurationError("角色模型配置必须是对象。")
+    if any(not isinstance(model, str) or len(model.strip()) > 200
+           or any(ord(char) < 32 for char in model) for model in value.values()):
+        raise ConfigurationError("角色模型 ID 必须是最多200字符的单行文本；留空继承默认模型。")
+    migrated, _ = _migrate_settings_roles({role: {"model": model.strip()} for role, model in value.items()}, version)
+    return {role: fields["model"] for role, fields in migrated.items()}

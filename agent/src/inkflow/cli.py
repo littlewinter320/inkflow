@@ -15,6 +15,7 @@ from .errors import InkFlowError
 from .provider import create_provider
 from .schemas import BookBrief
 from .terminal_session import TerminalSession
+from .runtime import ensure_run_runtime
 
 
 def _engine(root: str | Path) -> InkFlowEngine:
@@ -282,7 +283,9 @@ def _mcp(args: argparse.Namespace) -> None:
 def _chat(args: argparse.Namespace) -> dict[str, Any]:
     session = TerminalSession(_engine(args.root))
     if args.once is not None:
-        return asyncio.run(session.handle(args.root, args.once))
+        with ensure_run_runtime() as runtime:
+            response = asyncio.run(session.handle(args.root, args.once))
+            return {**response, "runtime_usage": runtime.snapshot()} if runtime.calls else response
 
     print("墨流终端会话已启动。用自然语言描述任务；输入“帮助”查看示例，输入“退出”结束。")
     while True:
@@ -290,7 +293,10 @@ def _chat(args: argparse.Namespace) -> dict[str, Any]:
             message = input("墨流> ")
         except EOFError:
             return {"ended": True, "message": "终端输入已结束。"}
-        response = asyncio.run(session.handle(args.root, message))
+        with ensure_run_runtime() as runtime:
+            response = asyncio.run(session.handle(args.root, message))
+            if runtime.calls:
+                response = {**response, "runtime_usage": runtime.snapshot()}
         _print(response)
         if response.get("ended"):
             return {"ended": True}
@@ -304,7 +310,13 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     try:
-        result = args.handler(args)
+        if args.command == "chat":
+            result = args.handler(args)
+        else:
+            with ensure_run_runtime() as runtime:
+                result = args.handler(args)
+                if isinstance(result, dict) and runtime.calls:
+                    result = {**result, "runtime_usage": runtime.snapshot()}
         if result is not None:
             _print(result)
     except InkFlowError as exc:

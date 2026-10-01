@@ -6,7 +6,7 @@
 $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
-$releaseRoot = 'D:\墨流\release\0.7.1'
+$releaseRoot = 'D:\墨流\release\0.7.2'
 $python = Join-Path $releaseRoot 'venv\Scripts\python.exe'
 $pyinstaller = Join-Path $releaseRoot 'venv\Scripts\pyinstaller.exe'
 $engineOutput = Join-Path $releaseRoot 'engine'
@@ -20,7 +20,9 @@ $env:npm_config_cache = Join-Path $releaseRoot 'cache\npm'
 $env:TEMP = Join-Path $releaseRoot 'temp'
 $env:TMP = $env:TEMP
 $env:PYINSTALLER_CONFIG_DIR = Join-Path $releaseRoot 'cache\pyinstaller'
-foreach ($directory in @($engineOutput, $extensionRelease, $desktopRelease, $buildWorkPath, $env:PIP_CACHE_DIR, $env:npm_config_cache, $env:TEMP, $env:PYINSTALLER_CONFIG_DIR)) {
+$env:ELECTRON_CACHE = Join-Path $releaseRoot 'cache\electron'
+$env:ELECTRON_BUILDER_CACHE = Join-Path $releaseRoot 'cache\electron-builder'
+foreach ($directory in @($engineOutput, $extensionRelease, $desktopRelease, $buildWorkPath, $env:PIP_CACHE_DIR, $env:npm_config_cache, $env:TEMP, $env:PYINSTALLER_CONFIG_DIR, $env:ELECTRON_CACHE, $env:ELECTRON_BUILDER_CACHE)) {
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
 }
 $systemPowerShellDirectory = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0'

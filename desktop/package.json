@@ -1,6 +1,6 @@
 {
   "name": "inkflow-desktop",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "private": true,
   "author": "InkFlow contributors",
   "description": "墨流（InkFlow）中文长篇小说桌面工作台",
@@ -47,7 +47,7 @@
       "en-US"
     ],
     "directories": {
-      "output": "D:/墨流/release/0.7.1/desktop"
+      "output": "D:/墨流/release/0.7.2/desktop"
     },
     "files": [
       "dist/**/*",
@@ -60,7 +60,7 @@
         "to": "icon.ico"
       },
       {
-        "from": "D:/墨流/release/0.7.1/engine/inkflow-engine.exe",
+        "from": "D:/墨流/release/0.7.2/engine/inkflow-engine.exe",
         "to": "engine/inkflow-engine.exe"
       },
       {

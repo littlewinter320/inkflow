@@ -10,10 +10,11 @@ from .schemas import BookBrief, DispatchPlan, DispatchStep, RoleCapability, Task
 
 
 NO_ACCEPTANCE_PATTERN = re.compile(
-    r"(?:只|仅)(?:要|做|生成|给我看)?(?:草稿|审查|初稿)|"
-    r"(?:不要|暂不|暂时不|暂时别|先别|别|先不|不必|无需|不能|不可)"
+    r"(?:只|仅)(?:要|做|生成|给我看)?(?:草稿|审查|复审|初稿)|"
+    r"(?:不要|暂不|暂时不|暂时别|先别|别|先不|不必|无需|不能|不可|不)"
     r"(?:再|先|自动|直接|立即|马上|现在|擅自|默认|替我|帮我)*"
     r"(?:验收|接收|接受|入正史|进入正史|写入正史|写进正史|提交正史|收进正史|收进正文|收进去|定稿|收(?=[，,。！？；\s]|$))|"
+    r"(?:不要|暂不|暂时不|暂时别|先别|别|先不)(?:修改正文|改稿|写正文)或(?:验收|接收|入正史)|"
     r"草稿(?:即可|就好|先看)|"
     r"(?:我想|让我|我)先(?:看|看看|过目)(?:一下)?|先给我看"
 )
@@ -84,6 +85,7 @@ _WORKFLOWS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
     "write_draft": (("writer", "chapter.write", "", "章节草稿"),),
     "scene_draft": (("writer", "scene.draft", "", "隔离场景草稿"),),
     "story_setting_edit": (("engine", "setting.update", "", "设定新版本、差异与受影响范围"),),
+    "story_settings_manage": (("engine", "setting.collection.manage", "", "按用户定义管理设定合集、记录与证据候选"),),
     "revise_selection": (("writer", "chapter.revise_selection", "", "指定选区的替换候选"),),
     "write_review": (
         ("writer", "chapter.write", "", "章节草稿"),

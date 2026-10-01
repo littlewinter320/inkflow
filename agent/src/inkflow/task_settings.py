@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from .config import PERSISTED_SETTING_NAMES, Settings
 from .errors import InkFlowError, ProjectError
-from .role_protocol import roles_for_mode
+from .role_protocol import new_task_mode, roles_for_mode
 from .utils import content_hash, utc_now
 
 
@@ -110,6 +110,8 @@ def capture_task_settings(
     role_protocol_version: int = 1, collaboration_mode: str = "everyday",
 ) -> dict[str, Any]:
     _check_role_mode(role_protocol_version, collaboration_mode)
+    if source == "task_start":
+        collaboration_mode = new_task_mode(collaboration_mode)
     values = {key: value for key, value in settings.to_mapping().items() if key in TASK_SETTINGS_FIELDS}
     _check_endpoint(values)
     snapshot = {
@@ -162,8 +164,9 @@ def validate_task_settings_snapshot(
     if not isinstance(snapshot["source"], str) or snapshot["source"] not in _SOURCES:
         raise TaskSettingsError("任务配置来源无效。")
     values = snapshot["settings"]
-    legacy_fields = TASK_SETTINGS_FIELDS - {"planning_publication_mode"}
-    if not isinstance(values, dict) or (set(values) != TASK_SETTINGS_FIELDS and set(values) != legacy_fields):
+    # New optional configuration must never be backfilled into a hashed old snapshot.
+    required_fields = TASK_SETTINGS_FIELDS - {"planning_publication_mode", "role_models", "manual_edit_review_enabled"}
+    if not isinstance(values, dict) or not required_fields <= set(values) <= TASK_SETTINGS_FIELDS:
         raise TaskSettingsError("任务配置字段与快照版本不一致，不能补入当前默认值。")
     _check_endpoint(values)
     expected = content_hash(_canonical({key: value for key, value in snapshot.items() if key != "snapshot_hash"}))

@@ -20,6 +20,8 @@ from .task_settings import (
     restore_task_settings, validate_task_settings_snapshot,
 )
 from .utils import atomic_write_text, content_hash, effective_character_count, json_dumps, utc_now
+from .writer_notes import approved_notes, notes_hash, version_notes
+from .role_protocol import new_task_mode
 
 
 STUDIO_SCHEMA = """
@@ -680,7 +682,9 @@ class StudioDatabase:
         def requested_mode_matches(scope: TaskSettingsScope) -> TaskSettingsScope:
             if role_protocol_version is not None and role_protocol_version != scope.role_protocol_version:
                 raise TaskSettingsError("恢复任务不能切换角色协议；请新建任务并明确选择模式。")
-            if collaboration_mode is not None and collaboration_mode != scope.collaboration_mode:
+            requested_mode = (new_task_mode(collaboration_mode)
+                if collaboration_mode == "deep" and scope.collaboration_mode != "deep" else collaboration_mode)
+            if requested_mode is not None and requested_mode != scope.collaboration_mode:
                 raise TaskSettingsError("恢复任务不能切换协作模式；请新建任务并明确选择模式。")
             return scope
 
@@ -1336,6 +1340,9 @@ class StudioService:
         old_hash = content_hash(old_content)
         if expected_hash and expected_hash != old_hash:
             raise ValidationGateError("文件已被其他操作修改。请重新载入并检查 Diff，墨流没有覆盖新内容。")
+        if content_hash(content) == old_hash:
+            return {"saved": True, "changed": False, "relative_path": relative, "content_hash": old_hash,
+                    "statistics": text_statistics(content), "annotations": self._reanchor_annotations(relative, content, old_hash)}
         protection = self._document_protection(relative)
         if protection["read_only"]:
             proposal = self.db.capture_version(
@@ -1345,8 +1352,11 @@ class StudioService:
                 source="accepted_chapter_revision_proposal",
                 applied=False,
             )
+            from .manual_edits import ManualEditsService
+            manual_job = ManualEditsService(self.project).mark_saved(relative, content, old_hash, source=source, applied=False)
             return {
                 "saved": False,
+                "manual_review": manual_job,
                 "proposal": proposal,
                 "gate": protection["reason"],
                 "requires_canon_revision": True,
@@ -1365,8 +1375,14 @@ class StudioService:
             title = _title_from_document(content, chapter_no)
             self.project.db.upsert_draft(chapter_no, title, relative, content)
         current_hash = content_hash(content)
+        from .manual_edits import ManualEditsService
+        manual = ManualEditsService(self.project)
+        manual_job = (manual.mark_saved(relative, content, old_hash, source=source)
+                      if source.startswith(("desktop_manual", "upload", "external", "story_setting")) else None)
+        if manual_job is None:
+            manual.note_engine_write(relative, content)
         return {
-            "saved": True,
+            "saved": True, "changed": True, "manual_review": manual_job,
             "relative_path": relative,
             "content_hash": current_hash,
             "statistics": text_statistics(content),
@@ -1465,24 +1481,7 @@ class StudioService:
         review_record = self.project.db.latest_review_record(chapter_no)
         artifacts = self.project.db.list_agent_artifacts(chapter_no=chapter_no, limit=30)
         current_version = int(record["version"]) if record else None
-        current_hook = next(
-            (
-                item
-                for item in artifacts
-                if item.get("artifact_type") == "writer_hook_note"
-                and int(item.get("chapter_version") or 0) == int(current_version or 0)
-            ),
-            None,
-        )
-        current_blueprint = next(
-            (
-                item
-                for item in artifacts
-                if item.get("artifact_type") == "writer_scene_blueprint"
-                and int(item.get("chapter_version") or 0) == int(current_version or 0)
-            ),
-            None,
-        )
+        current_notes = version_notes(self.project, chapter_no)
         current_context_manifest = next(
             (
                 item
@@ -1499,14 +1498,17 @@ class StudioService:
                 "path": review_record["path"],
                 "report": review_record["report"].model_dump(mode="json"),
                 "matches_current_version": review_record["chapter_version"] == current_version,
+                "matches_writer_notes": review_record["report"].writer_notes_hash == notes_hash(current_notes),
             }
+        accepted_intent = approved_notes(self.project, chapter_no)
         return {
             "chapter_no": chapter_no,
             "card": card,
             "record": record,
             "review": review,
-            "hook_note": current_hook["data"] if current_hook else None,
-            "scene_blueprint": current_blueprint["data"] if current_blueprint else None,
+            "hook_note": accepted_intent.get("hook_note") or current_notes.get("hook_note"),
+            "writer_intent": accepted_intent,
+            "scene_blueprint": current_notes.get("scene_blueprint"),
             "context_manifest": current_context_manifest["data"] if current_context_manifest else None,
             "context_pins": self.db.list_context_pins(chapter_no),
             "can_accept": bool(
@@ -1514,6 +1516,7 @@ class StudioService:
                 and record.get("status") == "draft"
                 and review
                 and review["matches_current_version"]
+                and review["matches_writer_notes"]
                 and review["report"].get("verdict") == "pass"
             ),
             "active_preferences": self.project.db.effective_preferences(),

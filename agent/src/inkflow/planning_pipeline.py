@@ -8,6 +8,7 @@ no candidate is canon.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import re
 from uuid import uuid4
@@ -15,14 +16,14 @@ from pathlib import Path
 from typing import Any
 
 from .errors import ValidationGateError
-from .project import InkFlowProject
+from .project import InkFlowProject, render_book_brief
 from .project_lock import project_write_lock, project_write_lock_sync
 from .schemas import (ArcPlan, ArcSummary, BookOutlineV2, BookPlan, ChapterCard,
                       PlanBundle, PlanningReviewV2, RollingPlanV2, VolumeCompass,
                       VolumeDetailV2, VolumePlan)
 from .trace import TraceRecorder
 from .task_settings import active_task_settings
-from .utils import atomic_write_text, content_hash, utc_now
+from .utils import atomic_write_text, content_hash, estimate_tokens, utc_now
 
 
 _WRITER_SYSTEM = """你是墨流 Writer。依照任务指明的层级写小说规划，只输出要求的 JSON。
@@ -41,6 +42,7 @@ _EDITOR_SYSTEM += """\n判事实矛盾前做共存检验：逐字引用的两件
 _WRITER_SYSTEM += """\n近期规划要让前章行动造成后章的新选择或代价。安静的生活章节可以保留，但若用户明确要求打破重复，不能只更换问话对象、公告或纸张，再让人物回到原处记录；在整个窗口里改变至少一条行动路径、人物关系、风险或可证实的局面。不要为制造变化凭空送来决定性证据，优先让人物以已有材料作不同选择并承担后果。"""
 _EDITOR_SYSTEM += """\n事实共存不等于任务完成。另从窗口起点到终点比较人物目标、障碍、实际选择与后果；当用户明确要求突破重复，而连续数章只是换人问话、看通知、回铺整理且没有推进目标或改变局面时，可判 revise，并引用这些章节的原句说明重复模式及最小重组范围。不要要求每章都有高潮，也不要因为单章安静就否决慢热叙事。"""
 _EDITOR_SYSTEM += """\n若判 pass，summary 要说清窗口收尾相比起点发生了什么由人物行动造成的局面变化或代价。单纯多得一条消息、又记了一张纸、把材料换地方藏，不自动等于任务要求的剧情推进；人物仍可保持谨慎，关键是谨慎带来新关系、新阻力或新的可执行选择。找不到这种变化而用户明确要打破重复时，应判 revise 并指出最小受影响章节段，不要用“线索逐步增多”代替实际后果。"""
+_EDITOR_SYSTEM += """\n交卷前专门核对全篇关键物件与人物的终态：同一物件若写成仍失踪/不归还，又写成主角拿到或被人放回，须解释是否确为不同物件，否则判 revise；“最后一次出现”若在不同卷重复，也须判 revise 并引用前后原句。不能只审核每段局部合理性。"""
 
 
 class PlanningNeedsAttention(ValidationGateError):
@@ -72,6 +74,86 @@ def _recent_planning_state(state: str, anchor: int) -> str:
     return (f"## 截至第 {anchor} 章的近期事实\n" + "\n".join(recent)
             + "\n\n## 未结线索与承诺\n" + threads
             + "\n\n较早章节状态按发生时点理解；物件当前持有和人物最新决定以已接受的最近章节正文为准。")
+
+
+def _accepted_text(project: InkFlowProject, row: dict[str, Any]) -> str:
+    """Read the accepted authority; old databases may have only a hash-bound projection."""
+    try:
+        text = project.db.canonical_chapter_content(int(row["chapter_no"]))
+        if text is None:
+            path = (project.root / str(row["path"])).resolve()
+            text = _read(path) if path.is_relative_to(project.root.resolve()) else ""
+    except (OSError, UnicodeError):
+        return ""
+    return text if text and content_hash(text) == row["content_hash"] else ""
+
+
+def _planning_thread_evidence(project: InkFlowProject, accepted: list[dict[str, Any]], *,
+                              anchor: int, end: int, included: set[int],
+                              token_limit: int) -> tuple[str, dict[str, Any]]:
+    """Attach bounded original-text leads for early unresolved promises, never invented proof."""
+    from .retrieval import HybridRetriever
+
+    early = [item for item in project.db.threads_as_of(anchor)
+             if any(0 < int(item.get(key) or 0) < anchor - 2
+                    for key in ("planted_chapter", "last_advanced_chapter"))]
+    early.sort(key=lambda item: (not (item.get("due_chapter") and int(item["due_chapter"]) <= end),
+        item.get("kind") not in {"promise", "foreshadow", "mystery"},
+        int(item.get("due_chapter") or 999999), str(item["thread_id"])))
+    selected = early[:4]
+    queries = [f"{item['title']} {item['description']}"[:160] for item in selected]
+    thread_records = [{"thread_id": item["thread_id"], "title": str(item["title"])[:160],
+        "source_chapters": [int(item[key]) for key in ("planted_chapter", "last_advanced_chapter") if item.get(key)],
+        "status": "资料不足：尚未读到可定位原文，不证明伏笔不存在"} for item in selected]
+    intro = ("\n【早期未结伏笔的原文补读】\n索引只负责指路；下面的连续原文须核对对象、时间和叙事视角，"
+             "检索相关或原文存在不等于支持结论。未选中、未命中、节选外内容都不能据此判不存在。"
+             "新未来设想无需旧章预先出现；只有关键过去前提仍缺必要来源才判资料不足。\n")
+    excerpt_limit = max(0, token_limit - estimate_tokens(intro + json.dumps(thread_records, ensure_ascii=False) + "\n\n\n" * 6))
+    retriever = HybridRetriever(project)
+    hits, diagnostics = retriever.recover_review_sources(queries, chapter_no=anchor + 1) if queries and excerpt_limit else ([], {})
+    rows = {int(item["chapter_no"]): item for item in accepted}
+    # Resolve known planting/advance identities before using fuzzy-search leads.
+    requested = list(dict.fromkeys(
+        int(item.get(key) or 0) for key in ("planted_chapter", "last_advanced_chapter")
+        for item in selected if int(item.get(key) or 0) in rows))
+    requested.extend(int(item["chapter_no"]) for item in hits)
+    requested = list(dict.fromkeys(number for number in requested if number not in included))[:6]
+    loaded, missing, excerpts = [], [], []
+    spent = 0
+    query = " ".join(queries)
+    for number in requested:
+        row = rows[number]
+        text = _accepted_text(project, row)
+        if not text:
+            missing.append({"chapter_no": number, "reason": "已接受原文缺失或哈希不符"})
+            continue
+        parts = [{"source_id": str(offset), "title": "", "body": text[offset:offset + 1400]}
+                 for offset in range(0, len(text), 1000)]
+        ranking = retriever._bm25_ranking(query, parts)
+        start = int(ranking[0][0]) if ranking else 0
+        excerpt = text[start:start + 1400]
+        label = f"【第 {number} 章已接受原文；版本 {row['version']}；位置 {start}:{start + len(excerpt)}；哈希 {row['content_hash']}】\n"
+        if spent + estimate_tokens(label + excerpt) > excerpt_limit:
+            missing.append({"chapter_no": number, "reason": "补读上下文预算不足，未作为已读来源"})
+            continue
+        spent += estimate_tokens(label + excerpt)
+        excerpts.append(label + excerpt)
+        loaded.append({"chapter_no": number, "version": int(row["version"]),
+            "content_hash": row["content_hash"], "start": start, "end": start + len(excerpt),
+            "excerpt": excerpt, "status": "原文已定位，是否支持该伏笔仍由当前审核角色核对"})
+    available = included | {item["chapter_no"] for item in loaded}
+    for record in thread_records:
+        if any(number in available for number in record["source_chapters"]):
+            record["status"] = "有原文可核对"
+    record = {"policy": "planning-thread-evidence-v1", "queries": queries, "threads": thread_records,
+        "loaded_sources": loaded, "missing_sources": missing, "search": diagnostics,
+        "unselected_thread_ids": [item["thread_id"] for item in early[4:]],
+        "added_tokens": spent, "token_limit": token_limit}
+    if not selected or not excerpt_limit:
+        return "", record
+    context = intro + json.dumps(thread_records, ensure_ascii=False) + "\n" + "\n\n".join(excerpts)
+    record["added_tokens"] = estimate_tokens(context)
+    return context, record
 
 
 def _stage_text(value: Any) -> str:
@@ -145,7 +227,7 @@ def _cleanup_suggestions(project: InkFlowProject) -> list[dict[str, str]]:
     return suggestions
 
 
-def load_active_planning(project: InkFlowProject) -> tuple[dict[str, Any], BookOutlineV2, VolumeDetailV2, RollingPlanV2] | None:
+def load_active_planning(project: InkFlowProject, *, allow_document_edits: bool = False) -> tuple[dict[str, Any], BookOutlineV2, VolumeDetailV2, RollingPlanV2] | None:
     """Resolve the active v2 hierarchy by manifest and content, never by file age."""
     manifest_path = project.root / "planning" / "active-v2.json"
     if not manifest_path.is_file():
@@ -162,6 +244,9 @@ def load_active_planning(project: InkFlowProject) -> tuple[dict[str, Any], BookO
                               ("STORY_DETAIL.md", "volume_detail_hash"),
                               ("RECENT_PLAN.md", "recent_plan_hash")):
             if content_hash(_read(project.root / filename)) != manifest[key]:
+                if allow_document_edits:
+                    # Explicit full redesign may replace edited projections; they are never returned as active plans.
+                    return None
                 raise ValueError(f"{filename} source changed")
         source = project.root / ".inkflow" / "runs" / source_id
         outline = BookOutlineV2.model_validate_json(_read(source / "outline-candidate.json"))
@@ -331,6 +416,10 @@ def restore_previous_planning_publication(
                 restored, ensure_ascii=False, indent=2,
             ))
             load_active_planning(project)
+            from .manual_edits import ManualEditsService
+            manual_edits = ManualEditsService(project)
+            for name, content in prior.items():
+                manual_edits.note_engine_write(name, content)
         except Exception:
             with project.db.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
@@ -442,6 +531,12 @@ def restore_kept_planning_publication(root: str | Path, revision_no: int) -> dic
                 ensure_ascii=False, indent=2))
             atomic_write_text(project.root / "planning/active-v2.json", json.dumps(restored, ensure_ascii=False, indent=2))
             load_active_planning(project)
+            from .manual_edits import ManualEditsService
+            manual_edits = ManualEditsService(project)
+            for name, content in rendered.items():
+                manual_edits.note_engine_write(name, content)
+            if revised_book != old_book:
+                manual_edits.note_engine_write("BOOK.md", revised_book)
         except Exception:
             if database_changed:
                 with project.db.connect() as connection:
@@ -475,32 +570,70 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         raise ValidationGateError("请说清以哪一章正史为锚点、要规划到第几章，以及后续剧情方向。")
     project = InkFlowProject(root)
     # A formal revision may only advance from a valid active publication.
-    load_active_planning(project)
+    load_active_planning(project, allow_document_edits=focus != "chapter-window")
     accepted = project.db.accepted_chapters()
     if not accepted or int(accepted[-1]["chapter_no"]) != anchor:
         raise ValidationGateError("规划起点必须是当前最后一章已接受正文；不会改写或跳过正史。")
     trace = TraceRecorder(project.root, "planning-v2", engine.settings.trace_level)
+    scope = active_task_settings.get()
+    review_role = "reviewer" if scope and scope.collaboration_mode in {"review_boost", "deep", "full_specialist"} else "editor"
     book = _read(project.root / "BOOK.md")
     state = _read(project.root / "STATE.md")
+    from .story_settings import StorySettingsService
+    story_settings = StorySettingsService(project)
+    settings_fingerprint = story_settings.source_fingerprint()
+    settings_context = story_settings.context(chapter_no=anchor + 1, actor="writer", max_chars=16000)
+    review_settings_context = story_settings.context(chapter_no=anchor + 1, actor=review_role, max_chars=16000)
     state_context = _recent_planning_state(state, anchor) if focus == "chapter-window" else state
     canon = []
     for item in accepted[-3:]:
-        path = project.root / str(item["path"])
-        content = _read(path)
-        if not content or content_hash(content) != item["content_hash"]:
+        content = _accepted_text(project, item)
+        if not content:
             raise ValidationGateError(f"第 {item['chapter_no']} 章正史文件缺失或版本不符，暂不重设计剧情。")
         canon.append(content)
+    cited_canon = []
+    cited_numbers = {int(number) for number in re.findall(r"第\s*(\d+)\s*章", instruction)}
+    for item in accepted[:-3]:
+        if int(item["chapter_no"]) not in cited_numbers:
+            continue
+        content = _accepted_text(project, item)
+        if not content:
+            raise ValidationGateError(f"第 {item['chapter_no']} 章正史文件缺失或版本不符，暂不重设计剧情。")
+        cited_canon.append(f"【第 {item['chapter_no']} 章已接受正文】\n{content}")
     summaries = "\n".join(f"第 {item['chapter_no']} 章：{item.get('summary') or item.get('title') or ''}" for item in accepted)
     stable_sources = f"【书籍设定】\n{book}\n【已接受章节摘要】\n{summaries}\n【时序化事实与伏笔】\n{state_context}\n【最近三章全文】\n" + "\n\n".join(canon)
+    from .manual_edits import ManualEditsService
+    manual_edits = ManualEditsService(project)
+    if focus != "chapter-window":
+        for job in manual_edits.jobs().values():
+            if job["kind"] == "setting_document" and job["relative_path"] in {"OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md", "PLAN.md"} and job["status"] not in {"superseded", "discarded", "reconciled"}:
+                edited_text = _read(project.root / job["relative_path"])
+                if content_hash(edited_text) == job["current_hash"]:
+                    stable_sources += f"\n【用户手动规划候选：{job['relative_path']}，尚非生效结构】\n" + edited_text
+    if cited_canon:
+        stable_sources += "\n【本次点名的已接受前章】\n" + "\n\n".join(cited_canon)
+    stable_sources += settings_context
     from .preferences import preference_prompt
     frozen_preferences = preference_prompt(project.db)
     stable_sources += frozen_preferences
+    protocol = scope.role_protocol_version if scope else 1
+    hard_limit = min(engine.settings.context_budget_for(role, protocol)[1] for role in ("writer", review_role))
+    base_tokens = estimate_tokens(stable_sources) + max(0, estimate_tokens(review_settings_context) - estimate_tokens(settings_context))
+    thread_context, thread_evidence = await asyncio.to_thread(_planning_thread_evidence,
+        project, accepted, anchor=anchor, end=end,
+        included={int(item["chapter_no"]) for item in accepted[-3:]} | cited_numbers,
+        token_limit=max(0, min(8000, hard_limit - base_tokens
+                               - engine.settings.max_output_tokens - 4096)))
+    stable_sources += thread_context
+    atomic_write_text(trace.run_dir / "thread-evidence.json", json.dumps(thread_evidence, ensure_ascii=False, indent=2))
+    trace.record("planning.thread-evidence", "completed", "早期未结伏笔先定位已接受原文，未定位项明确保留资料缺口",
+                 metadata={"loaded_chapters": [item["chapter_no"] for item in thread_evidence["loaded_sources"]],
+                           "missing_sources": thread_evidence["missing_sources"],
+                           "unselected_count": len(thread_evidence["unselected_thread_ids"])})
     frozen = content_hash(stable_sources)
     active_start_hashes = {name: content_hash(_read(project.root / name))
-                           for name in ("OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md",
+                           for name in ("BOOK.md", "PLAN.md", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md",
                                         "planning/active-v2.json")}
-    scope = active_task_settings.get()
-    review_role = "reviewer" if scope and scope.collaboration_mode in {"review_boost", "deep", "full_specialist"} else "editor"
     min_review_confidence = max(0.80, engine.settings.review_min_confidence)
     prior_runs = sorted(
         (path for path in (project.root / ".inkflow" / "runs").glob("*-planning-v2-*")
@@ -512,25 +645,33 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
     resume_requested = bool(re.search(
         r"(?:继续|恢复|接着|重试|复核).{0,18}(?:未完成|没做完|中断|断点|保存的候选|失败|停在)",
         instruction,
-    ))
+    ) or re.search(r"断点.{0,8}续修", instruction))
     previous_run: Path | None = None
     active_outline: BookOutlineV2 | None = None
     active_detail: VolumeDetailV2 | None = None
     active_source_run: Path | None = None
+    new_window = False
     if focus == "chapter-window":
         active = load_active_planning(project)
-        if active is None or active[0].get("accepted_anchor") != anchor or active[0].get("chapter_window") != [anchor, end]:
+        new_window = bool(active and anchor == project.db.latest_accepted_chapter_no()
+                          and anchor >= active[0].get("accepted_anchor", 0)
+                          and end > active[3].chapters[-1].chapter_no
+                          and end <= active[2].chapter_end)
+        if active is None or (not new_window and (active[0].get("accepted_anchor") != anchor
+                                                    or active[0].get("chapter_window") != [anchor, end])):
             raise ValidationGateError("当前三层规划的锚点或范围已变化；请先核对受影响章节，不会改写旧稿。")
         manifest, active_outline, active_detail, _active_window = active
         source_run = project.root / ".inkflow" / "runs" / str(manifest["trace_id"])
-        active_source_run = source_run
-        previous_run = source_run
+        if not new_window:
+            active_source_run = source_run
+            previous_run = source_run
     focus_range = re.search(
-        r"(?:只|仅)?(?:需|要)?(?:改|调整|修|修正|校正|重排|重构|重新规划|重新安排|梳理|优化)第\s*(\d+)\s*(?:到|至|～|~|—|-)\s*(\d+)\s*章",
+        r"(?<!不)(?<!别)(?<!勿)(?:只|仅)?(?:需|要)?(?:改|调整|修|修正|校正|重排|重构|重新规划|重新安排|梳理|优化)(?:当前|现行|生效)?第\s*(\d+)\s*(?:到|至|～|~|—|-)\s*(\d+)\s*章",
         instruction,
     )
-    focus_single = re.search(r"(?:只|仅)?(?:需|要)?(?:改|调整|修|修正|校正|重排|重构|重新规划|重新安排|梳理|优化)第\s*(\d+)\s*章", instruction)
-    focus_chapters = (set(range(int(focus_range.group(1)), int(focus_range.group(2)) + 1))
+    focus_single = re.search(r"(?<!不)(?<!别)(?<!勿)(?:只|仅)?(?:需|要)?(?:改|调整|修|修正|校正|重排|重构|重新规划|重新安排|梳理|优化)(?:当前|现行|生效)?第\s*(\d+)\s*章", instruction)
+    focus_chapters = (set(range(anchor + 1, end + 1)) if new_window else
+                      set(range(int(focus_range.group(1)), int(focus_range.group(2)) + 1))
                       if focus == "chapter-window" and focus_range else
                       {int(focus_single.group(1))} if focus == "chapter-window" and focus_single else set())
     replan_window = (focus == "chapter-window" and len(focus_chapters) > 1
@@ -540,6 +681,9 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
     requested_instruction = instruction
     resume_basis = {
         "canon_hash": frozen,
+        "settings_source_hash": settings_fingerprint,
+        "accepted_versions": [[item["chapter_no"], item["version"], item["content_hash"]]
+                              for item in accepted],
         "anchor": anchor,
         "end": end,
         "focus": focus or "",
@@ -605,14 +749,30 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         trace.record("planning.intent-resume", "completed", "续接时保留原创作目标，并让本次补充优先")
 
     def verify_canon() -> None:
+        if story_settings.source_fingerprint() != settings_fingerprint:
+            raise PlanningNeedsAttention("规划期间设定合集已变化，候选保留，未覆盖现行规划。",
+                                         "对照当前设定及其证据，从受影响的规划层继续。")
         if preference_prompt(project.db) != frozen_preferences:
             raise PlanningNeedsAttention("规划期间作者习惯或本书偏好已变化，候选保留。", "按最新偏好核对受影响规划后继续。")
         current = project.db.accepted_chapters()
-        if len(current) != len(accepted) or any(a["content_hash"] != b["content_hash"] for a, b in zip(accepted, current)):
+        if len(current) != len(accepted) or any((a["content_hash"], a["version"]) != (b["content_hash"], b["version"])
+                                              for a, b in zip(accepted, current)):
             raise PlanningNeedsAttention(
                 "规划期间正史已更新；候选已保存，未覆盖新版本。",
                 "以最新已接受正文为依据，从受影响的规划层继续；已通过且未受影响的上游内容保留。",
             )
+        by_number = {int(item["chapter_no"]): item for item in current}
+        for number in {int(item["chapter_no"]) for item in accepted[-3:]} | (cited_numbers & by_number.keys()):
+            if not _accepted_text(project, by_number[number]):
+                raise PlanningNeedsAttention("规划已读取的正史正文缺失或版本不符，候选保留。",
+                                             "恢复这一章的已接受来源后，从受影响层继续。")
+        for source in thread_evidence["loaded_sources"]:
+            row = by_number.get(source["chapter_no"])
+            text = _accepted_text(project, row) if row else ""
+            if (not row or int(row["version"]) != source["version"] or row["content_hash"] != source["content_hash"]
+                    or text[source["start"]:source["end"]] != source["excerpt"]):
+                raise PlanningNeedsAttention("早期伏笔的补读来源已变化，旧依据不再用于发布。",
+                                             "重新定位这一来源章的已接受原文，从受影响层核对。")
         if content_hash(_read(project.root / "BOOK.md") + _read(project.root / "STATE.md")) != content_hash(book + state):
             raise PlanningNeedsAttention(
                 "规划期间设定或事实账已变化；候选保留，未覆盖当前规划。",
@@ -620,6 +780,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             )
 
     async def generate_and_review(stage: str, model_type: Any, source: str, task: str) -> Any:
+        verify_canon()
         candidate_path = trace.run_dir / f"{stage}-candidate.json"
         review_path = trace.run_dir / f"{stage}-review.json"
         if candidate_path.is_file() and review_path.is_file():
@@ -646,7 +807,8 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                                  else "复用上次保存的候选，先重新审核；不重复生成整层")
                 except ValueError:
                     resumed_candidate = None
-        if focus == "chapter-window" and stage == "chapter-window" and previous_run == active_source_run:
+        if (focus == "chapter-window" and stage == "chapter-window"
+                and active_source_run is not None and previous_run == active_source_run):
             # A whole-window replan starts from canon and approved upper layers,
             # not from the old sequence that the user explicitly rejected.
             resumed_candidate = None
@@ -710,9 +872,17 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 replan_note = ("\n【范围说明】这是用户授权的多章重排，可以重新分配目标窗口的行动、场景和转折；"
                                "不必保留旧规划的逐章流程。不得改已接受正文、大纲和卷细纲，也不得凭空送来关键证据。"
                                if replan_window else "")
+                chapter_body_note = ("\n【逐章交稿长度】每章 body 至少200个汉字，后面的章节也要写全；"
+                                     "交代具体场景、人物目标、阻力、选择、可见后果及承接下一章的钩子。"
+                                     "不要把后半窗口缩成提纲，也不要用重复记纸凑字数。"
+                                     if stage == "chapter-window" else "")
+                focused_note = ("\n【定点返回】只返回第 " + "、".join(str(number) for number in sorted(focus_chapters))
+                                + " 章的章节卡；其他章节由程序从生效版保留，不要复写。"
+                                if stage == "chapter-window" and active_source_run is not None
+                                and len(focus_chapters) < end - anchor else "")
                 writer = await engine.provider.generate_json(
                     system_prompt=_WRITER_SYSTEM,
-                    user_prompt=f"{source}\n\n【用户最新授权】\n{instruction}\n\n【本层任务】\n{task}{replan_note}{revision_context}",
+                    user_prompt=f"{source}\n\n【用户最新授权】\n{instruction}\n\n【本层任务】\n{task}{replan_note}{chapter_body_note}{focused_note}{revision_context}",
                     output_model=model_type, effort="high", thinking=False,
                     max_tokens=engine.settings.max_output_tokens,
                     timeout_seconds=engine.settings.planning_timeout_seconds, agent_role="writer",
@@ -744,24 +914,31 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                         )
                     feedback = f"【用户明确要求的结构未兑现】\n{pattern_issue}"
                     continue
-            source_for_review = (f"【用户当前要求】\n{instruction}\n【已接受锚点正文】\n{canon[-1]}\n【时序化事实与伏笔】\n{state_context}\n"
-                                 f"【已生效全书大纲】\n{_render_outline(active_outline)}\n"
-                                 f"【已生效第二卷细纲】\n{_render_detail(active_detail)}"
+            source_for_review = (f"【用户当前要求】\n{instruction}\n【已接受锚点正文】\n{canon[-1]}\n"
+                                 + ("【本次点名的已接受前章】\n" + "\n\n".join(cited_canon) + "\n" if cited_canon else "")
+                                 + f"【时序化事实与伏笔】\n{state_context}\n"
+                                 + review_settings_context + thread_context
+                                 + f"【已生效全书大纲】\n{_render_outline(active_outline)}\n"
+                                 f"【已生效当前卷细纲】\n{_render_detail(active_detail)}"
                                  if focus == "chapter-window" and stage == "chapter-window"
                                  and active_outline is not None and active_detail is not None
-                                 else source)
+                                 else (source.replace(settings_context, review_settings_context, 1)
+                                       if settings_context else source + review_settings_context))
             if frozen_preferences not in source_for_review:
                 source_for_review += frozen_preferences
             quote_bank = []
-            for segment in re.split(r"(?<=[。！？；\n])", source_for_review):
+            original_text = "\n".join([*(item["excerpt"] for item in thread_evidence["loaded_sources"]),
+                                        canon[-1], *cited_canon, *canon[:-1]])
+            for segment in re.split(r"(?<=[。！？；\n])", original_text):
                 excerpt = segment.strip()
-                if 12 <= len(excerpt) <= 180 and any(word in excerpt for word in ("名单", "交货单", "钥匙", "铁盒")):
+                if 12 <= len(excerpt) <= 300:
                     quote_bank.append(excerpt)
                 if len(quote_bank) >= 24:
                     break
             quotes = "\n".join(f"- {item}" for item in quote_bank)
             review_prompt = (f"【来源】\n{source_for_review}\n\n【可逐字复制的来源短句，引用时不要带项目符号】\n{quotes}"
                              f"\n\n【用户要求】\n{instruction}\n\n【当前层任务】\n{task}\n\n【候选】\n{previous_candidate}")
+            verify_canon()
             reviewer = await engine.provider.generate_json(
                 system_prompt=_EDITOR_SYSTEM,
                 user_prompt=review_prompt,
@@ -769,6 +946,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 max_tokens=min(engine.settings.max_output_tokens, 8192),
                 timeout_seconds=engine.settings.planning_timeout_seconds, agent_role=review_role,
             )
+            verify_canon()
             review = reviewer.data
             atomic_write_text(review_path, review.model_dump_json(indent=2))
             trace.record_model(f"{stage}.editor.{attempt + 1}", reviewer, f"规划审核：{review.verdict}")
@@ -784,10 +962,9 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                     return False
                 if item.source_excerpt in review_source:
                     return True
-                # A rolling plan can contradict its own preceding chapter.
-                # Pass still requires an independent canon/outline anchor.
-                return (stage == "chapter-window" and review.verdict == "revise"
-                        and item.source_excerpt in candidate_text)
+                # Any planning layer can contradict itself. Pass still needs
+                # an independent canon/outline anchor.
+                return review.verdict == "revise" and item.source_excerpt in candidate_text
             exact_evidence = [
                 item for item in review.evidence
                 if grounded_item(item)
@@ -810,26 +987,41 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                          "candidate_found": item.candidate_excerpt in candidate_text,
                          "source_excerpt": item.source_excerpt,
                          "source_found": item.source_excerpt in review_source or
-                         (stage == "chapter-window" and review.verdict == "revise"
-                          and item.source_excerpt in candidate_text)}
+                         (review.verdict == "revise" and item.source_excerpt in candidate_text)}
                         for item in review.evidence
                         if not grounded_item(item)
                     ]
+                    candidate_spans = [part.strip() for part in re.split(r"(?<=[。！？；\n])", candidate_text)
+                                       if 12 <= len(part.strip()) <= 300]
+                    source_spans = [part.strip() for part in re.split(r"(?<=[。！？；\n])", source_for_review)
+                                    if 12 <= len(part.strip()) <= 300]
+                    candidate_examples = list(dict.fromkeys(
+                        span for item in review.evidence
+                        for span in difflib.get_close_matches(item.candidate_excerpt, candidate_spans, n=2, cutoff=0.25)
+                    ))
+                    source_examples = list(dict.fromkeys(
+                        span for item in review.evidence
+                        for span in difflib.get_close_matches(item.source_excerpt, source_spans, n=2, cutoff=0.25)
+                    ))
+                    verify_canon()
                     audit = await engine.provider.generate_json(
                         system_prompt=_EDITOR_SYSTEM,
                         user_prompt=(f"【来源】\n{source_for_review}\n\n【可逐字复制的来源短句，引用时不要带项目符号】\n{quotes}\n\n【用户要求】\n{instruction}\n\n【当前层任务】\n{task}"
                                      f"\n\n【候选】\n{candidate_text}\n\n【你上一份审核】\n{review.model_dump_json()}"
                                      f"\n\n【程序核出的无效引文】\n{json.dumps(invalid, ensure_ascii=False)}"
-                                     f"\n自动放行的把握度底线为 {min_review_confidence:.0%}。"
+                                     f"\n\n【候选可逐字复制的相近原句】\n" + "\n".join(candidate_examples)
+                                     + f"\n\n【外部来源可逐字复制的相近原句】\n" + "\n".join(source_examples)
+                                     + f"\n自动放行的把握度底线为 {min_review_confidence:.0%}。"
                                      "请只重核依据与判断；引文格式或把握度问题不能要求 Writer 重写。"
                                      "若候选含无来源的关键事实，判 revise 并给最小修改指令；"
                                      "若仍可通过，只给 1～3 条强证据，每条两个 excerpt 都必须是"
-                                     "来源与候选中的一整段连续原文；近期规划的 revise 也可引用候选内前后两章原句，"
+                                     "来源与候选中的一整段连续原文；revise 可引用候选内部互斥的两处原句，"
                                      "pass 仍须外部来源。不加事实 ID、引号、删节号，也不要拼接。"),
                         output_model=PlanningReviewV2, effort="high", thinking=False,
                         max_tokens=min(engine.settings.max_output_tokens, 8192),
                         timeout_seconds=engine.settings.planning_timeout_seconds, agent_role=review_role,
                     )
+                    verify_canon()
                     review = audit.data
                     atomic_write_text(review_path, review.model_dump_json(indent=2))
                     trace.record_model(f"{stage}.editor-citation-repair.{attempt + 1}.{citation_attempt + 1}", audit,
@@ -853,13 +1045,17 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             # same Editor to challenge an omission-based rejection before it
             # spends another Writer call. Keep the candidate and source prefix
             # unchanged so the follow-up can benefit from provider caching.
-            if (stage == "chapter-window" and review.verdict == "revise" and grounded
-                    and any(re.search(r"未(?:说明|交代|写明|明确)|可能|容易|建议|风险|模糊", item.finding)
+            if (review.verdict == "revise" and grounded
+                    and any(re.search(r"未(?:说明|交代|写明|明确)|可能|容易|建议|风险|模糊|已明确|已写|倒灌|缺少", item.finding)
                             for item in review.evidence)):
+                verify_canon()
                 challenge = await engine.provider.generate_json(
                     system_prompt=_EDITOR_SYSTEM,
                     user_prompt=(review_prompt + "\n\n【同一审核的共存复核】\n" + review.model_dump_json()
                                  + "\n逐项判断引用的两个事实能否同时成立；日常动作或先后发生的新事件无需额外证明。"
+                                 "来源引文若只记录了部分观察，不得说未记录的细节当时也已写下。"
+                                 "工作人员被主动询问后说明查询方向，不等于无代价送来原始证据。"
+                                 "若改判 pass，至少一条 evidence.source_excerpt 必须逐字取自【来源】的已接受正文或当前生效规划，不能全引候选内部句子。"
                                  "若仍判 revise，指出排他性矛盾或缺失的必需因果链；"
                                  "若只是可能误读、少一句说明，改判 pass 并将建议留在 summary。"
                                  "不要让 Writer 为审核措辞问题重写。"),
@@ -867,6 +1063,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                     max_tokens=min(engine.settings.max_output_tokens, 8192),
                     timeout_seconds=engine.settings.planning_timeout_seconds, agent_role=review_role,
                 )
+                verify_canon()
                 challenged = challenge.data
                 trace.record_model(f"{stage}.editor-coexistence.{attempt + 1}", challenge,
                                    f"复核同真性：{challenged.verdict}")
@@ -931,7 +1128,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             trace.record("outline.reuse", "completed", "沿用已生效大纲；本轮不重新生成")
         else:
             outline = await generate_and_review("outline", BookOutlineV2, stable_sources, outline_task)
-        if outline.volumes[0].chapter_end != anchor or len(outline.volumes) < 2:
+        if (active_outline is None and outline.volumes[0].chapter_end != anchor) or len(outline.volumes) < 2:
             raise ValidationGateError("大纲没有保留已接受第一卷边界并规划后续卷；候选未发布。")
         outline_text = _render_outline(outline)
         volume = next((item for item in outline.volumes if item.chapter_start <= anchor + 1 <= item.chapter_end), None)
@@ -957,7 +1154,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         if plan.anchor_chapter != anchor or [item.chapter_no for item in plan.chapters] != expected:
             raise ValidationGateError("近期规划没有准确覆盖用户范围，候选未发布。")
         plan_text = _render_window(plan)
-        current_publication = load_active_planning(project)
+        current_publication = load_active_planning(project, allow_document_edits=focus != "chapter-window")
         if current_publication is not None and all(
             content_hash(content) == current_publication[0][key]
             for content, key in ((outline_text, "outline_hash"), (detail_text, "volume_detail_hash"),
@@ -988,7 +1185,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             return {"status": "waiting_user", "decision": "awaiting_confirmation",
                     "candidate_run_id": trace.run_id,
                     "chapter_range": [anchor, end], "revision_no":
-                    (load_active_planning(project) or ({"revision_no": 0},))[0].get("revision_no", 0),
+                    (load_active_planning(project, allow_document_edits=focus != "chapter-window") or ({"revision_no": 0},))[0].get("revision_no", 0),
                     "next_action": "三层候选均已审核通过，当前正式版未改变。请明确说‘采用刚才审核通过的规划’，才会发布新版并递增修订号。"}
         async with project_write_lock(project.root):
             verify_canon()
@@ -999,8 +1196,10 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                         "先比较新旧规划的受影响章节，再从相应层续接；不会静默覆盖用户编辑。",
                     )
             prior_brief = project.db.get_brief()
+            from .manual_edits import _book_brief_from_document
+            source_brief = _book_brief_from_document(book) if book != render_book_brief(prior_brief) else prior_brief
             last_chapter = outline.volumes[-1].chapter_end
-            revised_brief = prior_brief.model_copy(update={
+            revised_brief = source_brief.model_copy(update={
                 "estimated_chapters": last_chapter, "estimated_volumes": len(outline.volumes),
             })
             revised_book, scale_matches = re.subn(
@@ -1073,6 +1272,15 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 atomic_write_text(project.root / "planning" / "active-v2.json",
                                   json.dumps(manifest, ensure_ascii=False, indent=2))
                 project.db.set_metadata("pending_planning_publication", {})
+                from .manual_edits import ManualEditsService
+                manual_edits = ManualEditsService(project)
+                if focus != "chapter-window":
+                    manual_edits.reconcile_planning(active_start_hashes, trace.run_id)
+                for name, text in (("OUTLINE.md", outline_text), ("STORY_DETAIL.md", detail_text),
+                                   ("RECENT_PLAN.md", plan_text)):
+                    manual_edits.note_engine_write(name, text)
+                if scale_matches == 1:
+                    manual_edits.note_engine_write("BOOK.md", revised_book)
                 trace.record("planning-v2.publish", "completed", "三层规划与规模设置已整组生效",
                              metadata={"manifest": "planning/active-v2.json", "outline_hash": manifest["outline_hash"]})
             except Exception:

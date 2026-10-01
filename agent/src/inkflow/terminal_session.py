@@ -26,9 +26,11 @@ from .prompts import MOBAO_PERSONA
 from .project_lock import project_write_lock
 from .schemas import ContextPacket, ContextSection, DispatchPlan, TaskTicket, TerminalIntent
 from .studio import StudioService
+from .conversation_scope import active_conversation, conversation_key
 from .task_settings import active_task_settings
 from .trace import TraceRecorder
 from .runtime import active_runtime
+from .role_protocol import new_task_mode
 from .provider import ProviderResult
 from .utils import atomic_write_text, content_hash, estimate_tokens, json_dumps, workflow_failure_reason, workflow_result_status
 
@@ -70,6 +72,7 @@ TERMINAL_ROUTER_SYSTEM = """
 - outline：仅生成单层大纲或卷细纲时使用；全书大纲与逐卷细纲不同于逐章规划。旧版 outline 流程尚未迁移到新契约时应说明，不能把逐章摘要冒充全书大纲。
 - 项目已有正式三层规划时，改其大纲或卷细纲应选择 redesign_story，以上一章已接受正文为锚点，并审核受影响的三层后发布；独立旧入口不能直接覆盖生效的一层。只改近期窗口时仍通过正式链修订，不绕回旧数据库重排入口。
 - scene_draft：用户明确要试写一个场景、片段或短草稿时使用。只由 Writer 产出隔离候选，narrative_scope=scene，不覆盖章节正文，不审查、验收或入正史。
+- story_settings_manage：设定是持续维护的合集，可记录人物、场景、道具、世界等及自定义字段，不仅开书资料。由语义理解用户请求，不靠固定关键词。setting_change.operation 选择 collection_create/collection_update/collection_archive/record_generate/record_supplement/record_save/record_archive/list；可用collection_id或collection_name唯一定位，更新删除须读取当前revision作为expected_revision。用户定义name/category/template_id/instructions/fields。生成新的设定交Writer，补证纠正交当前审查或记忆所有者；你只提取目标与参数，不编写设定正文，不更改正史、不永久删除。若回答后台手动核对疑问，可用manual_decide，必须绑定上下文中的job_id与current_hash作为expected_hash，decision为keep_pending/request_revision/confirm_exception/discard_candidate，reason保留用户解释；只有具体解释可请求一次限次复核，简单同意不覆盖硬正史。不明确合集或取舍时只问必要问题；有据记录、创作假设、人物信念分别标注。
 - story_setting_edit：用户明确要求修改书籍设定、大纲或剧情细纲时使用。document_kind 为 book、outline 或 story_detail；book 的 setting_change 只填明确要改的 BookBrief 字段，大纲和细纲只填唯一原文 old_text 与替换文字 new_text。不要把“讨论怎么改”解释为执行，也不要修改已接受正文。
 - plan：近期章节安排，参考设定、独立大纲、剧情细纲与已写正文，再切分章节和字数；用户未指定范围时只展开接下来约三章。逐章场景安排属于计划，不是细纲。
 - 用户要求“理顺/修改几章的安排、别重复已发生的事”属于 plan。若随后要求“按新安排修好这些章节，检查后接收”，用 batch_draft_accept，并采用 latest_pending_plan_revision 给出的明确窗口；不得扩回旧批次更大的范围。计划任务本身不写正文。
@@ -88,7 +91,7 @@ TERMINAL_ROUTER_SYSTEM = """
 - write_review：让 Writer 写指定章节，然后让 Editor 审查；绝不接受。
 - write_review_accept：用户明确要求写完检查并验收，或由已保存的自动验收策略升级时使用；包含必要的限次修订，只有当前版本 `pass` 才调用 记忆服务。用户要求先看草稿或不要验收时绝不能使用。
 - revise_review：让 Writer 依同版本审查修订指定章节，然后让 Editor 重审；绝不接受。
-- repair_accepted：用户明确要求自己核对并修复已接受正史章的疑点时使用。仅处理最新正史章已有的双引文疑点；先由审读者读完整章判断，必要时 Writer 单处补句，再独立复核并由引擎保留旧版提交。不撤回整章，不自动写下一章。只讨论或要求先看候选时不要执行。
+- repair_accepted：用户明确要求自己核对并修复已接受正史章的疑点时使用。仅处理最新正史章已有的双引文疑点或用户明确指出的局部连续性问题；先由审读者对照紧邻前章及完整当前章判断，必要时 Writer 局部修订，再独立复核并由引擎保留旧版提交。不撤回整章，不自动写下一章。只讨论或要求先看候选时不要执行。
 - review_accept：先让 Editor 审查；仅当 verdict=pass 时才让记忆服务接受，且 force 永远为 false。
 - revise_review_accept：修订→重审→必要时自动定点修复→仅 pass 时接受；常见可恢复问题不要求用户逐个确认。
 - accept：只尝试接受现有、同版本、已经 pass 的草稿；force 永远为 false。
@@ -177,14 +180,22 @@ _NEGATED_FRESH_BATCH_PATTERN = re.compile(
 )
 
 
+def _requests_upper_plan_edit(text: str) -> bool:
+    for clause in re.split(r"[。！？；\n]", text):
+        if (re.search(r"(?:修订|修改|改动|校正|重构|重写|重做|重新设计)[^。！？；\n]{0,20}(?:大纲|细纲)", clause)
+                and not re.search(r"(?:不|别|无需|不用)(?:要)?(?:修订|修改|改动|校正|重构|重写|重做|重新设计)[^。！？；\n]{0,20}(?:大纲|细纲)", clause)):
+            return True
+    return False
+
+
 def _focused_recent_plan_request(text: str) -> bool:
     """Recognize an explicit local edit without turning general feedback into work."""
     explicit_local = bool(
-        re.search(r"(?:只|仅)(?:需|要)?(?:改|调整|修|修正|校正|重排|梳理|优化)[^。！？\n]{0,35}(?:近期规划|章节规划|章节安排|近期安排)", text)
-        or re.search(r"(?:近期规划|章节规划|章节安排|近期安排)[^。！？\n]{0,35}(?:只|仅)(?:需|要)?(?:改|调整|修|修正|校正|重排|梳理|优化)", text)
+        re.search(r"(?:只|仅)(?:需|要)?(?:改|调整|修|修正|校正|重排|梳理|优化)[^。！？\n]{0,35}(?:近期(?:章节)?规划|章节规划|章节安排|近期安排)", text)
+        or re.search(r"(?:近期(?:章节)?规划|章节规划|章节安排|近期安排)[^。！？\n]{0,35}(?:只|仅)(?:需|要)?(?:改|调整|修|修正|校正|重排|梳理|优化)", text)
         or re.search(r"(?:重排|重构|重新规划|重新安排|调整|修改)第\s*\d+\s*(?:到|至|～|~|—|-)\s*\d+\s*章[^。！？\n]{0,12}(?:近期规划|章节规划|章节安排|近期安排)", text)
     )
-    return explicit_local and not bool(re.search(
+    return explicit_local and not _requests_upper_plan_edit(text) and not bool(re.search(
         r"先聊|讨论一下|会不会|能不能|不要执行|先别(?:改|调整|重排|梳理|优化|执行|做)"
         r"|先别动(?:这段|第\s*\d+|近期|章节|安排)", text,
     )) and not bool(re.search(r"(?:先|同时|然后)(?:重做|重构|重写|重新设计)(?:全书)?大纲", text))
@@ -225,6 +236,7 @@ _CANON_MUTATION_ACTIONS = {
     "planning_history_restore",
     "planning_publish_reviewed",
     "story_setting_edit",
+    "story_settings_manage",
     "plan_next_arc",
     "continue_run",
     "batch_accept",
@@ -305,14 +317,14 @@ class TerminalSession:
     @staticmethod
     def pending_resume(project: InkFlowProject, text: str) -> dict[str, Any] | None:
         """Share the exact resume decision with callers restoring task settings."""
-        updates = project.db.get_metadata("pending_terminal_user_updates", [])
+        updates = project.db.get_metadata(conversation_key("pending_terminal_user_updates"), [])
         if isinstance(updates, list) and any(isinstance(item, dict) and item.get("status") == "pending" for item in updates):
             # A new user revision needs a new Coordinator decision, not the
             # old task's automatic resume path.
             return None
         if TerminalSession._pending_question(project) is not None:
             return None
-        pending = project.db.get_metadata("pending_creation_task")
+        pending = project.db.get_metadata(conversation_key("pending_creation_task"))
         match = re.match(
             r"^\s*(?:(?:继续|接着)(?:完成)?(?:刚才|上次|之前)(?:的)?(?:任务|批次|进度)"
             r"|继续完成这批|继续这批|继续完成|继续写吧|继续吧|继续|接着写|接着做)(?:[。！!，,\s]+|$)",
@@ -339,7 +351,7 @@ class TerminalSession:
 
     @staticmethod
     def _save_pending_task(project: InkFlowProject, intent: TerminalIntent, status: str) -> None:
-        previous = project.db.get_metadata("pending_creation_task")
+        previous = project.db.get_metadata(conversation_key("pending_creation_task"))
         serialized_intent = intent.model_dump(mode="json")
         same_intent = isinstance(previous, dict) and ("intent" not in previous or previous["intent"] == serialized_intent)
         identifiers = {key: previous[key] for key in ("run_id", "task_id")
@@ -348,7 +360,7 @@ class TerminalSession:
         if runtime is not None:
             identifiers.update({key: value for key in ("run_id", "task_id")
                                 if (value := getattr(runtime, key, None))})
-        project.db.set_metadata("pending_creation_task", {
+        project.db.set_metadata(conversation_key("pending_creation_task"), {
             "status": status, "intent": serialized_intent, **identifiers,
         })
 
@@ -358,10 +370,10 @@ class TerminalSession:
         run_id = str(getattr(runtime, "run_id", "") or "")
         if not run_id:
             return False
-        pending = project.db.get_metadata("pending_creation_task")
+        pending = project.db.get_metadata(conversation_key("pending_creation_task"))
         if not isinstance(pending, dict) or str(pending.get("run_id") or "") != run_id:
             return False
-        project.db.set_metadata("pending_creation_task", {**pending, "status": "interrupted"})
+        project.db.set_metadata(conversation_key("pending_creation_task"), {**pending, "status": "interrupted"})
         return True
 
     @staticmethod
@@ -370,23 +382,23 @@ class TerminalSession:
         run_id = str(getattr(runtime, "run_id", "") or "")
         if not run_id:
             return False
-        pending = project.db.get_metadata("pending_creation_task")
+        pending = project.db.get_metadata(conversation_key("pending_creation_task"))
         if not isinstance(pending, dict) or str(pending.get("run_id") or "") != run_id:
             return False
         if pending.get("status") != "running":
             return False
-        project.db.set_metadata("pending_creation_task", {**pending, "status": "failed"})
+        project.db.set_metadata(conversation_key("pending_creation_task"), {**pending, "status": "failed"})
         return True
 
     @staticmethod
     def _pending_question(project: InkFlowProject) -> dict[str, Any] | None:
-        pending = project.db.get_metadata("pending_terminal_question")
+        pending = project.db.get_metadata(conversation_key("pending_terminal_question"))
         return pending if isinstance(pending, dict) and pending.get("id") else None
 
     @staticmethod
     def _remember_user_updates(project: InkFlowProject, messages: list[str], task_id: str) -> set[str]:
         """Keep steering verbatim even when a running batch stops before re-routing."""
-        updates = project.db.get_metadata("pending_terminal_user_updates", [])
+        updates = project.db.get_metadata(conversation_key("pending_terminal_user_updates"), [])
         if not isinstance(updates, list):
             updates = []
         new_updates = [
@@ -395,15 +407,15 @@ class TerminalSession:
             for message in messages if isinstance(message, str) and message.strip()
         ]
         updates.extend(new_updates)
-        project.db.set_metadata("pending_terminal_user_updates", updates[-20:])
+        project.db.set_metadata(conversation_key("pending_terminal_user_updates"), updates[-20:])
         return {item["id"] for item in new_updates}
 
     @staticmethod
     def _mark_user_updates_routed(project: InkFlowProject, update_ids: set[str]) -> None:
-        updates = project.db.get_metadata("pending_terminal_user_updates", [])
+        updates = project.db.get_metadata(conversation_key("pending_terminal_user_updates"), [])
         if not isinstance(updates, list) or not update_ids:
             return
-        project.db.set_metadata("pending_terminal_user_updates", [
+        project.db.set_metadata(conversation_key("pending_terminal_user_updates"), [
             {**item, "status": "routed"} if isinstance(item, dict) and item.get("id") in update_ids else item
             for item in updates
         ])
@@ -415,7 +427,7 @@ class TerminalSession:
     ) -> None:
         if response.get("needs_clarification") or response.get("questions"):
             question_id = f"pending-question-{uuid4().hex}"
-            project.db.set_metadata("pending_terminal_question", {
+            project.db.set_metadata(conversation_key("pending_terminal_question"), {
                 "id": question_id,
                 "task_id": ticket.ticket_id,
                 "intent": intent.model_dump(mode="json"),
@@ -430,7 +442,7 @@ class TerminalSession:
             ):
                 # Only the bound answer resolves this question. An unrelated
                 # completed task must not consume a still-unanswered decision.
-                project.db.set_metadata("pending_terminal_question", None)
+                project.db.set_metadata(conversation_key("pending_terminal_question"), None)
 
     @staticmethod
     def _planning_question(response: dict[str, Any]) -> None:
@@ -471,10 +483,10 @@ class TerminalSession:
         choice = answer.group(1).strip() if answer else ""
         if card.get("id") == "planning-publish" and choice == "暂不采用这版规划":
             async with project_write_lock(project.root):
-                project.db.set_metadata("pending_terminal_question", None)
-                task = project.db.get_metadata("pending_creation_task", {})
+                project.db.set_metadata(conversation_key("pending_terminal_question"), None)
+                task = project.db.get_metadata(conversation_key("pending_creation_task"), {})
                 if isinstance(task, dict) and task.get("status") == "waiting_user" and task.get("intent", {}).get("action") == "redesign_story":
-                    project.db.set_metadata("pending_creation_task", {**task, "status": "completed"})
+                    project.db.set_metadata(conversation_key("pending_creation_task"), {**task, "status": "completed"})
             return {"status": "waiting_user", "reply": "已审核候选继续保留，当前正式规划与修订号不变。以后明确提出采用时会重新核对来源。"}
         if card.get("id") != "planning-history" or choice not in {"保留旧版到历史", "查看旧版删除清单"}:
             return None
@@ -486,10 +498,10 @@ class TerminalSession:
                 return {"gate": "这份旧版的待处理状态已变化，请在项目中心重新查看。"}
             if choice == "保留旧版到历史":
                 result = cleanup_keep(project, confirmation_token=preview["confirmation_token"], revision_id=revision_id)
-                project.db.set_metadata("pending_terminal_question", None)
+                project.db.set_metadata(conversation_key("pending_terminal_question"), None)
                 return {"reply": result["next_action"], "result": result}
             paths = [item for item in preview["candidates"] if item.get("revision_id") == revision_id]
-            project.db.set_metadata("pending_terminal_question", None)
+            project.db.set_metadata(conversation_key("pending_terminal_question"), None)
             listing = "\n".join(
                 f"- {item['path']}：{item['blocked'] or '可选择删除'}（哈希 {item['content_hash'][:12]}）"
                 for item in paths
@@ -525,6 +537,8 @@ class TerminalSession:
         if explicit_mode:
             task_scope = active_task_settings.get()
             requested_mode = _COLLABORATION_MODE_NAMES[explicit_mode.group(1)]
+            if task_scope is None or task_scope.collaboration_mode != "deep":
+                requested_mode = new_task_mode(requested_mode)
             if (
                 (task_scope is None and requested_mode != "everyday")
                 or (task_scope is not None and task_scope.collaboration_mode != requested_mode)
@@ -557,7 +571,7 @@ class TerminalSession:
         batch_scopes = AsyncExitStack()
         original_engine = self.engine
         try:
-            queued_updates = project.db.get_metadata("pending_terminal_user_updates", [])
+            queued_updates = project.db.get_metadata(conversation_key("pending_terminal_user_updates"), [])
             queued_update_ids = {
                 str(item["id"]) for item in queued_updates
                 if isinstance(item, dict) and item.get("status") == "pending" and item.get("id")
@@ -629,10 +643,10 @@ class TerminalSession:
                 else:
                     if emit:
                         await emit({"type": "coordinator.model.started", "stage": "controller.routing", "role": "coordinator", "model": self.engine.settings.model, "summary": "墨宝正在理解你的要求"})
-                    trace.record_model_started("controller.routing", model=self.engine.settings.model, agent_role="coordinator", max_tokens=900, thinking=False)
+                    trace.record_model_started("controller.routing", model=self.engine.settings.model, agent_role="coordinator", max_tokens=1600, thinking=False)
                     route_result = await self.engine.provider.generate_json(
                         system_prompt=TERMINAL_ROUTER_SYSTEM, user_prompt=packet.to_model_prompt(),
-                        output_model=TerminalIntent, effort="low", max_tokens=900, thinking=False, agent_role="coordinator",
+                        output_model=TerminalIntent, effort="low", max_tokens=1600, thinking=False, agent_role="coordinator",
                     )
             steering_messages = await consume_steering() if consume_steering else []
             if steering_messages:
@@ -653,7 +667,7 @@ class TerminalSession:
                     "controller.routing.steer",
                     model=self.engine.settings.model,
                     agent_role="coordinator",
-                    max_tokens=900,
+                    max_tokens=1600,
                     timeout_seconds=self.engine.settings.request_timeout_seconds,
                     thinking=False,
                 )
@@ -662,7 +676,7 @@ class TerminalSession:
                     user_prompt=packet.to_model_prompt(),
                     output_model=TerminalIntent,
                     effort="low",
-                    max_tokens=900,
+                    max_tokens=1600,
                     thinking=False,
                     agent_role="coordinator",
                 )
@@ -678,11 +692,11 @@ class TerminalSession:
                 try:
                     active_plan = json.loads(active_path.read_text(encoding="utf-8"))
                     focused = re.search(
-                        r"(?:只|仅)?(?:需|要)?(?:改|调整|修|修正|校正|重排|重构|重新规划|重新安排|梳理|优化)第\s*(\d+)\s*章",
+                        r"(?:只|仅)?(?:需|要)?(?:改|调整|修|修正|校正|重排|重构|重新规划|重新安排|梳理|优化)(?:当前|现行|生效)?第\s*(\d+)\s*章",
                         text,
                     )
                     focused_range = re.search(
-                        r"(?:只|仅)?(?:需|要)?(?:改|调整|修|修正|校正|重排|重构|重新规划|重新安排|梳理|优化)第\s*(\d+)\s*(?:到|至|～|~|—|-)\s*(\d+)\s*章",
+                        r"(?:只|仅)?(?:需|要)?(?:改|调整|修|修正|校正|重排|重构|重新规划|重新安排|梳理|优化)(?:当前|现行|生效)?第\s*(\d+)\s*(?:到|至|～|~|—|-)\s*(\d+)\s*章",
                         text,
                     )
                     selected = (list(range(int(focused_range.group(1)), int(focused_range.group(2)) + 1))
@@ -725,7 +739,7 @@ class TerminalSession:
             elif raw_intent.response_kind == "question_answer":
                 raw_intent = raw_intent.model_copy(update={"pending_question_id": None})
             if raw_intent.response_kind == "task_revision" and not raw_intent.related_task_id:
-                active_task = project.db.get_metadata("pending_creation_task")
+                active_task = project.db.get_metadata(conversation_key("pending_creation_task"))
                 if (isinstance(active_task, dict)
                         and active_task.get("status") in {"running", "interrupted", "waiting_condition", "waiting_user"}):
                     related_id = active_task.get("task_id") or active_task.get("run_id")
@@ -1065,6 +1079,17 @@ class TerminalSession:
         if re.search(r"(?:不写|不要写|先别写|暂不写|只(?:调整|修改|重排|规划|讨论))[^。！？\n]{0,28}(?:正文|章节|草稿|计划|安排)", text):
             return None
 
+        if (re.search(r"(?:只|仅)修(?:订|正)?[^。！？\n]{0,24}草稿", text)
+                and re.search(r"批次|这批", text)
+                and _NO_ACCEPTANCE_PATTERN.search(text)):
+            return TerminalIntent(
+                action="batch_repair", requested_outcome=text[:1_000], confidence="high",
+                authorization="approved", authorization_source="current_request",
+                chapter_no=start_chapter, end_chapter_no=end_chapter,
+                max_revision_rounds=2, operation_instruction=text[-4_000:],
+                visible_reason=f"只修订现有批次第 {start_chapter}～{end_chapter} 章草稿并复审；不验收。",
+            )
+
         asks_for_prose = re.search(r"(?<!已)(?:写|续写|创作|生成|完成|做完)[^。！？\n]{0,24}(?:正文|章节|章|草稿)", text)
         explicit_execution = re.search(r"(?:请|继续|接着|开始|直接|现在|马上|替我|帮我|给我)|(?:写完|做完|完成)", text)
         looks_like_question = re.search(r"(?:为什么|怎么|如何|是否|能不能|可不可以|行不行)[^。！？\n]*[？?]?$", text)
@@ -1270,6 +1295,19 @@ class TerminalSession:
         authority for missing parameters, ambiguity and mutations of canon.
         """
 
+        if (_requests_upper_plan_edit(message)
+                and intent.action in {"plan", "outline", "plan_next_arc", "redesign_story"}
+                and not re.search(r"先聊|讨论一下|能不能|会不会|不要执行", message)):
+            boundary = project.db.latest_accepted_chapter_no()
+            _, end = self._explicit_chapter_range(message)
+            intent = intent.model_copy(update={
+                "action": "redesign_story", "chapter_no": boundary,
+                "end_chapter_no": end or intent.end_chapter_no or boundary + self.engine.settings.planning_window_chapters,
+                "operation_instruction": message, "document_kind": "none", "setting_change": {},
+                "missing_fields": [], "clarification_question": "", "clarification_questions": [],
+                "visible_reason": "先按正史修订大纲或卷细纲，再复核受影响的近期规划。",
+            })
+
         # Route an explicitly requested complete hierarchy before interpreting
         # chapter numbers as legacy plan/outline parameters. Keep narrow requests.
         complete_planning = (
@@ -1284,6 +1322,11 @@ class TerminalSession:
         if complete_planning and intent.action in {"plan", "outline", "plan_next_arc", "story_setting_edit", "redesign_story"}:
             boundary = project.db.latest_accepted_chapter_no()
             start, end = self._explicit_chapter_range(message)
+            anchored_ranges = [match for pattern in (_CHAPTER_FROM_TO_PATTERN, _CHAPTER_RANGE_PATTERN)
+                               for match in pattern.finditer(message)
+                               if int(match.group(1)) in {boundary, boundary + 1}]
+            if anchored_ranges:
+                start, end = (int(value) for value in anchored_ranges[-1].groups())
             endpoint = re.search(r"(?:到|至)第?\s*(\d+)\s*章", message)
             if end is None and endpoint:
                 start, end = None, int(endpoint.group(1))
@@ -1351,8 +1394,8 @@ class TerminalSession:
                            visible_reason=f"按本次终点从第 {explicit_start} 章推进到第 {explicit_end} 章后停止；旧范围任务保留，不自动沿用。")
             missing.discard("batch_id")
         if (action == "batch_repair" and explicit_end is not None
-                and re.search(r"继续|接着|写到|做到|停在", message)):
-            pending_task = project.db.get_metadata("pending_creation_task")
+                and re.search(r"(?:继续|接着)[^。；\n]{0,16}(?:写|续写|创作)|写到|做到|停在第\s*\d+\s*章", message)):
+            pending_task = project.db.get_metadata(conversation_key("pending_creation_task"))
             saved_action = (pending_task.get("intent", {}).get("action")
                             if isinstance(pending_task, dict) else None)
             accepts = (saved_action == "batch_draft_accept"
@@ -1452,6 +1495,13 @@ class TerminalSession:
             requested_end = updates.get("end_chapter_no", intent.end_chapter_no)
             if not intent.batch_id:
                 repairable_batches = self._repairable_batch_ids(project)
+                pending_task = project.db.get_metadata(conversation_key("pending_creation_task"))
+                pending_batch = (pending_task.get("intent", {}).get("batch_id")
+                                 if isinstance(pending_task, dict) else None)
+                if re.search(r"当前|刚才|这批|临时批次", message) and pending_batch in repairable_batches:
+                    span = self._batch_chapter_range(project, pending_batch)
+                    if span and (requested_start is None or span[0] <= requested_start <= span[1]) and (requested_end is None or requested_end == span[1]):
+                        repairable_batches = [pending_batch]
                 if requested_start is not None and requested_end is not None:
                     repairable_batches = [
                         batch_id for batch_id in repairable_batches
@@ -1473,6 +1523,10 @@ class TerminalSession:
         if action == "outline" and intent.outline_level == "detail":
             updates.update(chapter_no=None, end_chapter_no=None)
             missing.difference_update({"chapter_no", "end_chapter_no", "chapter_range"})
+        explicit_batch = re.search(r"\bbatch-[0-9a-f]{32}\b", message)
+        if explicit_batch and action in {"batch_draft", "batch_draft_accept", "batch_repair", "batch_accept"}:
+            updates["batch_id"] = explicit_batch.group()
+            missing.discard("batch_id")
         resolved = intent.model_copy(update={**updates, "missing_fields": sorted(missing)})
         required_missing = self._required_missing(resolved)
         if required_missing:
@@ -1839,9 +1893,7 @@ class TerminalSession:
                 value = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
-            repairable_status = value.get("status") == "ready_for_acceptance" or (
-                value.get("status") == "needs_revision" and isinstance(value.get("last_repair"), dict)
-            )
+            repairable_status = value.get("status") in {"ready_for_acceptance", "needs_revision", "interrupted"}
             if repairable_status and value.get("batch_id") == path.stem:
                 result.append(path.stem)
         return sorted(result)
@@ -2060,6 +2112,8 @@ class TerminalSession:
         status["draft_chapters"] = project.db.chapter_numbers_by_status("draft")
         status["ready_batches"] = self._ready_batch_ids(project)
         status["latest_pending_plan_revision"] = project.db.get_metadata("latest_pending_plan_revision")
+        from .manual_edits import ManualEditsService
+        status["manual_edit_questions"] = ManualEditsService(project).status()["issues"][:12]
         pending_planning = project.db.get_metadata("pending_planning_publication", {})
         if isinstance(pending_planning, dict) and pending_planning.get("run_id"):
             status["pending_planning_publication"] = {key: pending_planning.get(key)
@@ -2080,7 +2134,7 @@ class TerminalSession:
         pending_question = self._pending_question(project)
         if pending_question:
             status["pending_user_question"] = pending_question
-        pending_updates = project.db.get_metadata("pending_terminal_user_updates", [])
+        pending_updates = project.db.get_metadata(conversation_key("pending_terminal_user_updates"), [])
         if isinstance(pending_updates, list) and pending_updates:
             status["pending_user_updates"] = [
                 item for item in pending_updates[-20:]
@@ -2181,6 +2235,9 @@ class TerminalSession:
                 hard=True,
             ),
         ]
+        from .story_settings import StorySettingsService
+        sections.append(ContextSection(key="SET", title="用户定义的设定合集与职责（非正史）",
+            content=StorySettingsService(project).context(actor="coordinator", max_chars=14000), hard=False))
         sections.append(preference_section(project.db))
         packet = ContextPacket(
             project_id=project.project_id,
@@ -2205,7 +2262,9 @@ class TerminalSession:
 
     @staticmethod
     def _dialogue_path(project: InkFlowProject) -> Path:
-        return project.root / "DIALOGUE.md"
+        current = active_conversation.get()
+        return (project.root / "DIALOGUE.md" if current == "main" else
+                project.internal / "conversations" / f"{current}.md")
 
     def _recent_dialogue(self, project: InkFlowProject, limit: int = 6, char_limit: int = 12_000) -> str:
         path = self._dialogue_path(project)
@@ -2304,11 +2363,11 @@ class TerminalSession:
             interval = max(1, settings.dialogue_history_interval)
             if interval > 1:
                 # 自动保存按“每 N 轮”计数；计数放在项目元数据里，不新增文件。
-                pending = int(project.db.get_metadata("dialogue_turns_since_save", 0) or 0) + 1
+                pending = int(project.db.get_metadata(conversation_key("dialogue_turns_since_save"), 0) or 0) + 1
                 if pending < interval:
-                    project.db.set_metadata("dialogue_turns_since_save", pending)
+                    project.db.set_metadata(conversation_key("dialogue_turns_since_save"), pending)
                     return False
-        project.db.set_metadata("dialogue_turns_since_save", 0)
+        project.db.set_metadata(conversation_key("dialogue_turns_since_save"), 0)
         self._write_dialogue_entry(
             project,
             user_message,
@@ -2337,7 +2396,7 @@ class TerminalSession:
         cls._write_dialogue_entry(
             project, message, answer, action_note, settings.dialogue_history_limit
         )
-        project.db.set_metadata("dialogue_turns_since_save", 0)
+        project.db.set_metadata(conversation_key("dialogue_turns_since_save"), 0)
         return {
             "saved": True,
             "entries": len(cls._dialogue_entries(project)),
@@ -2466,6 +2525,9 @@ class TerminalSession:
                 root, intent.operation_instruction or intent.user_message,
                 scene_packet, chapter_no=intent.chapter_no,
             )}
+        if intent.action == "story_settings_manage":
+            return {"result": await self.engine.manage_story_settings(root, change=intent.setting_change,
+                instruction=intent.operation_instruction or intent.user_message)}
         if intent.action == "story_setting_edit":
             if intent.document_kind not in {"book", "outline", "story_detail"}:
                 return {"gate": "请明确要修改书籍设定、大纲还是剧情细纲；不会猜测修改范围。"}
@@ -2595,15 +2657,25 @@ class TerminalSession:
             )
             async with project_write_lock(root):
                 project = InkFlowProject(root)
-                pending_task = project.db.get_metadata("pending_creation_task", {})
+                pending_task = project.db.get_metadata(conversation_key("pending_creation_task"), {})
                 if (isinstance(pending_task, dict) and pending_task.get("status") == "waiting_user"
                         and pending_task.get("intent", {}).get("action") == "redesign_story"):
-                    project.db.set_metadata("pending_creation_task", {**pending_task, "status": "completed"})
+                    project.db.set_metadata(conversation_key("pending_creation_task"), {**pending_task, "status": "completed"})
             return {"result": published}
         if intent.action == "redesign_story":
             if intent.chapter_no is None or intent.end_chapter_no is None:
                 return {"gate": "请明确以哪一章已接受正文为起点、规划到第几章；例如‘以第15章为基础规划到第24章’。"}
             planning_instruction = intent.operation_instruction or intent.user_message
+            original = next((section.content for section in packet.sections if section.key == "A"),
+                            intent.user_message) if packet else intent.user_message
+            if (re.search(r"(?:继续|恢复|接着|重试|续修).{0,30}(?:未完成|中断|断点|候选|失败)|断点.{0,12}续修", original)
+                    and not re.search(r"继续.{0,18}未完成|断点.{0,8}续修", planning_instruction)):
+                planning_instruction = "继续未完成的规划。\n" + planning_instruction
+            if (intent.planning_revision_no is not None
+                    and not re.search(r"旧版|历史|以前|先前|之前|前面|参考|融合|恢复|第\s*\d+\s*版", original)):
+                intent = intent.model_copy(update={"planning_revision_no": None, "planning_part": "none",
+                                            "planning_reference_chapter_no": None,
+                                            "planning_reference_volume_no": None})
             if intent.planning_revision_no is not None:
                 if intent.planning_part == "none":
                     return {"gate": "请指定要参考旧版的大纲、卷细纲或近期规划；不会默认引用整版。"}
@@ -2819,8 +2891,7 @@ class TerminalSession:
             # Coordinator requested revision before there was a current review.
             current_review = bool(record and chapter
                 and record["chapter_version"] == chapter["version"]
-                and record["report"].source_hash == chapter["content_hash"]
-                and record["report"].verdict == "patch")
+                and record["report"].source_hash == chapter["content_hash"])
             if current_review:
                 revised = await self._run_step(
                     "writer.revise", self.engine.revise_chapter(root, chapter_no, instruction)

@@ -12,7 +12,8 @@ from typing import Any
 
 from .errors import ProjectError, ValidationGateError
 from .project import InkFlowProject
-from .utils import atomic_write_bytes, atomic_write_json, content_hash, json_dumps, safe_filename, utc_now
+from .render import render_state
+from .utils import atomic_write_bytes, atomic_write_json, atomic_write_text, content_hash, json_dumps, safe_filename, utc_now
 
 
 _CHECKPOINT_ID = re.compile(r"^cp-[0-9A-Za-zT]+-[0-9a-f]{8}$")
@@ -169,6 +170,58 @@ class CheckpointService:
             raise ValidationGateError(f"没有找到第 {boundary_chapter} 章已接受后的检查点。")
         return str(matches[0]["checkpoint_id"])
 
+    def _isolated_acceptance_chapter(self, database_path: Path, manifest: dict[str, Any]) -> int | None:
+        """Recognize one out-of-order acceptance while keeping later drafts intact."""
+        boundary = int(manifest.get("boundary_chapter") or 0)
+        with closing(sqlite3.connect(f"file:{database_path.as_posix()}?mode=ro", uri=True)) as snapshot:
+            target = snapshot.execute(
+                "SELECT chapter_no,content_hash FROM chapters WHERE status='accepted' ORDER BY chapter_no"
+            ).fetchall()
+        if [row[0] for row in target] != list(range(1, boundary + 1)):
+            return None
+        accepted = self.project.db.accepted_chapters()
+        if len(accepted) != boundary + 1 or [item["chapter_no"] for item in accepted[:boundary]] != list(range(1, boundary + 1)):
+            return None
+        isolated = accepted[-1]
+        chapter_no = int(isolated["chapter_no"])
+        if chapter_no <= boundary + 1 or isolated["path"] != f"chapters/chapter_{chapter_no:05d}.md":
+            return None
+        with self.project.db.connect() as connection:
+            patch_row = connection.execute(
+                "SELECT data_json FROM memory_patches WHERE chapter_no=?", (chapter_no,)
+            ).fetchone()
+            if not patch_row:
+                return None
+            patch = json.loads(patch_row[0])
+            if patch.get("operations"):
+                return None
+            events = [json.loads(row[0]) for row in connection.execute(
+                "SELECT value_json FROM metadata WHERE key LIKE 'memory.event:%'")]
+            if any(event.get("before") for event in events if event.get("chapter_no") == chapter_no
+                   and event.get("action") in {"add", "replace"}):
+                return None
+            touched_threads = {item["thread_id"] for item in patch.get("threads", [])}
+            for index, item in enumerate(accepted[:boundary]):
+                if item["content_hash"] == target[index][1]:
+                    continue
+                previous_patch = connection.execute(
+                    "SELECT data_json FROM memory_patches WHERE chapter_no=?", (item["chapter_no"],)
+                ).fetchone()
+                if not previous_patch or touched_threads.intersection(
+                    entry["thread_id"] for entry in json.loads(previous_patch[0]).get("threads", [])
+                ):
+                    return None
+        final = self.project.root / isolated["path"]
+        draft = self.project.root / "chapters" / f"chapter_{chapter_no:05d}.draft.md"
+        state_path = self.project.root / "STATE.md"
+        if (draft.exists() or not final.is_file()
+                or content_hash(final.read_text(encoding="utf-8")) != isolated["content_hash"]
+                or not state_path.is_file()
+                or content_hash(state_path.read_text(encoding="utf-8")) != content_hash(render_state(
+                    self.project.db.current_facts(), self.project.db.open_threads(), self.project.db.project_status()))):
+            return None
+        return chapter_no
+
     def preview_restore(self, checkpoint_id: str) -> dict[str, Any]:
         manifest = self._load_manifest(checkpoint_id, validate=True)
         current_records = {
@@ -211,6 +264,26 @@ class CheckpointService:
         }
         fingerprint = content_hash(json_dumps(fingerprint_payload, indent=None))
         confirmation_token = content_hash(f"restore:{checkpoint_id}:{fingerprint}")[:24]
+        isolated_chapter = self._isolated_acceptance_chapter(database_path, manifest)
+        if isolated_chapter is not None:
+            final = f"chapters/chapter_{isolated_chapter:05d}.md"
+            draft = f"chapters/chapter_{isolated_chapter:05d}.draft.md"
+            return {
+                "checkpoint": self._summary(manifest),
+                "current_status": self.project.db.project_status(),
+                "target_status": {**self.project.db.project_status(), "chapters": {
+                    **self.project.db.project_status()["chapters"],
+                    "accepted": manifest["status"]["chapters"]["accepted"],
+                    "draft": self.project.db.project_status()["chapters"].get("draft", 0) + 1,
+                }},
+                "impact": {"create": [draft], "overwrite": ["STATE.md"],
+                           "remove_to_recoverable_trash": [final],
+                           "reproject_from_database": [], "unchanged": len(current_paths) - 2},
+                "confirmation_token": confirmation_token,
+                "recovery_mode": "isolated_acceptance",
+                "isolated_chapter_no": isolated_chapter,
+                "instruction": "仅撤销越章误验收并恢复该章草稿；其余草稿、规划和审查记录保留。",
+            }
         return {
             "checkpoint": self._summary(manifest),
             "current_status": self.project.db.project_status(),
@@ -232,6 +305,100 @@ class CheckpointService:
     def restore(self, checkpoint_id: str, confirmation_token: str) -> dict[str, Any]:
         return self._restore(checkpoint_id, confirmation_token)
 
+    def _restore_isolated_acceptance(self, checkpoint_id: str, chapter_no: int) -> dict[str, Any]:
+        """Undo one proven out-of-order commit without discarding later draft work."""
+        self._acquire_lock(checkpoint_id)
+        safety: dict[str, Any] | None = None
+        try:
+            manifest = self._load_manifest(checkpoint_id, validate=True)
+            snapshot_path = self.root / checkpoint_id / "inkflow.db"
+            if self._isolated_acceptance_chapter(snapshot_path, manifest) != chapter_no:
+                raise ValidationGateError("误验收状态已变化，请重新预览回退。")
+            safety = self.create(label=f"撤销第 {chapter_no} 章误验收前安全点",
+                                 reason=f"pre_isolated_recovery:{chapter_no}", advance=True)
+            stamp = utc_now().replace("+00:00", "Z").replace(":", "").replace("-", "")
+            trash_dir = (self.project.internal / "trash" / f"{stamp}-isolated-accept-{chapter_no}").resolve()
+            trash_dir.mkdir(parents=True, exist_ok=False)
+            atomic_write_json(self.journal_path, {
+                "checkpoint_id": checkpoint_id, "safety_checkpoint_id": safety["checkpoint_id"],
+                "trash_dir": str(trash_dir), "started_at": utc_now(),
+            })
+            content = self.project.db.canonical_chapter_content(chapter_no)
+            if content is None:
+                raise ProjectError("误验收正文缺少可校验的数据库原文。")
+            final = self.project.root / "chapters" / f"chapter_{chapter_no:05d}.md"
+            draft = self.project.root / "chapters" / f"chapter_{chapter_no:05d}.draft.md"
+            state_path = self.project.root / "STATE.md"
+            if draft.exists() or content_hash(final.read_text(encoding="utf-8")) != content_hash(content):
+                raise ProjectError("误验收正文投影已变化，安全点已保留，未覆盖文件。")
+            with closing(sqlite3.connect(f"file:{snapshot_path.as_posix()}?mode=ro", uri=True)) as snapshot:
+                snapshot.row_factory = sqlite3.Row
+                with self.project.db.connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    patch = json.loads(connection.execute(
+                        "SELECT data_json FROM memory_patches WHERE chapter_no=?", (chapter_no,)
+                    ).fetchone()[0])
+                    for thread in patch.get("threads", []):
+                        thread_id = thread["thread_id"]
+                        row = snapshot.execute("SELECT * FROM plot_threads WHERE thread_id=?", (thread_id,)).fetchone()
+                        connection.execute("DELETE FROM plot_threads WHERE thread_id=?", (thread_id,))
+                        if row:
+                            columns = list(row.keys())
+                            connection.execute(
+                                f"INSERT INTO plot_threads ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                                tuple(row),
+                            )
+                    for fact in patch.get("facts", []):
+                        fact_id = fact["fact_id"]
+                        connection.execute("DELETE FROM facts WHERE fact_id=? AND source_chapter=?", (fact_id, chapter_no))
+                        connection.execute("DELETE FROM metadata WHERE key=?", ("memory.evidence:" + fact_id,))
+                    event_rows = connection.execute(
+                        "SELECT key,value_json FROM metadata WHERE key LIKE 'memory.event:%'"
+                    ).fetchall()
+                    for event in event_rows:
+                        if json.loads(event["value_json"]).get("chapter_no") == chapter_no:
+                            connection.execute("DELETE FROM metadata WHERE key=?", (event["key"],))
+                    connection.execute("DELETE FROM memory_patches WHERE chapter_no=?", (chapter_no,))
+                    connection.execute(
+                        "UPDATE chapters SET status='draft',path=?,accepted_at=NULL WHERE chapter_no=? AND status='accepted'",
+                        (f"chapters/chapter_{chapter_no:05d}.draft.md", chapter_no),
+                    )
+                    connection.execute(
+                        "DELETE FROM learning_events WHERE event_type='accepted' AND chapter_no=?", (chapter_no,)
+                    )
+                    connection.execute(
+                        "DELETE FROM collaboration_messages WHERE chapter_no=? AND message_type='memory_sync' "
+                        "AND claim LIKE '%已进入正史%'", (chapter_no,)
+                    )
+                    connection.execute(
+                        "UPDATE provisional_memory_patches SET status='invalidated',invalidation_reason=?,updated_at=? "
+                        "WHERE chapter_no>=? AND status='active'",
+                        (f"第 {chapter_no} 章误验收已撤销，后续临时记忆待重核", utc_now(), chapter_no),
+                    )
+                    connection.commit()
+            archived = trash_dir / "files" / "chapters" / final.name
+            archived.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(final, archived)
+            os.replace(final, draft)
+            atomic_write_text(state_path, render_state(
+                self.project.db.current_facts(), self.project.db.open_threads(), self.project.db.project_status()))
+            post = self.create(label=f"第 {chapter_no} 章误验收已撤销", reason=f"isolated_recovery:{chapter_no}")
+            branch_id = f"branch-{stamp}-{uuid.uuid4().hex[:6]}"
+            self._write_current(post["checkpoint_id"], branch_id, restored_from=safety["checkpoint_id"])
+            self._append_history({"event": "isolated_acceptance_reverted", "chapter_no": chapter_no,
+                                  "checkpoint_id": checkpoint_id, "safety_checkpoint_id": safety["checkpoint_id"],
+                                  "branch_id": branch_id, "created_at": utc_now()})
+            self.journal_path.unlink(missing_ok=True)
+            return {"status": "restored", "chapter_no": chapter_no,
+                    "safety_checkpoint_id": safety["checkpoint_id"],
+                    "project_status": self.project.db.project_status(),
+                    "next_action": f"第 {chapter_no} 章已恢复为草稿，其余草稿与规划保留。"}
+        except Exception as exc:
+            safety_id = safety["checkpoint_id"] if safety else "未创建"
+            raise ProjectError(f"误验收撤销未完整完成；安全检查点={safety_id}，错误={exc}") from exc
+        finally:
+            self.lock_path.unlink(missing_ok=True)
+
     def _restore(
         self,
         checkpoint_id: str,
@@ -248,6 +415,8 @@ class CheckpointService:
                 "上一次回退没有完成，之后的回退已被阻止；"
                 "请在“检查点与分支式回退”点击“恢复到中断前的状态”，再重新预览回退。"
             )
+        if preview.get("recovery_mode") == "isolated_acceptance":
+            return self._restore_isolated_acceptance(checkpoint_id, int(preview["isolated_chapter_no"]))
         self._acquire_lock(checkpoint_id)
         safety: dict[str, Any] | None = None
         trash_dir: Path | None = None

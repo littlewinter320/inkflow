@@ -1,7 +1,9 @@
 """One request-scoped budget and public event stream for nested workflows."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from contextvars import ContextVar
+from uuid import uuid4
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -51,3 +53,22 @@ class RunRuntime:
 
 
 active_runtime: ContextVar[RunRuntime | None] = ContextVar("inkflow_runtime", default=None)
+
+
+@contextmanager
+def ensure_run_runtime():
+    """Reuse a caller's budget, or attribute standalone requests and their retries."""
+    existing = active_runtime.get()
+    if existing is not None:
+        yield existing
+        return
+    scope_id = f"standalone-{uuid4().hex}"
+    from .task_settings import active_task_settings
+    task_scope = active_task_settings.get()
+    runtime = RunRuntime(publish=lambda event: None,
+                         task_id=task_scope.task_id if task_scope else scope_id, run_id=scope_id)
+    token = active_runtime.set(runtime)
+    try:
+        yield runtime
+    finally:
+        active_runtime.reset(token)

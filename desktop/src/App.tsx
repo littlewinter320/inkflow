@@ -1,4 +1,6 @@
 import { AuthorPreferences } from "./AuthorPreferences";
+import { ManualEditMonitor, StorySettings } from "./StorySettings";
+import type { ManualEditJob } from "./StorySettings";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { FormEvent, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MutableRefObject, PointerEvent as ReactPointerEvent, ReactNode } from "react";
@@ -60,6 +62,13 @@ type EditorSnapshot = {
   document: DocumentData | null;
   text: string;
   savedText: string;
+};
+type DocumentUploadCandidate = {
+  fileName: string;
+  projectRoot: string;
+  relativePath: string;
+  expectedHash: string;
+  content: string;
 };
 type Dashboard = {
   root: string;
@@ -212,7 +221,10 @@ type WorkspaceLayout = {
   navigationVisible: boolean;
   assistantVisible: boolean;
   inspectorVisible: boolean;
-  assistantPosition: "left" | "right";
+  assistantPosition: "left" | "right" | "bottom" | "floating";
+  assistantX: number;
+  assistantY: number;
+  assistantHeight: number;
   navigationWidth: number;
   assistantWidth: number;
   inspectorWidth: number;
@@ -257,6 +269,9 @@ const defaultWorkspaceLayout: WorkspaceLayout = {
   assistantVisible: true,
   inspectorVisible: false,
   assistantPosition: "right",
+  assistantX: 80,
+  assistantY: 100,
+  assistantHeight: 600,
   navigationWidth: 210,
   assistantWidth: 350,
   inspectorWidth: 236,
@@ -296,7 +311,10 @@ function loadWorkspaceLayout(): WorkspaceLayout {
       navigationVisible: stored.navigationVisible !== false,
       assistantVisible: stored.assistantVisible !== false,
       inspectorVisible: stored.inspectorVisible ?? defaultWorkspaceLayout.inspectorVisible,
-      assistantPosition: stored.assistantPosition === "left" ? "left" : "right",
+      assistantPosition: ["left", "right", "bottom", "floating"].includes(String(stored.assistantPosition)) ? stored.assistantPosition as WorkspaceLayout["assistantPosition"] : "right",
+      assistantX: Math.max(0, Math.min(window.innerWidth - 320, Number(stored.assistantX) || 80)),
+      assistantY: Math.max(0, Math.min(window.innerHeight - 80, Number(stored.assistantY) || 100)),
+      assistantHeight: Math.max(260, Math.min(window.innerHeight * .9, Number(stored.assistantHeight) || 600)),
       navigationWidth: clampWorkspaceWidth("navigation", Number(stored.navigationWidth) || defaultWorkspaceLayout.navigationWidth),
       assistantWidth: clampWorkspaceWidth("assistant", Number(stored.assistantWidth) || defaultWorkspaceLayout.assistantWidth),
       inspectorWidth: clampWorkspaceWidth("inspector", Number(stored.inspectorWidth) || defaultWorkspaceLayout.inspectorWidth),
@@ -388,6 +406,11 @@ function App() {
   const [projectOpenFailure, setProjectOpenFailure] = useState<{ root: string; message: string } | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showManualMonitor, setShowManualMonitor] = useState(false);
+  const [manualJobs, setManualJobs] = useState<ManualEditJob[]>([]);
+  const [manualMonitorError, setManualMonitorError] = useState("");
+  const conversationPanelRef = useRef<HTMLElement | null>(null);
+  const floatingMoveRef = useRef<{ x: number; y: number; startX: number; startY: number } | null>(null);
   const [showUpdate, setShowUpdate] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
@@ -525,6 +548,12 @@ function App() {
 
   useEffect(() => {
     const resize = (event: PointerEvent) => {
+      const moving = floatingMoveRef.current;
+      if (moving) {
+        const width = conversationPanelRef.current?.clientWidth || 320;
+        setWorkspaceLayout(current => ({ ...current, assistantX: Math.max(0, Math.min(window.innerWidth - width, moving.x + event.clientX - moving.startX)), assistantY: Math.max(0, Math.min(window.innerHeight - 80, moving.y + event.clientY - moving.startY)) }));
+        return;
+      }
       const activeResize = resizeRef.current;
       if (!activeResize) return;
       const width = clampWorkspaceWidth(activeResize.target, activeResize.startWidth + (event.clientX - activeResize.startX) * activeResize.direction);
@@ -533,6 +562,7 @@ function App() {
     };
     const stop = () => {
       resizeRef.current = null;
+      floatingMoveRef.current = null;
       window.document.body.classList.remove("layout-resizing");
     };
     window.addEventListener("pointermove", resize);
@@ -603,6 +633,55 @@ function App() {
     return () => { active = false; window.clearInterval(timer); };
   }, [projectRoot, request]);
 
+  const refreshManualEdits = useCallback(async () => {
+    if (!projectRoot) return;
+    try {
+      if (provider?.manual_edit_review_enabled !== false) await request("manual_edits.scan");
+      const result = await request<{ jobs: ManualEditJob[] }>("manual_edits.status");
+      if (projectRootRef.current !== projectRoot) return;
+      setManualJobs(result.jobs || []); setManualMonitorError("");
+    } catch (cause) {
+      if (projectRootRef.current === projectRoot) setManualMonitorError(errorMessage(cause));
+    }
+  }, [projectRoot, provider?.manual_edit_review_enabled, request]);
+  useEffect(() => {
+    if (!projectRoot) { setManualJobs([]); setManualMonitorError(""); return; }
+    let active = true; let polling = false;
+    const poll = async () => {
+      if (!active || polling) return;
+      polling = true;
+      try { await refreshManualEdits(); } finally { polling = false; }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 8000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [projectRoot, refreshManualEdits]);
+  useEffect(() => {
+    const panel = conversationPanelRef.current;
+    if (!panel || workspaceLayout.assistantPosition !== "floating") return;
+    const observer = new ResizeObserver(entries => {
+      const size = entries[0]?.borderBoxSize[0];
+      if (!size) return;
+      setWorkspaceLayout(current => {
+        const width = clampWorkspaceWidth("assistant", size.inlineSize);
+        const height = Math.round(size.blockSize);
+        return current.assistantWidth === width && current.assistantHeight === height ? current : { ...current, assistantWidth: width, assistantHeight: height };
+      });
+    });
+    observer.observe(panel);
+    return () => observer.disconnect();
+  }, [workspaceLayout.assistantPosition, workspaceLayout.assistantVisible]);
+  const openConversationWindow = async (conversationId?: string) => {
+    try { await window.inkflow.openConversationWindow(projectRoot, conversationId); }
+    catch (cause) { setError(errorMessage(cause)); }
+  };
+  const decideManualEdit = async (job: ManualEditJob, decision: string, reason: string) => {
+    try {
+      await request("manual_edits.decide", { job_id: job.job_id, decision, reason, expected_hash: job.current_hash || job.expected_hash || job.content_hash || "" });
+      await refreshManualEdits();
+    } catch (cause) { setManualMonitorError(errorMessage(cause)); }
+  };
+
   const decideComputerAction = async (action: PendingComputerAction, approved: boolean) => {
     if (computerActionWorking) return;
     setComputerActionWorking(true);
@@ -639,7 +718,7 @@ function App() {
     [projectRoot],
   );
 
-  const saveDocument = useCallback(async (quiet = false): Promise<boolean> => {
+  const saveDocument = useCallback(async (quiet = false, upload?: DocumentUploadCandidate): Promise<boolean> => {
     // Serialize saves and drain edits made while a save is in flight. Every
     // request keeps the original project, document and expected version.
     while (true) {
@@ -648,9 +727,15 @@ function App() {
         if (!await pending) return false;
         continue;
       }
-      const snapshot = editorSnapshotRef.current;
+      const current = editorSnapshotRef.current;
+      if (upload && (!current.document || current.projectRoot !== upload.projectRoot || current.document.relative_path !== upload.relativePath
+        || current.document.content_hash !== upload.expectedHash || current.text !== current.savedText)) {
+        setError("当前文档或未保存内容已变化。上传候选仍保留，请先处理编辑器内容，再重新选择上传稿核对。");
+        return false;
+      }
+      const snapshot = upload ? { ...current, text: upload.content } : current;
       const source = snapshot.document;
-      if (!source || snapshot.text === snapshot.savedText) return true;
+      if (!source || (!upload && snapshot.text === snapshot.savedText)) return true;
       const saving = (async () => {
         try {
           const result = await window.inkflow.request<Record<string, unknown>>("document.save", {
@@ -658,7 +743,7 @@ function App() {
             relative_path: source.relative_path,
             content: snapshot.text,
             expected_hash: source.content_hash,
-            source: "desktop_editor",
+            source: upload ? "upload_desktop" : "desktop_editor",
           });
           if (!result.saved && !result.proposal) throw new Error("引擎没有确认文档或修改提案已保存。");
           if (result.saved && typeof result.content_hash !== "string") throw new Error("引擎没有返回已保存文档的版本，请保留当前修改并检查保存记录。");
@@ -669,11 +754,17 @@ function App() {
             statistics: result.statistics as Statistics,
             annotations: result.annotations as Annotation[],
           } : source;
-          if (editorSnapshotRef.current.session === snapshot.session) {
-            editorSnapshotRef.current = { ...editorSnapshotRef.current, document: savedDocument, savedText: snapshot.text };
+          const latest = editorSnapshotRef.current;
+          if (latest.session === snapshot.session && (!upload || (latest.document?.content_hash === source.content_hash && latest.text === latest.savedText))) {
+            const displayedText = upload && !result.saved ? source.content : snapshot.text;
+            editorSnapshotRef.current = { ...latest, document: savedDocument, savedText: displayedText, ...(upload ? { text: displayedText } : {}) };
             setDocument(savedDocument);
-            setSavedText(snapshot.text);
-            if (!result.saved) setNotice(String(result.gate || "已保存为未应用的正史修改提案。"));
+            setSavedText(displayedText);
+            if (upload) setText(displayedText);
+            if (upload && result.changed === false) setNotice("上传稿与当前文件内容相同；没有创建新版本，也没有重新审查。");
+            else if (upload && !result.saved) setNotice(`“${upload.fileName}”已保存为未接受的修改提案，正史正文没有覆盖。${String(result.gate || "请到修改核对查看审核结果，再决定正史修订范围。")}`);
+            else if (!result.saved) setNotice(String(result.gate || "已保存为未应用的正史修改提案。"));
+            else if (upload) setNotice(`“${upload.fileName}”已保存到当前文档，上一版本已保留；按设置进行后台核对。`);
             else if (!quiet) { setNotice("已保存，并保留上一版本快照。"); setMascotMood("success"); }
           }
           // Metadata refresh cannot overwrite new edits or adopt a file version
@@ -687,7 +778,7 @@ function App() {
           void refresh(snapshot.projectRoot).catch(() => undefined);
           return true;
         } catch (cause) {
-          setError(`保存未完成，修改仍保留在编辑器中，暂不切换文档或项目。${errorMessage(cause)}`);
+          setError(`${upload ? "上传保存未完成，候选仍保留在预览中，原编辑器内容没有替换。" : "保存未完成，修改仍保留在编辑器中，暂不切换文档或项目。"}${errorMessage(cause)}`);
           setMascotMood("rest");
           return false;
         }
@@ -698,6 +789,7 @@ function App() {
       } finally {
         if (documentSaveRef.current === saving) documentSaveRef.current = null;
       }
+      if (upload) return true;
     }
   }, [refresh]);
 
@@ -1694,7 +1786,8 @@ function App() {
               : undefined
         } />}
         {showCreate && <CreateProject onClose={() => setShowCreate(false)} onCreated={openProject} />}
-        {showSettings && <SettingsDialog projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} layout={workspaceLayout} preferences={uiPreferences} onLayoutChange={updateWorkspaceLayout} onLayoutPreset={applyWorkspacePreset} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
+        {showManualMonitor && <Modal title="手动修改核对" subtitle="后台检测、依据和你的决定" onClose={() => setShowManualMonitor(false)} className="manual-monitor-modal"><ManualEditMonitor jobs={manualJobs} error={manualMonitorError} onRefresh={() => void refreshManualEdits()} onDecision={decideManualEdit} /></Modal>}
+      {showSettings && <SettingsDialog projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} layout={workspaceLayout} preferences={uiPreferences} onLayoutChange={updateWorkspaceLayout} onLayoutPreset={applyWorkspacePreset} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
         {showUpdate && <UpdateDialog info={updateInfo} onClose={() => setShowUpdate(false)} />}
       </div>
     );
@@ -1709,6 +1802,9 @@ function App() {
   const workspaceGridStyle = {
     "--navigation-width": `${workspaceLayout.navigationWidth}px`,
     "--assistant-width": `${workspaceLayout.assistantWidth}px`,
+    "--chat-x": `${workspaceLayout.assistantX}px`,
+    "--chat-y": `${workspaceLayout.assistantY}px`,
+    "--chat-height": `${workspaceLayout.assistantHeight}px`,
   } as CSSProperties;
 
   return (
@@ -1727,6 +1823,8 @@ function App() {
           <button onClick={() => setShowSearch(true)}>⌕ 搜索</button>
           <button onClick={() => void window.inkflow.openPath(projectRoot)}>打开文件夹</button>
           <button onClick={() => setShowSettings(true)}>设置</button>
+          <button onClick={() => void openConversationWindow()}>＋ 对话窗口</button>
+          <button onClick={() => setShowManualMonitor(true)}>修改核对</button>
           <button onClick={() => setShowUpdate(true)}>{updateInfo.status === "downloaded" ? "安装更新" : "检查更新"}</button>
         </nav>
       </header>
@@ -1754,7 +1852,14 @@ function App() {
         </>}
 
         {workspaceLayout.assistantVisible && <>
-        <section className="conversation-panel">
+        <section className="conversation-panel" ref={conversationPanelRef}>
+          <div className="floating-chat-controls">
+            {workspaceLayout.assistantPosition === "floating" && <button type="button" className="chat-drag-handle" aria-label="移动对话面板，方向键微调位置" onPointerDown={event => { event.preventDefault(); floatingMoveRef.current = { x: workspaceLayout.assistantX, y: workspaceLayout.assistantY, startX: event.clientX, startY: event.clientY }; }} onKeyDown={event => { const delta = ({ ArrowLeft: [-20, 0], ArrowRight: [20, 0], ArrowUp: [0, -20], ArrowDown: [0, 20] } as Record<string, number[]>)[event.key]; if (!delta) return; event.preventDefault(); updateWorkspaceLayout({ assistantX: Math.max(0, Math.min(window.innerWidth - 320, workspaceLayout.assistantX + delta[0])), assistantY: Math.max(0, Math.min(window.innerHeight - 80, workspaceLayout.assistantY + delta[1])) }); }}>⠿ 移动</button>}
+            <select className="conversation-layout-select" aria-label="对话面板位置" value={workspaceLayout.assistantPosition} onChange={event => updateWorkspaceLayout({ assistantPosition: event.target.value as WorkspaceLayout["assistantPosition"] })}><option value="left">正文左侧</option><option value="right">正文右侧</option><option value="bottom">正文下方</option><option value="floating">自由浮动</option></select>
+            <button type="button" onClick={() => void openConversationWindow()}>＋ 独立对话</button>
+            <button type="button" onClick={() => setShowManualMonitor(true)}>后台核对</button>
+          </div>
+          {manualJobs.some(job => ["needs_confirmation", "awaiting_confirmation", "waiting_user", "needs_evidence", "revision_requested", "conflict", "blocked", "failed"].includes(job.status)) && <details className="manual-edit-issues"><summary>手动修改有待处理问题</summary><p>原稿已保留，待核对改动不会自动变成正史。</p><button type="button" onClick={() => setShowManualMonitor(true)}>查看证据并决定</button></details>}
           <div className="panel-title">
             <div><h2>和墨宝一起写</h2><p className="panel-status" role="status">{busy ? "任务进行中，可以继续补充想法" : "把想法告诉我。"}</p></div>
             <div className="panel-mascot">
@@ -1833,7 +1938,7 @@ function App() {
             </div>
           </form>
         </section>
-        <ResizeHandle className="assistant-resize" label="调整 AI 对话栏宽度" onResizeStart={(event) => startWorkspaceResize("assistant", workspaceLayout.assistantPosition === "left" ? 1 : -1, event)} />
+        {["left", "right"].includes(workspaceLayout.assistantPosition) && <ResizeHandle className="assistant-resize" label="调整 AI 对话栏宽度" onResizeStart={(event) => startWorkspaceResize("assistant", workspaceLayout.assistantPosition === "left" ? 1 : -1, event)} />}
         </>}
 
         <section className="workbench">
@@ -1860,6 +1965,7 @@ function App() {
           )}
           {activeTab === "editor" && (
             <EditorPanel
+              projectRoot={projectRoot}
               document={document}
               text={text}
               savedText={savedText}
@@ -1869,6 +1975,7 @@ function App() {
               editorRef={editorRef}
               onChange={changeEditorText}
               onSave={() => void saveDocument(false)}
+              onUpload={(candidate) => saveDocument(false, candidate)}
               onDelete={() => void deleteCurrentDocument()}
               onAnnotate={openSelectionActions}
               onListen={openListeningCenter}
@@ -1913,6 +2020,7 @@ function App() {
 
       {(notice || error) && <Toast kind={error ? "error" : "info"} text={error || notice} onClose={() => { setError(""); setNotice(""); setMascotMood("idle"); }} action={error ? (/任务记录|原任务状态/.test(error) ? { label: "查看可恢复任务", onClick: () => setActiveTab("project") } : /API Key|密钥|模型接口|服务商|模型配置需要处理/.test(error) ? { label: "打开设置", onClick: () => setShowSettings(true) } : /重新审查/.test(error) ? { label: "打开审查", onClick: () => setActiveTab("review") } : /上下文容量|上下文占用/.test(error) ? { label: "查看上下文", onClick: () => setActiveTab("process") } : { label: "查看协作台", onClick: () => setActiveTab("process") }) : undefined} />}
       {showCreate && <CreateProject onClose={() => setShowCreate(false)} onCreated={openProject} />}
+      {showManualMonitor && <Modal title="手动修改核对" subtitle="后台检测、依据和你的决定" onClose={() => setShowManualMonitor(false)} className="manual-monitor-modal"><ManualEditMonitor jobs={manualJobs} error={manualMonitorError} onRefresh={() => void refreshManualEdits()} onDecision={decideManualEdit} /></Modal>}
       {showSettings && <SettingsDialog projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} layout={workspaceLayout} preferences={uiPreferences} onLayoutChange={updateWorkspaceLayout} onLayoutPreset={applyWorkspacePreset} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
       {showUpdate && <UpdateDialog info={updateInfo} onClose={() => setShowUpdate(false)} />}
       {showSearch && <SearchDialog request={request} result={searchResult} setResult={setSearchResult} onClose={() => setShowSearch(false)} onOpen={async (relativePath) => {
@@ -1921,6 +2029,8 @@ function App() {
         setShowSearch(false);
       }} />}
       {showHistory && <ConversationHistoryDialog
+        projectRoot={projectRoot}
+        onOpenConversation={openConversationWindow}
         entries={conversationHistory}
         mode={String(provider?.dialogue_history_mode || "auto")}
         limit={Number(provider?.dialogue_history_limit || 100)}
@@ -2070,6 +2180,7 @@ function TreeSection({ label, items, onOpen, active, opening }: { label: string;
 }
 
 function EditorPanel(props: {
+  projectRoot: string;
   document: DocumentData | null;
   text: string;
   savedText: string;
@@ -2079,6 +2190,7 @@ function EditorPanel(props: {
   editorRef: MutableRefObject<MonacoEditor.IStandaloneCodeEditor | null>;
   onChange: (value: string) => void;
   onSave: () => void;
+  onUpload: (candidate: DocumentUploadCandidate) => Promise<boolean>;
   onDelete: () => void;
   onAnnotate: () => void;
   onListen: () => void;
@@ -2096,6 +2208,11 @@ function EditorPanel(props: {
 }) {
   const [side, setSide] = useState<"comments" | "versions">("comments");
   const [showPrefill, setShowPrefill] = useState(false);
+  const [uploadCandidate, setUploadCandidate] = useState<DocumentUploadCandidate | null>(null);
+  const [uploadError, setUploadError] = useState("");
+  const [uploadWorking, setUploadWorking] = useState(false);
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadReadRef = useRef(0);
   const prefillState = useRef({ enabled: props.prefillEnabled, delay: props.prefillDelayMs, length: props.prefillLength, request: props.onPrefill });
   const prefillDisposable = useRef<{ dispose: () => void } | null>(null);
   const prefillSequence = useRef(0);
@@ -2103,19 +2220,54 @@ function EditorPanel(props: {
     prefillState.current = { enabled: props.prefillEnabled && showPrefill, delay: props.prefillDelayMs, length: props.prefillLength, request: props.onPrefill };
   }, [props.prefillEnabled, props.prefillDelayMs, props.prefillLength, props.onPrefill, showPrefill]);
   useEffect(() => () => prefillDisposable.current?.dispose(), []);
+  useEffect(() => {
+    uploadReadRef.current += 1;
+    setUploadCandidate(null); setUploadError("");
+  }, [props.projectRoot, props.document?.relative_path, props.document?.content_hash]);
+  const readUpload = async (file: File) => {
+    const source = props.document;
+    if (!source || props.isDirty) { setUploadError("请先保存当前编辑，上传不会覆盖未保存内容。"); return; }
+    const sequence = ++uploadReadRef.current;
+    setUploadError("");
+    try {
+      if (!/\.(md|txt)$/i.test(file.name)) throw new Error("请选择 Markdown 或 TXT 修改稿。");
+      const content = await file.text();
+      if (sequence !== uploadReadRef.current) return;
+      if (content.includes("\0")) throw new Error("文件含非文本字符，请先保存为 UTF-8 文本再上传。");
+      setUploadCandidate({ fileName: file.name, projectRoot: props.projectRoot, relativePath: source.relative_path, expectedHash: source.content_hash, content });
+    } catch (cause) { if (sequence === uploadReadRef.current) setUploadError(errorMessage(cause)); }
+  };
+  const saveUpload = async () => {
+    if (!uploadCandidate || uploadWorking) return;
+    setUploadWorking(true); setUploadError("");
+    try {
+      if (await props.onUpload(uploadCandidate)) setUploadCandidate(null);
+      else setUploadError("上传稿没有保存，候选仍保留。请根据错误提示处理后重试。");
+    }
+    catch (cause) { setUploadError(errorMessage(cause)); }
+    finally { setUploadWorking(false); }
+  };
   if (!props.document) return <EmptyPanel title="选择一份文档" text="从左侧打开正文、规划或审查报告。" />;
   return (
     <div className={`editor-layout ${props.document.read_only ? "has-canon-banner" : ""} ${showPrefill ? "has-prefill" : ""}`}>
       <div className="document-toolbar">
-        <div><strong>{props.document.relative_path}</strong><span>{props.isDirty ? "尚未保存" : "已同步"}</span></div>
+        <div><strong>{props.document.relative_path}</strong><span>{props.isDirty ? "尚未保存" : "已同步"}</span>{uploadError && !uploadCandidate && <span className="form-error" role="alert">{uploadError}</span>}</div>
         <div>
           {props.prefillEnabled && props.document.relative_path.endsWith(".draft.md") && <button className={showPrefill ? "active" : ""} onClick={() => setShowPrefill((value) => !value)}>预填续写</button>}
           <button onClick={props.onListen}>听读 / 转语音</button>
           <button onClick={props.onAnnotate}>批注选区</button>
+          <input ref={uploadInputRef} type="file" accept=".md,.txt,text/markdown,text/plain" hidden aria-label="选择当前文档的修改稿" onChange={event => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void readUpload(file); }} />
+          <button disabled={props.isDirty || uploadWorking} title={props.isDirty ? "先保存当前编辑，上传不会覆盖未保存内容" : "上传文件仅替换当前文档，先预览再保存"} onClick={() => uploadInputRef.current?.click()}>上传修改稿</button>
           {!props.document.read_only && <button className="danger" disabled={props.isDirty} title={props.isDirty ? "先保存或保留未保存内容" : "移入项目回收站，可恢复"} onClick={props.onDelete}>删除文件</button>}
           <button className="primary" disabled={!props.isDirty} onClick={props.onSave}>{props.document.read_only ? "保存修改提案" : "保存"}</button>
         </div>
       </div>
+      {uploadCandidate && <Modal title="上传修改稿 · 先核对差异" subtitle={`${uploadCandidate.fileName} → ${uploadCandidate.relativePath}。左侧为当前文件，右侧为上传候选；预览不会保存或修改正史。`} className="document-upload-modal" onClose={() => { if (!uploadWorking) { setUploadCandidate(null); setUploadError(""); } }}>
+        <div className="document-upload-diff"><Suspense fallback={<div className="editor-loading">正在载入修改对照…</div>}><DiffEditor height="100%" language="markdown" original={props.document.content} modified={uploadCandidate.content} theme={props.theme === "light" ? "vs" : "vs-dark"} options={{ readOnly: true, automaticLayout: true, minimap: { enabled: false }, wordWrap: "on" }} /></Suspense></div>
+        <p className="form-hint">{props.document.read_only ? "已接受正文会保存为未接受的修改提案，原正史保持原样。" : "保存会保留上一版本，按手动修改核对设置处理；上传不会导入其他章节。"}</p>
+        {uploadError && <p className="form-error" role="alert">{uploadError}</p>}
+        <div className="dialog-actions"><button disabled={uploadWorking} onClick={() => setUploadCandidate(null)}>取消上传</button><button className="primary" disabled={uploadWorking || props.isDirty || uploadCandidate.expectedHash !== props.document.content_hash} onClick={() => void saveUpload()}>{uploadWorking ? "正在保存…" : props.document.read_only ? "保存为未接受提案" : "保存这份修改稿"}</button></div>
+      </Modal>}
       {props.document.read_only && <div className="canon-banner"><strong>正史保护</strong>{props.document.reason}</div>}
       {showPrefill && <div className="prefill-bar"><div><strong>预填续写已开启</strong><span>停顿后显示灰字候选；Tab 接受、Esc 忽略。候选不会自动保存，正文一旦变化就会作废。</span></div><button onClick={() => setShowPrefill(false)}>关闭</button></div>}
       <div className={`editor-body ${props.inspectorVisible ? "inspector-visible" : "inspector-hidden"}`} style={{ "--inspector-width": `${props.inspectorWidth}px` } as CSSProperties}>
@@ -2784,8 +2936,9 @@ const PROVIDER_OPTIONS = [
   { id: "custom", name: "自定义", note: "其他 OpenAI 兼容服务", baseUrl: "", models: [] },
 ] as const;
 
-type SettingsSection = "author" | "appearance" | "layout" | "models" | "creation" | "voice" | "context" | "review" | "learning" | "advanced";
+type SettingsSection = "story_settings" | "author" | "appearance" | "layout" | "models" | "creation" | "voice" | "context" | "review" | "learning" | "advanced";
 const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string; note: string }> = [
+  { id: "story_settings", label: "本书设定", note: "人物、场景、道具与自定义资料模块" },
   { id: "author", label: "作者习惯与记忆", note: "跨书习惯、本书偏好和来源历史" },
   { id: "appearance", label: "外观", note: "主题、配色与密度" },
   { id: "layout", label: "布局", note: "面板、位置与宽度" },
@@ -2802,9 +2955,15 @@ const AGENT_TUNING_META: Array<{ id: AgentRole; label: string; note: string }> =
   { id: "coordinator", label: "Coordinator", note: "理解、派工、汇总" },
   { id: "writer", label: "Writer", note: "规划、起草、修订" },
   { id: "editor", label: "Editor", note: "日常审读、修改建议、记忆候选" },
-  { id: "reviewer", label: "Reviewer", note: "专项连续性核对 · 尚未启用" },
-  { id: "memory_keeper", label: "Memory Keeper", note: "专项记忆整理 · 尚未启用" },
+  { id: "reviewer", label: "Reviewer", note: "专项连续性核对 · 按任务模式启用" },
+  { id: "memory_keeper", label: "Memory Keeper", note: "专项记忆整理 · 按任务模式启用" },
 ];
+
+function roleModelsFromProvider(value: unknown): Record<AgentRole, string> {
+  const source = value && typeof value === "object" ? value as Partial<Record<AgentRole, unknown>> : {};
+  return Object.fromEntries((Object.keys(DEFAULT_AGENT_GENERATION) as AgentRole[]).map((role) =>
+    [role, typeof source[role] === "string" ? source[role] : ""])) as Record<AgentRole, string>;
+}
 
 function agentGenerationFromProvider(value: unknown): AgentGenerationProfiles {
   const source: Partial<Record<AgentRole, Partial<AgentGeneration>>> = value && typeof value === "object" ? value as Partial<Record<AgentRole, Partial<AgentGeneration>>> : {};
@@ -2845,7 +3004,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   onSaved: (value: Record<string, unknown>) => void;
   onVoiceSaved: (settings: VoiceSettings, status: VoiceStatus) => void;
 }) {
-  const [form, setForm] = useState({ provider_kind: String(provider?.provider_kind || "deepseek"), api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), hook_strategy: String(provider?.hook_strategy || "most_chapters"), chapter_length_tolerance: Number(provider?.chapter_length_tolerance ?? 0.1), review_min_confidence: Number(provider?.review_min_confidence ?? 0.8), acceptance_confirmation_mode: String(provider?.acceptance_confirmation_mode || "auto_after_review"), planning_publication_mode: String(provider?.planning_publication_mode || "auto_after_review"), planning_window_chapters: Number(provider?.planning_window_chapters ?? 10), dialogue_history_mode: String(provider?.dialogue_history_mode || "auto"), dialogue_history_interval: Number(provider?.dialogue_history_interval || 1), dialogue_history_limit: Number(provider?.dialogue_history_limit || 100), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), context_budget_mode: String(provider?.context_budget_mode || "unified"), agent_context_budgets: agentContextBudgetsFromProvider(provider?.agent_context_budgets), max_output_tokens: Number(provider?.max_output_tokens || 32000), input_price_per_million: Number(provider?.input_price_per_million || 0), output_price_per_million: Number(provider?.output_price_per_million || 0), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_experience_detail: String(provider?.review_experience_detail || "standard"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), agent_generation: agentGenerationFromProvider(provider?.agent_generation) });
+  const [form, setForm] = useState({ provider_kind: String(provider?.provider_kind || "deepseek"), api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), hook_strategy: String(provider?.hook_strategy || "most_chapters"), chapter_length_tolerance: Number(provider?.chapter_length_tolerance ?? 0.1), review_min_confidence: Number(provider?.review_min_confidence ?? 0.8), acceptance_confirmation_mode: String(provider?.acceptance_confirmation_mode || "auto_after_review"), planning_publication_mode: String(provider?.planning_publication_mode || "auto_after_review"), planning_window_chapters: Number(provider?.planning_window_chapters ?? 10), dialogue_history_mode: String(provider?.dialogue_history_mode || "auto"), dialogue_history_interval: Number(provider?.dialogue_history_interval || 1), dialogue_history_limit: Number(provider?.dialogue_history_limit || 100), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), context_budget_mode: String(provider?.context_budget_mode || "unified"), agent_context_budgets: agentContextBudgetsFromProvider(provider?.agent_context_budgets), max_output_tokens: Number(provider?.max_output_tokens || 32000), input_price_per_million: Number(provider?.input_price_per_million || 0), output_price_per_million: Number(provider?.output_price_per_million || 0), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_experience_detail: String(provider?.review_experience_detail || "standard"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), manual_edit_review_enabled: provider?.manual_edit_review_enabled !== false, agent_generation: agentGenerationFromProvider(provider?.agent_generation), role_models: roleModelsFromProvider(provider?.role_models) });
   const [voiceForm, setVoiceForm] = useState<VoiceSettings>(voiceSettings || {
     voice_enabled: false, voice_input_enabled: true, voice_output_enabled: true, voice_auto_read: false, voice_auto_send: false,
     voice_default_profile: "narrator_female", voice_speed: 1, voice_volume: 1, voice_pause_scale: 1, voice_input_device: "", voice_output_device: "",
@@ -3042,7 +3201,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   };
   const activePreset = SETTINGS_PRESETS.find((preset) => preset.reasoning_effort === form.reasoning_effort && preset.inquiry_frequency === form.inquiry_frequency && preset.context_soft_tokens === form.context_soft_tokens && preset.context_hard_tokens === form.context_hard_tokens)?.id;
   const inferredProvider = form.provider_kind;
-  const settingKeywords: Record<SettingsSection, string> = { author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", layout: "布局 面板 宽度 左右", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", learning: "学习 反馈 偏好 导出", advanced: "高级 temperature top p top k PowerShell" };
+  const settingKeywords: Record<SettingsSection, string> = { story_settings: "本书 设定 人物 场景 道具 世界 模板 资料 记录 证据 分类", author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", layout: "布局 面板 宽度 左右", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", learning: "学习 反馈 偏好 导出", advanced: "高级 temperature top p top k PowerShell" };
   const visibleSections = SETTINGS_SECTIONS.filter((item) => `${item.label}${item.note}${settingKeywords[item.id]}`.toLowerCase().includes(search.trim().toLowerCase()));
   const chooseProvider = (id: string) => {
     const choice = PROVIDER_OPTIONS.find((item) => item.id === id);
@@ -3181,8 +3340,8 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
           <SettingGroup title="生成参数与实际效率" note="按角色设置；统计来自当前小说的真实调用。">
             <div className="model-efficiency-head"><div><strong>{form.model || "未选择模型"}</strong><span>思考 {form.reasoning_effort} · 单次输出最多 {form.max_output_tokens.toLocaleString()} tokens</span></div><button type="button" disabled={!projectRoot} onClick={() => void refreshUsage()}>刷新统计</button></div>
             <div className="settings-fields two"><label>单次输出上限 <small>默认 32K，最高 128K tokens；实际额度取决于模型服务</small><input type="number" min={1000} max={128000} step={1000} value={form.max_output_tokens} onChange={(event) => updateForm({ max_output_tokens: Number(event.target.value) })} /></label><label>缓存解释<input readOnly value={form.provider_kind === "deepseek" ? "按相同输入前缀自动复用" : "按服务商返回值统计"} /></label></div>
-            <p className="form-hint">当前执行模式：Coordinator + Writer + Editor。Reviewer 与 Memory Keeper 可预设参数，但专项派工尚未启用，不会因保存设置自动增加调用。</p>
-            <section className="agent-tuning compact">{AGENT_TUNING_META.map((meta) => { const values = form.agent_generation[meta.id]; const roleStats = usageSummary?.by_agent_role?.[meta.id]; const budget = roleBudget(meta.id); const hit = roleStats?.prompt_cache_hit_rate; const miss = typeof hit === "number" ? 1 - hit : null; return <details key={meta.id} open={meta.id === "writer"}><summary><span><strong>{meta.label}</strong><small>{meta.note}</small></span><span>{roleStats?.calls ? `${roleStats.calls} 次 · 命中 ${typeof hit === "number" ? `${(hit * 100).toFixed(1)}%` : "未报告"}` : "暂无调用"}</span></summary><div className="agent-efficiency-grid"><div><small>输入 / 输出</small><strong>{roleStats ? `${roleStats.prompt_tokens.toLocaleString()} / ${roleStats.completion_tokens.toLocaleString()}` : "—"}</strong></div><div><small>命中 / 未命中</small><strong>{roleStats && typeof hit === "number" ? `${(hit * 100).toFixed(1)}% / ${((miss || 0) * 100).toFixed(1)}%` : "服务商未报告"}</strong></div><div><small>上下文预算</small><strong>{`${Math.round(budget.soft / 1000)}k / ${Math.round(budget.hard / 1000)}k`}</strong></div><div><small>平均输出</small><strong>{roleStats?.calls ? `${Math.round(roleStats.completion_tokens / roleStats.calls).toLocaleString()} tokens` : "—"}</strong></div></div><div className="agent-tuning-grid"><label>温度 <small>0～2</small><input type="number" min={0} max={2} step={0.05} value={values.temperature} onChange={(event) => updateAgentGeneration(meta.id, { temperature: Number(event.target.value) })} /></label><label>Top P <small>0.01～1</small><input type="number" min={0.01} max={1} step={0.01} value={values.top_p} onChange={(event) => updateAgentGeneration(meta.id, { top_p: Number(event.target.value) })} /></label><label>Top K <small>接口支持时发送</small><input type="number" min={1} max={200} step={1} value={values.top_k ?? ""} placeholder="自动" onChange={(event) => updateAgentGeneration(meta.id, { top_k: event.target.value === "" ? null : Number(event.target.value) })} /></label></div><button type="button" className="text-button" onClick={() => updateAgentGeneration(meta.id, DEFAULT_AGENT_GENERATION[meta.id])}>恢复该 Agent 默认值</button></details>; })}</section>
+            <p className="form-hint">日常使用 Coordinator + Writer + Editor；Reviewer 与 Memory Keeper 按当前任务模式参加。保存角色模型或参数不会启用角色，也不会改变正在运行的任务。角色模型 ID 必须受当前服务商支持。</p>
+            <section className="agent-tuning compact">{AGENT_TUNING_META.map((meta) => { const values = form.agent_generation[meta.id]; const roleStats = usageSummary?.by_agent_role?.[meta.id]; const budget = roleBudget(meta.id); const hit = roleStats?.prompt_cache_hit_rate; const miss = typeof hit === "number" ? 1 - hit : null; return <details key={meta.id} open={meta.id === "writer"}><summary><span><strong>{meta.label}</strong><small>{meta.note}</small></span><span>{roleStats?.calls ? `${roleStats.calls} 次 · 命中 ${typeof hit === "number" ? `${(hit * 100).toFixed(1)}%` : "未报告"}` : "暂无调用"}</span></summary><div className="agent-efficiency-grid"><div><small>输入 / 输出</small><strong>{roleStats ? `${roleStats.prompt_tokens.toLocaleString()} / ${roleStats.completion_tokens.toLocaleString()}` : "—"}</strong></div><div><small>命中 / 未命中</small><strong>{roleStats && typeof hit === "number" ? `${(hit * 100).toFixed(1)}% / ${((miss || 0) * 100).toFixed(1)}%` : "服务商未报告"}</strong></div><div><small>上下文预算</small><strong>{`${Math.round(budget.soft / 1000)}k / ${Math.round(budget.hard / 1000)}k`}</strong></div><div><small>平均输出</small><strong>{roleStats?.calls ? `${Math.round(roleStats.completion_tokens / roleStats.calls).toLocaleString()} tokens` : "—"}</strong></div></div><div className="agent-tuning-grid"><label>角色模型 <small>留空继承默认模型，共用当前服务商接口和密钥</small><input list="provider-models" value={form.role_models[meta.id]} placeholder={form.model} onChange={(event) => setForm((value) => ({ ...value, role_models: { ...value.role_models, [meta.id]: event.target.value } }))} /></label><label>温度 <small>0～2</small><input type="number" min={0} max={2} step={0.05} value={values.temperature} onChange={(event) => updateAgentGeneration(meta.id, { temperature: Number(event.target.value) })} /></label><label>Top P <small>0.01～1</small><input type="number" min={0.01} max={1} step={0.01} value={values.top_p} onChange={(event) => updateAgentGeneration(meta.id, { top_p: Number(event.target.value) })} /></label><label>Top K <small>接口支持时发送</small><input type="number" min={1} max={200} step={1} value={values.top_k ?? ""} placeholder="自动" onChange={(event) => updateAgentGeneration(meta.id, { top_k: event.target.value === "" ? null : Number(event.target.value) })} /></label></div><button type="button" className="text-button" onClick={() => updateAgentGeneration(meta.id, DEFAULT_AGENT_GENERATION[meta.id])}>恢复该 Agent 默认值</button></details>; })}</section>
             <p className="form-hint">温度和 Top P 影响输出取样，不改变输入缓存是否命中。缓存要靠相同前缀复用；墨流会把稳定规则放在前面，把本章任务放在末尾。未报告缓存数据的调用不会被误算成 0%。</p>
           </SettingGroup>
           <SettingGroup title="费用估算" note="单价单位为人民币 / 百万 Token，仅用于估算，不设置消费上限。两项均大于 0 时采用手填价格；否则仅官方 DeepSeek 已知型号在价格快照有效期内使用高峰参考价，其他情况显示未知。旧设置若填写了外币单价，请先换算为人民币。"><div className="settings-fields two"><label>输入单价 / 百万 Token<input type="number" min={0} step={0.01} value={form.input_price_per_million} onChange={(event) => updateForm({ input_price_per_million: Number(event.target.value) })} /></label><label>输出单价 / 百万 Token<input type="number" min={0} step={0.01} value={form.output_price_per_million} onChange={(event) => updateForm({ output_price_per_million: Number(event.target.value) })} /></label></div></SettingGroup>
@@ -3230,6 +3389,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
           <SettingGroup title="混合记忆检索" note="精确查询和本地 BM25 始终可用；召回数量按任务、人物、伏笔与剩余预算动态计算。"><div className="settings-fields two"><label>语义召回模型 <small>可选</small><input value={form.retrieval_embedding_model} onChange={(event) => updateForm({ retrieval_embedding_model: event.target.value })} placeholder="BAAI/bge-m3" /></label><label>精排模型 <small>可选</small><input value={form.retrieval_reranker_model} onChange={(event) => updateForm({ retrieval_reranker_model: event.target.value })} placeholder="BAAI/bge-reranker-v2-m3" /></label></div><p className="form-hint">留空不会下载模型。生成参数里的 Top K 默认也留空，只有接口支持且你明确设置时才发送。</p></SettingGroup>
         </SettingsPane>}
         {section === "review" && <SettingsPane title="Editor · 审查" note="Editor 给出证据化报告，不直接改正文。">
+          <SettingGroup title="手动修改自动核对" note="默认开启。只核对实际变化的设定、正文与草稿；后台处理，有冲突才提示。关闭后暂停自动审核，已存在的问题和正史保护仍保留。"><label className="setting-check"><input type="checkbox" checked={form.manual_edit_review_enabled} onChange={event => updateForm({ manual_edit_review_enabled: event.target.checked })} />开启手动修改后台核对</label></SettingGroup>
           <div className="settings-fields"><label>核验模式<select value={form.review_verification_mode} onChange={(event) => updateForm({ review_verification_mode: event.target.value })}><option value="evidence">基础：本地证据门禁</option><option value="assisted">增强：纠错并逐条核验</option><option value="strict">严格：争议时调用裁判</option></select></label><label>阅读体验建议<select value={form.review_experience_detail} onChange={(event) => updateForm({ review_experience_detail: event.target.value })}><option value="concise">精简：只提最重要一项</option><option value="standard">标准：优先 1～3 项</option><option value="detailed">详细：完整说明但不扩大硬门禁</option></select></label><label>本地中文 NLI <small>留空关闭</small><input value={form.review_local_nli_model} onChange={(event) => updateForm({ review_local_nli_model: event.target.value })} placeholder="本机模型路径或名称" /></label><label>争议裁判模型 <small>留空关闭</small><input value={form.review_judge_model} onChange={(event) => updateForm({ review_judge_model: event.target.value })} placeholder="当前兼容接口中的模型 ID" /></label></div><p className="form-hint">钩子的未知项、延后回应和开放问题本身不算表达不清；Editor 只阻止有证据的剧情硬冲突、知识越界和无法成立的因果。</p>
         </SettingsPane>}
         {section === "learning" && <SettingsPane title="本地学习" note="当前只在项目内记录可复核的反馈信号，不会把小说正文上传为公共训练数据。">
@@ -3243,6 +3403,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
             {learningNotice && <p className="form-success">{learningNotice}</p>}
           </SettingGroup>
         </SettingsPane>}
+        {section === "story_settings" && <SettingsPane title="本书设定" note="持续维护小说资料，模块和记录立即保存；正文与正史保留独立审核。"><StorySettings key={projectRoot} projectRoot={projectRoot} /></SettingsPane>}
         {section === "author" && <SettingsPane title="作者习惯与记忆" note="管理长期习惯，保留每本书自己的声音。"><AuthorPreferences projectRoot={projectRoot} /></SettingsPane>}
         {section === "advanced" && <SettingsPane title="高级" note="普通创作不需要修改这里。模型参数已归到模型页，语音参数只在语音页出现一次。">
           <SettingGroup title="高级电脑操作" note="默认关闭。开启后每条命令仍会弹窗展示并等待你单独确认；命令使用当前 Windows 账户权限，可能读写项目目录以外的文件、联网或启动应用。"><label className="setting-check"><input type="checkbox" checked={form.powershell_enabled} onChange={(event) => updateForm({ powershell_enabled: event.target.checked })} />允许墨流提出 PowerShell 操作请求</label></SettingGroup>
@@ -3290,7 +3451,8 @@ function WorkspaceLayoutPane({ layout, onChange, onPreset, onReset }: { layout: 
     </section>
     <section className="layout-settings-section">
       <div className="layout-settings-heading"><strong>对话位置</strong><small>让对话跟随你的阅读与输入习惯。</small></div>
-      <div className="layout-position-switch"><button type="button" className={layout.assistantPosition === "left" ? "active" : ""} onClick={() => onChange({ assistantPosition: "left" })}>AI 在正文左侧</button><button type="button" className={layout.assistantPosition === "right" ? "active" : ""} onClick={() => onChange({ assistantPosition: "right" })}>AI 在正文右侧</button></div>
+      <div className="layout-position-switch">{(["left", "right", "bottom", "floating"] as WorkspaceLayout["assistantPosition"][]).map(position => <button type="button" key={position} className={layout.assistantPosition === position ? "active" : ""} onClick={() => onChange({ assistantPosition: position })}>{({ left: "正文左侧", right: "正文右侧", bottom: "正文下方", floating: "自由浮动" })[position]}</button>)}</div>
+      <p className="form-hint">浮动面板可拖动标题上的“移动”按钮，并从右下角调整大小；也可使用方向键微调位置。独立对话窗口可以自由移动到其他屏幕，每个窗口保留自己的对话和待答卡。</p>
     </section>
     <section className="layout-settings-section">
       <div className="layout-settings-heading"><strong>精确宽度</strong><small>也可以直接拖拽工作区中的发光分隔线。</small></div>
@@ -3380,7 +3542,13 @@ function SelectionDialog({ selection, busy, onClose, onSubmit }: { selection: Se
   </Modal>;
 }
 
-function ConversationHistoryDialog({ entries, mode, limit, onSaveLast, onClose, onReuse }: { entries: ConversationHistoryEntry[]; mode: string; limit: number; onSaveLast: () => Promise<void>; onClose: () => void; onReuse: (value: string) => void }) {
+function ConversationHistoryDialog({ projectRoot, onOpenConversation, entries, mode, limit, onSaveLast, onClose, onReuse }: { projectRoot: string; onOpenConversation: (conversationId?: string) => Promise<void>; entries: ConversationHistoryEntry[]; mode: string; limit: number; onSaveLast: () => Promise<void>; onClose: () => void; onReuse: (value: string) => void }) {
+  const [windows, setWindows] = useState<Array<{ conversationId: string; openedAt: string }>>([]);
+  useEffect(() => {
+    let current = true;
+    void window.inkflow.conversationWindows(projectRoot).then(items => { if (current) setWindows(items); }).catch(cause => { if (current) setSaveNotice(errorMessage(cause)); });
+    return () => { current = false; };
+  }, [projectRoot]);
   const [query, setQuery] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveNotice, setSaveNotice] = useState("");
@@ -3398,6 +3566,7 @@ function ConversationHistoryDialog({ entries, mode, limit, onSaveLast, onClose, 
   };
   return <Modal title="对话历史" subtitle={`按项目保留最近 ${limit} 轮可见对话；不保存原始思维链、API Key 或模型内部推理。${mode === "manual" ? "当前是“被动保存”，需要你手动保存。" : ""}`} onClose={onClose}>
     <div className="history-dialog">
+      <details><summary>本书独立对话窗口 · {windows.length} 份</summary><div className="settings-inline-actions"><button type="button" onClick={() => void onOpenConversation()}>＋ 新对话</button>{windows.map((item, index) => <button type="button" key={item.conversationId} onClick={() => { void onOpenConversation(item.conversationId); }}>对话 {windows.length - index} · {formatTime(item.openedAt)}</button>)}</div><p className="form-hint">重新打开原窗口保留自己的历史和待答事项，不重新发送旧任务。</p></details>
       <div className="history-search"><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索问题、回答或工作流状态" /><span>{filtered.length} / {entries.length} 轮</span>{mode !== "auto" && <button type="button" disabled={saving} onClick={() => void saveLast()}>{saving ? "正在保存…" : "保存当前这一轮"}</button>}</div>
       {saveNotice && <p className="form-hint">{saveNotice}</p>}
       <div className="history-list">

@@ -901,6 +901,8 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .update-progress span { display: block; height: 100%; background: var(--accent); transition: width .25s ease; }
 .toast { position: fixed; z-index: 140; right: 20px; bottom: 20px; display: grid; grid-template-columns: 26px minmax(0, 1fr) 24px; align-items: center; gap: 8px; width: min(460px, calc(100vw - 40px)); padding: 11px; border: 1px solid #45532f; background: #1d2416; box-shadow: var(--shadow); }
 .toast.error { border-color: #6f3934; background: #281816; }
+.app-shell:has(.modal-backdrop) > .toast.info,
+.welcome-shell:has(.modal-backdrop) > .toast.info { display: none; }
 .toast > span { display: grid; place-items: center; width: 23px; height: 23px; border-radius: 50%; background: var(--accent); color: #16190f; font-weight: 700; }
 .toast.error > span { background: var(--red); color: white; }
 .toast p { max-height: 8em; margin: 0; overflow: auto; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; white-space: pre-line; }

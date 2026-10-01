@@ -452,6 +452,10 @@ class ProjectDatabase:
         )
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            previous_cards = {
+                int(row["plan_key"].split(":", 1)[1]): json.loads(row["data_json"])
+                for row in connection.execute("SELECT plan_key,data_json FROM plans WHERE kind='chapter'")
+            } if supersede_after_chapter is not None else {}
             if supersede_after_chapter is not None:
                 # A reviewed v2 publication replaces every unaccepted legacy
                 # execution card. Accepted chapters keep their source cards.
@@ -485,6 +489,8 @@ class ProjectDatabase:
                 )
             if supersede_after_chapter is not None:
                 for card in bundle.current_arc.chapter_cards:
+                    if previous_cards.get(card.chapter_no) == card.model_dump(mode="json"):
+                        continue
                     draft = connection.execute(
                         "SELECT version,content_hash FROM chapters WHERE chapter_no=? AND status='draft'",
                         (card.chapter_no,),
@@ -1307,6 +1313,11 @@ class ProjectDatabase:
             ).fetchone()
             if not current:
                 raise ValueError(f"第 {chapter_no} 章没有草稿记录")
+            accepted_before = connection.execute(
+                "SELECT COUNT(*) FROM chapters WHERE status='accepted' AND chapter_no<?", (chapter_no,)
+            ).fetchone()[0]
+            if accepted_before != chapter_no - 1:
+                raise ValueError(f"第 {chapter_no} 章之前仍有未接受章节，不能越章写入正史")
             if (
                 current["status"] != "draft"
                 or int(current["version"]) != expected_draft_version

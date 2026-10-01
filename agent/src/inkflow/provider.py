@@ -6,6 +6,7 @@ import math
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any, Generic, Protocol, TypeVar
 from uuid import uuid4
 
@@ -15,7 +16,7 @@ from pydantic import BaseModel, ValidationError
 from .config import Settings
 from .errors import ProviderError
 from .utils import content_hash, strip_json_fence, estimate_tokens
-from .runtime import active_runtime
+from .runtime import active_runtime, ensure_run_runtime
 from .model_usage import ModelAttempt, normalized_usage
 from .role_protocol import roles_for_mode
 from .task_settings import active_task_settings
@@ -72,6 +73,20 @@ def _model_role(role: str | None) -> str | None:
     if canonical is not None and canonical not in roles_for_mode(scope.collaboration_mode):
         raise ProviderError("当前协作模式未启用该模型角色；引擎服务不能作为 Agent 调用。")
     return canonical
+
+
+def _budgeted_generation(method):
+    @wraps(method)
+    async def generate(self, **kwargs):
+        with ensure_run_runtime():
+            return await method(self, **kwargs)
+    return generate
+
+
+def _selected_model(settings: Settings, role: str | None, override: str | None) -> str:
+    scope = active_task_settings.get()
+    version = scope.role_protocol_version if scope else 1
+    return override or settings.model_for(role, version)
 
 
 def _generation_settings(settings: Settings, role: str | None) -> dict[str, float | int | None]:
@@ -181,6 +196,7 @@ class DeepSeekProvider:
                 raise
             raise ProviderError(f"无法可靠读取 DeepSeek CNY 余额：{exc}") from exc
 
+    @_budgeted_generation
     async def generate_json(
         self,
         *,
@@ -195,6 +211,7 @@ class DeepSeekProvider:
         model_override: str | None = None,
     ) -> ProviderResult[T]:
         agent_role = _model_role(agent_role)
+        model_override = _selected_model(self.settings, agent_role, model_override)
         api_key = self.settings.require_api_key()
         schema = output_model.model_json_schema()
         # A canonical schema string keeps the long system-prefix byte-identical
@@ -443,6 +460,7 @@ class AnthropicProvider:
     async def get_balance(self) -> dict[str, Any]:
         raise ProviderError("Anthropic Messages API 不提供余额查询；请在服务商控制台查看。")
 
+    @_budgeted_generation
     async def generate_json(
         self,
         *,
@@ -457,6 +475,7 @@ class AnthropicProvider:
         model_override: str | None = None,
     ) -> ProviderResult[T]:
         agent_role = _model_role(agent_role)
+        model_override = _selected_model(self.settings, agent_role, model_override)
         del effort, thinking
         schema_prompt = json.dumps(
             output_model.model_json_schema(), ensure_ascii=False, sort_keys=True, separators=(",", ":")

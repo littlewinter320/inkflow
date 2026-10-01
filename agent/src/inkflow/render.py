@@ -176,6 +176,14 @@ def render_review(chapter_no: int, report: ReviewReport, code_metrics: dict[str,
         "## 核验后的当前结论",
         "",
         gate_summary,
+        "",
+        "## 自动补读与复核记录",
+        "",
+        f"- 证据契约：{report.evidence_policy_version or '旧报告未记录'}",
+        f"- Writer说明来源：{report.writer_notes_hash or '无独立说明'}；未来设想不作为正史证据。",
+        *(["```json", json.dumps(report.evidence_recovery, ensure_ascii=False, indent=2), "```"]
+          if report.evidence_recovery.get("attempted") else ["- 本次没有触发额外检索复核。"]),
+        "- 搜索未命中不证明事实不存在；补读记录不代表已经通过，以上方最终门禁为准。",
         *(
             [f"- 待核实依据：{item.verification_note or '尚未得到完整核验结果。'}" for item in pending_findings]
             if report.verdict == "unknown"
@@ -228,7 +236,7 @@ def render_review(chapter_no: int, report: ReviewReport, code_metrics: dict[str,
         "## 与规划和前章的逐字对照",
         "",
         *([line for item in report.source_comparisons for line in (
-            f"- 来源 `{item.source_id}`｜关系：{item.relation}｜{item.reason}",
+            f"- 来源 `{item.source_id}`｜关系：{item.relation}｜证据归因：{item.evidence_relation}｜{item.reason}",
             f"  - 来源原文：{item.source_evidence}",
             f"  - 本章原文：{item.chapter_evidence}",
         )] or ["- 本次报告未保存逐字对照；不能据此声称已完成跨章核对。"]),

@@ -20,7 +20,7 @@ from .planning_pipeline import load_active_planning, redesign_existing_story, sy
 from .errors import ProjectError, ProviderError, ValidationGateError
 from .project import InkFlowProject, render_book_brief
 from .project_lock import batch_workflow_lock, chapter_operation_locked, project_mutation_locked, project_mutation_locked_sync, project_write_lock, project_write_lock_sync
-from .role_protocol import check_owners_for_mode
+from .role_protocol import normalize_role, check_owners_for_mode
 from .prompts import (
     ARC_AUDIT_SYSTEM,
     EDITOR_FACT_EVIDENCE_SYSTEM,
@@ -40,16 +40,19 @@ from .prompts import (
     LENGTH_REPAIR_SYSTEM,
     WRITER_IDEATE_SYSTEM,
     WRITER_SYSTEM,
+    WRITER_NOTE_CLARIFICATION_SYSTEM,
     VOICE_CLONE_SCRIPT_WRITER_SYSTEM,
 )
 from .provider import JsonModelProvider, create_provider
 from .render import render_memory_conflict, render_plan, render_review
-from .review_rubric import GRADE_CREDIT, SCORING_VERSION, WEIGHTS, anchored_comparisons, score_review
+from .retrieval import HybridRetriever
+from .review_rubric import EVIDENCE_POLICY_VERSION, GRADE_CREDIT, SCORING_VERSION, UNRESOLVED_RELATIONS, WEIGHTS, anchored_comparisons, score_review
 from .review_verifier import (
     apply_dispute_decisions,
     apply_same_chapter_decisions,
     apply_semantic_decisions,
     carry_unresolved_same_chapter_recheck,
+    checked_claim_decisions,
     evidence_matches,
     findings_for_semantic_check,
     local_nli_decisions,
@@ -74,6 +77,7 @@ from .schemas import (
     ContextUseAudit,
     CreativeBrainstorm,
     DraftOutput,
+    WriterNoteClarification,
     ParagraphCutPlan,
     ParagraphExpansionPlan,
     EvidenceRepairBatch,
@@ -82,10 +86,8 @@ from .schemas import (
     MemoryPatch,
     ModeCheckOutput,
     PlanBundle,
-    PlanConflictAnchor,
     ReviewFinding,
     ReviewAssessment,
-    ReviewEvidenceRepair,
     ReviewFindingBatch,
     ReviewFocusObservation,
     ReviewSourceComparison,
@@ -104,6 +106,7 @@ from .schemas import (
     VoiceCloneReadingScript,
 )
 from .studio import StudioService, chapter_retry_state
+from .writer_notes import annotation_gaps, notes_hash, notes_prompt, recent_approved_notes, version_notes
 from .trace import TraceRecorder
 from .runtime import RunBudgetExceeded, active_runtime
 from .task_settings import TASK_SETTINGS_FIELDS, TaskSettingsError, active_task_settings, use_task_settings
@@ -159,7 +162,8 @@ class InkFlowEngine:
         return {**result.data.model_dump(mode="json"), "model": result.model}
 
     def _context_builder(self, project: InkFlowProject, role: str = "writer") -> ContextBuilder:
-        soft_limit, hard_limit = self.settings.context_budget_for(role)
+        soft_limit, hard_limit = self.settings.context_budget_for(role,
+            active_task_settings.get().role_protocol_version if active_task_settings.get() else 1)
         return ContextBuilder(
             project,
             soft_limit,
@@ -168,6 +172,7 @@ class InkFlowEngine:
             reranker_model=self.settings.retrieval_reranker_model,
             hook_strategy=self.settings.hook_strategy,
             review_experience_detail=self.settings.review_experience_detail,
+            actor=(normalize_role(role, active_task_settings.get().role_protocol_version if active_task_settings.get() else 1)),
         )
 
     @staticmethod
@@ -252,6 +257,12 @@ class InkFlowEngine:
                 or card.get("payoff_window")
                 or ""
             ),
+            "annotations": note.get("annotations", []),
+            "setting_updates": [item.model_dump(mode="json") for item in draft.setting_updates],
+            "decision_summary": draft.decision_summary,
+            "new_fact_candidates": [value[:400] for value in draft.new_fact_candidates[:8]],
+            "thread_changes": [value[:400] for value in draft.thread_changes[:8]],
+            "content_hash": (project.db.get_chapter(chapter_no) or {}).get("content_hash", content_hash(draft.content)),
         }
         for artifact in project.db.list_agent_artifacts(
             chapter_no=chapter_no, artifact_type="writer_hook_note", limit=20
@@ -400,6 +411,181 @@ class InkFlowEngine:
             trace.finish(status="failed", summary=f"场景试写未完成：{exc}")
             raise
 
+    def _adopt_setting_proposals(self, project, chapter_no, chapter_version, patch, review_record):
+        """Adopt reference candidates only after their prose version is accepted."""
+        from .story_settings import StorySettingsService
+        from .schemas import SettingRecordProposal
+        service=StorySettingsService(project)
+        scope=active_task_settings.get()
+        memory_owner=check_owners_for_mode(scope.collaboration_mode)["memory"] if scope and scope.role_protocol_version==2 else "editor"
+        proposals=[]
+        chapter = project.db.get_chapter(chapter_no)
+        notes = version_notes(project, chapter_no)
+        matching_review = (review_record and review_record["chapter_version"] == chapter_version
+            and chapter["version"] == chapter_version
+            and review_record["report"].verdict == "pass"
+            and review_record["report"].source_hash == chapter["content_hash"]
+            and review_record["report"].writer_notes_hash == notes_hash(notes))
+        if not matching_review:
+            return {"record_ids": [], "warnings": ["设定交接未绑定本次通过审查，未采用旧候选。"], "authority": "reference_only"}
+        proposals.extend(("writer", candidate) for candidate in notes.get("hook_note", {}).get("setting_updates", []))
+        bundle = review_record.get("mode_bundle") or {}
+        for actor, artifact_id in bundle.get("candidate_artifact_ids", {}).items():
+            with project.db.connect() as connection:
+                item = connection.execute("SELECT * FROM agent_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
+            if not item or item["artifact_type"] != "mode_check_candidate" or item["status"] != "verified" or item["role_protocol_version"] != 2 or item["role"] != actor or item["chapter_no"] != chapter_no or item["chapter_version"] != chapter_version:
+                continue
+            data = json.loads(item["data_json"])
+            output = data.get("output", {})
+            if (data.get("source_hash") == chapter["content_hash"] and data.get("story_fingerprint") == bundle.get("story_fingerprint")
+                    and data.get("snapshot_hash") == bundle.get("snapshot_hash") and item["dimension"] == bundle.get("mode")
+                    and output.get("verdict") == "pass"):
+                proposals.extend((actor, candidate) for candidate in output.get("setting_updates", []))
+        proposals.extend((memory_owner,candidate.model_dump(mode="json")) for candidate in patch.setting_updates)
+        applied=[]
+        warnings=[]
+        approved_writer_indices = set(review_record["report"].approved_setting_proposals)
+        for index,(actor,data) in enumerate(proposals):
+            try:
+                candidate=SettingRecordProposal.model_validate(data)
+                args=candidate.model_dump()
+                if actor=="writer":
+                    if candidate.record_id:
+                        raise ValidationGateError("Writer同次交稿只能另建设定候选，不能覆盖已核记录。")
+                    args["record_id"]="setting-record-"+content_hash(json_dumps({"chapter":chapter_no,"version":chapter_version,"candidate":data,"actor":actor}))[:32]
+                    if any(record["record_id"]==args["record_id"] for record in service.records(candidate.collection_id,include_archived=True)):
+                        continue
+                record=service.save_record(**args,actor=actor,operation="new" if actor=="writer" else "supplement",chapter_no=chapter_no)
+                applied.append(record["record_id"])
+                if actor != "writer" or index + 1 in approved_writer_indices:
+                    # Reuse the same-version review of the public handoff; this certifies a reference, never canon.
+                    service.record_review(record["record_id"], expected_revision=record["revision"],
+                        actor=memory_owner if actor == "writer" else actor, decision="verified_reference",
+                        source_fingerprint=service.source_fingerprint(), issues=[])
+                else:
+                    from .manual_edits import ManualEditsService
+                    ManualEditsService(project).enqueue("story-setting:"+record["record_id"],json_dumps(record),
+                        kind="setting_record", chapter_no=chapter_no, record_revision=record["revision"])
+            except Exception as exc:
+                warnings.append(f"设定参考候选{index+1}待处理：{exc}")
+        return {"record_ids":applied,"warnings":warnings,"authority":"reference_only"}
+
+    async def manage_story_settings(self, root, *, change, instruction=""):
+        from .story_settings import StorySettingsService
+        from .manual_edits import ManualEditsService
+        from .schemas import SettingRecordSet
+        project = InkFlowProject(root)
+        service = StorySettingsService(project)
+        operation = change.get("operation", "list")
+        if operation == "manual_decide":
+            job_id = str(change.get("job_id") or "")
+            job = ManualEditsService(project).jobs().get(job_id)
+            if not job:
+                return {"status":"needs_input", "reason":"请选择具体手动修改及疑问，不能把回答套到另一份候选。",
+                        "issues":ManualEditsService(project).status()["issues"]}
+            return ManualEditsService(project).decide(job_id, str(change.get("decision") or "keep_pending"),
+                str(change.get("reason") or instruction), str(change.get("expected_hash") or ""))
+        collections = service.list_collections()
+        if operation == "list":
+            return {"collections": collections, "templates": service.templates()}
+        collection_id = change.get("collection_id")
+        if not collection_id and change.get("collection_name"):
+            matches = [item for item in collections if item["name"] == change["collection_name"]]
+            if len(matches) != 1:
+                return {"status":"needs_input","reason":"请从设定合集列表选择唯一目标。","collections":collections}
+            collection_id = matches[0]["collection_id"]
+        if operation in {"collection_create","collection_update"}:
+            allowed={"name","template_id","category","instructions","fields","read_roles","write_roles","expected_revision"}
+            args={key:change[key] for key in allowed if key in change}
+            if operation == "collection_update":
+                args["collection_id"] = collection_id
+            if not args.get("name"):
+                existing = next((item for item in collections if item["collection_id"] == collection_id),None)
+                if existing:
+                    args["name"] = existing["name"]
+                else:
+                    return {"status":"needs_input","reason":"请给这份设定命名并选择模板或定义负责的字段。"}
+            previous = next((item for item in collections if item["collection_id"] == collection_id), None)
+            result = service.save_collection(**args)
+            ManualEditsService(project).collection_changed(previous, result)
+            return {"collection": result, "canon_changed":False}
+        if operation == "collection_archive":
+            paths = ["story-setting:" + record["record_id"] for record in service.records(collection_id)]
+            result = service.archive_collection(collection_id, expected_revision=change.get("expected_revision"))
+            ManualEditsService(project).supersede(paths)
+            return {"collection": result,
+                    "canon_changed":False,"summary":"已移出使用并留档，历史引用保留。"}
+        if operation == "record_archive":
+            record_id = str(change.get("record_id") or "")
+            record = service.archive_record(record_id, expected_revision=change.get("expected_revision"))
+            ManualEditsService(project).supersede(["story-setting:" + record_id])
+            return {"record":record,"canon_changed":False}
+        if operation == "record_save":
+            allowed={"record_id","title","name","values","evidence_refs","epistemic_status","chapter_no","expected_revision"}
+            record=service.save_record(collection_id,**{key:change[key] for key in allowed if key in change})
+            if record.get("changed"):
+                ManualEditsService(project).enqueue("story-setting:"+record["record_id"],json_dumps(record),
+                    kind="setting_record",chapter_no=record.get("source_chapter"),record_revision=record["revision"])
+            return {"record":record,"canon_changed":False}
+        if operation not in {"record_generate","record_supplement"}:
+            raise ValidationGateError("未支持的设定操作；请明确创建、修改、补证或移出使用的对象。")
+        collection=next((item for item in collections if item["collection_id"] == collection_id),None)
+        if not collection:
+            return {"status":"needs_input","reason":"先选择或创建负责这类内容的设定合集。","collections":collections}
+        scope=active_task_settings.get()
+        canonical_role="writer" if operation=="record_generate" else (check_owners_for_mode(scope.collaboration_mode)["memory"] if scope and scope.role_protocol_version==2 else "editor")
+        model_role=canonical_role if scope and scope.role_protocol_version==2 else "writer" if canonical_role=="writer" else "reviewer"
+        sources=service.source_fingerprint()
+        story_source=self._planning_source_fingerprint(project,1,max(1,project.db.latest_accepted_chapter_no()+1))
+        if canonical_role not in collection["write_roles"]:
+            return {"status":"needs_input","reason":"当前负责角色未获这份设定的记录权限；请先在设置中调整权限或指定其他已启用职责。"}
+        if canonical_role not in collection["read_roles"]:
+            return {"status":"needs_input","reason":"当前负责角色没有读取目标设定的权限，不能在不了解原记录时修改它。"}
+        if operation=="record_supplement" and not change.get("record_id"):
+            return {"status":"needs_input","reason":"请选择需要补证或纠正的记录；新创作设定交Writer建立候选。","records":collection["records"]}
+        reference_text=service.context(actor=canonical_role,max_chars=16000)
+        if operation=="record_supplement":
+            selected_record = next((record for record in collection["records"] if record["record_id"] == change.get("record_id")), None)
+            if not selected_record:
+                return {"status":"needs_input", "reason":"目标设定记录不存在或已移出使用，请选择当前记录。"}
+            reference_text += "\n指定记录的当前字段与修订号：\n" + json_dumps({key:value for key,value in selected_record.items() if key not in {"history","updated_at"}})
+            reference_text+="\n当前正史事实与伏笔：\n"+json_dumps({"facts":project.db.current_facts()[:128],"threads":project.db.open_threads()[:64]})
+            for item in project.db.accepted_chapters()[-3:]:
+                reference_text+=f"\n已接受第{item['chapter_no']}章 {item['path']}：\n"+(project.db.canonical_chapter_content(int(item["chapter_no"])) or "")[:10000]
+        setting_prompt=reference_text+"\n指定合集：\n"+json_dumps({key:value for key,value in collection.items() if key not in {"history","records"}})+"\n本次操作：\n"+json_dumps(change)+"\n用户原话：\n"+instruction
+        from .utils import estimate_tokens
+        if estimate_tokens(setting_prompt)+5000>self.settings.context_budget_for(model_role,scope.role_protocol_version if scope else 1)[1]:
+            raise ValidationGateError("设定请求超过当前角色上下文预算，请缩小记录范围或调整预算。")
+        result=await self.provider.generate_json(system_prompt=(
+            "按用户定义的设定合集字段记录内容，不写小说正文、不提交正史、不更改合集职责。"
+            "Writer只能新创作设想；补证或纠正必须返回可定位来源的原句，不凭常识补造事实。"
+            "仅使用指定collection_id；更新指定record_id须使用当前expected_revision。"
+            "设想、信念、传闻与客观参考分开，未来设想不能证明过去发生。"),
+            user_prompt=setting_prompt,
+            output_model=SettingRecordSet,max_tokens=min(5000,self.settings.max_output_tokens),
+            thinking=False,agent_role=model_role)
+        if service.source_fingerprint()!=sources or self._planning_source_fingerprint(project,1,max(1,project.db.latest_accepted_chapter_no()+1))!=story_source:
+            raise ValidationGateError("生成设定时来源或合集定义已变化，未覆盖当前记录。")
+        for candidate in result.data.records:
+            if operation=="record_generate" and candidate.record_id is not None:
+                raise ValidationGateError("Writer新增设定须另建候选，不能覆盖已有记录。")
+            if candidate.collection_id!=collection_id or (operation=="record_supplement" and candidate.record_id!=change.get("record_id")):
+                raise ValidationGateError("模型返回了授权范围之外的设定记录，未写入。")
+        records=[]
+        failures=[]
+        for index, candidate in enumerate(result.data.records):
+            try:
+                record=service.save_record(**candidate.model_dump(), actor=canonical_role,
+                    operation="new" if canonical_role=="writer" else "supplement",chapter_no=change.get("chapter_no"))
+                records.append(record)
+                if record.get("changed"):
+                    ManualEditsService(project).enqueue("story-setting:"+record["record_id"],json_dumps(record),
+                        kind="setting_record",chapter_no=record.get("source_chapter"),record_revision=record["revision"])
+            except Exception as exc:
+                failures.append({"index":index+1, "record_id":candidate.record_id, "reason":str(exc)[:1600]})
+        return {"records":records,"failures":failures,"status":"partial" if failures and records else "failed" if failures else "saved",
+                "canon_changed":False,"summary":"已保存条目与未完成条目分别列出；设定只作参考，原文引用与语义审查分开，不自动写成正史。"}
+
     async def edit_story_setting(self, root: str | Path, *, document_kind: str,
                                  setting_change: dict[str, Any], instruction: str = "") -> dict[str, Any]:
         """Apply only an explicit, version-checked setting edit; never edit accepted prose."""
@@ -462,9 +648,16 @@ class InkFlowEngine:
                       "after_hash": content_hash(new_text), "instruction": instruction.strip(),
                       "changed_fields": sorted(setting_change)},
             )
+        from .manual_edits import ManualEditsService
+        from .story_settings import StorySettingsService
+        job = ManualEditsService(project).mark_saved(relative,new_text,content_hash(old_text),source="story_setting_edit")
+        impact = StorySettingsService(project).impact_summary()
         return {"changed": True, "document": relative, "before_hash": content_hash(old_text),
-                "after_hash": content_hash(new_text),
-                "summary": "设定已更新。后续写作会读取新文件；受影响的旧规划和草稿需按新设定核对。"}
+                "after_hash": content_hash(new_text), "before": old_text, "after": new_text,
+                "changes": setting_change, "impact":impact,"manual_review":job,
+                "affected_documents":[name for name in ("OUTLINE.md","STORY_DETAIL.md","RECENT_PLAN.md","PLAN.md")
+                                      if name != relative and (project.root/name).is_file()],
+                "summary": "设定已保存新版本；结构依赖与差异已列出，下游等待同来源核对，不自动改写规划或已接受正文。"}
 
     def create_project(self, root: str | Path, brief: BookBrief) -> dict[str, Any]:
         project = InkFlowProject.create(root, brief)
@@ -493,6 +686,8 @@ class InkFlowEngine:
             raise ValidationGateError("补齐近期计划需要有效的起止章节，不会自行扩大写作范围。")
         async with project_write_lock(root):
             project = InkFlowProject(root)
+            from .manual_edits import ManualEditsService
+            ManualEditsService(project).assert_planning_ready(end_chapter_no)
             synchronize_v2_projection(project)
         active_v2 = load_active_planning(project)
         if active_v2 is not None:
@@ -978,46 +1173,23 @@ class InkFlowEngine:
                     grounded = _grounded_internal_plan_conflict(finding, candidate)
                 if grounded and not any(item.claim == grounded.claim for item in hard):
                     hard.append(grounded)
-            if not hard and checked.data.verdict in {"patch", "replan"} and any(
-                item.severity in {"major", "blocking"} for item in checked.data.findings
-            ):
-                sources = packet_sources(packet)
-                cited_refs = list(dict.fromkeys(
-                    ref for item in checked.data.findings for ref in item.canon_refs if ref in sources
-                ))
-                reanchor_refs = cited_refs or list(sources)[-2:]
-                anchored = await self.provider.generate_json(
-                    system_prompt=(
-                        "只为已报告的近期计划与正史硬冲突补两条逐字证据，不重新打分。"
-                        "plan_excerpt 必须原样截取候选计划 JSON 中至少8字，canon_excerpt 必须原样截取"
-                        "对应 accepted:chapter 来源的正文至少8字。不要加引号、标签、省略号或自己的概括。"
-                        "如果先前指控有误，仍按原文给出最接近的两处，不要伪造文字；宿主会核对。"
-                    ),
-                    user_prompt=("# 本次审查涉及的已接受正文\n"
-                                 + json_dumps({ref: sources[ref] for ref in reanchor_refs})
-                                 + "\n# 候选计划 JSON\n" + candidate
-                                 + "\n# 待定位的审查意见\n" + checked.data.summary),
-                    output_model=PlanConflictAnchor, effort="low", thinking=False, max_tokens=900,
+            if hard:
+                semantic = await self.provider.generate_json(
+                    system_prompt=REVIEW_CLAIM_CHECK_SYSTEM + "\n本次核对未来规划与正史。前章未提到的提问、后来发生的新事件和人物可以同时成立；只有两处原文排他时才选 supported。",
+                    user_prompt=json_dumps({"findings": [
+                        {"finding_index": index, "finding": item.model_dump(mode="json")}
+                        for index, item in enumerate(hard)
+                    ]}),
+                    output_model=ReviewClaimDecisionBatch, effort="low", thinking=False,
+                    max_tokens=min(2500, max(800, len(hard) * 450)),
                     timeout_seconds=self.settings.planning_timeout_seconds, agent_role=continuity_role,
                 )
                 calls += 1
-                trace.record_model("plan.continuity.reanchor", anchored, "补齐计划与正史的逐字引文")
-                anchor = anchored.data
-                canon_ref = anchor.canon_ref if anchor.canon_excerpt in sources.get(anchor.canon_ref, "") else next(
-                    (ref for ref, source in sources.items() if anchor.canon_excerpt in source), "",
-                )
-                if anchor.plan_excerpt in candidate and canon_ref:
-                    hard.append(ReviewFinding(
-                        category="causality", severity="major", rule_id="impossible_causality",
-                        evidence=anchor.plan_excerpt, reference_evidence=anchor.canon_excerpt,
-                        canon_refs=[canon_ref], explanation=anchor.reason,
-                        repair_instruction="只修正与这两处逐字证据冲突的近期计划，保留用户本次剧情目标。",
-                        verification_status="anchored", claim=checked.data.summary[:500],
-                    ))
-                else:
-                    raise ValidationGateError(
-                        "规划审查明确报告了硬冲突，但补证后的两处引文仍无法定位；候选未采用，旧卡保留。"
-                    )
+                trace.record_model("plan.continuity.semantic", semantic, f"逐条核对 {len(hard)} 个规划硬问题")
+                decisions = {item.finding_index: item for item in semantic.data.decisions}
+                if any(index not in decisions or decisions[index].verdict == "uncertain" for index in range(len(hard))):
+                    raise ValidationGateError("规划硬问题语义核对资料不足；旧卡保留，请核对原文来源。")
+                hard = [item for index, item in enumerate(hard) if decisions[index].verdict == "supported"]
             trace.record_model(f"plan.continuity.{attempt + 1}", checked, f"规划连续性核对：{len(hard)} 个双来源硬问题")
             if not hard:
                 if checked.data.verdict == "unknown" and checked.data.context_use_audit.missing_required_source_ids:
@@ -1202,6 +1374,7 @@ class InkFlowEngine:
     @staticmethod
     def _planning_source_fingerprint(project: InkFlowProject, begin: int, end: int) -> str:
         """Guard creative inputs, never SQLite mtimes changed by UI polling."""
+        from .story_settings import StorySettingsService
         bundle = project.db.get_current_plan_bundle()
         accepted = project.db.accepted_chapters()
         prose = []
@@ -1213,6 +1386,7 @@ class InkFlowEngine:
             prose.append({"chapter_no": item["chapter_no"], "canonical": content_hash(content) if content is not None else None,
                           "visible": content_hash(path.read_text(encoding="utf-8")) if path.is_file() else None})
         sources = {
+            "custom_settings": StorySettingsService(project).source_fingerprint(),
             "brief": project.db.get_brief().model_dump(mode="json"),
             "plan": bundle.model_dump(mode="json") if bundle else None,
             "cards": [project.db.get_chapter_card(n) for n in range(max(1, begin - 1), end + 2)],
@@ -1231,6 +1405,7 @@ class InkFlowEngine:
             "story": InkFlowEngine._planning_source_fingerprint(project, chapter_no, chapter_no),
             "target": chapter_retry_state(project, chapter_no),
             "preferences": project.db.effective_preferences(),
+            "writer_intent_references": recent_approved_notes(project, chapter_no),
         }))
 
     @staticmethod
@@ -1243,6 +1418,7 @@ class InkFlowEngine:
         return content_hash(json_dumps({
             "writer_sources": InkFlowEngine._writer_source_fingerprint(project, chapter_no),
             "latest_review_id": prior_id,
+            "writer_notes_hash": notes_hash(version_notes(project, chapter_no)),
         }))
 
     @staticmethod
@@ -1277,6 +1453,15 @@ class InkFlowEngine:
             active_v2 = load_active_planning(project)
             if active_v2 is not None:
                 window = active_v2[3]
+                accepted = project.db.latest_accepted_chapter_no()
+                if (chapter_range[0] > accepted and chapter_range[1] > window.chapters[-1].chapter_no
+                        and chapter_range[1] <= active_v2[2].chapter_end):
+                    return await self.redesign_story(
+                        root, anchor=accepted, end=chapter_range[1],
+                        instruction=(f"{instruction.strip()}\n以第 {accepted} 章正史为锚续开第 {accepted + 1}～{chapter_range[1]} 章近期窗口；"
+                                     f"其中第 {accepted + 1}～{window.chapters[-1].chapter_no} 章沿用仍有效的既定因果。"),
+                        focus="chapter-window",
+                    )
                 if chapter_range != (window.anchor_chapter + 1, window.chapters[-1].chapter_no):
                     raise ValidationGateError("当前使用正式三层规划；请明确重排整个生效近期窗口或发起新的三层规划，不会用旧版章节卡局部覆盖。")
                 return await self.redesign_story(
@@ -1429,10 +1614,14 @@ class InkFlowEngine:
                     _assert_new_plan_cards(project, bundle.current_arc)
                 project.db.save_plan_bundle(bundle)
                 atomic_write_text(project.root / "PLAN.md", render_plan(bundle))
+                from .manual_edits import ManualEditsService
+                ManualEditsService(project).note_engine_write("PLAN.md", render_plan(bundle))
                 project.db.set_metadata("current_plan_text_hash", content_hash(render_plan(bundle)))
                 if not preserve_brief:
                     project.db.set_brief(synced_brief)
                     atomic_write_text(project.root / "BOOK.md", render_book_brief(synced_brief))
+                    ManualEditsService(project).note_engine_write("BOOK.md", render_book_brief(synced_brief))
+                    project.db.set_metadata("current_plan_source_hashes", project.db.planning_source_hashes())
                 trace.record(
                     "plan.commit",
                     "completed",
@@ -2240,6 +2429,8 @@ class InkFlowEngine:
                 _assert_new_plan_cards(project, arc)
                 project.db.save_plan_bundle(bundle)
                 atomic_write_text(project.root / "PLAN.md", render_plan(bundle))
+                from .manual_edits import ManualEditsService
+                ManualEditsService(project).note_engine_write("PLAN.md", render_plan(bundle))
                 project.db.set_metadata("current_plan_text_hash", content_hash(render_plan(bundle)))
                 checkpoint = CheckpointService(project).create(
                     label=f"滚动规划 · {arc.title}",
@@ -2341,6 +2532,9 @@ class InkFlowEngine:
                     f"第 {chapter_no} 章在原失败任务之后已有新版本，旧重试已取消；"
                     "当前草稿和正史均保留，请从当前版本继续。"
                 )
+            from .manual_edits import ManualEditsService
+            ManualEditsService(project).scan()
+            ManualEditsService(project).assert_ready(chapter_no)
             existing_chapter = project.db.get_chapter(chapter_no)
             if existing_chapter and existing_chapter["status"] == "accepted":
                 raise ValidationGateError(
@@ -2885,6 +3079,8 @@ class InkFlowEngine:
         if not chapter or chapter["status"] != "draft" or not record or not card:
             return None
         report = record["report"]
+        if report.writer_notes_hash != notes_hash(version_notes(project, chapter_no)):
+            return None
         scope = active_task_settings.get()
         expected_protocol = scope.role_protocol_version if scope else 1
         if record["role_protocol_version"] != expected_protocol:
@@ -2905,6 +3101,8 @@ class InkFlowEngine:
         if (record["chapter_version"] != int(chapter["version"])
                 or report.verdict != "pass"
                 or report.scoring_version != SCORING_VERSION
+                or report.evidence_policy_version != EVIDENCE_POLICY_VERSION
+                or _recovered_sources_changed(project, report.evidence_recovery)
                 or report.confidence < max(0.80, self.settings.review_min_confidence)):
             return None
         content = (project.root / chapter["path"]).read_text(encoding="utf-8")
@@ -3057,16 +3255,18 @@ class InkFlowEngine:
                 clarity_strategy = ""
                 chapter = project.db.get_chapter(chapter_no)
                 chapter_version = int(chapter["version"]) if chapter else -1
-                if reviewed["verdict"] == "unknown" and chapter_version not in rechecked_versions:
+                if reviewed["verdict"] == "unknown" and chapter_version not in rechecked_versions and not reviewed.get("evidence_recovery", {}).get("attempted"):
                     rechecked_versions.add(chapter_version)
                     record = project.db.latest_review_record(chapter_no)
                     trace.record("recovery.evidence", "started", "审核材料不确定，切换为逐项证据复核", details=reviewed.get("summary", ""))
                     reviewed = await review_current(recheck_report=record["report"] if record else None)
                     continue
-                if reviewed["verdict"] == "unknown" and reviewed.get("auto_pass_gate") in {"unfocused", "low_confidence", "source_comparison"}:
+                if reviewed["verdict"] == "unknown" and (reviewed.get("auto_pass_gate") in {"unfocused", "low_confidence", "source_comparison"}
+                        or reviewed.get("evidence_recovery", {}).get("attempted")):
                     reason = (
                         f"第 {chapter_no} 章正文未因审查自报分数或跑题而自动改写。"
-                        f"{reviewed.get('summary', '')} 请查看本章与审查引文，必要时写下具体原因再复核。"
+                        f"{reviewed.get('summary', '')} 已完成允许范围内的自动检索与复核；"
+                        "尚缺的必要来源或解释保留在断点中，补齐来源后可从审查节点续做，不要求重写整章。"
                     )
                     trace.finish(status="waiting", summary=reason)
                     return {**reviewed, "status": "needs_input", "reason": reason,
@@ -3139,6 +3339,7 @@ class InkFlowEngine:
                 raise ValidationGateError("草稿文件与记录版本不一致；未发送审查请求。")
             source_fingerprint = self._review_source_fingerprint(project, chapter_no)
             story_fingerprint = self._writer_source_fingerprint(project, chapter_no)
+            writer_notes = version_notes(project, chapter_no)
             metrics, code_findings = _deterministic_audit(
                 content, int(card["target_words"]), project.db.get_brief().user_rules,
                 length_tolerance=self.settings.chapter_length_tolerance,
@@ -3152,14 +3353,15 @@ class InkFlowEngine:
             }
             outputs: dict[str, ModeCheckOutput] = {}
             packets: dict[str, ContextPacket] = {}
+            source_recoveries: dict[str, dict[str, Any]] = {}
             artifact_ids: dict[str, str] = {}
             hard_code_issue = any(item.severity in {"major", "blocking"} for item in code_findings)
 
-            async def run_role(role: str, *, memory_correction: bool = False) -> ModeCheckOutput:
+            async def run_role(role: str) -> ModeCheckOutput:
                 checks = [name for name, owner in owners.items() if owner == role]
                 packet = self._context_builder(project, role).build(
-                    chapter_no, f"第 {chapter_no} 章{role}限定检查", mode="review",
-                    protected_input=content, provisional_chapters=provisional_chapters,
+                    chapter_no, f"第 {chapter_no} 章{role}限定检查。{instruction}", mode="review",
+                    protected_input=content + notes_prompt(writer_notes), provisional_chapters=provisional_chapters,
                 )
                 packet = _review_evidence_packet(project, packet, chapter_no,
                     recheck_report.missing_source_ids if recheck_report else [])
@@ -3167,14 +3369,21 @@ class InkFlowEngine:
                 user_prompt = (
                     packet.to_model_prompt() + "\n\n# 当前正文\n" + content
                     + "\n\n# 唯一分配给你的检查项\n" + json_dumps(checks)
+                    + "\n\n# 本次检查所有权\n" + json_dumps(owners)
                     + "\n\n# 职责边界\n"
                     + ("你负责同版本记忆候选；通过时附有正文证据的 memory_patch。"
                        if owners["memory"] == role else "你不负责记忆候选，memory_patch 必须为 null。")
                     + "\n每条问题引用正文原文；依据不足给 unknown，不代其他角色宣布通过。"
                     + "\n\n# 确定性指标\n" + json_dumps(metrics)
+                    + notes_prompt(writer_notes)
                 )
                 if instruction.strip():
                     user_prompt += "\n\n# 用户当前要求\n" + instruction.strip()
+                inherited_reply = source_recoveries.get(owners.get("general") or owners.get("logic_continuity"), {}).get("writer_note_clarification", {})
+                if inherited_reply:
+                    user_prompt += "\n\n# 主审已取得的Writer短答（仍须核验，不作正史证据）\n" + json_dumps(inherited_reply)
+                if role != (owners.get("general") or owners.get("logic_continuity")):
+                    user_prompt += "\n你不是主审，writer_note_questions必须为空；归类问题修候选，缺历史资料用source_queries。"
                 if recheck_report is not None:
                     user_prompt += "\n\n# 定向补审任务（重新核对原文，不复述上一份报告）\n" + json_dumps({
                         "待修复审核缺口": recheck_report.confidence_basis,
@@ -3183,17 +3392,12 @@ class InkFlowEngine:
                     })
                 user_prompt += (
                     "\n\n# 输出前核对\nsource_comparisons 先分别填写 OUTLINE.md、STORY_DETAIL.md、"
-                    "RECENT_PLAN.md 三份当前原文，再填写至少一篇已接受前章；章节执行卡不能替代三份文件。"
+                    "RECENT_PLAN.md 三份当前原文，再填写紧邻前章（本批临时前章也算）的原文；章节执行卡不能替代三份文件。"
+                    "核对关键物件在前章末的持有人和位置，以及本章首次取用它的动作。"
                     "每条只摘一处连续短句，不合并相隔的对话冒充连续原句。"
                     "新人物、新事件不必已在正史出现；同姓或职业差异不是身份同一的证明。"
                     "被语义核验判为 not_blocking 的指控，若无新的双方证据，不再当作必需项失败。"
                 )
-                if memory_correction:
-                    user_prompt += (
-                        "\n\n# 一次性 Editor 交接纠错\n你此前判断正文通过，但遗漏记忆候选。"
-                        "请复核并填写有正文证据的 memory_patch；若无法确认，返回 unknown。"
-                        "此前结果：" + json_dumps(outputs[role].model_dump(mode="json"))
-                    )
                 call_key = content_hash(json_dumps({
                     "role": role, "mode": mode, "checks": checks, "source": source_fingerprint,
                     "snapshot": scope.snapshot_hash, "system": systems[role], "prompt": user_prompt,
@@ -3205,7 +3409,13 @@ class InkFlowEngine:
                     if (item["role_protocol_version"] == 2 and item["role"] == role
                             and item["status"] == "verified" and data.get("call_key") == call_key):
                         candidate = ModeCheckOutput.model_validate(data["output"])
-                        if recheck_report is None or candidate.verdict != "unknown":
+                        recovery = data.get("evidence_recovery", {})
+                        if (recheck_report is None or candidate.verdict != "unknown") and not _recovered_sources_changed(project, recovery):
+                            if recovery:
+                                packet = _review_evidence_packet(project, packet, chapter_no,
+                                    [f"chapter:{item['chapter_no']:05d}" for item in recovery.get("loaded_sources", [])])
+                                packets[role] = packet
+                                source_recoveries[role] = recovery
                             artifact_ids[role] = item["artifact_id"]
                             return candidate
                 if self._review_source_fingerprint(project, chapter_no) != source_fingerprint:
@@ -3219,10 +3429,22 @@ class InkFlowEngine:
                 )
                 candidate = ModeCheckOutput.model_validate(result.data)
                 if role != owners["memory"] and candidate.memory_patch is not None:
+                    raise ValidationGateError(f"{role} 越权提出记忆候选，未进入补读或写回流程。")
+                candidate, packet, recovery = await self._recover_review_evidence(
+                    project, candidate, content, packet, trace, agent_role=role,
+                    system_prompt=systems[role], primary=(role == (owners.get("general") or owners.get("logic_continuity"))),
+                    role_instruction=json_dumps({"checks": checks, "memory_owner": owners["memory"],
+                        "user_instruction": instruction, "mode": mode, "writer_clarification": inherited_reply}),
+                )
+                packets[role] = packet
+                source_recoveries[role] = recovery
+                if role != owners["memory"] and candidate.memory_patch is not None:
                     raise ValidationGateError(f"{role} 越权提交记忆候选，未作为有效检查保存。")
                 async with project_write_lock(project.root):
                     if self._review_source_fingerprint(project, chapter_no) != source_fingerprint:
                         raise ValidationGateError("专项结果返回时正文或审查依据已变化；迟到结果未写回。")
+                    if _recovered_sources_changed(project, recovery):
+                        raise ValidationGateError("专项补读来源已变化；未保存过期结果。")
                     item = project.db.save_agent_artifact(
                         artifact_type="mode_check_candidate", run_id=trace.run_id,
                         role=role, role_protocol_version=2, chapter_no=chapter_no,
@@ -3230,7 +3452,7 @@ class InkFlowEngine:
                         data={"call_key": call_key, "source_hash": source_hash,
                               "story_fingerprint": story_fingerprint,
                               "snapshot_hash": scope.snapshot_hash, "checks": checks,
-                              "output": candidate.model_dump(mode="json")},
+                              "output": candidate.model_dump(mode="json"), "evidence_recovery": recovery},
                     )
                     artifact_ids[role] = item["artifact_id"]
                 trace.record_model(f"mode.{role}", result, f"{role} 限定检查：{candidate.verdict}")
@@ -3245,10 +3467,6 @@ class InkFlowEngine:
                     if isinstance(result, BaseException):
                         raise result
                     outputs[role] = result
-                if (owners["memory"] == "editor" and outputs["editor"].verdict == "pass"
-                        and outputs["editor"].memory_patch is None):
-                    trace.record("mode.editor.memory_handoff", "warning", "Editor 通过但缺记忆候选，限次同角色纠错")
-                    outputs["editor"] = await run_role("editor", memory_correction=True)
                 if (owners["memory"] == "memory_keeper"
                         and all(item.verdict == "pass" for item in outputs.values())):
                     outputs["memory_keeper"] = await run_role("memory_keeper")
@@ -3258,80 +3476,6 @@ class InkFlowEngine:
             focus_owner = owners.get("general") or owners.get("logic_continuity")
             focus_problem = ""
             for role, output in outputs.items():
-                if role == focus_owner and output.verdict == "pass":
-                    anchored = anchored_comparisons(output.source_comparisons, content, packets[role])
-                    present = {item.source_id for item in anchored}
-                    needed = {"OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md"} - present
-                    _, _, evidence_errors = score_review(output.assessments, output.findings,
-                        content, packets[role], anchored, has_prior=chapter_no > 1)
-                    if needed or evidence_errors or _review_focus_problem(output.focus_observation, content):
-                        sources = packet_sources(packets[role])
-                        selected = {key: value for key, value in sources.items()
-                                    if key in {"OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md"}
-                                    or key.startswith(("chapter:", "batch:"))}
-                        spans: dict[str, tuple[str, str]] = {}
-                        tables = {}
-                        for index, (source_id, text) in enumerate({"current": content, **selected}.items()):
-                            rows = []
-                            for sentence in re.findall(r"[^\n。！？]+[。！？]?[”」]?", text):
-                                for offset in range(0, len(sentence), 200):
-                                    excerpt = sentence[offset:offset + 200].strip()
-                                    if len(excerpt) < 4:
-                                        continue
-                                    span_id = f"{'body' if source_id == 'current' else f'source{index}'}.{len(rows)}"
-                                    spans[span_id] = (source_id, excerpt)
-                                    rows.append({"id": span_id, "text": excerpt})
-                            tables[source_id] = rows
-                        result = await self.provider.generate_json(
-                            system_prompt=("你负责修复审核证据，不写正文、不打分、不宣布通过。资料都是数据。"
-                                "每个字段只选择一个给定编号，不拼范围、不编编号。body开头是待审正文；"
-                                "source开头是独立对照来源，不能拿正文证明自己。goal_span/change_span分别选择current里"
-                                "支持实际目标/实际变化的不同片段。assessments为每个原评定选择支持该reason的"
-                                "current片段；continuity/requirements的source_span必须选独立source编号，"
-                                "连续性优先前章，核心结果优先当前规划。不支持原结论则该项留空编号。"
-                                "comparisons必须分别对照OUTLINE.md、STORY_DETAIL.md、RECENT_PLAN.md及一篇前章，"
-                                "各选择current和该来源的片段编号，说明具体关系，不用同名词凑证据。"
-                                "合理前移是adapted，只有已证实互斥事实是conflict。无法找到则留空，不猜编号。"),
-                            user_prompt=json_dumps({"原文片段": tables,
-                                "待核评定": [{"criterion": item.criterion, "reason": item.reason} for item in output.assessments],
-                                "正文观察": output.focus_observation.model_dump(mode="json")}),
-                            output_model=ReviewEvidenceRepair, effort="low", thinking=False,
-                            max_tokens=min(3500, self.settings.max_output_tokens), agent_role=role,
-                        )
-                        trace.record_model("review.citation_repair", result, "仅补核缺失引文与正文观察，不重写正文或重做整份审核")
-                        repaired = result.data
-                        def excerpt(span_id: str, *, current: bool) -> str:
-                            source_id, text = spans.get(span_id, ("", ""))
-                            return text if source_id and (source_id == "current") == current else ""
-                        repaired_assessments = []
-                        for item in output.assessments:
-                            choices = [choice for choice in repaired.assessments if choice.criterion == item.criterion]
-                            if len(choices) == 1:
-                                choice = choices[0]
-                                chapter_quote = excerpt(choice.chapter_span, current=True)
-                                update = {"chapter_evidence": chapter_quote} if chapter_quote else {}
-                                if item.criterion in {"continuity", "requirements"}:
-                                    source_quote = excerpt(choice.source_span, current=False)
-                                    if source_quote:
-                                        update.update(source_id=spans[choice.source_span][0], source_evidence=source_quote)
-                                item = item.model_copy(update=update)
-                            repaired_assessments.append(item)
-                        comparisons = list(anchored)
-                        for choice in repaired.comparisons:
-                            chapter_quote = excerpt(choice.chapter_span, current=True)
-                            source_quote = excerpt(choice.source_span, current=False)
-                            if chapter_quote and source_quote:
-                                comparisons.append(ReviewSourceComparison(
-                                    source_id=spans[choice.source_span][0], source_evidence=source_quote,
-                                    chapter_evidence=chapter_quote, relation=choice.relation, reason=choice.reason))
-                        output = output.model_copy(update={
-                            "focus_observation": output.focus_observation.model_copy(update={
-                                "goal_evidence": excerpt(repaired.goal_span, current=True),
-                                "change_evidence": excerpt(repaired.change_span, current=True)}),
-                            "assessments": repaired_assessments,
-                            "source_comparisons": anchored_comparisons(comparisons, content, packets[role]),
-                        })
-                        outputs[role] = output
                 checked, checked_verdict = await self._verify_review_output(
                     project,
                     ReviewReport(verdict=output.verdict, confidence=output.confidence,
@@ -3355,6 +3499,10 @@ class InkFlowEngine:
             if focus_output:
                 source_comparisons = anchored_comparisons(focus_output.source_comparisons, content, packets[focus_owner])
                 discarded_comparisons = len(focus_output.source_comparisons) - len(source_comparisons)
+                prior_ids = {ref for ref in packet_sources(packets[focus_owner])
+                             if chapter_no > 1 and ref.endswith(f"chapter:{chapter_no - 1:05d}")}
+                if prior_ids and not prior_ids.intersection(item.source_id for item in source_comparisons):
+                    comparison_problem = "尚未用正文原句对照紧邻前章的状态变化"
             carried_verdict = None
             if recheck_report is not None and recheck_report.source_hash == source_hash:
                 findings, carried_verdict = carry_unresolved_same_chapter_recheck(
@@ -3369,6 +3517,9 @@ class InkFlowEngine:
             if memory_patch is not None and memory_patch.chapter_no == chapter_no:
                 memory_patch, open_questions = _separate_open_questions(memory_patch)
                 memory_patch, _ = _align_patch_evidence(memory_patch, content)
+                # A shared quote is not an issue identity. Memory conflicts are
+                # resolved by their owner during recovery, never erased because
+                # a different prose allegation citing the same words was rejected.
                 original_fact_count = len(memory_patch.facts)
                 supported_facts = [fact for fact in memory_patch.facts if _evidence_in_content(fact.evidence, content)]
                 discarded_memory_facts = original_fact_count - len(supported_facts)
@@ -3445,10 +3596,16 @@ class InkFlowEngine:
                 model_self_confidence=min((item.confidence for item in outputs.values()), default=None),
                 confidence_basis=confidence_basis,
                 scoring_version=SCORING_VERSION, assessments=assessments,
+                evidence_policy_version=EVIDENCE_POLICY_VERSION,
+                evidence_recovery={"attempted": any(value.get("attempted") for value in source_recoveries.values()),
+                                   "roles": source_recoveries},
                 missing_source_ids=focus_output.missing_source_ids if focus_output else [],
+                source_queries=focus_output.source_queries if focus_output else [],
                 summary=summary, findings=findings,
                 scorecard=_build_review_scorecard(findings, assessments) if verdict != "unknown" else [],
                 source_hash=source_hash,
+                writer_notes_hash=notes_hash(writer_notes),
+                approved_setting_proposals=memory_output.approved_setting_proposals if memory_output else [],
                 context_fingerprint="",
                 instruction_hash=content_hash(instruction.strip()) if instruction.strip() else "",
                 focus_observation=(outputs[focus_owner].focus_observation if focus_owner in outputs else ReviewFocusObservation()),
@@ -3465,6 +3622,8 @@ class InkFlowEngine:
             relative = Path("reviews") / f"chapter_{chapter_no:05d}_v{chapter['version']}_{trace.run_id}.review.md"
             async with project_write_lock(project.root):
                 current = project.db.get_chapter(chapter_no)
+                if _recovered_sources_changed(project, report.evidence_recovery):
+                    raise ValidationGateError("审查汇合时补读正史已变化；未写回过期结果。")
                 if (self._review_source_fingerprint(project, chapter_no) != source_fingerprint
                         or self._writer_source_fingerprint(project, chapter_no) != story_fingerprint
                         or not current or current["status"] != "draft"
@@ -3484,6 +3643,7 @@ class InkFlowEngine:
                 "findings": [item.model_dump(mode="json") for item in findings],
                 "score_total": None if verdict == "unknown" else _score_total(report.scorecard), "review_path": str(project.root / relative),
                 "review_id": review_id, "trace_id": trace.run_id,
+                "evidence_recovery": report.evidence_recovery,
                 "mode": mode, "coverage": coverage,
                 "auto_pass_gate": "unfocused" if focus_problem else "source_comparison" if comparison_problem else "low_confidence" if low_confidence else "",
                 "next_action": "接受章节" if verdict == "pass" else "按检查结果修订或补足依据",
@@ -3572,49 +3732,22 @@ class InkFlowEngine:
                     "model_skipped": True,
                     "regression_check": regression,
                 }
+            writer_notes = version_notes(project, chapter_no)
             packet = self._context_builder(project, "reviewer").build(
                 chapter_no,
-                f"审查第 {chapter_no} 章草稿",
+                f"审查第 {chapter_no} 章草稿。{instruction}",
                 mode="review",
                 provisional_chapters=provisional_chapters,
-                protected_input=content,
+                protected_input=content + notes_prompt(writer_notes),
             )
             base_context_fingerprint = _review_context_fingerprint(packet)
             packet = _review_evidence_packet(project, packet, chapter_no,
                 recheck_report.missing_source_ids if recheck_report else [])
-            hook_note = next(
-                (
-                    item["data"]
-                    for item in project.db.list_agent_artifacts(
-                        chapter_no=chapter_no, artifact_type="writer_hook_note", limit=20
-                    )
-                    if int(item.get("chapter_version") or 0) == int(chapter["version"])
-                ),
-                None,
-            )
-            scene_blueprint = next(
-                (
-                    item["data"]
-                    for item in project.db.list_agent_artifacts(
-                        chapter_no=chapter_no, artifact_type="writer_scene_blueprint", limit=20
-                    )
-                    if int(item.get("chapter_version") or 0) == int(chapter["version"])
-                ),
-                None,
-            )
             user_prompt = (
                 packet.to_model_prompt()
-                + "\n\n# 待审正文\n\n"
-                + content
-                + "\n\n# Writer 版本说明（版本绑定的协作资料，不是正文或正史）\n\n"
-                + json_dumps(
-                    {
-                        "hook_note": hook_note or {"说明": "当前版本没有单独钩子说明，请直接依据正文判断。"},
-                        "scene_blueprint": scene_blueprint,
-                    }
-                )
-                + "\n\n# 代码层指标\n\n"
-                + json_dumps(metrics)
+                + "\n\n# 待审正文\n\n" + content
+                + notes_prompt(writer_notes)
+                + "\n\n# 代码层指标\n\n" + json_dumps(metrics)
             )
             if recheck_report is not None:
                 user_prompt += (
@@ -3664,13 +3797,19 @@ class InkFlowEngine:
                 thinking=review_thinking,
                 agent_role="reviewer",
             )
-            model_report = ReviewReport(**result.data.model_dump(mode="json"))
+            model_output, packet, source_recovery = await self._recover_review_evidence(
+                project, result.data, content, packet, trace, agent_role="reviewer",
+                system_prompt=REVIEWER_SYSTEM, primary=True,
+                role_instruction=json_dumps({"user_instruction": instruction,
+                    "checks": ["general", "memory"], "memory_owner": "reviewer (v1综合Editor)"}),
+            )
+            model_report = ReviewReport(**model_output.model_dump(mode="json", include=set(ReviewReport.model_fields)))
             available_source_ids = {
                 source_id for section in packet.sections for source_id in section.source_ids
             }
             context_use_audit = ContextUseAudit(
                 used_source_ids=[item for item in model_report.context_use_audit.used_source_ids if item in available_source_ids],
-                missing_required_source_ids=[item for item in model_report.context_use_audit.missing_required_source_ids if item in available_source_ids],
+                missing_required_source_ids=model_report.context_use_audit.missing_required_source_ids,
                 conflicting_source_ids=[item for item in model_report.context_use_audit.conflicting_source_ids if item in available_source_ids],
                 summary=model_report.context_use_audit.summary,
             )
@@ -3681,6 +3820,8 @@ class InkFlowEngine:
                 packet,
                 trace,
             )
+            if model_report.verdict == "unknown" and verdict == "pass":
+                verdict = "unknown"
             if recheck_report is not None and recheck_report.source_hash == content_hash(content):
                 before = len(verified)
                 verified, verdict = carry_unresolved_same_chapter_recheck(recheck_report, verified, content)
@@ -3726,7 +3867,9 @@ class InkFlowEngine:
                 confidence=evidence_confidence,
                 model_self_confidence=model_report.confidence,
                 confidence_basis=confidence_basis, scoring_version=SCORING_VERSION,
+                evidence_policy_version=EVIDENCE_POLICY_VERSION, evidence_recovery=source_recovery,
                 assessments=model_report.assessments, missing_source_ids=model_report.missing_source_ids,
+                source_queries=model_report.source_queries,
                 source_comparisons=comparisons,
                 summary=(
                     f"{focus_note} {confidence_note} {model_report.summary}".strip()
@@ -3737,6 +3880,7 @@ class InkFlowEngine:
                 findings=findings,
                 scorecard=_build_review_scorecard(findings, model_report.assessments) if verdict != "unknown" else [],
                 source_hash=content_hash(content),
+                writer_notes_hash=notes_hash(writer_notes),
                 context_fingerprint=base_context_fingerprint,
                 instruction_hash=content_hash(instruction.strip()) if instruction.strip() else "",
                 hook_assessment=model_report.hook_assessment,
@@ -3747,6 +3891,8 @@ class InkFlowEngine:
             trace.record_model("review.model", result, f"综合审查结论：{report.verdict}")
             relative = Path("reviews") / f"chapter_{chapter_no:05d}.review.md"
             async with project_write_lock(project.root):
+                if _recovered_sources_changed(project, source_recovery):
+                    raise ValidationGateError("综合审查补读来源已变化；未覆盖当前报告。")
                 if self._review_source_fingerprint(project, chapter_no) != source_fingerprint:
                     candidate_path = trace.run_dir / "stale-review-candidate.json"
                     atomic_write_text(candidate_path, report.model_dump_json(indent=2))
@@ -3775,6 +3921,7 @@ class InkFlowEngine:
                 "score_total": None if report.verdict == "unknown" else _score_total(report.scorecard),
                 "scorecard": [item.model_dump(mode="json") for item in report.scorecard],
                 "pre_confidence_verdict": pre_confidence_verdict,
+                "evidence_recovery": report.evidence_recovery,
                 "auto_pass_gate": "unfocused" if focus_note else "low_confidence" if confidence_note else "",
                 "repairable_finding_count": sum(
                     item.severity in {"minor", "major", "blocking"}
@@ -3798,6 +3945,210 @@ class InkFlowEngine:
             trace.record("review", "failed", "章节审查失败", str(exc))
             trace.finish(status="failed", summary="审查未完成，章节不会放行")
             raise
+
+    async def _clarify_writer_notes(
+        self, project: InkFlowProject, notes: dict[str, Any], questions: list[str],
+        content: str, packet: ContextPacket, trace: TraceRecorder,
+    ) -> dict[str, Any]:
+        """At most one Writer answer per body hash, including failed/interrupted attempts."""
+        chapter_no = packet.chapter_no
+        scope = active_task_settings.get()
+        source_fingerprint = self._review_source_fingerprint(project, chapter_no)
+        story_fingerprint = self._writer_source_fingerprint(project, chapter_no)
+        body_hash = content_hash(content)
+        async with project_write_lock(project.root):
+            if self._review_source_fingerprint(project, chapter_no) != source_fingerprint:
+                raise ValidationGateError("追问前正文、说明或审查依据已变化。")
+            previous = next((item for item in project.db.list_agent_artifacts(
+                chapter_no=chapter_no, artifact_type="writer_note_clarification", limit=200)
+                if item["status"] != "superseded" and item["data"].get("source_hash") == body_hash), None)
+            if previous:
+                if (previous["data"].get("writer_notes_hash") != notes_hash(notes)
+                        or previous["data"].get("story_fingerprint") != story_fingerprint):
+                    return {"status": "attempt_limit", "artifact_id": previous["artifact_id"],
+                            "reason": "同一正文已经追问过；说明变化不重置次数，保留问题供定向处理。"}
+                return {**previous["data"], "artifact_id": previous["artifact_id"], "reused": True}
+            data = {"status": "attempted", "source_hash": body_hash,
+                    "writer_notes_hash": notes_hash(notes), "story_fingerprint": story_fingerprint, "questions": questions}
+            attempt = project.db.save_agent_artifact(
+                artifact_type="writer_note_clarification", run_id=trace.run_id, role="writer",
+                role_protocol_version=scope.role_protocol_version if scope else 1,
+                chapter_no=chapter_no, chapter_version=notes["chapter_version"], data=data,
+            )
+        prompt = packet.to_model_prompt() + "\n\n# 当前正文\n" + content + notes_prompt(notes)
+        prompt += "\n\n# 仅回答以下问题，保留有效说明，不改正文\n" + json_dumps(questions)
+        _, hard_limit = self.settings.context_budget_for("writer", scope.role_protocol_version if scope else 1)
+        if estimate_tokens(WRITER_NOTE_CLARIFICATION_SYSTEM + prompt) + min(2_000, self.settings.max_output_tokens) > hard_limit:
+            return {**data, "status": "context_budget_exhausted", "artifact_id": attempt["artifact_id"]}
+        try:
+            result = await self.provider.generate_json(
+                system_prompt=WRITER_NOTE_CLARIFICATION_SYSTEM, user_prompt=prompt,
+                output_model=WriterNoteClarification, agent_role="writer", effort="low",
+                max_tokens=min(2_000, self.settings.max_output_tokens), timeout_seconds=90, thinking=False,
+            )
+            reply = WriterNoteClarification.model_validate(result.data)
+            if len(reply.answers) != len(questions):
+                raise ValueError("Writer未逐题回答，短答不能作为已解决问题")
+            data.update(status="answered", reply=reply.model_dump(mode="json"))
+            trace.record_model("writer.note_clarification", result, "Writer仅答创作意图，正文没有重生成")
+        except (RunBudgetExceeded, ValidationGateError):
+            raise
+        except Exception as exc:
+            data.update(status="failed", error=str(exc))
+            trace.record("writer.note_clarification", "warning", "Writer短答未完成，保留断点，不重复追问", str(exc))
+        async with project_write_lock(project.root):
+            if self._review_source_fingerprint(project, chapter_no) != source_fingerprint:
+                raise ValidationGateError("Writer答复期间来源版本变化；迟到短答未用于放行。")
+            saved = project.db.save_agent_artifact(
+                artifact_type="writer_note_clarification", run_id=trace.run_id, role="writer",
+                role_protocol_version=scope.role_protocol_version if scope else 1,
+                chapter_no=chapter_no, chapter_version=notes["chapter_version"], data=data,
+            )
+            project.db.set_agent_artifact_status(attempt["artifact_id"], "superseded")
+        return {**data, "artifact_id": saved["artifact_id"]}
+
+    async def _recover_review_evidence(
+        self, project: InkFlowProject, output: Any, content: str,
+        packet: ContextPacket, trace: TraceRecorder, *, agent_role: str,
+        system_prompt: str, role_instruction: str, primary: bool,
+        source_boundary: int | None = None,
+    ) -> tuple[Any, ContextPacket, dict[str, Any]]:
+        """One role-scoped search/reread/review, before publishing a missing-data report."""
+        scope = active_task_settings.get()
+        memory_required = isinstance(output, ReviewModelOutput) or (
+            isinstance(output, ModeCheckOutput) and scope is not None
+            and check_owners_for_mode(scope.collaboration_mode)["memory"] == agent_role)
+        boundary = source_boundary if source_boundary is not None else packet.chapter_no
+        gaps = _review_evidence_gaps(output, content, packet, primary=primary, memory_required=memory_required, source_boundary=boundary)
+        notes = version_notes(project, boundary) if not isinstance(output, ArcAuditReport) else {}
+        note_questions = list(getattr(output, "writer_note_questions", [])) if primary and notes else []
+        if primary and notes:
+            note_questions.extend(annotation_gaps(notes.get("hook_note", {}), content))
+        note_questions = list(dict.fromkeys(value.strip()[:400] for value in note_questions if value.strip()))[:3]
+        note_snapshot = {"writer_notes_hash": notes_hash(notes), "chapter_no": boundary} if notes else {}
+        if not gaps:
+            snapshots = _recovered_source_snapshots(project, packet)
+            if not note_questions:
+                return output, packet, {"attempted": False, "loaded_sources": snapshots, **note_snapshot} if snapshots or notes else {}
+        trace.record("review.source_recovery", "started", "资料缺口先自动检索和补读，不交 Writer 改稿",
+                     metadata={"role": agent_role, "gaps": gaps})
+        queries = list(getattr(output, "source_queries", []))
+        findings = getattr(output, "findings", getattr(output, "deviations", []))
+        queries.extend(item.claim or item.explanation for item in findings
+                       if item.severity in {"major", "blocking"})
+        queries.extend(item.reason for item in output.assessments if item.status == "data_missing"
+                       or item.evidence_relation in UNRESOLVED_RELATIONS)
+        patch = getattr(output, "memory_patch", None)
+        if patch:
+            queries.extend(patch.unresolved_conflicts)
+        if not queries:
+            queries = [output.summary]
+        card = project.db.get_chapter_card(boundary) or {}
+        hook_leads = [str(card.get("hook_question") or ""),
+                      *[str(value) for value in card.get("foreshadow_advance", [])],
+                      *[str(value) for value in card.get("payoff", [])]]
+        queries.extend(value for value in hook_leads if value.strip())
+        queries = list(dict.fromkeys(value.strip()[:160] for value in queries if value.strip()))[:4]
+        hits, recovery = (await asyncio.to_thread(
+            HybridRetriever(project).recover_review_sources, queries, chapter_no=boundary,
+        )) if gaps else ([], {"queries": [], "searched_chapters": []})
+        recovery.update({"attempted": True, "role": agent_role, "gaps": gaps,
+                         "loaded_sources": [], **note_snapshot})
+        requested = list(output.missing_source_ids)
+        requested.extend(ref for finding in findings for ref in finding.canon_refs)
+        if patch:
+            memory_evidence = [ref for fact in patch.facts for ref in fact.evidence_refs]
+            memory_evidence.extend(ref for operation in patch.operations for ref in operation.evidence)
+            requested.extend(f"chapter:{ref.source_chapter:05d}" for ref in memory_evidence if ref.source_chapter < boundary)
+        requested.extend(f"chapter:{item['chapter_no']:05d}" for item in hits)
+        # Both explicit references and fuzzy hits must resolve to accepted canon.
+        _, hard_limit = self.settings.context_budget_for(agent_role, scope.role_protocol_version if scope else 1)
+        packet = _review_evidence_packet(project, packet, boundary, requested,
+            added_token_limit=8_000, hard_token_limit=min(168_000, hard_limit - min(6_000, self.settings.max_output_tokens) - 2_000))
+        recovery["load_warnings"] = packet.warnings
+        recovery["loaded_sources"] = _recovered_source_snapshots(project, packet)
+        trace_path = trace.run_dir / f"source-recovery-{agent_role}.json"
+        atomic_write_text(trace_path, json_dumps(recovery))
+        if _recovered_sources_changed(project, recovery):
+            raise ValidationGateError("补读来源版本已变化，未请求模型复核。")
+        clarification = {}
+        if note_questions:
+            clarification = await self._clarify_writer_notes(project, notes, note_questions, content, packet, trace)
+            recovery["writer_note_clarification"] = clarification
+        # Only the assigned role is rerun. This is a repair call, not a second
+        # complete multi-agent debate, and uses the ordinary runtime budget.
+        repair_prompt = packet.to_model_prompt()
+        if not any(section.key == "E" and section.content == content for section in packet.sections):
+            repair_prompt += "\n\n# 当前完整正文\n" + content
+        repair_prompt += "\n\n# 本次职责和权限（继续保持）\n" + role_instruction
+        if notes:
+            repair_prompt += notes_prompt(notes)
+        if clarification:
+            repair_prompt += "\n\n# Writer限次短答（仍需对照原文，不能当正史证据）\n" + json_dumps(clarification)
+        repair_prompt += "\n\n# 自动补读后的定向复核\n" + json_dumps({
+            "缺口": gaps, "检索记录": recovery, "待核判断": {
+                "summary": output.summary,
+                "assessments": [item.model_dump(mode="json") for item in output.assessments],
+                "findings": [item.model_dump(mode="json") for item in findings],
+                "memory_conflicts": patch.unresolved_conflicts if patch else [],
+            },
+            "要求": "重新依据正文和来源判断，不以旧报告为真。先区分新增信息、状态变化、人物信念/谎言、规划调整和排他矛盾。"
+            "已找到的引文也要核对对象、事件时间和说话人；未命中不等于不存在。合理新增或悬念不因旧章没提过而失败。"
+            "缺关键前提仍用unknown/data_missing，说明确切缺什么；只有双侧原文证实硬问题才交Writer。"
+            "记忆归类或候选错误由记忆责任角色修正，不要求Writer改正文。保留仍有效的判断，填写可定位引文与证据关系。",
+        })
+        if estimate_tokens(system_prompt + repair_prompt) + min(6_000, self.settings.max_output_tokens) > min(176_000, hard_limit):
+            recovery["status"] = "context_budget_exhausted"
+            atomic_write_text(trace_path, json_dumps(recovery))
+            return output.model_copy(update={"verdict": "unknown"}), packet, recovery
+        try:
+            result = await self.provider.generate_json(
+                system_prompt=system_prompt, user_prompt=repair_prompt,
+                output_model=type(output), effort="low", max_tokens=min(6_000, self.settings.max_output_tokens),
+                timeout_seconds=120, thinking=False, agent_role=agent_role,
+            )
+        except (RunBudgetExceeded, ValidationGateError):
+            raise
+        except Exception as exc:
+            recovery.update(status="repair_failed", error=str(exc))
+            trace.record("review.source_recovery", "warning", "补读复核未完成，保留未定结论", str(exc))
+            atomic_write_text(trace_path, json_dumps(recovery))
+            return output.model_copy(update={"verdict": "unknown"}), packet, recovery
+        repaired = result.data
+        # An omitted or merely relabelled concrete two-quote conflict still
+        # needs the existing, evidence-bound same-chapter decision.
+        before, _ = verify_review(ReviewReport(verdict="unknown", confidence=output.confidence,
+            summary=output.summary, findings=findings), content, packet)
+        new_findings = getattr(repaired, "findings", getattr(repaired, "deviations", []))
+        carried = [before[item["finding_index"]].model_copy(update={
+            "reference_evidence": item["second_evidence"], "rule_id": "internal_chapter_conflict",
+            "severity": before[item["finding_index"]].proposed_severity or "major",
+            "verification_status": "unchecked", "semantic_status": "unchecked"})
+            for item in same_chapter_disputes(before, content)
+            if not any(before[item["finding_index"]].evidence == new.evidence
+                       and before[item["finding_index"]].category == new.category
+                       and new.severity in {"major", "blocking"} for new in new_findings)]
+        carried.extend(old.model_copy(update={"semantic_status": "unchecked"}) for old in before
+            if old.rule_id == "canon_conflict" and old.verification_status == "anchored"
+            and old.severity in {"major", "blocking"}
+            and not any(new.evidence == old.evidence and new.category == old.category
+                        and new.severity in {"major", "blocking"} for new in new_findings))
+        if carried:
+            key = "deviations" if isinstance(repaired, ArcAuditReport) else "findings"
+            repaired = repaired.model_copy(update={key: [*carried, *getattr(repaired, key)]})
+        remaining = _review_evidence_gaps(repaired, content, packet, primary=primary, memory_required=memory_required, source_boundary=boundary)
+        if note_questions:
+            corrected = clarification.get("reply", {}).get("corrected_hook_note")
+            if clarification.get("status") != "answered":
+                remaining.append("Writer意图短答未完成；不以忽略问题作为解决")
+            remaining.extend(annotation_gaps(corrected or notes.get("hook_note", {}), content))
+            remaining.extend(f"创作意图仍待核：{value}" for value in getattr(repaired, "writer_note_questions", []))
+        recovery.update(status="remaining_gaps" if remaining else "rechecked", remaining_gaps=remaining)
+        if remaining and repaired.verdict in {"pass", "aligned"}:
+            repaired = repaired.model_copy(update={"verdict": "unknown"})
+        atomic_write_text(trace_path, json_dumps(recovery))
+        trace.record_model("review.source_recovery", result, "同责任角色已补读原文并重新核对；最终门禁仍由引擎执行")
+        return repaired, packet, recovery
 
     async def _verify_review_output(
         self,
@@ -3882,14 +4233,14 @@ class InkFlowEngine:
         if targets:
             checked = await self.provider.generate_json(
                 system_prompt=REVIEW_CLAIM_CHECK_SYSTEM,
-                user_prompt=json_dumps({"findings": targets, "chapter_content": content}),
+                user_prompt=json_dumps({"findings": _claim_source_contexts(targets, findings, packet), "chapter_content": content}),
                 output_model=ReviewClaimDecisionBatch,
                 effort="low",
                 max_tokens=min(4_000, max(800, len(targets) * 320)),
                 thinking=False,
                 agent_role=agent_role,
             )
-            decision_sets.append(checked.data.decisions)
+            decision_sets.append(_ground_review_decisions(checked.data.decisions, findings, content, packet))
             trace.record_model("review.semantic", checked, f"逐条语义核验 {len(targets)} 个硬问题")
 
         if targets and self.settings.review_local_nli_model:
@@ -3925,17 +4276,18 @@ class InkFlowEngine:
             if disputed:
                 judged = await self.provider.generate_json(
                     system_prompt=REVIEW_DISPUTE_SYSTEM,
-                    user_prompt=json_dumps({"disputed_findings": disputed}),
+                    user_prompt=json_dumps({"disputed_findings": _claim_source_contexts(disputed, findings, packet),
+                        "chapter_content": content}),
                     output_model=ReviewClaimDecisionBatch,
                     effort="low",
                     max_tokens=min(4_000, max(800, len(disputed) * 320)),
                     thinking=False,
-                    agent_role="reviewer_judge",
+                    agent_role=agent_role,
                     model_override=self.settings.review_judge_model,
                 )
                 findings, verdict = apply_dispute_decisions(
                     findings,
-                    judged.data.decisions,
+                    _ground_review_decisions(judged.data.decisions, findings, content, packet),
                     source=f"争议裁判 {judged.model}",
                 )
                 trace.record_model("review.dispute_judge", judged, f"裁决 {len(disputed)} 个语义争议")
@@ -4003,7 +4355,7 @@ class InkFlowEngine:
     async def repair_accepted_continuity(
         self, root: str | Path, chapter_no: int, instruction: str = "",
     ) -> dict[str, Any]:
-        """Resolve a two-quote hold on the latest accepted chapter, without rollback."""
+        """Resolve a review hold or explicit feedback on the latest accepted chapter."""
         project = InkFlowProject(root)
         scope = active_task_settings.get()
         protocol = scope.role_protocol_version if scope else 1
@@ -4018,12 +4370,14 @@ class InkFlowEngine:
         try:
             hold = project.latest_accepted_quality_hold()
             chapter = project.db.get_chapter(chapter_no)
-            if (not hold or int(hold["chapter_no"]) != chapter_no or not chapter
+            feedback_repair = bool(instruction.strip()) and not hold
+            if ((not hold and not feedback_repair)
+                    or (hold and int(hold["chapter_no"]) != chapter_no) or not chapter
                     or chapter["status"] != "accepted"
                     or project.db.latest_accepted_chapter_no() != chapter_no):
                 trace.finish(status="waiting", summary="当前章不符合自动局部修复条件，正史未改")
                 return {"status": "needs_input", "chapter_no": chapter_no,
-                        "reason": "当前章没有可自动处理的双引文疑点，或已有后续正史依赖；未修改正文。",
+                        "reason": "没有明确的修订意见，或已有后续正史依赖；未修改正文。",
                         "trace_id": trace.run_id}
             current = project.db.canonical_chapter_content(chapter_no)
             if current is None or content_hash(current) != chapter["content_hash"]:
@@ -4032,14 +4386,16 @@ class InkFlowEngine:
             projection = project.root / relative
             if not projection.is_file() or content_hash(projection.read_text(encoding="utf-8")) != chapter["content_hash"]:
                 raise ValidationGateError("正史文件与数据库不一致；未覆盖用户文件。")
-            first = str(hold["first_evidence"])
-            second = str(hold["second_evidence"])
+            first = str(hold["first_evidence"]) if hold else ""
+            second = str(hold["second_evidence"]) if hold else ""
             first_at, second_at = current.find(first), current.find(second)
-            if first_at < 0 or second_at < first_at + len(first):
+            if hold and (first_at < 0 or second_at < first_at + len(first)):
                 raise ValidationGateError("疑点的两处引文无法按顺序定位；未猜测或修改。")
             review = project.db.latest_review_record(chapter_no)
             if not review:
                 raise ValidationGateError("缺少原审查记录；正史未改。")
+            if feedback_repair and review["chapter_version"] != int(chapter["version"]):
+                raise ValidationGateError("当前正史没有对应版本的审查记录；未按旧审核修订。")
             if review["chapter_version"] != int(chapter["version"]):
                 prior_repair = any(
                     artifact["status"] == "verified"
@@ -4053,17 +4409,19 @@ class InkFlowEngine:
                 if not prior_repair:
                     raise ValidationGateError("原审查版本已变化且找不到当前版修订依据；正史未改。")
             source_fingerprint = self._revision_source_fingerprint(project, chapter_no)
+            previous = project.db.canonical_chapter_content(chapter_no - 1) or ""
             base = (
                 f"第 {chapter_no} 章已接受正文的连续性疑点。\n"
-                f"先前审查指向的第一处原文：{first}\n第二处原文：{second}\n"
-                f"完整章节正文（只读，不能因旧评分而直接放行）：\n{current}\n"
-                f"本次用户意见：{instruction or '自行核对并最小修复'}"
+                + (f"先前审查指向的第一处原文：{first}\n第二处原文：{second}\n" if hold else "")
+                + (f"紧邻前章已接受正文（只读）：\n{previous}\n" if feedback_repair else "")
+                + f"完整章节正文（只读，不能因旧评分而直接放行）：\n{current}\n"
+                + f"本次用户意见：{instruction or '自行核对并最小修复'}"
             )
             trace.record("accepted_repair.inspect", "completed", "已读取完整正史与两处原文",
                          metadata={"chapter_version": chapter["version"], "source_hash": chapter["content_hash"]})
             diagnosis_result = await self.provider.generate_json(
                 system_prompt=(
-                    "你是本次连续性审读者。阅读完整章节，判断两处原文是否真的缺少中间动作。"
+                    "你是本次连续性审读者。阅读当前完整章节及提供的紧邻前章，核对用户指出的状态接力。"
                     "用户本次指出的新疑点也要核对，不能只围绕旧审核的两句打转。"
                     "沿着疑点涉及的关键物件及人物认知，检查从章首到章末的每次出现，不只核对这两句。"
                     "修法必须从最早的错误状态句开始：若物件已明确放回甲处，不能只在乙处补一句'取出'。"
@@ -4086,7 +4444,7 @@ class InkFlowEngine:
             patch = None
             if diagnosis.verdict == "already_explained":
                 bridge = diagnosis.bridge_evidence.strip()
-                if not bridge or bridge not in current[first_at + len(first):second_at]:
+                if not bridge or bridge not in (current if feedback_repair else current[first_at + len(first):second_at]):
                     raise ValidationGateError("声称已有过桥动作，但引文不在两处疑点之间；未放行。")
             repair_direction = diagnosis.repair_instruction.strip()
             if diagnosis.verdict == "needs_local_repair" and not repair_direction:
@@ -4102,7 +4460,9 @@ class InkFlowEngine:
                             "核对关键物件从首次出现到章末的持有人、位置、取出、交接和收回链条；"
                             "不能凭空补一处取出：要先在前文找到该物件已被放入该处的原句。若它一直在人物手里，直接补随身携带动作。"
                             "状态移动要写在实际发生的位置，不能只在几十行后的回忆或总结中补交代；删掉因修订而重复的解释句。"
+                            "取出物件后若紧接着要使用或装入随身袋，不得先把它放回原处；若已放回，必须写出再次取出。"
                             "若审读者指出后文新矛盾，须连同它一起修好，不要只重复上一轮补句。"
+                            "若仅需纠正线索来源或人物知识，只替换错误句，不新增物件移动或位置解释。"
                             "最多改四小处，不改人物选择、伏笔、结局或别章。新增文字不要用顿号。"
                         ),
                         user_prompt=(base + "\n审读者的具体方向：" + repair_direction
@@ -4123,7 +4483,9 @@ class InkFlowEngine:
                             continue
                         target_at = source.find(target)
                         if (source.count(target) != 1
-                                or not any(name in target for name in diagnosis.key_objects)
+                                or not (target in repair_direction or any(
+                                    len(name) >= 2 and (name in target or name[-2:] in target)
+                                    for name in diagnosis.key_objects))
                                 or replacement.count("、") > target.count("、")):
                             ignored_edits.append(target[:80])
                             continue
@@ -4199,6 +4561,8 @@ class InkFlowEngine:
                     system_prompt=(
                         "你是独立审读者。复核整章中关键物件与人物认知的因果链，而非只看最初两句。"
                         "特别核对每个'取出'动作前是否真的写过放入或交付；若候选新造了来源，返回 not_resolved。"
+                        "还要核对取出后有没有放回原处，不能把已经放回的物件紧接着当作仍在手里。"
+                        "对照紧邻前章末的物件状态与本章首次取用，不要只检查当前章内部。"
                         "输入末尾列出关键物件在候选正文中的每处出现。逐项检查后，在 checked_state_ids 填写所有已核对的编号；"
                         "不能跳过早期或后期出现。confidence 如实填写；低于80%不得自称可以自动通过。"
                         "只有候选真正消除所有相关位置/因果疑点，且没有改变人物选择或制造新矛盾，"
@@ -4225,7 +4589,8 @@ class InkFlowEngine:
                             ) + f"审核把握度 {verification.confidence:.0%}，自动通过底线为 {max(0.80, self.settings.review_min_confidence):.0%}。已保留当前版本和候选。",
                             "trace_id": trace.run_id}
                 if verification.verdict == "resolved" and verification.anchor_excerpt.strip() in candidate:
-                    if patch is None and verification.anchor_excerpt.strip() not in current[first_at + len(first):second_at]:
+                    if (patch is None and verification.anchor_excerpt.strip() not in
+                            (current if feedback_repair else current[first_at + len(first):second_at])):
                         raise ValidationGateError("复核没有在两处原文之间定位已有过桥动作，正史未改。")
                     break
                 if verification.verdict == "needs_user":
@@ -4760,6 +5125,13 @@ class InkFlowEngine:
         trace = TraceRecorder(project.root, f"accept-{chapter_no:05d}", self.settings.trace_level)
         committed = False
         try:
+            from .manual_edits import ManualEditsService
+            ManualEditsService(project).scan()
+            ManualEditsService(project).assert_ready(chapter_no)
+            accepted_before = {item["chapter_no"] for item in project.db.accepted_chapters()
+                               if item["chapter_no"] < chapter_no}
+            if accepted_before != set(range(1, chapter_no)):
+                raise ValidationGateError(f"第 {chapter_no} 章之前仍有未接受章节，不能越章写入正史。")
             quality_hold = project.latest_accepted_quality_hold()
             if quality_hold and chapter_no > int(quality_hold["chapter_no"]):
                 held = int(quality_hold["chapter_no"])
@@ -4781,6 +5153,8 @@ class InkFlowEngine:
                     f"当前草稿是 v{chapter['version']}；正文修改后必须重新审查。"
                 )
             review = review_record["report"]
+            if review.writer_notes_hash != notes_hash(version_notes(project, chapter_no)):
+                raise ValidationGateError("Writer说明与审查版本不一致，须核对当前说明后接受；正文没有重生成。")
             scope = active_task_settings.get()
             if scope and scope.role_protocol_version == 2:
                 bundle = review_record.get("mode_bundle") or {}
@@ -4799,6 +5173,11 @@ class InkFlowEngine:
                 raise ValidationGateError("当前任务与审查协议版本不一致，请按当前任务模式重审。")
             if review.scoring_version != SCORING_VERSION and not force:
                 raise ValidationGateError("该草稿仍使用旧审核计分契约，请按当前证据量表重审；已接受正文不受影响。")
+            if (review.evidence_policy_version != EVIDENCE_POLICY_VERSION
+                    and (not force or (scope and scope.role_protocol_version == 2))):
+                raise ValidationGateError("该草稿缺少当前证据归因契约，请重审；已接受正文和旧角色记录不改写。")
+            if _recovered_sources_changed(project, review.evidence_recovery):
+                raise ValidationGateError("审查补读的前章版本已变化，必须重新核对当前来源后提交。")
             if review.verdict != "pass" and not force:
                 raise ValidationGateError(f"审查结论为 {review.verdict}，需要修改或显式 force 接受。")
             if (review.verdict == "pass" and review.confidence < max(0.80, self.settings.review_min_confidence)
@@ -4993,6 +5372,11 @@ class InkFlowEngine:
                 "章节、事实、线索和状态视图已事务提交",
                 metadata={"final_path": final_relative.as_posix()},
             )
+            try:
+                setting_result = self._adopt_setting_proposals(project,chapter_no,int(chapter["version"]),patch,review_record)
+                post_commit_warnings.extend(setting_result["warnings"])
+            except Exception as setting_error:
+                post_commit_warnings.append(f"设定参考交接待补齐：{setting_error}")
             try:
                 checkpoint = CheckpointService(project).create(
                     label=f"第 {chapter_no} 章已接受",
@@ -5429,15 +5813,16 @@ class InkFlowEngine:
 
     async def _review_batch_chapter(
         self, root: str | Path, chapter_no: int, *,
-        provisional_chapters: list[dict[str, Any]],
+        provisional_chapters: list[dict[str, Any]], instruction: str = "",
     ) -> dict[str, Any]:
         scope = active_task_settings.get()
         if scope is not None and scope.role_protocol_version == 2:
             return await self.review_chapter_mode(
                 root, chapter_no, mode=scope.collaboration_mode,
-                provisional_chapters=provisional_chapters,
+                provisional_chapters=provisional_chapters, instruction=instruction,
             )
-        return await self.review_chapter(root, chapter_no, provisional_chapters=provisional_chapters)
+        return await self.review_chapter(root, chapter_no, provisional_chapters=provisional_chapters,
+                                         instruction=instruction)
 
     async def _stage_batch_memory(
         self, project: InkFlowProject, *, batch_id: str, chapter_no: int,
@@ -5851,12 +6236,11 @@ class InkFlowEngine:
             raise ValidationGateError("批次修复的额外自动修订轮数必须在 0～2 之间。")
         project = InkFlowProject(root)
         manifest = self._load_batch_manifest(project, batch_id)
-        repairable_status = manifest.get("status") == "ready_for_acceptance" or (
-            manifest.get("status") == "needs_revision" and isinstance(manifest.get("last_repair"), dict)
-        )
+        repairable_status = manifest.get("status") in {"ready_for_acceptance", "needs_revision", "interrupted"}
         if not repairable_status:
-            raise ValidationGateError("只有已完成的临时批次，或此前修复中断且保留修复记录的批次可以继续修复。")
-        entries = list(manifest.get("chapters") or [])
+            raise ValidationGateError("只有未验收的待修订、已完成或已中断临时批次可以继续修复。")
+        entries = [item for item in manifest.get("chapters") or []
+                   if all(key in item for key in ("title", "draft_path", "review_path", "version"))]
         if not entries:
             raise ValidationGateError("批次没有可修复的章节。")
         entries.sort(key=lambda item: int(item["chapter_no"]))
@@ -5866,12 +6250,21 @@ class InkFlowEngine:
         requested_end = end_chapter_no if end_chapter_no is not None else batch_end
         if start < batch_start or requested_end > batch_end or requested_end < start:
             raise ValidationGateError(f"修复范围必须位于该批次的第 {batch_start}～{batch_end} 章内。")
-        # Once an earlier chapter changes, every later draft was written from
-        # stale continuity.  Rebuild the remaining suffix instead of allowing
-        # stale provisional memory to reach the acceptance gate.
-        end = batch_end
-
         entry_by_chapter = {int(item["chapter_no"]): item for item in entries}
+        # A failed draft and later drafts from an earlier attempt may not yet
+        # have manifest entries. Include the contiguous drafted suffix only.
+        end = batch_start - 1
+        for number in range(batch_start, batch_end + 1):
+            draft = project.db.get_chapter(number)
+            if not draft or draft["status"] != "draft":
+                break
+            if number not in entry_by_chapter:
+                entry_by_chapter[number] = {"chapter_no": number, "revision_rounds": 0}
+                entries.append(entry_by_chapter[number])
+            end = number
+        if end < start:
+            raise ValidationGateError("目标章节尚无批次草稿，不能以修订代替新章写作。")
+        entries.sort(key=lambda item: int(item["chapter_no"]))
         selected = list(range(start, end + 1))
         missing = [chapter_no for chapter_no in selected if chapter_no not in entry_by_chapter]
         if missing:
@@ -5882,43 +6275,19 @@ class InkFlowEngine:
         previous_status = str(manifest.get("status"))
         manifest["status"] = "repairing"
         manifest["stop_reason"] = ""
+        manifest["chapters"] = [item for item in entries if "title" in item]
         manifest["last_repair"] = {
             "started_at": utc_now(),
             "chapter_range": [start, end],
             "requested_chapter_range": [start, requested_end],
-            "range_expanded_for_continuity": requested_end < batch_end,
+            "range_expanded_for_continuity": requested_end < end,
             "instruction": instruction,
             "max_additional_revision_rounds": max_additional_revision_rounds,
             "trace_id": trace.run_id,
         }
         await self._save_batch_manifest_async(project, manifest)
 
-        # Preload only earlier temporary chapters.  They are the valid local
-        # continuity context for the first repaired chapter; later chapters
-        # must wait for the repaired predecessor.
         provisional: list[dict[str, Any]] = []
-        for entry in entries:
-            chapter_no = int(entry["chapter_no"])
-            if chapter_no >= start:
-                break
-            current = project.db.get_chapter(chapter_no)
-            if not current or current["status"] != "draft":
-                continue
-            content = (project.root / current["path"]).read_text(encoding="utf-8")
-            staged_memory = project.db.get_provisional_memory_patch(batch_id, chapter_no)
-            provisional.append(
-                {
-                    "batch_id": batch_id,
-                    "chapter_no": chapter_no,
-                    "content": content,
-                    **(
-                        {"memory_patch": staged_memory["patch"].model_dump(mode="json")}
-                        if staged_memory and staged_memory["status"] == "active"
-                        else {}
-                    ),
-                }
-            )
-
         try:
             trace.record(
                 "batch.repair.start",
@@ -5929,6 +6298,60 @@ class InkFlowEngine:
                     "max_additional_revision_rounds": max_additional_revision_rounds,
                 },
             )
+            # An interrupted resume may have shortened the manifest while the
+            # draft files survived. Rebuild only source-bound passing entries;
+            # missing reviewer evidence is handled by Reviewer, not Writer.
+            for chapter_no in range(batch_start, start):
+                current = project.db.get_chapter(chapter_no)
+                if not current or current["status"] != "draft":
+                    raise ValidationGateError(f"第 {chapter_no} 章不是可复用的临时草稿。")
+                reviewed = self.current_pass_review(
+                    project, chapter_no, provisional_chapters=provisional, instruction="",
+                )
+                if reviewed is None:
+                    reviewed = await self._review_batch_chapter(
+                        project.root, chapter_no, provisional_chapters=provisional,
+                    )
+                    trace.record("batch.repair.prefix_review", "completed",
+                                 f"第 {chapter_no} 章补审现有草稿：{reviewed['verdict']}",
+                                 metadata={"trace_id": reviewed["trace_id"]})
+                if reviewed["verdict"] != "pass":
+                    manifest["status"] = "needs_revision"
+                    manifest["stopped_at_chapter"] = chapter_no
+                    manifest["stop_reason"] = f"第 {chapter_no} 章现有草稿尚未通过来源复核；正文未因此改写。"
+                    await self._save_batch_manifest_async(project, manifest)
+                    trace.finish(status="failed", summary="批次前章资料待核对；未提交正史")
+                    return {**self._batch_result(project, manifest), "trace_id": trace.run_id}
+                content = (project.root / current["path"]).read_text(encoding="utf-8")
+                staged = project.db.get_provisional_memory_patch(batch_id, chapter_no)
+                if (not staged or staged["status"] != "active"
+                        or staged["chapter_version"] != int(current["version"])
+                        or staged["content_hash"] != content_hash(content)):
+                    prior_patches = [item["memory_patch"] for item in provisional if "memory_patch" in item]
+                    memory_patch, _, _ = await self._extract_memory_patch(
+                        project, chapter_no, content, trace, source_status="provisional",
+                        provisional_patches=prior_patches, force=False,
+                    )
+                    await self._stage_batch_memory(
+                        project, batch_id=batch_id, chapter_no=chapter_no,
+                        chapter_version=int(current["version"]), content=content,
+                        memory_patch=memory_patch, trace=trace,
+                        claim=f"第 {chapter_no} 章现有版本已补审；临时记忆重新同步，未进入正史。",
+                        requested_response="后续章节使用当前临时记忆；集中验收时再提升。",
+                    )
+                    staged = project.db.get_provisional_memory_patch(batch_id, chapter_no)
+                assert staged is not None
+                entry_by_chapter[chapter_no] = self._batch_entry(
+                    project, current, reviewed,
+                    previous_rounds=int(entry_by_chapter[chapter_no].get("revision_rounds", 0)),
+                    added_rounds=0,
+                )
+                entry_by_chapter[chapter_no]["memory_status"] = "provisional"
+                manifest["chapters"] = [entry_by_chapter[int(item["chapter_no"])] for item in entries
+                                        if "title" in entry_by_chapter[int(item["chapter_no"])]]
+                await self._save_batch_manifest_async(project, manifest)
+                provisional.append({"batch_id": batch_id, "chapter_no": chapter_no,
+                                    "content": content, "memory_patch": staged["patch"].model_dump(mode="json")})
             for chapter_no in selected:
                 current = project.db.get_chapter(chapter_no)
                 if not current or current["status"] != "draft":
@@ -5958,7 +6381,7 @@ class InkFlowEngine:
                     initial_review = await self._review_batch_chapter(
                         project.root,
                         chapter_no,
-                        provisional_chapters=provisional,
+                        provisional_chapters=provisional, instruction=instruction,
                     )
                     trace.record(
                         "batch.repair.reviewer.baseline",
@@ -5987,7 +6410,7 @@ class InkFlowEngine:
                     reviewed = await self._review_batch_chapter(
                         project.root,
                         chapter_no,
-                        provisional_chapters=provisional,
+                        provisional_chapters=provisional, instruction=instruction,
                     )
                     trace.record(
                         "batch.repair.reviewer.current",
@@ -6005,7 +6428,8 @@ class InkFlowEngine:
                         previous_rounds=base_revision_rounds,
                         added_rounds=revision_rounds,
                     )
-                    manifest["chapters"] = [entry_by_chapter[int(item["chapter_no"])] for item in entries]
+                    manifest["chapters"] = [entry_by_chapter[int(item["chapter_no"])] for item in entries
+                                            if "title" in entry_by_chapter[int(item["chapter_no"])]]
                     await self._save_batch_manifest_async(project, manifest)
 
                     if reviewed["verdict"] == "pass":
@@ -6059,6 +6483,15 @@ class InkFlowEngine:
                     trace.finish(status="failed", summary="批次修复停在待修订章节；未提交正史")
                     return {**self._batch_result(project, manifest), "trace_id": trace.run_id}
 
+            if end < batch_end:
+                manifest["status"] = "needs_revision"
+                manifest["stopped_at_chapter"] = end + 1
+                manifest["stop_reason"] = f"第 {start}～{end} 章已修订并重审；第 {end + 1}～{batch_end} 章尚未写作。"
+                manifest["last_repair"]["finished_at"] = utc_now()
+                manifest["last_repair"]["status"] = "repaired_existing_drafts"
+                await self._save_batch_manifest_async(project, manifest)
+                trace.finish(summary="已有草稿修复完成；后续未写章节留待原批次续写")
+                return {**self._batch_result(project, manifest), "trace_id": trace.run_id}
             manifest["static_basis_hash"] = self._batch_static_basis(
                 project, int(manifest["start_chapter_no"]), int(manifest["end_chapter_no"])
             )
@@ -6311,23 +6744,13 @@ class InkFlowEngine:
                 (section.content for section in packet.sections if section.key == "E"),
                 "",
             )
-            initial_comparisons = anchored_comparisons(report.source_comparisons, audit_content, packet)
-            _, _, missing_sources = score_review(report.assessments, report.deviations,
-                audit_content, packet, initial_comparisons, has_prior=start_chapter_no > 1)
-            if missing_sources:
-                trace.record("arc_audit.evidence", "warning", "审查漏引必要来源，限次定向补证", "、".join(missing_sources))
-                trace.record_model("arc_audit.initial", result, "首轮复审缺少可核实的来源对照")
-                result = await self.provider.generate_json(
-                    system_prompt=ARC_AUDIT_SYSTEM,
-                    user_prompt=packet.to_model_prompt()
-                    + "\n\n# 本次只补审查证据，不修改正文\n首轮报告："
-                    + report.model_dump_json(exclude={"source_comparisons"})
-                    + "\n缺少：" + "、".join(missing_sources)
-                    + "。请重新阅读已提供的当前原文，source_comparisons 必须引用可逐字定位的来源原句。",
-                    output_model=ArcAuditReport, effort="low", max_tokens=self.settings.max_output_tokens,
-                    timeout_seconds=120, thinking=False, agent_role=audit_role,
-                )
-                report = result.data
+            report, packet, source_recovery = await self._recover_review_evidence(
+                project, report, audit_content, packet, trace, agent_role=audit_role,
+                system_prompt=ARC_AUDIT_SYSTEM, primary=True,
+                source_boundary=start_chapter_no,
+                role_instruction=json_dumps({"range": [start_chapter_no, end_chapter_no],
+                    "checks": ["general"], "memory_owner": None, "body_repair_is_proposal_only": True}),
+            )
             verification_report = ReviewReport(
                 verdict=(
                     "unknown"
@@ -6348,7 +6771,7 @@ class InkFlowEngine:
                 trace,
                 agent_role=audit_role,
             )
-            if verified_verdict == "unknown":
+            if verified_verdict == "unknown" or (report.verdict == "unknown" and verified_verdict == "pass"):
                 arc_verdict = "unknown"
             elif any(item.severity in {"major", "blocking"} for item in verified_deviations):
                 arc_verdict = "needs_replan" if report.verdict == "needs_replan" else "blocked"
@@ -6381,6 +6804,8 @@ class InkFlowEngine:
                     "confidence": evidence_confidence,
                     "confidence_basis": confidence_basis,
                     "scoring_version": SCORING_VERSION,
+                    "evidence_policy_version": EVIDENCE_POLICY_VERSION,
+                    "evidence_recovery": source_recovery,
                     "source_comparisons": valid_comparisons,
                     "deviations": verified_deviations,
                     "source_hash": content_hash(audit_content),
@@ -6428,7 +6853,8 @@ class InkFlowEngine:
                     start_chapter_no, end_chapter_no, provisional_chapters=current_provisional,
                 )
                 if (current_batch_id != source_batch_id
-                        or content_hash(current_packet.to_model_prompt()) != source_fingerprint):
+                        or content_hash(current_packet.to_model_prompt()) != source_fingerprint
+                        or _recovered_sources_changed(project, source_recovery)):
                     atomic_write_text(trace.run_dir / "stale-arc-audit-candidate.json", report.model_dump_json(indent=2))
                     raise ValidationGateError("篇章复审期间正文或规划依据已变化；未覆盖当前报告。")
                 atomic_write_text(
@@ -6464,6 +6890,7 @@ class InkFlowEngine:
                 "score_total": None if report.verdict == "unknown" else _score_total(scorecard),
                 "summary": report.summary,
                 "fulfilled_commitments": report.fulfilled_commitments,
+                "evidence_recovery": report.evidence_recovery,
                 "deviations": [item.model_dump(mode="json") for item in report.deviations],
                 "future_impact": report.future_impact,
                 "body_repair_recommended": body_repair_recommended,
@@ -7268,6 +7695,13 @@ def _render_arc_audit(
         "",
         report.summary,
         "",
+        "## 自动补读与复核",
+        "",
+        f"- 证据契约：{report.evidence_policy_version or '旧报告未记录'}",
+        *(["```json", json_dumps(report.evidence_recovery), "```"] if report.evidence_recovery.get("attempted")
+          else ["- 本次没有触发额外检索复核。"]),
+        "- 未命中不证明事实不存在；是否通过仍按最终门禁判断。",
+        "",
         "## 把握度依据",
         "",
         *([f"- {item}" for item in report.confidence_basis] or ["- 旧版报告无计算明细"]),
@@ -7381,36 +7815,204 @@ _REVIEW_SCORE_RULES: tuple[tuple[str, int, frozenset[str]], ...] = (
 _REVIEW_SCORE_DEDUCTIONS = {"info": 0, "minor": 3, "major": 12, "blocking": 25}
 
 
+def _ground_review_decisions(decisions: list[ReviewClaimDecision], findings: list[ReviewFinding], content: str, packet: ContextPacket) -> list[ReviewClaimDecision]:
+    sources = packet_sources(packet)
+    result = []
+    for decision in checked_claim_decisions(decisions):
+        if decision.finding_index >= len(findings):
+            continue
+        finding = findings[decision.finding_index]
+        texts = [content, *[sources[ref] for ref in finding.canon_refs if ref in sources]]
+        invalid = (decision.verdict == "supported" and finding.rule_id in {"canon_conflict", "internal_chapter_conflict"}
+                   and decision.conflict_type != "exclusive_conflict")
+        if decision.verdict in {"not_blocking", "contradicted"}:
+            invalid = invalid or not (8 <= len(decision.resolution_evidence.strip()) <= 200
+                and any(evidence_matches(decision.resolution_evidence, text) for text in texts))
+        if invalid:
+            decision = decision.model_copy(update={"verdict": "uncertain",
+                "reason": decision.reason + "；冲突分类或消解原文未在本问题的正文/来源成立，保留待核。"})
+        result.append(decision)
+    return result
+
+
+def _claim_source_contexts(targets: list[dict[str, Any]], findings: list[ReviewFinding], packet: ContextPacket) -> list[dict[str, Any]]:
+    sources = packet_sources(packet)
+    result = []
+    for target in targets:
+        finding = findings[target["finding_index"]]
+        contexts = []
+        for ref in finding.canon_refs:
+            source_id = resolve_packet_source_id(ref, sources)
+            if not source_id or not evidence_matches(finding.reference_evidence, sources[source_id]):
+                continue
+            text = sources[source_id]
+            quote = finding.reference_evidence.strip().strip('“”"「」')
+            quote = re.split(r"(?:…{2,}|\.{3,})", quote)[0].strip()
+            at = text.find(quote)
+            if at < 0:
+                compact = re.sub(r"\s+", "", text)
+                position = compact.find(re.sub(r"\s+", "", quote))
+                positions = [match.start() for match in re.finditer(r"\S", text)]
+                at = positions[position] if position >= 0 else 0
+            contexts.append({"source_id": source_id, "quote": finding.reference_evidence,
+                "surrounding_text": text[max(0, at - 800):at + len(quote) + 800],
+                "authority": "未来规划假设" if source_id in {"OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md"} or source_id.startswith("plan:")
+                else "批次临时正文，未进入正史" if source_id.startswith("batch:") else "来源原文；须核对其客观/信念/传闻层级"})
+            if len(contexts) == 2:
+                break
+        result.append({**target, "reference_contexts": contexts})
+    return result
+
+
+def _review_evidence_gaps(output: Any, content: str, packet: ContextPacket, *, primary: bool, memory_required: bool = False, source_boundary: int | None = None) -> list[str]:
+    sources = packet_sources(packet)
+    boundary = source_boundary if source_boundary is not None else packet.chapter_no
+    gaps = [f"待补来源：{value}" for value in output.missing_source_ids]
+    if primary:
+        comparisons = anchored_comparisons(output.source_comparisons, content, packet)
+        scope = active_task_settings.get()
+        deferred = {"readability"} if isinstance(output, ModeCheckOutput) and scope is not None and check_owners_for_mode(scope.collaboration_mode).get("expression") else set()
+        _, _, errors = score_review(output.assessments,
+            getattr(output, "findings", getattr(output, "deviations", [])), content, packet, comparisons,
+            has_prior=boundary > 1, deferred_criteria=deferred)
+        gaps.extend(errors)
+        focus = getattr(output, "focus_observation", None)
+        if focus is not None and _review_focus_problem(focus, content):
+            gaps.append(_review_focus_problem(focus, content))
+        prior_ids = {ref for ref in sources if boundary > 1
+                     and ref.endswith(f"chapter:{boundary - 1:05d}")}
+        if prior_ids and not prior_ids.intersection(item.source_id for item in comparisons):
+            gaps.append("尚未用双方原文对照紧邻前章的状态变化")
+    else:
+        if getattr(output, "writer_note_questions", []):
+            gaps.append("只有主审可以追问Writer；当前角色须自行核对其负责的证据或候选，不扩大分工")
+        for item in output.assessments:
+            if item.status == "data_missing" or item.evidence_relation in UNRESOLVED_RELATIONS or not item.chapter_evidence.strip() or not evidence_matches(item.chapter_evidence, content):
+                gaps.append(f"待核评定：{item.criterion}：{item.reason}")
+    findings = getattr(output, "findings", getattr(output, "deviations", []))
+    for item in findings:
+        if item.severity not in {"major", "blocking"}:
+            continue
+        if not item.evidence.strip() or not evidence_matches(item.evidence, content):
+            gaps.append(f"指控正文引文未定位：{item.explanation}")
+        if item.canon_refs and not any(
+            resolve_packet_source_id(ref, sources) and item.reference_evidence.strip()
+            and evidence_matches(item.reference_evidence, sources[resolve_packet_source_id(ref, sources)])
+            for ref in item.canon_refs
+        ):
+            gaps.append(f"指控对照资料未定位：{item.explanation}")
+    patch = getattr(output, "memory_patch", None)
+    if memory_required and output.verdict == "pass" and patch is None:
+        gaps.append("当前记忆责任角色遗漏memory_patch，须补齐交接候选，不能直接提交或让Writer改正文")
+    if patch:
+        gaps.extend(f"记忆候选待核：{value}" for value in patch.unresolved_conflicts)
+        gaps.extend(f"记忆证据未定位：{fact.subject} {fact.predicate}" for fact in patch.facts
+                    if not _evidence_in_content(fact.evidence, content))
+        memory_evidence = [ref for fact in patch.facts for ref in fact.evidence_refs]
+        memory_evidence.extend(ref for operation in patch.operations for ref in operation.evidence)
+        for ref in memory_evidence:
+            if ref.source_chapter == boundary:
+                source_text = content
+            else:
+                source_id = resolve_packet_source_id(f"chapter:{ref.source_chapter:05d}", sources)
+                source_text = sources.get(source_id, "") if ref.source_chapter < boundary else ""
+            if not source_text or not evidence_matches(ref.quote, source_text):
+                gaps.append(f"记忆附加证据待核：第{ref.source_chapter}章：{ref.quote[:80]}")
+    if output.verdict == "unknown" and not gaps:
+        gaps.append(f"责任角色尚未形成结论：{output.summary}")
+    return list(dict.fromkeys(gaps))[:16]
+
+
+def _recovered_source_snapshots(project: InkFlowProject, packet: ContextPacket) -> list[dict[str, Any]]:
+    snapshots = []
+    for section in packet.sections:
+        if not section.key.startswith("repair-"):
+            continue
+        for source_id in section.source_ids:
+            number = int(source_id.split(":")[-1])
+            row = project.db.get_chapter(number)
+            if not row or row["status"] != "accepted":
+                raise ValidationGateError("补读章节记录已变化，不能采用过期原文。")
+            text = project.db.canonical_chapter_content(number)
+            if text is None:
+                path = (project.root / row["path"]).resolve()
+                text = path.read_text(encoding="utf-8") if path.is_relative_to(project.root.resolve()) and path.is_file() else ""
+            if not text or content_hash(text) != row["content_hash"] or section.content != text.strip():
+                raise ValidationGateError("补读原文已变化，不能用旧资料绑定新来源。")
+            snapshots.append({"chapter_no": number, "version": int(row["version"]),
+                "content_hash": row["content_hash"]})
+    return snapshots
+
+
+def _recovered_sources_changed(project: InkFlowProject, recovery: dict[str, Any]) -> bool:
+    if (recovery.get("writer_notes_hash")
+            and recovery["writer_notes_hash"] != notes_hash(version_notes(project, int(recovery["chapter_no"])))):
+        return True
+    for data in recovery.get("roles", {}).values():
+        if _recovered_sources_changed(project, data):
+            return True
+    for item in recovery.get("loaded_sources", []):
+        row = project.db.get_chapter(int(item["chapter_no"]))
+        if (not row or row["status"] != "accepted" or int(row["version"]) != item["version"]
+                or row["content_hash"] != item["content_hash"]):
+            return True
+        try:
+            text = project.db.canonical_chapter_content(int(item["chapter_no"]))
+            if text is None:
+                path = (project.root / row["path"]).resolve()
+                text = path.read_text(encoding="utf-8") if path.is_relative_to(project.root.resolve()) and path.is_file() else ""
+        except (OSError, UnicodeError):
+            return True
+        if content_hash(text) != item["content_hash"]:
+            return True
+    return False
+
+
 def _review_evidence_packet(project: InkFlowProject, packet: ContextPacket,
-                            chapter_no: int, requested: list[str]) -> ContextPacket:
+                            chapter_no: int, requested: list[str], *,
+                            added_token_limit: int = 8_000, hard_token_limit: int = 168_000) -> ContextPacket:
     """Bounded source repair by the reviewer, never a Writer rewrite or arbitrary file read."""
-    sections = list(packet.sections)
+    sections = [section for section in packet.sections if section.key != "review-source-catalog"]
     existing = packet_sources(packet)
-    catalog = []
-    for number in range(1, chapter_no):
-        chapter = project.db.get_chapter(number)
-        if chapter and chapter["status"] == "accepted":
-            catalog.append(f"chapter:{number:05d}")
-    for source_id in dict.fromkeys(requested[:6]):
+    catalog = [f"chapter:{int(row['chapter_no']):05d}" for row in project.db.accepted_chapters()
+               if int(row["chapter_no"]) < chapter_no]
+    base_tokens = packet.estimated_tokens - sum(estimate_tokens(section.content) for section in packet.sections if section.key == "review-source-catalog")
+    added_tokens = 0
+    preloaded = sum(estimate_tokens(section.content) for section in sections if section.key.startswith("repair-"))
+    remaining_count = max(0, 6 - sum(section.key.startswith("repair-") for section in sections))
+    warnings = list(packet.warnings)
+    eligible = [source_id for source_id in dict.fromkeys(requested) if source_id in catalog and source_id not in existing]
+    for source_id in eligible[:remaining_count]:
         if source_id in existing or source_id not in catalog:
             continue
         number = int(source_id.split(":")[1])
         chapter = project.db.get_chapter(number)
-        text = project.db.canonical_chapter_content(number)
-        if text is None:
-            path = project.root / chapter["path"]
-            text = path.read_text(encoding="utf-8") if path.is_file() else ""
+        try:
+            text = project.db.canonical_chapter_content(number)
+            if text is None:
+                path = (project.root / chapter["path"]).resolve()
+                text = path.read_text(encoding="utf-8") if path.is_relative_to(project.root.resolve()) and path.is_file() else ""
+        except (OSError, UnicodeError):
+            text = ""
         if not text or content_hash(text) != chapter["content_hash"]:
+            warnings.append(f"补读{source_id}失败：已接受正文缺失或版本不符，不能推断事实不存在。")
             continue
+        tokens = estimate_tokens(text)
+        if preloaded + added_tokens + tokens > added_token_limit or base_tokens + added_tokens + tokens + 1500 > hard_token_limit:
+            warnings.append(f"补读{source_id}受上下文预算限制：来源尚未装入，必要审核不能按通过处理。")
+            continue
+        added_tokens += tokens
         sections.append(ContextSection(key=f"repair-{number}", title=f"定向补读第{number}章正史",
             content=text, source_ids=[source_id], hard=True))
+    loaded = packet_sources(packet.model_copy(update={"sections": sections}))
     sections.append(ContextSection(key="review-source-catalog", title="审核资料可用性与补读入口",
-        content=json_dumps({"已装入": sorted(packet_sources(packet)), "可申请前章原文": catalog,
+        content=json_dumps({"已装入": sorted(loaded), "可申请前章原文": catalog[-120:], "已接受前章总数": len(catalog),
             "当前规划文件": {name: "已装入" if name in existing else "缺失或未装入"
                 for name in ("OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md")},
-            "缺口处理": "只在缺关键资料时填写 missing_source_ids。引擎限次补读，资料问题不交 Writer 改稿。"}), hard=True))
+            "缺口处理": "知道来源时填missing_source_ids；不知哪章时填短source_queries。引擎先检索正文、事实和伏笔并补读，再限次同角色复核；未命中不证明不存在，资料问题不交Writer改稿。"}), hard=True))
     return packet.model_copy(update={"sections": sections,
-        "estimated_tokens": packet.estimated_tokens + sum(estimate_tokens(item.content) for item in sections[len(packet.sections):])})
+        "warnings": list(dict.fromkeys(warnings)),
+        "estimated_tokens": base_tokens + added_tokens + estimate_tokens(sections[-1].content)})
 
 
 def _merge_claim_decisions(
@@ -7437,6 +8039,8 @@ def _merge_claim_decisions(
                 verdict=verdict,
                 confidence=min((item.confidence for item in available), default=0.0),
                 reason="；".join(item.reason for item in available) or "核验器未返回结果",
+                conflict_type=available[0].conflict_type if available else "insufficient",
+                resolution_evidence=available[0].resolution_evidence if available else "",
             )
         )
     return merged
@@ -8296,8 +8900,8 @@ def _deterministic_audit(
     comma_dense_sentences = sum(1 for item in sentences if item.count("，") + item.count(",") >= 4)
     non_terminal_punctuation = sum(content.count(mark) for mark in ("，", ",", "；", ";", "：", ":", "—", "…", "（", "）", "(", ")"))
     unquoted_speech_cues = re.findall(
-        r"(?:说|问|喊|答|应|开口|嘟囔|念叨|招呼)[^。！？\n]{0,12}：\s*(?![“「])[^\n]+",
-        content,
+        r"(?:说|问|喊|答|应|开口|嘟囔|念叨|招呼)(?:道|着|了(?:一声|一句)?|一句|一声)?：[ \t]*(?![“「])[^\n]+",
+        re.sub(r"“[^”]*”|「[^」]*」", lambda match: match.group()[0] + match.group()[-1], content),
     )
     metrics = {
         "content_characters": char_count,

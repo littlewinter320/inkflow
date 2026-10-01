@@ -35,6 +35,8 @@ MODE_CHECK_OWNERS: Mapping[CollaborationMode, Mapping[str, AgentRole]] = Mapping
         "expression": "editor", "logic_continuity": "reviewer", "memory": "memory_keeper"
     }),
 })
+# Keep deep's original owners only for frozen tasks and historical records.
+ACTIVE_COLLABORATION_MODES = tuple(mode for mode in MODE_ROLES if mode != "deep")
 _LEGACY_EDITOR_NAMES = frozenset({"reviewer", "reviewer_verifier", "reviewer_judge"})
 
 
@@ -70,6 +72,12 @@ def check_owners_for_mode(mode: str) -> dict[str, AgentRole]:
     """Return an independent copy of the mode's unique check ownership."""
     roles_for_mode(mode)
     return dict(MODE_CHECK_OWNERS[cast(CollaborationMode, mode)])
+
+
+def new_task_mode(mode: str) -> CollaborationMode:
+    """Merge the retired name before freezing a new task; never rewrite old snapshots."""
+    roles_for_mode(mode)
+    return cast(CollaborationMode, "memory_boost" if mode == "deep" else mode)
 
 
 def migrate_role_settings(

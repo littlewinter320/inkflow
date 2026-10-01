@@ -92,6 +92,6 @@ def outline_sections(root: Path, start: int | None = None, end: int | None = Non
                 key=key, title=title,
                 content=path.read_text(encoding="utf-8"),
                 source_ids=[name], hard=True,
-                cache_scope="chapter" if key == "O2" else "book",
+                cache_scope="book",
             ))
     return result

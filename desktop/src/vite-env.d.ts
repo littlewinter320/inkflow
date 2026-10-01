@@ -5,6 +5,8 @@ type InkFlowEvent = Record<string, unknown>;
 interface Window {
   inkflow: {
     request<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>;
+    openConversationWindow(projectRoot: string, conversationId?: string): Promise<{ conversationId: string }>;
+    conversationWindows(projectRoot: string): Promise<Array<{ conversationId: string; projectRoot: string; openedAt: string }>>;
     confirm(message: string): Promise<boolean>;
     chooseFolder(title: string): Promise<string | null>;
     recentProjects(): Promise<Array<{ root: string; title: string; openedAt: string }>>;
@@ -18,7 +20,7 @@ interface Window {
     audioUrl(target: string): Promise<string>;
     openPath(target: string): Promise<string>;
     showItem(target: string): Promise<void>;
-    launchContext(): Promise<{ projectRoot: string | null }>;
+    launchContext(): Promise<{ projectRoot: string | null; conversationId: string }>;
     updateStatus(): Promise<InkFlowEvent>;
     checkUpdate(): Promise<InkFlowEvent>;
     downloadUpdate(): Promise<InkFlowEvent>;
