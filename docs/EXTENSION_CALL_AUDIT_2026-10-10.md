@@ -2,6 +2,8 @@
 
 日期：2026-10-10。依据为当前工作树中的 `extension/src/extension.ts`、`extension/src/controlHtml.ts`、`extension/package.json`、`agent/src/inkflow/app_server.py`、`config.py`、`provider.py`。这是扩展补完前的静态调用审计和对接依据，没有读取用户小说、发送模型请求、安装软件或验证实际服务商连接。后续实现与构建证据另行记录。
 
+本页所列界面及调用缺口为改造前观察；API 导入、连接检查、任务状态、脱敏与日志入口已纳入 0.7.4。实现和离线检查见 [扩展工作台记录](EXTENSION_WORKBENCH_2026-10-10.md)，最终附件与发布证据见 [0.7.4 发布记录](RELEASE_0.7.4.md)。
+
 ## 直接复用的后台接口
 
 | RPC | 输入 | 返回 / 行为 |
