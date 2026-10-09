@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import json
 from typing import Any
 
 from .schemas import ContextPacket, ReviewClaimDecision, ReviewFinding, ReviewReport
@@ -22,6 +23,25 @@ _SAME_CHAPTER_CONFLICT_NOTE = "本章双处逐字引文待核"
 def packet_sources(packet: ContextPacket) -> dict[str, str]:
     sources: dict[str, str] = {}
     for section in packet.sections:
+        if section.key == "F0" or (section.key == "F" and section.title == "分层混合检索结果"):
+            try:
+                payload = json.loads(section.content)
+            except ValueError:
+                # A compressed or damaged index is not evidence for every ID it once listed.
+                continue
+            entries = payload.get("自适应结果", []) if isinstance(payload, dict) else payload
+            indexed = {str(item["source_id"]): item for item in entries if isinstance(item, dict)
+                       and item.get("source_id") and isinstance(item.get("body"), str)}
+            for ref in section.source_ids:
+                if ref in indexed:
+                    sources[ref] = sources.get(ref, "") + "\n" + str(indexed[ref]["body"])
+            continue
+        if section.key.startswith("reference-recovery-"):
+            payload = json.loads(section.content)
+            for ref in section.source_ids:
+                if ref == payload.get("source_id"):
+                    sources[ref] = sources.get(ref, "") + "\n" + str(payload["body"])
+            continue
         chapter_chunks: dict[int, str] = {}
         matches = list(re.finditer(r"(?m)^### .*?第\s*(\d+)\s*章[^\n]*\n", section.content))
         for index, match in enumerate(matches):

@@ -2,28 +2,54 @@
   "name": "inkflow-vscode",
   "displayName": "inkflow墨流",
   "description": "墨流中文长篇小说创作工作台",
-  "version": "0.7.2",
+  "version": "0.7.4",
   "publisher": "inkflow",
   "license": "MIT",
   "icon": "media/mobao.png",
   "pricing": "Free",
-  "galleryBanner": { "color": "#181a14", "theme": "dark" },
+  "galleryBanner": {
+    "color": "#181a14",
+    "theme": "dark"
+  },
   "homepage": "https://github.com/littlewinter320/inkflow#readme",
-  "bugs": { "url": "https://github.com/littlewinter320/inkflow/issues" },
+  "bugs": {
+    "url": "https://github.com/littlewinter320/inkflow/issues"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/littlewinter320/inkflow.git"
   },
-  "engines": { "vscode": "^1.100.0" },
-  "categories": ["Other", "Machine Learning"],
-  "keywords": ["小说", "网文", "写作", "中文写作", "人工智能", "novel", "writing", "agent", "mcp"],
-  "activationEvents": ["workspaceContains:.inkflow/project.json", "onView:inkflow.control", "onView:inkflow.explorer"],
-  "extensionKind": ["workspace"],
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "小说",
+    "网文",
+    "写作",
+    "中文写作",
+    "人工智能",
+    "novel",
+    "writing",
+    "agent",
+    "mcp"
+  ],
+  "activationEvents": [
+    "workspaceContains:.inkflow/project.json",
+    "onView:inkflow.control",
+    "onView:inkflow.explorer"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
   "main": "./dist/extension.js",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js",
-    "package": "npm run build && vsce package --no-dependencies -o D:/墨流/release/0.7.2/extension/inkflow-vscode-0.7.2.vsix"
+    "package": "npm run build && vsce package --no-dependencies -o D:/墨流/release/0.7.4/extension/inkflow-vscode-0.7.4.vsix"
   },
   "dependencies": {
     "jsonc-parser": "^3.3.1"
@@ -38,49 +64,210 @@
   "contributes": {
     "viewsContainers": {
       "activitybar": [
-        { "id": "inkflow", "title": "墨流", "icon": "media/inkflow.svg" }
+        {
+          "id": "inkflow",
+          "title": "墨流",
+          "icon": "media/inkflow.svg"
+        }
       ]
     },
     "views": {
       "inkflow": [
-        { "id": "inkflow.control", "name": "创作主控", "type": "webview" },
-        { "id": "inkflow.explorer", "name": "小说结构" }
+        {
+          "id": "inkflow.control",
+          "name": "创作主控",
+          "type": "webview"
+        },
+        {
+          "id": "inkflow.explorer",
+          "name": "小说结构"
+        }
       ]
     },
     "commands": [
-      { "command": "inkflow.refresh", "title": "墨流：刷新小说树", "icon": "$(refresh)" },
-      { "command": "inkflow.ask", "title": "墨流：自然语言讨论或安排任务", "icon": "$(comment-discussion)" },
-      { "command": "inkflow.generatePlan", "title": "墨流：生成四级规划", "icon": "$(map)" },
-      { "command": "inkflow.writeChapter", "title": "墨流：写当前章节草稿", "icon": "$(edit)" },
-      { "command": "inkflow.acceptChapter", "title": "墨流：验收当前章节进入正史", "icon": "$(check)" },
-      { "command": "inkflow.configureMcp", "title": "墨流：为当前工作区配置 MCP" },
-      { "command": "inkflow.commentSelection", "title": "墨流：批注选中文字" },
-      { "command": "inkflow.reviseSelection", "title": "墨流：让写作角色修订选中文字" },
-      { "command": "inkflow.reviewChapter", "title": "墨流：让审查角色检查当前章节" },
-      { "command": "inkflow.openStatus", "title": "墨流：打开项目状态" },
-      { "command": "inkflow.createCheckpoint", "title": "墨流：创建安全检查点" },
-      { "command": "inkflow.openTaskHistory", "title": "墨流：查看任务记录" },
-      { "command": "inkflow.openDesktop", "title": "墨流：在桌面版中打开" }
+      {
+        "command": "inkflow.refresh",
+        "title": "墨流：刷新小说树",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "inkflow.ask",
+        "title": "墨流：自然语言讨论或安排任务",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "inkflow.generatePlan",
+        "title": "墨流：生成三层规划",
+        "icon": "$(map)"
+      },
+      {
+        "command": "inkflow.writeChapter",
+        "title": "墨流：写当前章节草稿",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "inkflow.acceptChapter",
+        "title": "墨流：验收当前章节进入正史",
+        "icon": "$(check)"
+      },
+      {
+        "command": "inkflow.configureMcp",
+        "title": "墨流：为当前工作区配置 MCP"
+      },
+      {
+        "command": "inkflow.commentSelection",
+        "title": "墨流：批注选中文字"
+      },
+      {
+        "command": "inkflow.reviseSelection",
+        "title": "墨流：让写作角色修订选中文字"
+      },
+      {
+        "command": "inkflow.reviewChapter",
+        "title": "墨流：让审查角色检查当前章节"
+      },
+      {
+        "command": "inkflow.openStatus",
+        "title": "墨流：打开项目状态"
+      },
+      {
+        "command": "inkflow.createCheckpoint",
+        "title": "墨流：创建安全检查点"
+      },
+      {
+        "command": "inkflow.openTaskHistory",
+        "title": "墨流：查看任务记录"
+      },
+      {
+        "command": "inkflow.openDesktop",
+        "title": "墨流：在桌面版中打开"
+      },
+      {
+        "command": "inkflow.configureApi",
+        "title": "墨流：配置模型 API",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "inkflow.importApi",
+        "title": "墨流：导入第三方 API 配置",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "inkflow.checkConnection",
+        "title": "墨流：检查模型连接（可能计费）",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "inkflow.diagnostics",
+        "title": "墨流：查看引擎与接口诊断",
+        "icon": "$(debug-alt)"
+      },
+      {
+        "command": "inkflow.copyDiagnostics",
+        "title": "墨流：复制脱敏诊断",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "inkflow.showOutput",
+        "title": "墨流：打开运行输出与失败日志",
+        "icon": "$(output)"
+      },
+      {
+        "command": "inkflow.resumeTask",
+        "title": "墨流：继续未完成任务",
+        "icon": "$(debug-continue)"
+      },
+      {
+        "command": "inkflow.attachFile",
+        "title": "墨流：附加当前文件到对话",
+        "icon": "$(file-text)"
+      },
+      {
+        "command": "inkflow.attachSelection",
+        "title": "墨流：附加选区到对话",
+        "icon": "$(selection)"
+      }
     ],
     "menus": {
       "view/title": [
-        { "command": "inkflow.ask", "when": "view == inkflow.control", "group": "navigation@1" },
-        { "command": "inkflow.refresh", "when": "view == inkflow.control", "group": "navigation@2" },
-        { "command": "inkflow.refresh", "when": "view == inkflow.explorer", "group": "navigation" },
-        { "command": "inkflow.configureMcp", "when": "view == inkflow.explorer", "group": "navigation" },
-        { "command": "inkflow.createCheckpoint", "when": "view == inkflow.explorer", "group": "navigation" },
-        { "command": "inkflow.openTaskHistory", "when": "view == inkflow.explorer", "group": "navigation" }
+        {
+          "command": "inkflow.ask",
+          "when": "view == inkflow.control",
+          "group": "navigation@1"
+        },
+        {
+          "command": "inkflow.refresh",
+          "when": "view == inkflow.control",
+          "group": "navigation@2"
+        },
+        {
+          "command": "inkflow.refresh",
+          "when": "view == inkflow.explorer",
+          "group": "navigation"
+        },
+        {
+          "command": "inkflow.configureMcp",
+          "when": "view == inkflow.explorer",
+          "group": "navigation"
+        },
+        {
+          "command": "inkflow.createCheckpoint",
+          "when": "view == inkflow.explorer",
+          "group": "navigation"
+        },
+        {
+          "command": "inkflow.openTaskHistory",
+          "when": "view == inkflow.explorer",
+          "group": "navigation"
+        },
+        {
+          "command": "inkflow.configureApi",
+          "when": "view == inkflow.control",
+          "group": "navigation@3"
+        },
+        {
+          "command": "inkflow.diagnostics",
+          "when": "view == inkflow.control",
+          "group": "inkflow@1"
+        },
+        {
+          "command": "inkflow.showOutput",
+          "when": "view == inkflow.control",
+          "group": "inkflow@2"
+        }
       ],
       "editor/context": [
-        { "command": "inkflow.commentSelection", "when": "editorHasSelection && resourceExtname == .md", "group": "inkflow@1" },
-        { "command": "inkflow.reviseSelection", "when": "editorHasSelection && resourceExtname == .md", "group": "inkflow@2" },
-        { "command": "inkflow.reviewChapter", "when": "resourceFilename =~ /chapter_\\d+.*\\.md/", "group": "inkflow@3" }
+        {
+          "command": "inkflow.commentSelection",
+          "when": "editorHasSelection && resourceExtname == .md",
+          "group": "inkflow@1"
+        },
+        {
+          "command": "inkflow.reviseSelection",
+          "when": "editorHasSelection && resourceExtname == .md",
+          "group": "inkflow@2"
+        },
+        {
+          "command": "inkflow.reviewChapter",
+          "when": "resourceFilename =~ /chapter_\\d+.*\\.md/",
+          "group": "inkflow@3"
+        },
+        {
+          "command": "inkflow.attachSelection",
+          "when": "editorHasSelection && resourceExtname == .md && inkflow.project",
+          "group": "inkflow@0"
+        },
+        {
+          "command": "inkflow.attachFile",
+          "when": "resourceExtname == .md && inkflow.project",
+          "group": "inkflow@4"
+        }
       ]
     },
     "viewsWelcome": [
       {
         "view": "inkflow.explorer",
-        "contents": "请先打开包含 `.inkflow/project.json` 的墨流小说项目。\n[打开项目文件夹](command:workbench.action.files.openFolder)\n[打开墨流桌面版](command:inkflow.openDesktop)",
+        "contents": "请先打开包含 `.inkflow/project.json` 的墨流小说项目。\n[打开项目文件夹](command:workbench.action.files.openFolder)\n[打开墨流桌面版](command:inkflow.openDesktop)\n[导入第三方模型 API](command:inkflow.importApi)\n[查看接口与引擎诊断](command:inkflow.diagnostics)",
         "when": "!inkflow.project"
       }
     ],
@@ -90,10 +277,46 @@
         "title": "开始使用墨流",
         "description": "从打开项目到完成一章的中文长篇创作流程。",
         "steps": [
-          { "id": "open", "title": "打开墨流小说项目", "description": "先用桌面版新建小说，或打开已有的墨流项目文件夹。", "media": { "markdown": "media/walkthrough-open.md" } },
-          { "id": "plan", "title": "生成四级规划", "description": "先由 Coordinator 理解方向，再安排生成全书、卷、篇章和章节卡。", "media": { "markdown": "media/walkthrough-plan.md" } },
-          { "id": "draft", "title": "写作与审查", "description": "写作角色生成草稿，审查角色给出证据与扣分；你确认后才进入正史。", "media": { "markdown": "media/walkthrough-draft.md" } },
-          { "id": "connect", "title": "连接编程助手", "description": "把墨流合并到当前工作区的 MCP 配置，用自然语言调用同一套引擎。", "media": { "markdown": "media/walkthrough-connect.md" } }
+          {
+            "id": "api",
+            "title": "导入并检查模型 API",
+            "description": "[导入第三方 JSON/JSONC 配置](command:inkflow.importApi)，预览并保存后，再[检查连接](command:inkflow.checkConnection)。检查会发短模型请求，可能计费；不需要先打开小说。",
+            "media": {
+              "markdown": "media/walkthrough-api.md"
+            }
+          },
+          {
+            "id": "open",
+            "title": "打开墨流小说项目",
+            "description": "先用桌面版新建小说，或打开已有的墨流项目文件夹。",
+            "media": {
+              "markdown": "media/walkthrough-open.md"
+            }
+          },
+          {
+            "id": "plan",
+            "title": "生成三层规划",
+            "description": "先由 Coordinator 理解方向，再安排生成全书大纲、卷与篇章细纲、近期章节规划。",
+            "media": {
+              "markdown": "media/walkthrough-plan.md"
+            }
+          },
+          {
+            "id": "draft",
+            "title": "写作与审查",
+            "description": "写作角色生成草稿，审查角色给出证据与扣分；你确认后才进入正史。",
+            "media": {
+              "markdown": "media/walkthrough-draft.md"
+            }
+          },
+          {
+            "id": "connect",
+            "title": "连接编程助手",
+            "description": "把墨流合并到当前工作区的 MCP 配置，用自然语言调用同一套引擎。",
+            "media": {
+              "markdown": "media/walkthrough-connect.md"
+            }
+          }
         ]
       }
     ],
@@ -103,12 +326,14 @@
         "inkflow.enginePath": {
           "type": "string",
           "default": "",
-          "description": "可选：inkflow-engine.exe 的完整路径。留空时自动寻找桌面版或工作区 Python 环境。"
+          "description": "可选：inkflow-engine.exe 的完整路径。留空时自动寻找桌面版或工作区 Python 环境。",
+          "scope": "machine"
         },
         "inkflow.pythonPath": {
           "type": "string",
           "default": "",
-          "description": "可选：用于运行 inkflow.app_server 的 Python 路径。"
+          "description": "可选：用于运行 inkflow.app_server 的 Python 路径。",
+          "scope": "machine"
         },
         "inkflow.revealCharactersPerSecond": {
           "type": "number",
@@ -118,6 +343,16 @@
           "description": "对话答复逐字淡入速度。开启系统“减少动态效果”时会立即显示。"
         }
       }
+    }
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "未受信任时只展示界面；不启动本地引擎、不读取密钥或改写配置。",
+      "restrictedConfigurations": [
+        "inkflow.enginePath",
+        "inkflow.pythonPath"
+      ]
     }
   }
 }

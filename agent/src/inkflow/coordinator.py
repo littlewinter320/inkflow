@@ -1,11 +1,11 @@
-"""Bounded workflow plans for legacy and five-role task snapshots."""
+"""Bounded workflow plans with one role contract and frozen task settings."""
 from __future__ import annotations
 
 import re
 from uuid import uuid4
 
 from .project import InkFlowProject
-from .role_protocol import CollaborationMode, check_owners_for_mode, normalize_role, roles_for_mode
+from .role_protocol import CollaborationMode, check_owners_for_mode, new_task_mode, roles_for_mode
 from .schemas import BookBrief, DispatchPlan, DispatchStep, RoleCapability, TaskTicket, TerminalIntent
 
 
@@ -24,7 +24,7 @@ ROLE_CAPABILITIES: tuple[RoleCapability, ...] = (
     RoleCapability(
         role="coordinator",
         novel_production_agent=False,
-        can=["理解多样自然语言", "合并补充说明", "拆解任务", "选择与切换预定义工作流", "提出最小澄清", "汇总分歧", "通过 Novel Engine 请求白名单设置变更"],
+        can=["理解多样自然语言", "合并补充说明", "拆解任务", "识别进度和待处理事项并安排关联任务", "新增优化先询问用户", "选择与切换预定义工作流", "提出最小澄清", "汇总分歧", "通过 Novel Engine 请求白名单设置变更"],
         cannot=["写正文", "审查正文", "提交正史", "直接写设置文件或数据库", "绕过引擎门禁", "自行扩权"],
     ),
     RoleCapability(
@@ -33,18 +33,6 @@ ROLE_CAPABILITIES: tuple[RoleCapability, ...] = (
         can=["规划", "写作", "按证据定点修订"],
         cannot=["批准自己的正文", "写入正史", "修改审核规则"],
     ),
-    RoleCapability(
-        role="reviewer",
-        novel_production_agent=True,
-        can=["审读正文", "给出定点修订建议", "复审新版本", "产出同版本记忆更新候选"],
-        cannot=["直接修改正文", "写入正史", "批准未审版本"],
-    ),
-)
-
-# Capability declarations are informational; plans and engine gates authorize calls.
-ROLE_CAPABILITIES_V2: tuple[RoleCapability, ...] = (
-    ROLE_CAPABILITIES[0],
-    ROLE_CAPABILITIES[1],
     RoleCapability(
         role="editor", novel_production_agent=True,
         can=["日常综合审读", "给出定点修订建议", "复审同版本正文", "仅在承担记忆职责时产出记忆候选"],
@@ -64,6 +52,7 @@ ROLE_CAPABILITIES_V2: tuple[RoleCapability, ...] = (
 
 
 _WORKFLOWS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
+    "pending_work": (("engine", "work.pending", "", "待处理事项、关联任务与用户处理选择"),),
     "status": (("engine", "status.read", "", "项目状态"),),
     "help": (("engine", "help.read", "", "使用说明"),),
     "plan": (("writer", "plan.generate", "", "四级规划"),),
@@ -89,27 +78,27 @@ _WORKFLOWS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
     "revise_selection": (("writer", "chapter.revise_selection", "", "指定选区的替换候选"),),
     "write_review": (
         ("writer", "chapter.write", "", "章节草稿"),
-        ("reviewer", "chapter.review", "step-1", "证据化审查报告"),
+        ("engine", "chapter.review_mode", "step-1", "证据化审查报告"),
     ),
     "write_review_accept": (
         ("writer", "chapter.write", "", "章节草稿"),
-        ("reviewer", "chapter.review", "step-1", "当前版本审查报告"),
+        ("engine", "chapter.review_mode", "step-1", "当前版本审查报告"),
         ("engine", "chapter.accept", "step-2", "正史记忆补丁与提交结果"),
     ),
-    "review": (("reviewer", "chapter.review", "", "证据化审查报告"),),
+    "review": (("engine", "chapter.review_mode", "", "证据化审查报告"),),
     "revise_draft": (("writer", "chapter.revise", "", "新草稿版本"),),
     "repair_accepted": (("engine", "chapter.repair_accepted", "", "正史疑点诊断、局部候选与复核结果"),),
     "revise_review": (
         ("writer", "chapter.revise", "", "新草稿版本"),
-        ("reviewer", "chapter.review", "step-1", "新版本审查报告"),
+        ("engine", "chapter.review_mode", "step-1", "新版本审查报告"),
     ),
     "review_accept": (
-        ("reviewer", "chapter.review", "", "当前版本审查报告"),
+        ("engine", "chapter.review_mode", "", "当前版本审查报告"),
         ("engine", "chapter.accept", "step-1", "正史记忆补丁与提交结果"),
     ),
     "revise_review_accept": (
         ("writer", "chapter.revise", "", "新草稿版本"),
-        ("reviewer", "chapter.review", "step-1", "新版本审查报告"),
+        ("engine", "chapter.review_mode", "step-1", "新版本审查报告"),
         ("engine", "chapter.accept", "step-2", "正史记忆补丁与提交结果"),
     ),
     "accept": (("engine", "chapter.accept", "", "正史记忆补丁与提交结果"),),
@@ -142,15 +131,11 @@ _REVIEW_ACTIONS = frozenset({
 
 
 def _mode_template(
-    action: str, protocol_version: int, collaboration_mode: CollaborationMode = "everyday"
+    action: str, collaboration_mode: CollaborationMode = "everyday"
 ) -> tuple[tuple[str, str, str, str], ...]:
     template = _WORKFLOWS[action]
-    if protocol_version == 1:
-        return template
     return tuple(
-        ("engine", "chapter.review_mode", dependency, output)
-        if role == "reviewer" and operation == "chapter.review"
-        else ("editor" if collaboration_mode == "everyday" else "reviewer", operation, dependency, output)
+        (check_owners_for_mode(collaboration_mode).get("logic_continuity", "editor"), operation, dependency, output)
         if operation == "arc.audit"
         else (role, operation, dependency, output)
         for role, operation, dependency, output in template
@@ -279,23 +264,21 @@ class Coordinator:
         return intent.model_copy(update=updates)
 
     def compile(
-        self, intent: TerminalIntent, *, role_protocol_version: int = 1,
+        self, intent: TerminalIntent, *, role_protocol_version: int | None = None,
         collaboration_mode: CollaborationMode = "everyday",
         task_snapshot_hash: str | None = None,
     ) -> tuple[TaskTicket, DispatchPlan]:
         if intent.user_message:
             intent = self.normalize_intent(intent, intent.user_message)
-        normalize_role("coordinator", role_protocol_version)
+        collaboration_mode = new_task_mode(collaboration_mode)
         roles_for_mode(collaboration_mode)
-        if role_protocol_version == 1 and collaboration_mode != "everyday":
-            raise ValueError("旧角色协议只支持日常模式")
-        if role_protocol_version == 2 and not task_snapshot_hash:
-            raise ValueError("五角色计划必须绑定已冻结的任务配置快照")
-        template = _mode_template(intent.action, role_protocol_version, collaboration_mode)
+        if not task_snapshot_hash:
+            raise ValueError("工作流计划必须绑定已冻结的任务配置快照")
+        template = _mode_template(intent.action, collaboration_mode)
         steps: list[DispatchStep] = []
         for index, (role, operation, dependency, output) in enumerate(template, 1):
             gate = ""
-            if role_protocol_version == 2 and operation == "chapter.review_mode":
+            if operation == "chapter.review_mode":
                 gate = "引擎按模式执行独占检查责任；同版本结果汇合并校验覆盖、记忆、权限和预算"
             elif operation == "scene.draft":
                 gate = "仅 Writer 生成隔离草稿；不审查、不验收、不写正史"
@@ -305,10 +288,10 @@ class Coordinator:
                 gate = "先冻结目标选区与来源版本；Writer 仅返回该范围替换候选"
             elif operation == "chapter.repair_accepted":
                 gate = "仅最新已接受章的可定位疑点；审读诊断、Writer 单处补句、独立复核、保留旧版并校验版本后提交"
-            elif role == "reviewer":
-                gate = "旧协议 reviewer 执行综合 Editor 审查；必须绑定当前章节版本并引用证据"
+            elif role in {"editor", "reviewer", "memory_keeper"}:
+                gate = "仅完成当前模式分配的责任；必须绑定来源版本并引用证据"
             elif operation == "chapter.accept":
-                gate = "仅当前版本 Editor 审查通过且用户授权后执行；force=false"
+                gate = "仅当前版本满足本次模式的全部必需审查、记忆候选及用户接受授权后提交；force=false"
             elif operation in {"chapter.write", "batch.draft_loop", "chapter.gated_loop"}:
                 gate = "缺卡先在已授权范围内由 Writer 补必要近期计划；不改旧卡或正史，依据缺失不猜写"
             steps.append(
@@ -324,11 +307,10 @@ class Coordinator:
         chapter = self.project.db.get_chapter(intent.chapter_no) if intent.chapter_no else None
         chapter_count = max(1, (intent.end_chapter_no or intent.chapter_no or 1) - (intent.chapter_no or 1) + 1)
         estimated_calls = self._model_call_budget(intent, chapter_count)
-        if role_protocol_version == 2 and intent.action in _REVIEW_ACTIONS:
+        if intent.action in _REVIEW_ACTIONS:
             role_count = len(set(check_owners_for_mode(collaboration_mode).values()))
             estimated_calls = min(100, max(estimated_calls, role_count * 6 * chapter_count))
         ticket = TaskTicket(
-            role_protocol_version=role_protocol_version,
             collaboration_mode=collaboration_mode,
             task_snapshot_hash=task_snapshot_hash,
             ticket_id=f"ticket-{uuid4().hex}",
@@ -336,6 +318,7 @@ class Coordinator:
             user_message=intent.user_message,
             task_revision=intent.task_revision,
             related_task_id=intent.related_task_id,
+            pending_work_id=intent.pending_work_id,
             pending_question_id=intent.pending_question_id,
             response_kind=intent.response_kind,
             narrative_scope=intent.narrative_scope,
@@ -351,7 +334,7 @@ class Coordinator:
             hard_constraints=[
                 "用户当前明确指令优先，但不能绕过正史和安全门禁",
                 "旧审查不能批准新版本",
-                "旧协议 reviewer 是综合 Editor；Editor 不修改正文",
+                "Editor、Reviewer 与 Memory Keeper 按模式分工；审查角色不直接修改正文",
                 "记忆服务 不读取未批准草稿写正史",
                 "最多两轮 Agent 方向讨论，仍有分歧则交给用户",
                 "用户表达方式不绑定固定命令；同一目标允许多条合理实现路径",
@@ -372,26 +355,25 @@ class Coordinator:
             acceptance_confirmation_mode=intent.acceptance_confirmation_mode,
         )
         plan = DispatchPlan(
-            role_protocol_version=role_protocol_version,
             collaboration_mode=collaboration_mode,
             task_snapshot_hash=task_snapshot_hash,
             required_checks=(
                 list(check_owners_for_mode(collaboration_mode))
-                if role_protocol_version == 2 and intent.action in _REVIEW_ACTIONS else []
+                if intent.action in _REVIEW_ACTIONS else []
             ),
             check_owners=(
                 check_owners_for_mode(collaboration_mode)
-                if role_protocol_version == 2 and intent.action in _REVIEW_ACTIONS else {}
+                if intent.action in _REVIEW_ACTIONS else {}
             ),
             memory_owner=(
                 check_owners_for_mode(collaboration_mode)["memory"]
-                if role_protocol_version == 2 and intent.action in _REVIEW_ACTIONS else None
+                if intent.action in _REVIEW_ACTIONS else None
             ),
-            return_to_base=role_protocol_version == 2 and collaboration_mode != "everyday",
+            return_to_base=collaboration_mode != "everyday",
             workflow=intent.action,
             steps=steps,
             parallel=(
-                role_protocol_version == 2 and collaboration_mode in {"review_boost", "full_specialist"}
+                collaboration_mode in {"review_boost", "full_specialist"}
                 and any(item.operation in {"chapter.review_mode", "batch.draft_loop", "batch.repair_loop", "chapter.gated_loop"} for item in steps)
             ),
             stop_conditions=[
@@ -407,53 +389,47 @@ class Coordinator:
 
     @staticmethod
     def validate(plan: DispatchPlan, ticket: TaskTicket | None = None) -> None:
-        normalize_role("coordinator", plan.role_protocol_version)
         allowed_roles = roles_for_mode(plan.collaboration_mode)
-        if plan.role_protocol_version == 1 and plan.collaboration_mode != "everyday":
-            raise ValueError("旧角色协议只支持日常模式")
-        if plan.role_protocol_version == 2 and not plan.task_snapshot_hash:
-            raise ValueError("五角色计划缺少任务配置快照")
+        if not plan.task_snapshot_hash:
+            raise ValueError("工作流计划缺少任务配置快照")
         template = _WORKFLOWS.get(plan.workflow)
         if template is None:
             raise ValueError("Coordinator 只能选择预定义工作流")
-        allowed = _mode_template(plan.workflow, plan.role_protocol_version, plan.collaboration_mode)
+        allowed = _mode_template(plan.workflow, plan.collaboration_mode)
         actual = [(item.role, item.operation, item.depends_on, item.required_output) for item in plan.steps]
         expected = [(role, operation, [dependency] if dependency else [], output)
                     for role, operation, dependency, output in allowed]
         expected_parallel = (
-            plan.role_protocol_version == 2 and plan.collaboration_mode in {"review_boost", "full_specialist"}
+            plan.collaboration_mode in {"review_boost", "full_specialist"}
             and any(operation in {"chapter.review_mode", "batch.draft_loop", "batch.repair_loop", "chapter.gated_loop"}
                     for _, operation, _, _ in allowed)
         )
         if actual != expected or plan.parallel != expected_parallel:
             raise ValueError("Coordinator 调度计划超出固定能力边界")
-        if plan.role_protocol_version == 2 and any(
+        if any(
             item.role not in allowed_roles for item in plan.steps if item.role != "engine"
         ):
             raise ValueError("工作流包含当前协作模式未启用的角色")
         expected_checks = (
             check_owners_for_mode(plan.collaboration_mode)
-            if plan.role_protocol_version == 2 and plan.workflow in _REVIEW_ACTIONS else {}
+            if plan.workflow in _REVIEW_ACTIONS else {}
         )
         if (plan.required_checks != list(expected_checks)
                 or plan.check_owners != expected_checks
                 or plan.memory_owner != expected_checks.get("memory")
-                or plan.return_to_base != (plan.role_protocol_version == 2 and plan.collaboration_mode != "everyday")
+                or plan.return_to_base != (plan.collaboration_mode != "everyday")
                 or any(owner not in allowed_roles for owner in plan.check_owners.values())):
             raise ValueError("检查覆盖或记忆责任不符合协作模式")
         if ticket is not None:
-            if (ticket.role_protocol_version != plan.role_protocol_version
-                    or ticket.collaboration_mode != plan.collaboration_mode
+            if (ticket.collaboration_mode != plan.collaboration_mode
                     or ticket.task_snapshot_hash != plan.task_snapshot_hash
                     or ticket.max_model_calls < len(set(plan.check_owners.values()))
                     or ticket.max_tokens < ticket.max_model_calls):
                 raise ValueError("计划与任务快照或调用预算不一致")
 
     @staticmethod
-    def capabilities(protocol_version: int = 1) -> list[dict]:
-        normalize_role("coordinator", protocol_version)  # Reject unknown versions.
-        roles = ROLE_CAPABILITIES if protocol_version == 1 else ROLE_CAPABILITIES_V2
-        return [item.model_dump(mode="json") for item in roles]
+    def capabilities(protocol_version: int | None = None) -> list[dict]:
+        return [item.model_dump(mode="json") for item in ROLE_CAPABILITIES]
 
     @staticmethod
     def _input_sources(intent: TerminalIntent) -> list[str]:
@@ -472,10 +448,12 @@ class Coordinator:
 
     @staticmethod
     def _model_call_budget(intent: TerminalIntent, chapter_count: int) -> int:
-        if intent.action in {"status", "help", "plan_preview", "planning_history_view", "planning_history_restore", "planning_publish_reviewed", "checkpoint_list", "rollback_preview", "exit"}:
+        if intent.action in {"pending_work", "status", "help", "plan_preview", "planning_history_view", "planning_history_restore", "planning_publish_reviewed", "checkpoint_list", "rollback_preview", "exit"}:
             return 0
         if intent.action in {"discuss", "chat"}:
             return 1
+        if intent.action == "batch_repair" and intent.batch_review_only:
+            return min(100, chapter_count * 4)
         if intent.action in {"batch_draft", "batch_draft_accept", "batch_repair", "continue_run"}:
             return min(100, 1 + chapter_count * (4 + 4 * max(0, intent.max_revision_rounds)))
         if intent.action == "batch_accept":

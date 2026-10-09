@@ -1,14 +1,61 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .role_protocol import AgentRole, CollaborationMode
+from .role_protocol import AgentRole, CollaborationMode, ROLE_PROTOCOL_VERSION, adapt_role, new_task_mode
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class UnifiedRoleModel(StrictModel):
+    """Consume old role tags at input; serialized contracts contain only canonical roles."""
+
+    @property
+    def role_protocol_version(self) -> int:
+        return ROLE_PROTOCOL_VERSION
+
+    @model_validator(mode="before")
+    @classmethod
+    def adapt_role_input(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        label = result.pop("role_protocol_version", None)
+        if label is not None and (type(label) is not int or label not in {1, 2}):
+            raise ValueError("导入结构中的旧角色标签无效。")
+        legacy = label == 1
+        if "collaboration_mode" in result:
+            result["collaboration_mode"] = new_task_mode(result["collaboration_mode"])
+
+        def canonical_role(role: str) -> str:
+            return role if isinstance(role, str) and role in {"engine", "user"} else adapt_role(role, legacy=legacy)
+
+        for key in ("role", "memory_owner"):
+            if result.get(key) is not None:
+                result[key] = canonical_role(result[key])
+        if isinstance(result.get("check_owners"), dict):
+            result["check_owners"] = {check: canonical_role(role) for check, role in result["check_owners"].items()}
+        # Only schema-owned role structures are adapted; user setting_change/content remain verbatim.
+        for key, field in (("steps", "role"), ("coverage", "owner")):
+            if isinstance(result.get(key), list):
+                items = []
+                for raw in result[key]:
+                    item = raw.model_dump() if isinstance(raw, BaseModel) else dict(raw) if isinstance(raw, dict) else raw
+                    if isinstance(item, dict) and item.get(field) is not None:
+                        item[field] = canonical_role(item[field])
+                    items.append(item)
+                result[key] = items
+        for key in ("first", "second"):
+            raw = result.get(key)
+            item = raw.model_dump() if isinstance(raw, BaseModel) else dict(raw) if isinstance(raw, dict) else raw
+            if isinstance(item, dict) and item.get("role") is not None:
+                item["role"] = canonical_role(item["role"])
+                result[key] = item
+        return result
 
 
 class BookBrief(StrictModel):
@@ -363,6 +410,13 @@ class RollingChapterV2(StrictModel):
     chapter_no: int = Field(ge=1)
     title: str = Field(min_length=1, max_length=160)
     body: str = Field(min_length=200, max_length=700)
+    time_location: str = Field(default="", max_length=300)
+    goal: str = Field(default="", max_length=400)
+    obstacle: str = Field(default="", max_length=400)
+    decision: str = Field(default="", max_length=400)
+    consequence: str = Field(default="", max_length=400)
+    scenes: list[str] = Field(default_factory=list, max_length=8)
+    hook_question: str = Field(default="", max_length=300)
 
 
 class RollingPlanV2(StrictModel):
@@ -715,7 +769,43 @@ class ReviewAssessment(StrictModel):
     evidence_relation: EvidenceRelation = "unchecked"
 
 
-class ReviewReport(StrictModel):
+class PreferenceConflictSource(StrictModel):
+    preference_id: str = Field(min_length=1, max_length=180)
+    revision: int = Field(ge=0)
+    quote: str = Field(min_length=2, max_length=1000)
+
+
+class PreferenceConflict(StrictModel):
+    sources: list[PreferenceConflictSource] = Field(min_length=1, max_length=2)
+    current_task_quote: str = Field(default="", max_length=2000)
+    suggested_id: str = Field(default="", max_length=180)
+    reason: str = Field(min_length=4, max_length=600)
+
+
+class ReviewReferenceObservation(StrictModel):
+    """Optional evidence-bound reading notes; no independent score or release gate."""
+
+    aspect: str = Field(min_length=1, max_length=80)
+    observation: str = Field(min_length=1, max_length=800)
+    chapter_evidence: str = Field(default="", max_length=400)
+    source_id: str = Field(default="", max_length=160)
+    source_evidence: str = Field(default="", max_length=400)
+    alternative: str = Field(min_length=1, max_length=400)
+    reference_use: str = Field(min_length=1, max_length=400)
+
+
+class MemorySummaryRebuild(StrictModel):
+    """A same-call proposal to rebuild one stale summary from accepted full text."""
+
+    chapter_no: int = Field(ge=1)
+    source_version: int = Field(ge=1)
+    source_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    chapter_summary: str = Field(min_length=1, max_length=6_000)
+    evidence_quotes: list[Annotated[str, Field(min_length=2, max_length=1_200)]] = Field(min_length=1, max_length=6)
+
+
+class ReviewReport(UnifiedRoleModel):
+    preference_decisions: list[dict[str, Any]] = Field(default_factory=list, max_length=6)
     verdict: Literal["pass", "patch", "replan", "unknown"]
     confidence: float = Field(ge=0, le=1)
     model_self_confidence: float | None = Field(default=None, ge=0, le=1)
@@ -739,41 +829,15 @@ class ReviewReport(StrictModel):
     context_use_audit: ContextUseAudit = Field(default_factory=ContextUseAudit)
     focus_observation: ReviewFocusObservation = Field(default_factory=ReviewFocusObservation)
     source_comparisons: list[ReviewSourceComparison] = Field(default_factory=list)
+    reference_observations: list[ReviewReferenceObservation] = Field(default_factory=list, max_length=8)
     memory_patch: MemoryPatch | None = None
 
 
-class ReviewModelOutput(StrictModel):
-    """Only fields the Reviewer must generate; provenance and scores are deterministic."""
-
-    verdict: Literal["pass", "patch", "replan", "unknown"]
-    confidence: float = Field(ge=0, le=1)
-    assessments: list[ReviewAssessment] = Field(default_factory=list, max_length=6)
-    missing_source_ids: list[str] = Field(default_factory=list, max_length=6)
-    source_queries: list[str] = Field(default_factory=list, max_length=4)
-    writer_note_questions: list[str] = Field(default_factory=list, max_length=3)
-    approved_setting_proposals: list[int] = Field(default_factory=list, max_length=8)
-    source_comparisons: list[ReviewSourceComparison] = Field(default_factory=list, max_length=8)
-    summary: str = Field(min_length=1, max_length=2_000)
-    strengths: list[str] = Field(default_factory=list, max_length=8)
-    findings: list[ReviewFinding] = Field(default_factory=list, max_length=24)
-    hook_assessment: HookAssessment | None = None
-    context_use_audit: ContextUseAudit = Field(default_factory=ContextUseAudit)
-    focus_observation: ReviewFocusObservation = Field(default_factory=ReviewFocusObservation)
-    memory_patch: MemoryPatch | None = None
-
-    @model_validator(mode="after")
-    def passed_review_must_handoff_memory(self) -> "ReviewModelOutput":
-        """Keep a successful review and its memory handoff in one cacheable call."""
-
-        if self.verdict == "pass" and self.memory_patch is None:
-            raise ValueError("Reviewer 通过章节时必须同时填写 memory_patch，不能另起低命中率的补提取调用")
-        return self
-
-
-class ModeCheckOutput(StrictModel):
-    """V2 role-scoped model output; the engine owns role and source identity."""
+class ModeCheckOutput(UnifiedRoleModel):
+    """Unified role-scoped output; source identity and memory ownership belong to the engine."""
 
     verdict: Literal["pass", "patch", "unknown"]
+    preference_conflicts: list[PreferenceConflict] = Field(default_factory=list, max_length=3)
     confidence: float = Field(ge=0, le=1)
     assessments: list[ReviewAssessment] = Field(default_factory=list, max_length=6)
     missing_source_ids: list[str] = Field(default_factory=list, max_length=6)
@@ -781,11 +845,20 @@ class ModeCheckOutput(StrictModel):
     writer_note_questions: list[str] = Field(default_factory=list, max_length=3)
     setting_updates: list[SettingRecordProposal] = Field(default_factory=list, max_length=8)
     summary: str = Field(min_length=1, max_length=2_000)
+    strengths: list[str] = Field(default_factory=list, max_length=8)
     approved_setting_proposals: list[int] = Field(default_factory=list, max_length=8)
     findings: list[ReviewFinding] = Field(default_factory=list, max_length=24)
     focus_observation: ReviewFocusObservation = Field(default_factory=ReviewFocusObservation)
     source_comparisons: list[ReviewSourceComparison] = Field(default_factory=list, max_length=8)
+    reference_observations: list[ReviewReferenceObservation] = Field(default_factory=list, max_length=8)
+    source_summary_rebuilds: list[MemorySummaryRebuild] = Field(default_factory=list, max_length=6)
     memory_patch: MemoryPatch | None = None
+    hook_assessment: HookAssessment | None = None
+    context_use_audit: ContextUseAudit = Field(default_factory=ContextUseAudit)
+
+
+# Import-name compatibility only; no separate output contract or execution path.
+ReviewModelOutput = ModeCheckOutput
 
 
 class ReviewFindingBatch(StrictModel):
@@ -820,6 +893,7 @@ class ArcAuditReport(StrictModel):
     fulfilled_commitments: list[str] = Field(default_factory=list)
     deviations: list[ReviewFinding] = Field(default_factory=list)
     source_comparisons: list[ReviewSourceComparison] = Field(default_factory=list, max_length=8)
+    reference_observations: list[ReviewReferenceObservation] = Field(default_factory=list, max_length=8)
     future_impact: list[str] = Field(default_factory=list)
     body_repair_recommended: bool = False
     body_repair_scope: list[int] = Field(default_factory=list)
@@ -1051,9 +1125,7 @@ class RoleCapability(StrictModel):
     cannot: list[str]
 
 
-class TaskTicket(StrictModel):
-    # Missing version means the historical combined reviewer, not a specialist.
-    role_protocol_version: Literal[1, 2] = 1
+class TaskTicket(UnifiedRoleModel):
     collaboration_mode: CollaborationMode = "everyday"
     task_snapshot_hash: str | None = None
     ticket_id: str
@@ -1061,6 +1133,7 @@ class TaskTicket(StrictModel):
     user_message: str = ""
     task_revision: int = Field(default=1, ge=1)
     related_task_id: str | None = None
+    pending_work_id: str | None = None
     pending_question_id: str | None = None
     response_kind: Literal["new_task", "task_revision", "question_answer"] = "new_task"
     narrative_scope: Literal["none", "scene", "chapter", "batch"] = "none"
@@ -1096,8 +1169,7 @@ class DispatchStep(StrictModel):
     gate: str = ""
 
 
-class DispatchPlan(StrictModel):
-    role_protocol_version: Literal[1, 2] = 1
+class DispatchPlan(UnifiedRoleModel):
     collaboration_mode: CollaborationMode = "everyday"
     task_snapshot_hash: str | None = None
     required_checks: list[str] = Field(default_factory=list)
@@ -1146,10 +1218,9 @@ class ConflictAttempt(StrictModel):
     outcome: str = Field(min_length=1, max_length=1_000)
 
 
-class ConflictRecord(StrictModel):
+class ConflictRecord(UnifiedRoleModel):
     """One focused, versioned disagreement; not permission to bypass a gate."""
 
-    role_protocol_version: Literal[1, 2]
     conflict_id: str = Field(min_length=1)
     ticket_id: str = Field(min_length=1)
     task_revision: int = Field(ge=1)
@@ -1182,10 +1253,9 @@ class ConflictRecord(StrictModel):
         return self
 
 
-class ReviewResultBase(StrictModel):
+class ReviewResultBase(UnifiedRoleModel):
     """Validated envelope, not a direct model output or permission to accept prose."""
 
-    role_protocol_version: Literal[2] = 2
     role: Literal["editor", "reviewer"]
     sources: ResultSources
     verdict: Literal["pass", "revise", "insufficient_context"]
@@ -1229,10 +1299,8 @@ class ReviewerResult(ReviewResultBase):
     # No memory_patch: the specialist must not inherit the old Editor contract.
 
 
-class MemoryResult(StrictModel):
-    """Design-level envelope; current v2 model calls use ModeCheckOutput."""
-
-    role_protocol_version: Literal[2] = 2
+class MemoryResult(UnifiedRoleModel):
+    """Validated envelope; actual role model calls use the common ModeCheckOutput."""
     role: Literal["memory_keeper"] = "memory_keeper"
     sources: ResultSources
     status: Literal["ready", "conflict", "insufficient_context"]
@@ -1252,6 +1320,7 @@ class MemoryResult(StrictModel):
 
 
 TerminalAction = Literal[
+    "pending_work",
     "chat",
     "ideate",
     "discuss",
@@ -1303,18 +1372,48 @@ class PreferenceObservation(StrictModel):
     scope: str = "project"
     topic: str = ""
     explicit: bool = False
+    preference_id: str = Field(default="", max_length=180)
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+class CoordinatorRecoveryStep(StrictModel):
+    action: Literal["diagnose_dependencies", "review", "arc_audit", "batch_review", "ask_user", "development_fix"]
+    chapter_no: int | None = Field(default=None, ge=1)
+    end_chapter_no: int | None = Field(default=None, ge=1)
+    reason: str = Field(min_length=4, max_length=500)
+    evidence: str = Field(min_length=4, max_length=1000)
+    instruction: str = Field(default="", max_length=2000)
+
+
+class CoordinatorRecoveryPlan(StrictModel):
+    summary: str = Field(min_length=4, max_length=500)
+    steps: list[CoordinatorRecoveryStep] = Field(min_length=1, max_length=3)
+
+
+class PendingWorkProposal(StrictModel):
+    reason: str = Field(min_length=4, max_length=500)
+    evidence: str = Field(min_length=4, max_length=1000)
+    action: TerminalAction
+    chapter_no: int | None = Field(default=None, ge=1)
+    end_chapter_no: int | None = Field(default=None, ge=1)
+    outline_level: Literal["story", "detail"] = "story"
+    instruction: str = Field(min_length=4, max_length=4000)
 
 
 class TerminalIntent(StrictModel):
     """Coordinator 的受限路由输出；不能发明工作流、写正文或强制验收。"""
 
     action: TerminalAction
+    preference_conflicts: list[PreferenceConflict] = Field(default_factory=list, max_length=3)
     preference_observations: list[PreferenceObservation] = Field(default_factory=list, max_length=3)
     outline_level: Literal["story", "detail"] = "story"
     requested_outcome: str = Field(default="", max_length=1_000)
     user_message: str = Field(default="", max_length=4_000)
     task_revision: int = Field(default=1, ge=1)
     related_task_id: str | None = Field(default=None, max_length=180)
+    pending_work_id: str | None = Field(default=None, max_length=180)
+    pending_work_decision: Literal["inspect", "process", "process_all", "defer"] = "inspect"
+    pending_work_proposals: list["PendingWorkProposal"] = Field(default_factory=list, max_length=3)
     pending_question_id: str | None = Field(default=None, max_length=180)
     response_kind: Literal["new_task", "task_revision", "question_answer"] = "new_task"
     narrative_scope: Literal["none", "scene", "chapter", "batch"] = "none"
@@ -1341,13 +1440,14 @@ class TerminalIntent(StrictModel):
     checkpoint_id: str | None = Field(default=None, max_length=120)
     confirmation_token: str | None = Field(default=None, max_length=120)
     batch_id: str | None = Field(default=None, max_length=180)
+    batch_review_only: bool = False
     plan_change_confirmed: bool = False
     planning_revision_no: int | None = Field(default=None, ge=0)
     planning_part: Literal["none", "outline", "detail", "recent"] = "none"
     planning_reference_chapter_no: int | None = Field(default=None, ge=1)
     planning_reference_volume_no: int | None = Field(default=None, ge=1)
     target_characters: int | None = Field(default=None, ge=1_000, le=5_000_000)
-    max_revision_rounds: int = Field(default=2, ge=0, le=6)
+    max_revision_rounds: int = Field(default=2, ge=0, le=2)
     operation_instruction: str = Field(default="", max_length=4_000)
     settings_patch: dict[str, Any] = Field(default_factory=dict, max_length=16)
     visible_reason: str = Field(min_length=1, max_length=240)

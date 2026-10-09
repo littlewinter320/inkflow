@@ -18,7 +18,7 @@ from .errors import ProviderError
 from .utils import content_hash, strip_json_fence, estimate_tokens
 from .runtime import active_runtime, ensure_run_runtime
 from .model_usage import ModelAttempt, normalized_usage
-from .role_protocol import roles_for_mode
+from .role_protocol import normalize_role, roles_for_mode
 from .task_settings import active_task_settings
 
 
@@ -61,16 +61,13 @@ def _retry_after_seconds(response: httpx.Response, attempt: int) -> float:
 
 def _model_role(role: str | None) -> str | None:
     scope = active_task_settings.get()
-    if scope is None or scope.role_protocol_version == 1:
-        # Legacy reviewer is the combined Editor. Keep its stored role label.
-        if role in {"reviewer_verifier", "reviewer_judge"}:
-            return "reviewer"
-        if role not in {None, "coordinator", "writer", "reviewer"}:
-            raise ProviderError("旧版模型调用仅支持协调者、写作者和综合编辑者。")
-        return role
-    # The old verifier/judge helpers still belong to Editor, not specialist Reviewer.
-    canonical = "editor" if role in {"reviewer_verifier", "reviewer_judge"} else role
-    if canonical is not None and canonical not in roles_for_mode(scope.collaboration_mode):
+    # Helper capability aliases belong to Editor; they are not formal Agent identities.
+    try:
+        canonical = ("editor" if role in {"reviewer_verifier", "reviewer_judge"}
+                     else normalize_role(role) if role is not None else None)
+    except (TypeError, ValueError) as exc:
+        raise ProviderError("模型调用须使用当前正式 Agent 角色。") from exc
+    if scope is not None and canonical is not None and canonical not in roles_for_mode(scope.collaboration_mode):
         raise ProviderError("当前协作模式未启用该模型角色；引擎服务不能作为 Agent 调用。")
     return canonical
 
@@ -84,17 +81,13 @@ def _budgeted_generation(method):
 
 
 def _selected_model(settings: Settings, role: str | None, override: str | None) -> str:
-    scope = active_task_settings.get()
-    version = scope.role_protocol_version if scope else 1
-    return override or settings.model_for(role, version)
+    return override or settings.model_for(role)
 
 
 def _generation_settings(settings: Settings, role: str | None) -> dict[str, float | int | None]:
     if role is None:
         return {}
-    scope = active_task_settings.get()
-    version = scope.role_protocol_version if scope else 1
-    return settings.generation_for(role, version)
+    return settings.generation_for(role)
 
 
 @dataclass(slots=True)
@@ -232,7 +225,9 @@ class DeepSeekProvider:
             "system_contract_hash": content_hash(system),
             "user_prefix_4096_hash": content_hash(user_prompt[:4096]),
         }
-        requested_max_tokens = min(max(1, int(max_tokens)), self.settings.max_output_tokens)
+        requested_max_tokens = self.settings.effective_output_tokens(max_tokens, agent_role, model_override,
+            estimate_tokens(json.dumps([{"role": "system", "content": system},
+                                       {"role": "user", "content": user_prompt}], ensure_ascii=False)))
         payload: dict[str, Any] = {
             "model": model_override or self.settings.model,
             "messages": [
@@ -271,6 +266,9 @@ class DeepSeekProvider:
         for attempt in range(3):
             runtime = active_runtime.get()
             serialized_input = json.dumps(payload["messages"], ensure_ascii=False)
+            requested_max_tokens = self.settings.effective_output_tokens(
+                min(max_tokens, requested_max_tokens), agent_role, model_override, estimate_tokens(serialized_input))
+            payload["max_tokens"] = requested_max_tokens
             reservation_output = requested_max_tokens
             reserved = runtime.reserve(
                 estimate_tokens(serialized_input) + reservation_output
@@ -281,6 +279,11 @@ class DeepSeekProvider:
             accounting = ModelAttempt(self.settings, request_id=request_id,
                 model=str(payload["model"]), role=agent_role or "unspecified",
                 prompt_family=prefix_diagnostic["prompt_family"],
+                diagnostic={**prefix_diagnostic, "stage": output_model.__name__,
+                            "user_prefix_4096_hash": content_hash(str(payload["messages"][1]["content"])[:4096]),
+                            "materials_hash": content_hash(serialized_input),
+                            "quality_hash": content_hash(json.dumps({key: value for key, value in payload.items()
+                                if key not in {"messages", "model"}}, sort_keys=True, ensure_ascii=False))},
                 input_estimate=estimate_tokens(serialized_input), max_output_tokens=requested_max_tokens,
                 input_bound=len(serialized_input.encode("utf-8")) + 1024,
                 task_id=runtime.task_id if runtime else "")
@@ -290,6 +293,7 @@ class DeepSeekProvider:
                 request_timeout = timeout_seconds or self.settings.request_timeout_seconds
                 async with _model_request_slot(self.settings):
                     async with httpx.AsyncClient(timeout=request_timeout) as client:
+                        accounting.mark_request_sent()
                         response = await asyncio.wait_for(
                             client.post(url, headers=headers, json=payload),
                             timeout=request_timeout,
@@ -368,6 +372,9 @@ class DeepSeekProvider:
                 accounting.failure = accounting.failure or type(exc).__name__
                 last_error = exc
                 if retry_kind == "permanent":
+                    exc.recovery_node = "provider.request"
+                    exc.recovery_attempts = attempt
+                    exc.recovery_exhausted = True
                     raise
                 if isinstance(exc, (httpx.HTTPError, asyncio.TimeoutError)):
                     retry_kind = "transport"
@@ -415,7 +422,11 @@ class DeepSeekProvider:
             reason = f"连接或等待模型响应超时（{type(last_error).__name__}）；请检查网络和模型服务后继续，已有内容已保留。"
         else:
             reason = str(last_error).strip() or type(last_error).__name__
-        raise ProviderError(f"模型请求经过 3 次限次自恢复仍未完成：{reason}") from last_error
+        exhausted = ProviderError(f"模型请求经过 3 次限次自恢复仍未完成：{reason}")
+        exhausted.recovery_node = "provider.request"
+        exhausted.recovery_attempts = attempt
+        exhausted.recovery_exhausted = True
+        raise exhausted from last_error
 
 
 class AnthropicProvider:
@@ -485,7 +496,7 @@ class AnthropicProvider:
             "model": model_override or self.settings.model,
             "system": system_prompt.rstrip() + "\n\n只输出满足下列 JSON Schema 的 JSON 对象，不要使用 Markdown：\n" + schema_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
-            "max_tokens": min(max(1, int(max_tokens)), self.settings.max_output_tokens),
+            "max_tokens": self.settings.effective_output_tokens(max_tokens, agent_role, model_override),
         }
         if generation:
             payload["temperature"] = generation.get("temperature")
@@ -494,21 +505,30 @@ class AnthropicProvider:
                 payload["top_k"] = generation["top_k"]
         request_timeout = timeout_seconds or self.settings.request_timeout_seconds
         runtime = active_runtime.get()
-        serialized_input = payload["system"] + user_prompt
+        serialized_input = json.dumps({"system": payload["system"], "messages": payload["messages"]}, ensure_ascii=False)
         request_id = uuid4().hex
         recovery_events: list[dict[str, Any]] = []
         for attempt in range(3):
+            payload["max_tokens"] = self.settings.effective_output_tokens(
+                max_tokens, agent_role, model_override, estimate_tokens(serialized_input))
             reserved = runtime.reserve(
                 estimate_tokens(serialized_input) + int(payload["max_tokens"])
             ) if runtime else 0
             accounting = ModelAttempt(self.settings, request_id=request_id,
                 model=str(payload["model"]), role=agent_role or "unspecified",
+                prompt_family=f"anthropic:{payload['model']}:{agent_role or 'unknown'}:{output_model.__name__}",
+                diagnostic={"stage": output_model.__name__, "system_contract_hash": content_hash(payload["system"]),
+                            "user_prefix_4096_hash": content_hash(user_prompt[:4096]),
+                            "materials_hash": content_hash(serialized_input),
+                            "quality_hash": content_hash(json.dumps({key: value for key, value in payload.items()
+                                if key not in {"messages", "system", "model"}}, sort_keys=True, ensure_ascii=False))},
                 input_estimate=estimate_tokens(serialized_input), max_output_tokens=int(payload["max_tokens"]),
                 input_bound=len(serialized_input.encode("utf-8")) + 1024,
                 task_id=runtime.task_id if runtime else "")
             try:
                 async with _model_request_slot(self.settings):
                     async with httpx.AsyncClient(timeout=request_timeout) as client:
+                        accounting.mark_request_sent()
                         response = await asyncio.wait_for(
                             client.post(f"{self.settings.base_url}/v1/messages", headers=self._headers(), json=payload),
                             timeout=request_timeout,
@@ -565,11 +585,22 @@ class AnthropicProvider:
             except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError, ValidationError, ProviderError) as exc:
                 accounting.failure = accounting.failure or type(exc).__name__
                 if isinstance(exc, ProviderError):
+                    exc.recovery_node = "provider.request"
+                    exc.recovery_attempts = attempt
+                    exc.recovery_exhausted = True
                     raise
-                raise ProviderError(f"Anthropic JSON 调用失败：{exc}") from exc
+                failure = ProviderError(f"Anthropic JSON 调用失败：{exc}")
+                failure.recovery_node = "provider.request"
+                failure.recovery_attempts = attempt
+                failure.recovery_exhausted = True
+                raise failure from exc
             finally:
                 accounting.finish()
-        raise ProviderError("Anthropic 模型请求经过 3 次限流重试仍未完成。")
+        exhausted = ProviderError("Anthropic 模型请求经过 3 次限流重试仍未完成。")
+        exhausted.recovery_node = "provider.request"
+        exhausted.recovery_attempts = attempt
+        exhausted.recovery_exhausted = True
+        raise exhausted
 
 
 def create_provider(settings: Settings) -> JsonModelProvider:

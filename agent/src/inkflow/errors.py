@@ -1,6 +1,10 @@
 class InkFlowError(Exception):
     """墨流可预期错误的基类。"""
 
+    recovery_node: str = ""
+    recovery_attempts: int = 0
+    recovery_exhausted: bool = False
+
 
 class ConfigurationError(InkFlowError):
     """配置不完整或不可用。"""

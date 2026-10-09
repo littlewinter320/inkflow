@@ -110,3 +110,50 @@ input, textarea, select { background: var(--bg); border-radius: 10px; }
 .computer-action-modal section > p { margin: 6px 0 16px; font-size: 12px; line-height: 1.7; }
 .computer-command-preview { max-height: 34vh; overflow: auto; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); color: var(--text); font: 12px/1.6 ui-monospace, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .computer-action-modal .dialog-actions { justify-content: flex-end; }
+
+/* Pending work belongs in the workbench; the file rail carries only its summary. */
+.rail-pending { margin: 18px 4px 0; padding: 12px; border: 1px solid var(--line-soft); border-radius: 10px; }
+.rail-pending > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; }
+.rail-pending > div span, .pending-board-heading h3 span { color: var(--accent); font-variant-numeric: tabular-nums; }
+.rail-pending p { margin: 8px 0; color: var(--muted); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.rail-pending button { width: 100%; padding: 8px; font-size: 11px; white-space: nowrap; }
+.pending-board { min-width: 0; margin: 0 0 24px; padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
+.pending-board-heading { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 14px; }
+.pending-board-heading > div { min-width: 0; flex: 1 1 190px; }
+.pending-board-heading h3 { margin: 0; font-size: 18px; }
+.pending-board-heading h3 span { margin-left: 6px; font-size: 14px; }
+.pending-board-heading p, .pending-empty { margin: 8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
+.pending-board-heading > button { flex: 0 0 auto; max-width: 100%; white-space: nowrap; font-size: 12px; padding: 10px 12px; }
+.pending-empty { padding: 16px 0 4px; }
+.pending-chapter-group { margin-top: 22px; }
+.pending-chapter-group > h4 { display: flex; align-items: baseline; gap: 10px; margin: 0 0 10px; font-size: 13px; }
+.pending-chapter-group > h4 span { color: var(--muted); font-size: 11px; font-weight: 400; }
+.pending-work-card { min-width: 0; margin-top: 10px; padding: 14px; border: 1px solid var(--line-soft); border-radius: 10px; background: var(--bg); }
+.pending-work-card > header, .pending-discussion > header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; }
+.pending-work-card > header strong, .pending-discussion > header strong { color: var(--text); font-size: 13px; }
+.pending-work-card > header span { flex: 0 0 auto; color: var(--accent); font-size: 11px; }
+.pending-work-card.blocked > header span, .pending-work-card.decision > header span { color: var(--muted); }
+.pending-work-card p, .pending-discussion p { margin: 9px 0; color: var(--muted); font-size: 12px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+.pending-work-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.pending-work-actions button { max-width: 100%; padding: 8px 11px; font-size: 12px; white-space: normal; word-break: keep-all; }
+.pending-work-actions .text-button { margin-left: auto; color: var(--muted); }
+.pending-work-diagnostic { margin-top: 12px; padding-top: 9px; border-top: 1px solid var(--line-soft); }
+.pending-work-diagnostic > summary, .pending-board-disclosure > summary { cursor: pointer; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.pending-work-diagnostic > div { margin-top: 12px; }
+.pending-work-diagnostic strong { color: var(--text); font-size: 12px; }
+.pending-work-diagnostic small { display: block; color: var(--faint); font-size: 11px; overflow-wrap: anywhere; }
+.pending-board-disclosure { margin-top: 18px; padding-top: 13px; border-top: 1px solid var(--line-soft); }
+.pending-board-disclosure > summary { color: var(--text); font-size: 12px; }
+.pending-board-disclosure > summary span { margin-left: 6px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.pending-board-disclosure > p { color: var(--muted); font-size: 12px; line-height: 1.7; }
+.pending-discussion { margin-top: 12px; padding: 12px; border-radius: 9px; background: var(--bg); }
+.pending-discussion > header span { color: var(--muted); font-size: 11px; }
+.pending-work-card .batch-state-details { font-size: 12px; }
+.messages { overflow-x: hidden; }
+.message > div, .editor-toolbar > div { min-width: 0; }
+.message-text { overflow-wrap: anywhere; }
+.floating-chat-controls { flex-wrap: wrap; }
+.floating-chat-controls > button, .conversation-layout-select { flex-shrink: 0; white-space: nowrap; }
+.editor-toolbar { flex-wrap: wrap; gap: 9px; }
+.editor-toolbar > div { flex-wrap: wrap; }
+@media (max-width: 1100px) { .pending-board { padding: 16px; } }

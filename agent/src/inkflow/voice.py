@@ -1248,7 +1248,7 @@ class VoiceRuntime:
         path = self.profiles_dir / f"{profile_id}.json"
         profile = _read_json(path)
         if not profile:
-            raise ValueError("只允许微调本机创建的自定义声音。")
+            raise ValueError("只允许调整本机创建的自定义声音。")
         for key in ("name", "description", "instruction", "gender"):
             if key in params:
                 profile[key] = str(params[key]).strip()
@@ -1259,24 +1259,6 @@ class VoiceRuntime:
         profile["updated_at"] = _now()
         _atomic_json(path, profile)
         return profile
-
-    def prepare_finetune(self, profile_id: str, dataset_path: str) -> dict[str, Any]:
-        profile = self._profile(profile_id)
-        if profile.get("kind") != "clone":
-            raise ValueError("本地微调只适用于用户创建的克隆声音。")
-        dataset = Path(dataset_path).resolve()
-        if not dataset.is_dir():
-            raise ValueError("请选择包含授权语音与文本标注的数据集文件夹。")
-        plan = {
-            "training_id": f"training-{uuid.uuid4().hex}",
-            "status": "prepared",
-            "profile_id": profile_id,
-            "dataset_path": str(dataset),
-            "created_at": _now(),
-            "message": "微调计划已准备，尚未开始训练、下载模型或占用显卡。开始训练前需要单独确认资源与数据授权。",
-        }
-        _atomic_json(self.root / "training" / f"{plan['training_id']}.json", plan)
-        return plan
 
     def get_role_map(self, project_root: str | Path) -> dict[str, Any]:
         path = self._role_map_path(project_root)

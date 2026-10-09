@@ -10,9 +10,9 @@ from typing import Any, Iterator
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from .config import PERSISTED_SETTING_NAMES, Settings
+from .config import PERSISTED_SETTING_NAMES, Settings, adapt_settings
 from .errors import InkFlowError, ProjectError
-from .role_protocol import new_task_mode, roles_for_mode
+from .role_protocol import ROLE_PROTOCOL_VERSION, new_task_mode
 from .utils import content_hash, utc_now
 
 
@@ -20,10 +20,10 @@ TASK_SETTINGS_SCHEMA_VERSION = 2
 TASK_SETTINGS_FIELDS = frozenset(PERSISTED_SETTING_NAMES) - {
     "input_price_per_million", "output_price_per_million"
 }
-_SNAPSHOT_FIELDS_V1 = frozenset({
+_SNAPSHOT_IDENTITY_FIELDS = frozenset({
     "schema_version", "task_id", "novel_id", "captured_at", "source", "settings", "snapshot_hash"
 })
-_SNAPSHOT_FIELDS_V2 = _SNAPSHOT_FIELDS_V1 | {"role_protocol_version", "collaboration_mode"}
+_SNAPSHOT_FIELDS = _SNAPSHOT_IDENTITY_FIELDS | {"collaboration_mode"}
 _SOURCES = {"task_start", "legacy_recovery"}
 
 
@@ -39,25 +39,24 @@ class TaskSettingsScope:
     snapshot_hash: str
     captured_at: str
     source: str
-    role_protocol_version: int
     collaboration_mode: str
     settings: Settings
 
+    @property
+    def role_protocol_version(self) -> int:
+        """Obsolete signature compatibility; the runtime has one role contract."""
+        return ROLE_PROTOCOL_VERSION
+
     def public_summary(self) -> dict[str, Any]:
-        summary = {
+        return {
             "schema_version": self.schema_version,
             "task_id": self.task_id,
             "novel_id": self.novel_id,
             "snapshot_hash": self.snapshot_hash,
             "captured_at": self.captured_at,
             "source": self.source,
+            "collaboration_mode": self.collaboration_mode,
         }
-        if self.schema_version >= 2:
-            summary.update({
-                "role_protocol_version": self.role_protocol_version,
-                "collaboration_mode": self.collaboration_mode,
-            })
-        return summary
 
 
 active_task_settings: ContextVar[TaskSettingsScope | None] = ContextVar(
@@ -107,11 +106,9 @@ def _check_endpoint(settings: dict[str, Any]) -> None:
 
 def capture_task_settings(
     settings: Settings, *, novel_id: str, task_id: str | None = None, source: str = "task_start",
-    role_protocol_version: int = 1, collaboration_mode: str = "everyday",
+    role_protocol_version: int | None = None, collaboration_mode: str = "everyday",
 ) -> dict[str, Any]:
-    _check_role_mode(role_protocol_version, collaboration_mode)
-    if source == "task_start":
-        collaboration_mode = new_task_mode(collaboration_mode)
+    collaboration_mode = _check_mode(collaboration_mode)
     values = {key: value for key, value in settings.to_mapping().items() if key in TASK_SETTINGS_FIELDS}
     _check_endpoint(values)
     snapshot = {
@@ -120,7 +117,6 @@ def capture_task_settings(
         "novel_id": novel_id,
         "captured_at": utc_now(),
         "source": source,
-        "role_protocol_version": role_protocol_version,
         "collaboration_mode": collaboration_mode,
         "settings": values,
     }
@@ -129,15 +125,23 @@ def capture_task_settings(
     return snapshot
 
 
-def _check_role_mode(protocol_version: int, mode: str) -> None:
-    if type(protocol_version) is not int or protocol_version not in {1, 2}:
-        raise TaskSettingsError("任务角色协议版本无效。")
+def _check_mode(mode: str) -> str:
     try:
-        roles_for_mode(mode)
+        return new_task_mode(mode)
     except ValueError as exc:
         raise TaskSettingsError("任务协作模式无效。") from exc
-    if protocol_version == 1 and mode != "everyday":
-        raise TaskSettingsError("旧角色协议只支持日常模式。")
+
+
+def adapt_task_reference(reference: dict[str, Any]) -> dict[str, Any]:
+    """Consume old reference labels while preserving the original signed identity."""
+    if not isinstance(reference, dict):
+        raise TaskSettingsError("任务配置引用必须是对象。")
+    result = dict(reference)
+    label = result.pop("role_protocol_version", None)
+    if label is not None and (type(label) is not int or label not in {1, 2}):
+        raise TaskSettingsError("任务配置引用中的旧角色标签无效。")
+    result["collaboration_mode"] = _check_mode(result.get("collaboration_mode", "everyday"))
+    return result
 
 
 def validate_task_settings_snapshot(
@@ -149,11 +153,12 @@ def validate_task_settings_snapshot(
     version = snapshot.get("schema_version")
     if type(version) is not int or version not in {1, TASK_SETTINGS_SCHEMA_VERSION}:
         raise TaskSettingsError("任务配置快照版本不受当前程序支持。")
-    expected_fields = _SNAPSHOT_FIELDS_V1 if version == 1 else _SNAPSHOT_FIELDS_V2
-    if set(snapshot) != expected_fields:
+    input_fields = frozenset(snapshot)
+    allowed_shapes = {_SNAPSHOT_FIELDS, _SNAPSHOT_FIELDS | {"role_protocol_version"}}
+    if version == 1:
+        allowed_shapes.add(_SNAPSHOT_IDENTITY_FIELDS)
+    if input_fields not in allowed_shapes:
         raise TaskSettingsError("任务配置快照结构不完整，不能用当前设置静默替换。")
-    if version == 2:
-        _check_role_mode(snapshot["role_protocol_version"], snapshot["collaboration_mode"])
     for key in ("task_id", "novel_id", "captured_at", "snapshot_hash"):
         if not isinstance(snapshot[key], str) or not snapshot[key].strip():
             raise TaskSettingsError("任务配置快照缺少身份或校验信息。")
@@ -166,16 +171,32 @@ def validate_task_settings_snapshot(
     values = snapshot["settings"]
     # New optional configuration must never be backfilled into a hashed old snapshot.
     required_fields = TASK_SETTINGS_FIELDS - {"planning_publication_mode", "role_models", "manual_edit_review_enabled"}
-    if not isinstance(values, dict) or not required_fields <= set(values) <= TASK_SETTINGS_FIELDS:
+    if not isinstance(values, dict) or not required_fields <= set(values) <= TASK_SETTINGS_FIELDS | {"role_settings_version"}:
         raise TaskSettingsError("任务配置字段与快照版本不一致，不能补入当前默认值。")
     _check_endpoint(values)
     expected = content_hash(_canonical({key: value for key, value in snapshot.items() if key != "snapshot_hash"}))
     if snapshot["snapshot_hash"] != expected:
         raise TaskSettingsError("任务配置快照校验失败，不能用当前设置回填。")
-    summary = {key: snapshot[key] for key in expected_fields if key != "settings"}
-    if version == 1:
-        summary.update({"role_protocol_version": 1, "collaboration_mode": "everyday"})
-    return summary
+    # Consume format labels only after the original, unmodified envelope passes its hash.
+    return adapt_task_reference({key: snapshot[key] for key in input_fields if key != "settings"})
+
+
+def _frozen_values_match(values: dict[str, Any], restored: dict[str, Any]) -> bool:
+    """Check every explicit frozen value; added roles use static defaults, never live settings."""
+    for name, expected in values.items():
+        actual = restored.get(name)
+        if name in {"agent_generation", "agent_context_budgets"}:
+            if not isinstance(actual, dict):
+                return False
+            actual = {role: {key: actual.get(role, {}).get(key) for key in fields}
+                      for role, fields in expected.items()}
+        elif name == "role_models":
+            if not isinstance(actual, dict):
+                return False
+            actual = {role: actual.get(role) for role in expected}
+        if _canonical({name: actual}) != _canonical({name: expected}):
+            return False
+    return True
 
 
 def restore_task_settings(
@@ -183,18 +204,20 @@ def restore_task_settings(
 ) -> TaskSettingsScope:
     summary = validate_task_settings_snapshot(snapshot, novel_id=novel_id)
     try:
-        settings = Settings.from_mapping(snapshot["settings"], workspace_root=workspace_root)
+        raw_values = dict(snapshot["settings"])
+        # A signed old envelope may identify old role keys without repeating the settings tag.
+        if "role_settings_version" not in raw_values and snapshot.get("role_protocol_version") == 1:
+            raw_values["role_settings_version"] = 1
+        values = adapt_settings(raw_values)
+        settings = Settings.from_mapping(values, workspace_root=workspace_root)
     except (TypeError, ValueError, InkFlowError) as exc:
         raise TaskSettingsError("任务配置快照包含无效设置，无法恢复。") from exc
-    # The configuration parser may evolve; silently migrating an existing
-    # snapshot would make its hash no longer describe the actual execution.
-    restored = {key: value for key, value in settings.to_mapping().items() if key in snapshot["settings"]}
-    if _canonical(restored) != _canonical(snapshot["settings"]):
-        raise TaskSettingsError("当前程序会改变已有任务配置，请显式迁移任务后再恢复。")
+    if not _frozen_values_match(values, settings.to_mapping()):
+        raise TaskSettingsError("当前程序会改变已有任务配置中的明确取值，不能用当前设置替代。")
     return TaskSettingsScope(
         schema_version=summary["schema_version"],
         task_id=summary["task_id"], novel_id=summary["novel_id"],
         snapshot_hash=summary["snapshot_hash"], captured_at=summary["captured_at"],
-        source=summary["source"], role_protocol_version=summary["role_protocol_version"],
+        source=summary["source"],
         collaboration_mode=summary["collaboration_mode"], settings=settings,
     )

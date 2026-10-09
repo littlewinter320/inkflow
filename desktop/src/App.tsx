@@ -4,7 +4,7 @@ import type { ManualEditJob } from "./StorySettings";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { FormEvent, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MutableRefObject, PointerEvent as ReactPointerEvent, ReactNode } from "react";
-import { Mascot, MascotShowcase, mobaoIdlePoster } from "./Mascot";
+import { Mascot, MascotShowcase, MobaoGuide, mobaoIdlePoster } from "./Mascot";
 import type { MascotMood } from "./Mascot";
 import { ProjectCenter } from "./ProjectCenter";
 import { VoiceCenter } from "./VoiceCenter";
@@ -97,7 +97,6 @@ type TaskStatusResponse = {
 type PendingComputerAction = { request_id: string; command: string; command_hash: string; action_kind: string; created_at: string; expires_at: string };
 type EngineEvent = {
   run_id?: string;
-  role_protocol_version?: number;
   type?: string;
   stage?: string;
   status?: string;
@@ -203,17 +202,34 @@ type ContextStatus = {
   stale_reason?: string;
 };
 type CanonMigration = { required: boolean; confirmation_token: string; accepted_chapter_count: number; impact: string; backup_path?: string; unresolved_chapters?: number[]; message?: string };
-type CollaborationMessage = { message_id: string; sender_role: string; recipient_role: string; role_protocol_version?: number; message_type: string; claim: string; status: string; chapter_no?: number; chapter_version?: number; context_packet_id?: string; evidence_refs?: string[]; requested_response?: string; created_at: string };
+type CollaborationMessage = { message_id: string; sender_role: string; recipient_role: string; message_type: string; claim: string; status: string; chapter_no?: number; chapter_version?: number; context_packet_id?: string; evidence_refs?: string[]; requested_response?: string; created_at: string };
 type TraceReference = { label: string; absolute_path: string; relative_path: string; exists: boolean };
 type TraceStep = { timestamp: string; stage: string; status: string; summary: string; details?: string; metadata?: Record<string, unknown>; references?: TraceReference[] };
 type TraceRun = { run_id: string; operation: string; status: string; summary: string; started_at: string; finished_at: string; events: TraceStep[]; trace_reference?: TraceReference };
-type BatchSummary = { batch_id: string; status: string; run_id?: string; resume_available?: boolean; stop_reason?: string; stopped_at_chapter?: number; start_chapter_no?: number; end_chapter_no?: number; chapters: Array<{ chapter_no?: number; version?: number; review_verdict?: string; memory_status?: string }> };
+type BatchChapterSummary = {
+  chapter_no?: number; version?: number; status?: string; chapter_status?: string;
+  verdict?: string; review_verdict?: string; review_status?: string; memory_status?: string;
+  phase?: string; dependency_reason?: string; invalidation_reason?: string; error?: string;
+};
+type BatchSummary = {
+  batch_id: string; status: string; run_id?: string; resume_available?: boolean;
+  stop_reason?: string; stopped_at_chapter?: number; start_chapter_no?: number; end_chapter_no?: number;
+  phase?: string; current_phase?: string; error?: string; next_action?: string; pending_work_id?: string;
+  checkpoint?: { chapter_no?: number; phase?: string; error?: string };
+  remaining_review_range?: number[] | null;
+  last_repair?: { chapter_range?: number[]; requested_chapter_range?: number[]; preserved_suffix_range?: number[] | null;
+    review_only?: boolean; completed_chapters?: number[]; status?: string };
+  chapters: BatchChapterSummary[];
+};
 type LearningEvent = { event_id: string; event_type: string; chapter_no?: number; created_at: string; payload: Record<string, unknown> };
 type UsageSummary = { calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; prompt_cache_hit_rate?: number | null; prompt_cache_miss_rate?: number | null; average_prompt_tokens?: number; average_completion_tokens?: number; cache_reported_calls?: number; cache_unknown_calls?: number; cache_unknown_prompt_tokens?: number };
-type RecentCacheSummary = { calls: number; reported_calls: number; unknown_calls: number; input_tokens: number; hit_tokens: number; miss_tokens: number; hit_rate: number | null; last_at: string | null; by_role?: Record<string, { calls: number; reported_calls: number; unknown_calls: number; hit_rate: number | null }>; by_family?: Record<string, { calls: number; reported_calls: number; input_tokens: number; hit_tokens: number; miss_tokens: number; hit_rate: number | null }> };
+type PerformanceDiagnostic = { calls: number; sent_calls: number; not_sent_calls: number; unknown_sent_calls: number; request_count: number; failed_calls: number; unknown_usage_calls: number; unknown_cost_calls: number; raw_input_tokens: number | null; cached_input_tokens: number | null; uncached_input_tokens: number | null; output_tokens: number | null; attempt_elapsed_ms: number | null; unknown_duration_calls: number; same_scope_groups?: Array<{ stage: string; calls: number; scope_known: boolean; raw_input_tokens: number | null; cached_input_tokens: number | null; uncached_input_tokens: number | null; output_tokens: number | null }>; writer_sequence?: Array<{ before_attempt_id: string; after_attempt_id: string; conclusion: string }>; time_note?: string; quality_note?: string };
+type QualifiedProduction = { accepted_products: number; unknown_cost_calls: number; known_estimated_cost: number; estimated_cost_per_product: number | null; limitation: string };
+type RecentCacheSummary = { calls: number; reported_calls: number; unknown_calls: number; input_tokens: number; hit_tokens: number; miss_tokens: number; hit_rate: number | null; last_at: string | null; by_role?: Record<string, { calls: number; reported_calls: number; unknown_calls: number; hit_rate: number | null }>; by_family?: Record<string, { calls: number; reported_calls: number; input_tokens: number; hit_tokens: number; miss_tokens: number; hit_rate: number | null }>; performance_diagnostic?: PerformanceDiagnostic; qualified_production?: QualifiedProduction };
 type VoiceInstallProgress = { status: string; stage: string; progress: number; summary: string; downloaded_mb: number; retryable: boolean; error?: string };
-type PersistentUsage = { calls: number; since: string | null; estimated_cost: number; pending_estimated_cost: number; unknown_usage_calls: number; unknown_cost_calls: number; training_validation_calls: number; price_note: string };
-type CollaborationOverview = { messages: CollaborationMessage[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; trace_runs?: TraceRun[]; usage?: UsageSummary & { by_agent_role?: Record<string, UsageSummary>; recent_deepseek_cache?: RecentCacheSummary | null; estimated_cost: number; currency: string; pricing_configured: boolean; accounting?: { available: boolean; warning?: string; project?: PersistentUsage; all_projects?: PersistentUsage } } };
+type PersistentUsage = { calls: number; since: string | null; estimated_cost: number; pending_estimated_cost: number; unknown_usage_calls: number; unknown_cost_calls: number; price_note: string };
+type PendingWorkItem = { id: string; kind: string; status: string; reason: string; next_action: string; chapter_no?: number | null; handling?: string; can_process?: boolean; parent_id?: string; processing_attempts?: number; source?: Record<string, unknown>; intent?: { action?: string; batch_id?: string | null } };
+type CollaborationOverview = { messages: CollaborationMessage[]; pending_work?: PendingWorkItem[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; trace_runs?: TraceRun[]; usage?: UsageSummary & { by_agent_role?: Record<string, UsageSummary>; recent_deepseek_cache?: RecentCacheSummary | null; estimated_cost: number; currency: string; pricing_configured: boolean; accounting?: { available: boolean; warning?: string; project?: PersistentUsage; all_projects?: PersistentUsage } } };
 type PrefillResult = { insertion: string; document_hash: string; cursor_offset: number; confidence: string };
 type WorkspacePreset = "balanced" | "writing" | "planning" | "review";
 type WorkspaceResizeTarget = "navigation" | "assistant" | "inspector";
@@ -398,8 +414,14 @@ function App() {
   const editorSnapshotRef = useRef<EditorSnapshot>({ session: 0, projectRoot: "", document: null, text: "", savedText: "" });
   const documentSaveRef = useRef<Promise<boolean> | null>(null);
   const pendingChatRef = useRef<string[]>([]);
+  const projectRefreshRef = useRef<{ root: string; promise: Promise<void> } | null>(null);
+  const suggestionRefreshRef = useRef<{ root: string; promise: Promise<void> } | null>(null);
   const cancelRequestedRef = useRef(false);
   const [mascotMood, setMascotMood] = useState<MascotMood>("idle");
+  const [mobaoCompletion, setMobaoCompletion] = useState<{ id: string; summary: string; messageId: string; runId: string; root: string } | null>(null);
+  const mobaoWorkAreaRef = useRef<HTMLElement | null>(null);
+  const mobaoTargetRef = useRef<HTMLElement | null>(null);
+  const mobaoDockRef = useRef<HTMLDivElement | null>(null);
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>([]);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -619,19 +641,24 @@ function App() {
       setPendingComputerActions([]);
       return;
     }
+    if (provider?.powershell_enabled !== true && !pendingComputerActions.length) return;
     let active = true;
+    let polling = false;
     const poll = async () => {
+      if (!active || polling || !canPollWorkspace(window.document.visibilityState, window.document.hasFocus())) return;
+      polling = true;
       try {
         const result = await request<{ items: PendingComputerAction[] }>("computer.actions.list");
         if (active) setPendingComputerActions(result.items || []);
       } catch {
         // This feature is optional; a temporary poll failure must not disrupt writing.
-      }
+      } finally { polling = false; }
     };
     void poll();
     const timer = window.setInterval(() => void poll(), 2500);
-    return () => { active = false; window.clearInterval(timer); };
-  }, [projectRoot, request]);
+    window.addEventListener("focus", poll);
+    return () => { active = false; window.clearInterval(timer); window.removeEventListener("focus", poll); };
+  }, [projectRoot, request, provider?.powershell_enabled, pendingComputerActions.length]);
 
   const refreshManualEdits = useCallback(async () => {
     if (!projectRoot) return;
@@ -703,17 +730,20 @@ function App() {
   const refresh = useCallback(
     async (root = projectRoot) => {
       if (!root) return;
-      const [opened, overview] = await Promise.all([
-        window.inkflow.request<{ dashboard: Dashboard; tree: ProjectTree; canon_migration?: CanonMigration }>("project.open", {
-        project_root: root,
-        }),
-        window.inkflow.request<CollaborationOverview>("collaboration.overview", { project_root: root }),
-      ]);
-      if (root !== projectRootRef.current && projectRootRef.current) return;
-      setDashboard(opened.dashboard);
-      setTree(opened.tree);
-      setCollaboration(overview);
-      setCanonMigration(opened.canon_migration || null);
+      if (projectRefreshRef.current?.root === root) return projectRefreshRef.current.promise;
+      const promise = (async () => {
+        const opened = await window.inkflow.request<{ dashboard: Dashboard; tree: ProjectTree; canon_migration?: CanonMigration }>("project.open", { project_root: root });
+        if (root !== projectRootRef.current) return;
+        const overview = await window.inkflow.request<CollaborationOverview>("collaboration.overview", { project_root: root });
+        if (root !== projectRootRef.current) return;
+        setDashboard(opened.dashboard);
+        setTree(opened.tree);
+        setCollaboration(overview);
+        setCanonMigration(opened.canon_migration || null);
+      })();
+      projectRefreshRef.current = { root, promise };
+      try { await promise; }
+      finally { if (projectRefreshRef.current?.promise === promise) projectRefreshRef.current = null; }
     },
     [projectRoot],
   );
@@ -959,7 +989,7 @@ function App() {
       })
       .catch(showStartupError);
     void window.inkflow.request<Record<string, unknown>>("app.initialize").then(setAppInfo).catch(showStartupError);
-    void window.inkflow.request<Record<string, unknown>>("provider.status", { role_settings_version: 2 }).then(setProvider).catch(() => undefined);
+    void window.inkflow.request<Record<string, unknown>>("provider.status", {}).then(setProvider).catch(() => undefined);
     void window.inkflow.request<VoiceSettings>("voice.settings.get").then(setVoiceSettings).catch(() => undefined);
     void window.inkflow.updateStatus().then((update) => setUpdateInfo(update as UpdateInfo)).catch(() => undefined);
   }, [openProject]);
@@ -1008,16 +1038,17 @@ function App() {
   // 打开或切换项目后刷新一次动态提示词，让快捷按钮贴合当前项目阶段。
   useEffect(() => {
     if (!projectRoot) return;
+    setSuggestedPrompts(defaultSuggestedPrompts);
     void refreshSuggestedPrompts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectRoot]);
+  }, [projectRoot, uiPreferences.suggestedPromptsEnabled]);
 
   useEffect(() => {
     if (!projectRoot) { setContextStatus(null); setCollaboration(null); contextSnapshotRef.current = null; return; }
     let active = true;
     let polling = false;
     const poll = async () => {
-      if (!active || polling || activeRunIdRef.current || window.document.visibilityState === "hidden") return;
+      if (!active || polling || activeRunIdRef.current || projectRefreshRef.current?.root === projectRoot || !canPollWorkspace(window.document.visibilityState, window.document.hasFocus())) return;
       polling = true;
       try {
         const [value, overview] = await Promise.all([
@@ -1046,23 +1077,30 @@ function App() {
     };
     void poll();
     const timer = window.setInterval(() => void poll(), 15000);
-    return () => { active = false; window.clearInterval(timer); };
+    window.addEventListener("focus", poll);
+    return () => { active = false; window.clearInterval(timer); window.removeEventListener("focus", poll); };
   }, [projectRoot]);
 
+  const batchProgressActive = Boolean(activeRunId && ((collaboration?.batches || []).some(batch => batch.run_id === activeRunId)
+    || events.some(event => event.run_id === activeRunId && (event.metadata?.batch_id || /batch/.test(`${event.stage || ""} ${event.dispatch_plan?.workflow || ""}`)))));
   useEffect(() => {
-    if (!projectRoot || !activeRunId) return;
+    if (!projectRoot || !activeRunId || !batchProgressActive) return;
     let active = true;
+    let polling = false;
     const pollBatch = async () => {
-      if (window.document.visibilityState === "hidden") return;
+      if (!active || polling || !canPollWorkspace(window.document.visibilityState, window.document.hasFocus())) return;
+      polling = true;
       try {
         const progress = await window.inkflow.request<{ batches: BatchSummary[] }>("batch.progress", { project_root: projectRoot });
         if (active) setCollaboration((current) => current ? { ...current, batches: progress.batches } : current);
       } catch { /* Live events remain visible if this optional read is busy. */ }
+      finally { polling = false; }
     };
     void pollBatch();
     const timer = window.setInterval(() => void pollBatch(), 10000);
-    return () => { active = false; window.clearInterval(timer); };
-  }, [projectRoot, activeRunId]);
+    window.addEventListener("focus", pollBatch);
+    return () => { active = false; window.clearInterval(timer); window.removeEventListener("focus", pollBatch); };
+  }, [projectRoot, activeRunId, batchProgressActive]);
 
   const openDocument = async (item: TreeItem) => {
     const root = projectRootRef.current;
@@ -1287,21 +1325,23 @@ function App() {
     void sendChat(undefined, target.text);
   };
 
-  // 每轮对话后刷新输入区动态提示词；模型失败时静默保留当前建议。
-  const refreshSuggestedPrompts = async (recent?: { role: string; text: string }[]) => {
-    if (!uiPreferences.suggestedPromptsEnabled || !projectRoot) return;
-    try {
-      const history = recent ?? messages.slice(-6).map((item) => ({ role: item.role, text: item.text }));
-      const result = await request<{ suggestions: SuggestedPromptItem[] }>("assistant.suggest", { workspace_root: projectRoot, recent_messages: history });
-      if (Array.isArray(result?.suggestions)) {
-        const cleaned = result.suggestions
-          .map((item) => ({ label: String(item?.label || "继续"), prompt: String(item?.prompt || "").trim() }))
-          .filter((item) => item.prompt);
-        if (cleaned.length > 0) setSuggestedPrompts(cleaned);
-      }
-    } catch {
-      // 预测失败保持当前建议，不打断对话。
-    }
+  // Stage suggestions are local; no conversation payload is needed.
+  const refreshSuggestedPrompts = async (root = projectRootRef.current) => {
+    if (!uiPreferences.suggestedPromptsEnabled || !root || root !== projectRootRef.current) return;
+    if (suggestionRefreshRef.current?.root === root) return suggestionRefreshRef.current.promise;
+    const promise = (async () => {
+      try {
+        const result = await request<{ suggestions: SuggestedPromptItem[] }>("assistant.suggest", { project_root: root, workspace_root: root });
+        if (root !== projectRootRef.current) return;
+        if (Array.isArray(result?.suggestions)) {
+          const cleaned = result.suggestions.map(item => ({ label: String(item?.label || "继续"), prompt: String(item?.prompt || "").trim() })).filter(item => item.prompt);
+          if (cleaned.length > 0) setSuggestedPrompts(cleaned);
+        }
+      } catch { /* Keep the existing local suggestions; writing can continue. */ }
+    })();
+    suggestionRefreshRef.current = { root, promise };
+    try { await promise; }
+    finally { if (suggestionRefreshRef.current?.promise === promise) suggestionRefreshRef.current = null; }
   };
 
   // 边听边出字：录音中每 2.5 秒对当前累计音频做一次快照转写，结果实时填入输入框。
@@ -1399,11 +1439,13 @@ function App() {
     activeRunIdRef.current = runId;
     cancelRequestedRef.current = false;
     setActiveRunId(runId);
-    let assistantReply = "";
+    let refreshSuggestions = false;
     try {
       const result = await request<unknown>("conversation.send", { message, run_id: runId });
       const visible = visibleResult(result);
-      assistantReply = visible.summary;
+      const refreshScope = chatRefreshScope(result);
+      refreshSuggestions = Boolean(refreshScope === "project" && result && typeof result === "object"
+        && ["completed", "accepted", "resolved"].includes(String((result as Record<string, unknown>).status || "")));
       const questionSource = result && typeof result === "object" ? (result as Record<string, unknown>).questions : null;
       if (Array.isArray(questionSource)) setPendingQuestions(questionSource as QuestionCard[]);
       const assistantMessageId = crypto.randomUUID();
@@ -1412,14 +1454,24 @@ function App() {
         // Coordinator settings changes are persisted by the engine. Refresh
         // the two settings snapshots so reopening Settings immediately shows
         // the values just reported in chat.
-        void window.inkflow.request<Record<string, unknown>>("provider.status", { workspace_root: projectRootRef.current, role_settings_version: 2 }).then(setProvider).catch(() => undefined);
+        void window.inkflow.request<Record<string, unknown>>("provider.status", { workspace_root: projectRootRef.current }).then(setProvider).catch(() => undefined);
         void window.inkflow.request<VoiceSettings>("voice.settings.get", { workspace_root: projectRootRef.current }).then(setVoiceSettings).catch(() => undefined);
       }
       if (voiceSettings?.voice_enabled && voiceSettings.voice_output_enabled && voiceSettings.voice_auto_read) void speakText(assistantMessageId, visible.summary);
       try {
-        const history = await request<{ entries: ConversationHistoryEntry[] }>("conversation.history", { limit: 100 });
-        setConversationHistory(history.entries);
-        if (runRoot === projectRootRef.current) await refresh(runRoot);
+        const history = await request<{ entries: ConversationHistoryEntry[] }>("conversation.history", { project_root: runRoot, limit: 100 });
+        if (runRoot === projectRootRef.current) {
+          setConversationHistory(history.entries);
+          if (refreshScope === "project") await refresh(runRoot);
+          else if (refreshScope === "pending") {
+            const work = (result as Record<string, unknown>).pending_work;
+            if (Array.isArray(work)) setCollaboration(current => current ? { ...current, pending_work: work as PendingWorkItem[] } : current);
+            else {
+              const overview = await request<CollaborationOverview>("collaboration.overview", { project_root: runRoot });
+              if (runRoot === projectRootRef.current) setCollaboration(overview);
+            }
+          }
+        }
       } catch (cause) {
         const reason = (cause instanceof Error ? cause.message : String(cause))
           .replace(/^Error invoking remote method ['"]engine:request['"]:\s*Error:\s*/i, "")
@@ -1427,7 +1479,19 @@ function App() {
           .trim();
         setNotice(`本次对话结果已返回；只是项目面板没有刷新，已提交的正文不会因此撤回。\n刷新失败原因：${reason}\n可稍后点“刷新”核对章节状态。`);
       }
-      setMascotMood("success");
+      const resultState = result && typeof result === "object" ? String((result as Record<string, unknown>).status || "") : "";
+      if (["failed", "interrupted", "waiting_condition"].includes(resultState) && runRoot === projectRootRef.current) {
+        setSuggestedPrompts([{ label: "查看待办与恢复条件", prompt: "查看待办" }]);
+      }
+      const completedIntent = result && typeof result === "object" ? (result as Record<string, unknown>).intent as Record<string, unknown> | undefined : undefined;
+      if (["completed", "accepted", "resolved"].includes(resultState) && runRoot === projectRootRef.current &&
+          !(Array.isArray(questionSource) && questionSource.length) && completedIntent?.action !== "discuss" &&
+          !(completedIntent?.action === "pending_work" && ["inspect", "defer"].includes(String(completedIntent.pending_work_decision)))) {
+        setMobaoCompletion({ id: `${runRoot}:${runId}:${assistantMessageId}`, root: runRoot, runId, messageId: assistantMessageId, summary: visible.summary });
+      }
+      setMascotMood(resultState === "failed" ? "rest" :
+        ["waiting_user", "waiting_condition", "needs_input", "interrupted"].includes(resultState) ||
+        (Array.isArray(questionSource) && questionSource.length > 0) ? "waiting" : "success");
     } catch (cause) {
       const messageText = errorMessage(cause);
       const cancelled = /任务已取消|当前任务已停止|任务由界面的停止操作中断|任务在运行期间意外中断/.test(messageText);
@@ -1438,16 +1502,14 @@ function App() {
       }]);
       if (!cancelled) setError(messageText);
       setMascotMood(cancelled ? "waiting" : "rest");
+      if (runRoot === projectRootRef.current) setSuggestedPrompts([{ label: "查看待办与恢复条件", prompt: "查看待办" }]);
     } finally {
       if (activeRunIdRef.current === runId) {
         activeRunIdRef.current = null;
         setBusy(false);
         setActiveRunId(null);
       }
-      void refreshSuggestedPrompts([
-        { role: "user", text: message },
-        ...(assistantReply ? [{ role: "assistant", text: assistantReply }] : []),
-      ]);
+      if (refreshSuggestions && runRoot === projectRootRef.current && !pendingChatRef.current.length) void refreshSuggestedPrompts(runRoot);
       if (!cancelRequestedRef.current && pendingChatRef.current.length > 0 && projectRootRef.current) {
         const next = pendingChatRef.current.shift();
         if (next) window.setTimeout(() => void sendChat(undefined, next), 0);
@@ -1623,12 +1685,16 @@ function App() {
         ...extra,
       });
       const visible = visibleResult(result);
+      const assistantMessageId = crypto.randomUUID();
       setMessages((items) => [
         ...items,
-        { id: crypto.randomUUID(), role: "assistant", text: visible.summary, details: visible.details, reasoning: visible.reasoning, animate: true },
+        { id: assistantMessageId, role: "assistant", text: visible.summary, details: visible.details, reasoning: visible.reasoning, animate: true },
       ]);
       if (runRoot === projectRootRef.current) await refresh(runRoot);
       const resultRecord = result && typeof result === "object" ? result as Record<string, unknown> : {};
+      if (["completed", "accepted", "resolved"].includes(String(resultRecord.status || "")) && runRoot === projectRootRef.current) {
+        setMobaoCompletion({ id: `${runRoot}:${runId}:${assistantMessageId}`, root: runRoot, runId, messageId: assistantMessageId, summary: visible.summary });
+      }
       const targetPath = String(resultRecord.review_path || resultRecord.draft_path || "");
       if (targetPath && runRoot === projectRootRef.current && sourceNavigation === editorNavigationRef.current && canRefreshEditor(sourceEditor)) {
         const normalizedRoot = projectRoot.replace(/\\/g, "/").replace(/\/$/, "");
@@ -1739,6 +1805,7 @@ function App() {
   const stats = document?.statistics || emptyStatistics;
   const title = String(dashboard?.brief.title || "墨流");
   const isDirty = Boolean(document && text !== savedText);
+  const pendingSummary = collaborationPending(collaboration);
 
   if (!projectRoot) {
     return (
@@ -1829,7 +1896,7 @@ function App() {
         </nav>
       </header>
 
-      <main className={workspaceGridClass} style={workspaceGridStyle}>
+      <main className={workspaceGridClass} style={workspaceGridStyle} ref={mobaoWorkAreaRef}>
         {workspaceLayout.navigationVisible && <>
         <aside className="left-rail">
           <div className="rail-heading"><span>小说结构</span><button title="新建小说" onClick={() => setShowCreate(true)}>＋</button></div>
@@ -1841,7 +1908,8 @@ function App() {
           {(tree?.groups || []).filter(group => group.items.length > 0).map((group) => (
             <TreeSection key={group.id} label={group.label} items={group.items} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
           ))}
-          <details className="rail-tools"><summary>资料与协作详情</summary><ContextBudgetPanel value={contextStatus} onPin={setContextPin} /><CollaborationBoard value={collaboration} onAcceptBatch={(batchId) => void runWorkflow("batch_accept", { batch_id: batchId })} onResumeBatch={(batchId) => void runWorkflow("batch_resume", { batch_id: batchId })} /></details>
+          <section className="rail-pending" aria-label="待办摘要"><div><strong>待办与收尾</strong><span>{pendingSummary.count}</span></div><p>{pendingSummary.count ? "按章节查看下一步" : "当前没有待办"}{pendingSummary.messages.length ? ` · ${pendingSummary.messages.length} 条待回应消息` : ""}</p><button type="button" onClick={() => setActiveTab("process")}>打开待办看板</button></section>
+          <details className="rail-tools"><summary>资料与容量详情</summary><ContextBudgetPanel value={contextStatus} onPin={setContextPin} /></details>
           <div className="rail-summary">
             <div><span>草稿</span><strong>{dashboard?.status.chapters?.draft || 0}</strong></div>
             <div><span>正史</span><strong>{dashboard?.status.chapters?.accepted || 0}</strong></div>
@@ -1864,7 +1932,7 @@ function App() {
             <div><h2>和墨宝一起写</h2><p className="panel-status" role="status">{busy ? "任务进行中，可以继续补充想法" : "把想法告诉我。"}</p></div>
             <div className="panel-mascot">
               <button className="history-trigger" onClick={() => setShowHistory(true)}>对话历史 <span>{conversationHistory.length}</span></button>
-              <div className="mascot-conversation">
+              <div className="mascot-conversation" ref={mobaoDockRef}>
                 <Mascot
                   mood={busy ? ([...events].reverse().find(item => item.run_id === activeRunId && item.role)?.role === "writer" ? "writing" : [...events].reverse().find(item => item.run_id === activeRunId && item.role)?.role === "reviewer" ? "reviewing" : "thinking") : mascotMood}
                   onSettled={() => setMascotMood("idle")}
@@ -1882,7 +1950,7 @@ function App() {
           )}
           <div className="messages" ref={messagesRef}>
             {messages.map((message) => (
-              <article key={message.id} className={`message ${message.role}`}>
+              <article key={message.id} className={`message ${message.role}`} ref={message.id === mobaoCompletion?.messageId ? mobaoTargetRef : undefined}>
                 <span className="avatar">{message.role === "user" ? "你" : message.role === "system" ? "记" : "墨"}</span>
                 <div>
                   <p>{message.text}</p>
@@ -2014,10 +2082,21 @@ function App() {
           {activeTab === "memory" && <MemoryPanel dashboard={dashboard} workspace={chapterWorkspace} request={request} onRefresh={() => refresh()} />}
           {activeTab === "references" && <ReferencesPanel request={request} />}
           {activeTab === "listen" && <VoiceCenter refreshKey={voiceRevision} projectRoot={projectRoot} source={voiceSource} characterNames={(dashboard?.bible_entries || []).filter((item) => String(item.kind || "") === "character").map((item) => String(item.name || "")).filter(Boolean)} request={request} onNotice={setNotice} onError={setError} onPlay={(path) => playAudioPath(path)} />}
-          {activeTab === "process" && <ProcessPanelCompact events={events} collaboration={collaboration} context={contextStatus} provider={provider} workspace={chapterWorkspace} request={request} referenceDocument={referenceDocument} onOpenReference={openReference} onCloseReference={() => setReferenceDocument(null)} onNavigate={setActiveTab} />}
+          {activeTab === "process" && <ProcessPanelCompact events={events} collaboration={collaboration} context={contextStatus} provider={provider} workspace={chapterWorkspace} request={request} referenceDocument={referenceDocument} onOpenReference={openReference} onCloseReference={() => setReferenceDocument(null)} onNavigate={setActiveTab} pendingBoard={<CollaborationBoard value={collaboration} busy={busy} onProcessAll={() => void sendChat(undefined, "处理所有待办")} onWork={(item, action) => { if (action === "inspect" && item.kind === "manual_edit" && item.handling === "decision") setShowManualMonitor(true); else void sendChat(undefined, `${action === "process" ? "处理待办" : action === "defer" ? "下次再处理待办" : "查看待办"} ${item.id}`); }} onAcceptBatch={(batchId) => void runWorkflow("batch_accept", { batch_id: batchId })} onResumeBatch={(batchId) => void runWorkflow("batch_resume", { batch_id: batchId })} onInspectBatch={(batch) => { updateWorkspaceLayout({ assistantVisible: true }); setChatInput(`请查看批次 ${batch.batch_id}${batch.pending_work_id ? ` 的待处理事项 ${batch.pending_work_id}` : ""}，先说明保留正文及待核范围并询问我是否处理；现在不要改写或补审。`); window.setTimeout(() => chatInputRef.current?.focus(), 0); }} />} />}
         </section>
       </main>
 
+      <MobaoGuide cue={mobaoCompletion?.root === projectRoot ? mobaoCompletion : null}
+        workAreaRef={mobaoWorkAreaRef} targetRef={mobaoTargetRef} dockRef={mobaoDockRef}
+        disabled={busy || projectLoading || Boolean(chatInput.trim()) || text !== savedText || voiceRecording || voiceTranscribing || pendingQuestions.length > 0 || pendingComputerActions.length > 0 || showSettings || showCreate || showManualMonitor || showHistory || showSearch || showUpdate || showMigration || Boolean(selectionDraft || compareContent)}
+        onPreview={() => {
+          const reference = completionReference(events, mobaoCompletion?.runId);
+          if (!reference) { mobaoTargetRef.current?.scrollIntoView({ block: "nearest" }); return; }
+          void request<DocumentData>("document.read_reference", { project_root: mobaoCompletion?.root, relative_path: reference.relative_path }).then(loaded => {
+            if (mobaoCompletion?.root !== projectRootRef.current) return;
+            setReferenceDocument(loaded); setActiveTab("process");
+          }).catch(cause => setError(errorMessage(cause)));
+        }} />
       {(notice || error) && <Toast kind={error ? "error" : "info"} text={error || notice} onClose={() => { setError(""); setNotice(""); setMascotMood("idle"); }} action={error ? (/任务记录|原任务状态/.test(error) ? { label: "查看可恢复任务", onClick: () => setActiveTab("project") } : /API Key|密钥|模型接口|服务商|模型配置需要处理/.test(error) ? { label: "打开设置", onClick: () => setShowSettings(true) } : /重新审查/.test(error) ? { label: "打开审查", onClick: () => setActiveTab("review") } : /上下文容量|上下文占用/.test(error) ? { label: "查看上下文", onClick: () => setActiveTab("process") } : { label: "查看协作台", onClick: () => setActiveTab("process") }) : undefined} />}
       {showCreate && <CreateProject onClose={() => setShowCreate(false)} onCreated={openProject} />}
       {showManualMonitor && <Modal title="手动修改核对" subtitle="后台检测、依据和你的决定" onClose={() => setShowManualMonitor(false)} className="manual-monitor-modal"><ManualEditMonitor jobs={manualJobs} error={manualMonitorError} onRefresh={() => void refreshManualEdits()} onDecision={decideManualEdit} /></Modal>}
@@ -2099,9 +2178,8 @@ function ContextTopbarBadge({ value, onOpen }: { value: ContextStatus | null; on
   </button>;
 }
 
-function roleLabel(role: string, protocolVersion = 1) {
-  if (role === "reviewer" && protocolVersion === 2) return "专项审查";
-  return ({ coordinator: "墨宝 · 调度", writer: "创作", editor: "编辑", reviewer: "编辑", memory_keeper: "记忆整理", engine: "工作引擎", user: "你" } as Record<string, string>)[role] || role;
+function roleLabel(role: string) {
+  return ({ coordinator: "墨宝 · 调度", writer: "创作", editor: "编辑", reviewer: "专项审查", memory_keeper: "记忆整理", engine: "工作引擎", user: "你" } as Record<string, string>)[role] || role;
 }
 
 function messageTypeLabel(type: string) {
@@ -2112,44 +2190,159 @@ function learningLabel(type: string) {
   return ({ accepted: "用户接受", rejected: "用户拒绝", revised: "版本修订", rolled_back: "正史回退", preference_changed: "偏好变化" } as Record<string, string>)[type] || type;
 }
 
+function batchChapterAccepted(item: BatchChapterSummary): boolean {
+  return item.status === "accepted" || item.chapter_status === "accepted" || item.memory_status === "canon";
+}
+
+function batchChapterReviewed(item: BatchChapterSummary): boolean {
+  return batchChapterAccepted(item) || (!item.dependency_reason && !["needs_review", "invalidated", "pending", "stale"].includes(item.review_status || "")
+    && (item.review_status === "passed" || (item.review_verdict || item.verdict) === "pass"));
+}
+
+function batchPhaseLabel(phase?: string): string {
+  return ({ drafting: "写作", writer: "写作", review: "审查", reviewing: "审查", needs_review: "待补审",
+    memory: "临时记忆暂存", memory_handoff: "临时记忆交接", memory_pending: "临时记忆待恢复", writer_revision: "Writer 定向修订", repaired: "修订已保存", accepting: "正史接受", chapter_complete: "本章已完成",
+    complete: "已完成", completed: "已完成" } as Record<string, string>)[phase || ""] || phase || "待续接";
+}
+
+function batchMemoryLabel(status?: string): string {
+  return ({ canon: "已入正史", promoted: "已转正史", active: "临时有效", provisional: "临时有效",
+    staged: "临时已暂存", valid: "临时有效", invalidated: "临时失效", stale: "临时待核",
+    needs_review: "临时待核", pending: "尚未暂存", memory_pending: "暂存待恢复" } as Record<string, string>)[status || ""] || status || "尚无有效补丁";
+}
+
+function batchRangeLabel(range?: number[] | null): string {
+  return range?.length ? range.length === 1 || range[0] === range[1] ? `第 ${range[0]} 章` : `第 ${range[0]}–${range[1]} 章` : "无";
+}
+
+function BatchStateDetails({ batch }: { batch: BatchSummary }) {
+  const repair = batch.last_repair;
+  const chapter = batch.stopped_at_chapter ?? batch.checkpoint?.chapter_no;
+  const phase = batch.current_phase || batch.phase || batch.checkpoint?.phase;
+  return <details className="batch-state-details"><summary>逐章正文、审查与临时记忆</summary>
+    {repair && <p>{repair.review_only ? "本次只补审并核对临时记忆" : "本次定向修订"}：请求 {batchRangeLabel(repair.requested_chapter_range)}，实际处理 {batchRangeLabel(repair.chapter_range)}。{repair.preserved_suffix_range?.length ? `后缀 ${batchRangeLabel(repair.preserved_suffix_range)} 正文保留。` : ""}{repair.completed_chapters?.length ? `已处理：${repair.completed_chapters.join("、")} 章。` : ""}</p>}
+    {batch.remaining_review_range?.length ? <p>待核后缀：{batchRangeLabel(batch.remaining_review_range)}。保留正文，后续审查与临时记忆尚未完成；由 Coordinator 询问是否处理。</p> : null}
+    {(chapter || phase) && <p>当前断点：{chapter ? `第 ${chapter} 章 · ` : ""}{batchPhaseLabel(phase)}。</p>}
+    {(batch.stop_reason || batch.error || batch.checkpoint?.error) && <p>原因：{batch.stop_reason || batch.error || batch.checkpoint?.error}</p>}
+    {batch.chapters.length ? <table className="batch-state-table"><caption>临时成果与已接受正史分别显示</caption><thead><tr><th>章节</th><th>正文</th><th>审查</th><th>记忆</th></tr></thead>{batch.chapters.map((item) => <tbody key={item.chapter_no}><tr>
+      <th scope="row">{item.chapter_no}章{item.version ? ` v${item.version}` : ""}</th>
+      <td>{batchChapterAccepted(item) ? "已接受" : item.version ? "草稿保留" : "尚未写入"}</td>
+      <td>{batchChapterReviewed(item) ? "已通过" : item.review_status === "needs_review" || item.dependency_reason ? "待补审" : item.review_verdict || item.verdict || "尚未完成"}</td>
+      <td>{batchChapterAccepted(item) ? "正史" : batchMemoryLabel(item.memory_status)}</td></tr>
+      {(item.dependency_reason || item.invalidation_reason || item.error || item.phase === "memory_pending") && <tr><td colSpan={4}>{[item.phase === "memory_pending" ? "临时记忆暂存未完成" : "", item.dependency_reason, item.invalidation_reason, item.error].filter(Boolean).filter((reason, index, all) => all.indexOf(reason) === index).join("；")}</td></tr>}
+    </tbody>)}</table> : <p>本批次尚无已保存章节。</p>}
+    {batch.next_action && <p>下一步：{batch.next_action}</p>}
+  </details>;
+}
+
 function BatchProgressStatus({ batches, events, activeRunId }: { batches: BatchSummary[]; events: EngineEvent[]; activeRunId: string | null }) {
-  const batch = batches.find((item) => item.run_id === activeRunId && ["drafting", "accepting"].includes(item.status))
-    || batches.find((item) => ["accepting", "drafting", "ready_for_acceptance"].includes(item.status));
+  const batch = activeRunId ? batches.find((item) => item.run_id === activeRunId) : undefined;
   if (!batch || !batch.start_chapter_no || !batch.end_chapter_no) return null;
   const total = batch.end_chapter_no - batch.start_chapter_no + 1;
   if (total < 1) return null;
-  const passed = new Set(batch.chapters.filter((item) => item.review_verdict === "pass").map((item) => item.chapter_no));
+  const passed = new Set(batch.chapters.filter(batchChapterReviewed).map((item) => item.chapter_no));
   const completed = [...passed].filter((number) => number && number >= batch.start_chapter_no! && number <= batch.end_chapter_no!).length;
-  const current = Math.min(batch.end_chapter_no, batch.start_chapter_no + completed);
+  const current = batch.stopped_at_chapter ?? batch.checkpoint?.chapter_no
+    ?? Array.from({ length: total }, (_, index) => batch.start_chapter_no! + index).find((number) => !passed.has(number));
   const latest = activeRunId ? [...events].reverse().find((item) => item.run_id === activeRunId && item.type === "workflow.stage" && item.summary) : null;
   const stage = latest?.stage || "";
-  const activity = stage.includes("writer") ? "Writer 写作" : stage.includes("review") ? "Editor 审查" : stage.includes("memory") ? "记忆同步" : "准备下一步";
+  const phase = batch.current_phase || batch.phase || batch.checkpoint?.phase;
+  const activity = phase ? batchPhaseLabel(phase) : stage.includes("writer") ? "Writer 写作" : stage.includes("review") ? "审查" : stage.includes("memory") ? "临时记忆暂存" : "结果核验";
   const ready = batch.status === "ready_for_acceptance";
   const accepting = batch.status === "accepting";
-  const accepted = batch.chapters.filter((item) => item.memory_status === "canon").length;
+  const accepted = batch.chapters.filter(batchChapterAccepted).length;
+  const waiting = Boolean(batch.remaining_review_range?.length) || ["needs_review", "needs_revision", "waiting_suffix_review", "interrupted", "memory_pending", "failed"].includes(batch.status);
   return <section className="batch-progress-status" aria-label="批量创作进度">
-    <div className="batch-progress-heading"><strong>第 {batch.start_chapter_no}—{batch.end_chapter_no} 章</strong><span>{accepting ? `已入正文 ${accepted}/${total}${batch.stop_reason ? " · 接收待续" : " · 正在接收"}` : ready ? "逐章审查完成，待入正史" : `已过审 ${completed}/${total} · 第 ${current} 章 ${activity}`}</span></div>
-    <div className="batch-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={total} aria-valuenow={completed} aria-label="已通过审查的章节"><span style={{ width: `${completed / total * 100}%` }} /></div>
+    <div className="batch-progress-heading"><strong>第 {batch.start_chapter_no}—{batch.end_chapter_no} 章</strong><span>{batch.status === "accepted" ? `已入正史 ${accepted}/${total}` : accepting ? `已入正史 ${accepted}/${total} · ${batch.stop_reason ? "接收待续" : "正在接收"}` : ready ? "逐章审查与临时记忆完成，待入正史" : waiting ? `已保留断点${current ? ` · 第 ${current} 章` : ""} · ${activity}` : `有效审查 ${completed}/${total}${current ? ` · 第 ${current} 章` : ""} · ${activity}`}</span></div>
+    <div className="batch-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={total} aria-valuenow={completed} aria-label="当前有效审查的章节"><span style={{ width: `${completed / total * 100}%` }} /></div>
     <ol className="batch-progress-chapters">{Array.from({ length: total }, (_, index) => {
       const number = batch.start_chapter_no! + index;
       const item = batch.chapters.find((entry) => entry.chapter_no === number);
-      return <li key={number} className={item?.memory_status === "canon" || passed.has(number) ? "done" : !ready && number === current ? "current" : "pending"}>{number}章 <small>{item?.memory_status === "canon" ? "已入正文" : passed.has(number) ? "已过审" : !ready && number === current ? "进行中" : "待写"}</small></li>;
+      return <li key={number} className={item && batchChapterAccepted(item) || passed.has(number) ? "done" : !ready && number === current ? "current" : "pending"}>{number}章 <small>{item && batchChapterAccepted(item) ? "已入正史" : item?.dependency_reason || item?.review_status === "needs_review" ? "正文保留·待核" : ["memory_pending", "memory_handoff"].includes(item?.phase || "") ? "记忆待完成" : passed.has(number) ? "已过审" : item?.version ? "草稿已保存" : number === current && !waiting ? "进行中" : "待写"}</small></li>;
     })}</ol>
+    <BatchStateDetails batch={batch} />
   </section>;
 }
 
-function CollaborationBoard({ value, onAcceptBatch, onResumeBatch }: { value: CollaborationOverview | null; onAcceptBatch: (batchId: string) => void; onResumeBatch: (batchId: string) => void }) {
-  const activeMessages = (value?.messages || []).filter((item) => ["pending", "responded", "escalated"].includes(item.status));
-  const readyBatches = (value?.batches || []).filter((item) => ["ready_for_acceptance", "accepting"].includes(item.status));
-  const resumableBatches = (value?.batches || []).filter((item) => item.resume_available);
-  return <details className="collaboration-board" open>
-    <summary><span>协作看板</span><strong>{activeMessages.length} 待处理</strong></summary>
-    <p>Coordinator 只分配和汇总；正文、审查、记忆各自留痕。</p>
-    {resumableBatches.length > 0 && <section><h4>可续接批次</h4>{resumableBatches.map((batch) => <div className="batch-card" key={batch.batch_id}><strong>第 {batch.start_chapter_no}–{batch.end_chapter_no} 章</strong><small>{batch.stop_reason || "已保存的章节会保留，续接时从可验证的断点继续；本次只生成草稿，不提交正史。"}</small><button type="button" onClick={() => onResumeBatch(batch.batch_id)}>继续未完成部分</button></div>)}</section>}
-    {readyBatches.length > 0 && <section><h4>可验收批次</h4>{readyBatches.map((batch) => <div className="batch-card" key={batch.batch_id}><strong>第 {batch.start_chapter_no}–{batch.end_chapter_no} 章</strong><small>{batch.status === "accepting" ? batch.stop_reason || "已接收的章节保留，从下一章继续接收。" : "Editor 审查已通过，记忆服务已保存临时记忆。"}</small><button type="button" onClick={() => onAcceptBatch(batch.batch_id)}>{batch.status === "accepting" ? "继续收进正文" : "接收为正史"}</button></div>)}</section>}
-    <section><h4>协作消息</h4>{activeMessages.length === 0 ? <small>当前没有待回应消息。</small> : activeMessages.slice(0, 5).map((item) => <div className="collaboration-message" key={item.message_id}><span>{roleLabel(item.sender_role, item.role_protocol_version)} → {roleLabel(item.recipient_role, item.role_protocol_version)}</span><strong>{messageTypeLabel(item.message_type)}</strong><p>{item.claim}</p><small>{item.chapter_no ? `第 ${item.chapter_no} 章 · ` : ""}{item.status}</small></div>)}</section>
-    <section><h4>内部学习信号</h4><small>仅记录接受、拒绝、修订与偏好变化，用于本地优化；不会上传小说正文。</small>{(value?.learning_events || []).slice(0, 3).map((item) => <div className="learning-event" key={item.event_id}>{learningLabel(item.event_type)}{item.chapter_no ? ` · 第 ${item.chapter_no} 章` : ""}</div>)}</section>
-  </details>;
+function collaborationPending(value: CollaborationOverview | null) {
+  const items = (value?.pending_work || []).filter(item => !["completed", "superseded"].includes(item.status));
+  const work = items.filter(item => !item.parent_id || !items.some(parent => parent.id === item.parent_id));
+  const batches = (value?.batches || []).filter(batch => !(batch.chapters.length && batch.chapters.every(batchChapterAccepted))
+    && !work.some(item => item.id === batch.pending_work_id || item.intent?.batch_id === batch.batch_id || item.source?.batch_id === batch.batch_id));
+  const readyBatches = batches.filter((item) => ["ready_for_acceptance", "accepting"].includes(item.status)
+    && !item.remaining_review_range?.length && !item.chapters.some((chapter) => chapter.dependency_reason || ["invalidated", "stale", "memory_pending"].includes(chapter.memory_status || "")));
+  const resumableBatches = batches.filter((item) => !readyBatches.includes(item) && item.resume_available
+    && (!item.remaining_review_range?.length || item.last_repair?.review_only && ["failed", "interrupted"].includes(item.last_repair.status || "")));
+  const pendingBatches = batches.filter((item) => !readyBatches.includes(item) && !resumableBatches.includes(item)
+    && (Boolean(item.remaining_review_range?.length) || ["repairing", "needs_review", "needs_revision", "waiting_suffix_review", "memory_pending", "interrupted", "failed"].includes(item.status)));
+  const messages = (value?.messages || []).filter(item => ["pending", "responded", "escalated"].includes(item.status));
+  return { items, work, readyBatches, resumableBatches, pendingBatches, messages,
+    count: work.filter(item => item.status !== "deferred").length + readyBatches.length + resumableBatches.length + pendingBatches.length };
+}
+
+function canPollWorkspace(visibility: string, focused: boolean): boolean {
+  return visibility === "visible" && focused;
+}
+
+function chatRefreshScope(result: unknown): "project" | "pending" | "none" {
+  if (!result || typeof result !== "object") return "project";
+  const intent = (result as { intent?: { action?: string; pending_work_decision?: string } }).intent;
+  if (intent?.action === "pending_work" && ["inspect", "defer"].includes(intent.pending_work_decision || "")) return "pending";
+  return ["status", "help", "discuss"].includes(intent?.action || "") ? "none" : "project";
+}
+
+function completionReference(events: EngineEvent[], runId?: string): TraceReference | undefined {
+  return [...events].reverse().filter(event => event.run_id === runId && runId
+    && ["completed", "accepted", "resolved"].includes(event.status || "")
+    && !/context|retriev|input/.test(`${event.stage || ""} ${event.type || ""}`))
+    .flatMap(event => event.references || []).find(reference => reference.exists);
+}
+
+function pendingWorkLabel(item: PendingWorkItem, action = false): string {
+  if (item.kind === "plan_revision") return item.status === "needs_writer" ? action ? "修订并复审这章" : "执行卡修订交接" : action ? "复审这章" : "规划交接核对";
+  const labels: Record<string, [string, string]> = {
+    accepted_projection: ["正史文件同步", "同步章节文件"], planning_publication: ["规划发布收尾", "恢复规划发布"],
+    manual_edit: ["手动修改核对", "继续核对修改"], review_gate: ["本章审查缺口", "补齐本章审查"],
+    review_evidence: ["审查依据补核", "补核本章依据"], chapter_gate: ["章节交接核对", "补齐本章核对"],
+    workflow: ["原任务断点", "继续原任务"], accept_finalization: ["正史提交收尾", "完成提交收尾"],
+    development_repair: ["程序修复条件", "查看修复条件"], coordinator_recovery: ["自动补救记录", "查看补救记录"],
+  };
+  return labels[item.kind]?.[action ? 1 : 0] || (action ? "按原任务处理" : "任务条件待核对");
+}
+
+function CollaborationBoard({ value, busy, onProcessAll, onWork, onAcceptBatch, onResumeBatch, onInspectBatch }: { value: CollaborationOverview | null; busy: boolean; onProcessAll: () => void; onWork: (item: PendingWorkItem, action: "inspect" | "process" | "defer") => void; onAcceptBatch: (batchId: string) => void; onResumeBatch: (batchId: string) => void; onInspectBatch: (batch: BatchSummary) => void }) {
+  const pending = collaborationPending(value);
+  const active = pending.work.filter(item => item.status !== "deferred");
+  const deferred = pending.work.filter(item => item.status === "deferred");
+  const chapterNumbers = [...new Set(active.map(item => item.chapter_no || 0))].sort((a, b) => a - b);
+  const rank = (item: PendingWorkItem) => item.handling === "running" ? 0 : item.can_process ? 1 : item.handling === "decision" ? 2 : 3;
+  const renderWork = (item: PendingWorkItem) => {
+    const children = pending.items.filter(child => child.parent_id === item.id);
+    const decision = item.handling === "decision" && item.kind === "manual_edit";
+    return <article className={`pending-work-card ${item.handling || "blocked"}`} key={item.id}>
+      <header><strong>{pendingWorkLabel(item)}</strong><span>{({ deferred: "留待下次", running: "进行中", blocked: "需补充条件", decision: "需要你决定", local: "可本地恢复", manual: "可续核", review: "可复审", resume: "可续接" } as Record<string, string>)[item.handling || ""] || "待核对"}</span></header>
+      <p className="pending-work-reason">{item.reason}</p>
+      <div className="pending-work-actions">
+        {item.can_process && item.handling !== "running" && <button type="button" className="primary" disabled={busy} onClick={() => onWork(item, "process")}>{pendingWorkLabel(item, true)}</button>}
+        {!item.can_process && item.handling !== "running" && <button type="button" disabled={busy} onClick={() => onWork(item, "inspect")}>{decision ? "核对修改并决定" : "查看恢复条件"}</button>}
+        {item.status !== "deferred" && item.handling !== "running" && <button type="button" className="text-button" disabled={busy} onClick={() => onWork(item, "defer")}>留到下次</button>}
+      </div>
+      <details className="pending-work-diagnostic"><summary>下一步与诊断{children.length ? ` · ${children.length} 条关联记录` : ""}</summary><p>{item.next_action}</p>{children.map(child => <div key={child.id}><strong>{pendingWorkLabel(child)}</strong><p>{child.reason}</p><p>{child.next_action}</p></div>)}<small>本项已记录处理尝试 {Math.max(item.processing_attempts || 0, Number(item.source?.attempts || 0))} 次 · {item.id}</small></details>
+    </article>;
+  };
+  const renderBatch = (batch: BatchSummary, mode: "resume" | "accept" | "inspect") => <article className="pending-work-card" key={batch.batch_id}>
+    <header><strong>{batch.start_chapter_no ? `第 ${batch.start_chapter_no}${batch.end_chapter_no && batch.end_chapter_no !== batch.start_chapter_no ? `–${batch.end_chapter_no}` : ""} 章` : "章节批次"}</strong><span>{mode === "resume" ? "可续接" : mode === "accept" ? "待验收" : "需核对范围"}</span></header>
+    <p>{batch.next_action || batch.stop_reason || (mode === "accept" ? "必要审查与临时记忆已完成，可以继续正式接受。" : "已保存正文保留，从原任务断点核对下一步。")}</p>
+    <div className="pending-work-actions"><button type="button" disabled={busy} className={mode === "inspect" ? "" : "primary"} onClick={() => mode === "resume" ? onResumeBatch(batch.batch_id) : mode === "accept" ? onAcceptBatch(batch.batch_id) : onInspectBatch(batch)}>{mode === "resume" ? "继续这个批次" : mode === "accept" ? "继续收进正史" : "查看并确认补核范围"}</button></div><BatchStateDetails batch={batch} />
+  </article>;
+  return <section className="pending-board" aria-labelledby="pending-board-title">
+    <header className="pending-board-heading"><div><h3 id="pending-board-title">待办与收尾 <span>{pending.count}</span></h3><p>按章节接着处理，每项都有结果和结束条件。</p></div><button type="button" className="primary" title="逐项处理可恢复的原任务；需要你决定或尝试耗尽时保留对应条件。" disabled={busy || !active.some(item => item.can_process)} onClick={onProcessAll}>{busy ? "任务处理中…" : "处理当前全部待办"}</button></header>
+    {!value ? <p className="pending-empty" role="status">正在读取待办…</p> : !pending.count && <p className="pending-empty" role="status">当前没有需要处理的任务。{deferred.length ? `${deferred.length} 项留待下次，可在下方展开。` : ""}</p>}
+    {chapterNumbers.map(number => <section className="pending-chapter-group" key={number}><h4>{number ? `第 ${number} 章` : "项目收尾"}<span>{active.filter(item => (item.chapter_no || 0) === number).length} 项</span></h4>{active.filter(item => (item.chapter_no || 0) === number).sort((a, b) => rank(a) - rank(b)).map(renderWork)}</section>)}
+    {pending.resumableBatches.length + pending.readyBatches.length + pending.pendingBatches.length > 0 && <section className="pending-chapter-group"><h4>批次交接</h4>{pending.resumableBatches.map(batch => renderBatch(batch, "resume"))}{pending.readyBatches.map(batch => renderBatch(batch, "accept"))}{pending.pendingBatches.map(batch => renderBatch(batch, "inspect"))}</section>}
+    {deferred.length > 0 && <details className="pending-board-disclosure"><summary>留到下次的事项 <span>{deferred.length}</span></summary>{deferred.map(renderWork)}</details>}
+    {pending.messages.length > 0 && <details className="pending-board-disclosure"><summary>Agent 协作讨论 <span>{pending.messages.length}</span></summary><p>这里保留角色交接和待回应问题，具体处理与运行记录见下方「Agent」。</p>{pending.messages.map(item => <article className="pending-discussion" key={item.message_id}><header><strong>{item.chapter_no ? `第 ${item.chapter_no} 章 · ` : ""}{messageTypeLabel(item.message_type)}</strong><span>{roleLabel(item.sender_role)} → {roleLabel(item.recipient_role)}</span></header><p>{item.claim}</p></article>)}</details>}
+  </section>;
 }
 
 function CanonMigrationDialog({ migration, busy, onClose, onApply }: { migration: CanonMigration; busy: boolean; onClose: () => void; onApply: () => void }) {
@@ -2388,15 +2581,33 @@ function ChapterPanel({ workspace, request, onPrompt }: { workspace: Record<stri
 function ReviewPanel({ document, reviewDocument, tree, workspace, request, onOpen, onPrompt }: { document: DocumentData | null; reviewDocument: DocumentData | null; tree: ProjectTree | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; onOpen: (item: TreeItem) => void; onPrompt: (value: string) => void }) {
   const reviews = tree?.groups.find((group) => group.id === "reviews")?.items || [];
   const [panelResult, setPanelResult] = useState<Record<string, unknown> | null>(null);
-  const chapterMatch = document?.relative_path.match(/chapter_(\d+)\.draft\.md$/);
+  const [panelWorking, setPanelWorking] = useState(false);
+  const panelSequence = useRef(0);
+  const chapterMatch = document?.relative_path.match(/chapter_(\d+)(?:\.draft)?\.md$/);
   const reviewChapterMatch = reviewDocument?.relative_path.match(/chapter_(\d+)\.review\.md$/);
   const chapterNo = Number(chapterMatch?.[1] || reviewChapterMatch?.[1] || 0);
+  const sourceKey = `${chapterNo}:${document?.content_hash || ""}:${JSON.stringify(workspace?.record || {})}`;
+  const currentPanelSource = useRef(sourceKey);
+  currentPanelSource.current = sourceKey;
+  useEffect(() => { panelSequence.current += 1; setPanelResult(null); setPanelWorking(false); }, [sourceKey, request]);
+  const runPanel = async () => {
+    const source = sourceKey;
+    const sequence = ++panelSequence.current;
+    setPanelWorking(true);
+    try {
+      const value = await request<Record<string, unknown>>("chapter.review_panel", { chapter_no: chapterNo });
+      if (sequence === panelSequence.current && source === currentPanelSource.current) setPanelResult(value);
+    } finally {
+      if (sequence === panelSequence.current && source === currentPanelSource.current) setPanelWorking(false);
+    }
+  };
   const panelFindings = (panelResult?.merged_findings || []) as Array<Record<string, unknown>>;
   return <div className="scroll-panel review-panel">
-    <div className="section-heading"><p className="eyebrow">审查</p><h2>证据化审查</h2><p>每个扣分项都应指向正文、章节卡或正史依据；旧审查不能批准新版本。报告里的百分比是模型自评把握度，不是统计正确率；请结合原文证据与审查范围判断。</p></div>
+    <div className="section-heading"><p className="eyebrow">审查</p><h2>证据化审查</h2><p>每个扣分项都应指向正文、章节卡或正史依据；旧审查不能批准新版本。量表百分比是证据化规则符合度，模型自报把握度另列；分值需结合原文、必需审查覆盖和已证实问题判断。</p></div>
     {workspace && <ChapterStatusStrip workspace={workspace} />}
     {reviewDocument && <article className="markdown-preview review-document"><header><strong>{reviewDocument.relative_path}</strong><span>审查报告 · 只读</span></header><pre>{reviewDocument.content}</pre><small>审查报告单独显示；正文仍在编辑器中打开，不会被报告覆盖。</small></article>}
-    {chapterNo > 0 && <section className="stack-section"><h3>Editor 多维预审</h3><p className="form-hint">Editor 分别检查连续性、人物、叙事和表达，再按证据去重；不会直接修改正文。</p><button onClick={async () => setPanelResult(await request<Record<string, unknown>>("chapter.review_panel", { chapter_no: chapterNo }))}>运行多维预审</button>{panelResult && <div>{panelFindings.length === 0 && <p className="empty-mini">没有发现可引用的问题。</p>}{panelFindings.map((finding, index) => <article className="thread-card" key={index}><strong>[{String(finding.severity || "info")}] {String(finding.category || "阅读体验")}</strong><p>原文：{String(finding.evidence || "未提供")}</p><p>影响：{String(finding.explanation || "未单独说明")}</p><small>修订方向：{String(finding.repair_instruction || "由作者决定是否调整")}</small></article>)}</div>}</section>}
+    {reviewChapterMatch && chapterMatch && Number(reviewChapterMatch[1]) !== chapterNo && <p className="form-hint">已打开第 {Number(reviewChapterMatch[1])} 章报告；本次预审和精修目标为编辑器中的第 {chapterNo} 章。</p>}
+    {chapterNo > 0 && <section className="stack-section"><h3>Editor 多维预审 · 第 {chapterNo} 章</h3><p className="form-hint">Editor 分别检查连续性、人物、叙事和表达，再按证据去重；不会直接修改正文。</p><button disabled={panelWorking} onClick={() => void runPanel()}>{panelWorking ? "正在审查本章…" : "运行多维预审"}</button>{panelResult && <div>{panelFindings.length === 0 && <p className="empty-mini">没有发现可引用的问题。</p>}{panelFindings.map((finding, index) => <article className="thread-card" key={index}><strong>[{String(finding.severity || "info")}] {String(finding.category || "阅读体验")}</strong><p>原文：{String(finding.evidence || "未提供")}</p><p>影响：{String(finding.explanation || "未单独说明")}</p><small>修订方向：{String(finding.repair_instruction || "由作者决定是否调整")}</small></article>)}</div>}</section>}
     {chapterNo > 0 && <button className="wide-action" onClick={() => onPrompt(`请根据第 ${chapterNo} 章当前版本的 Editor 审查证据进入精修模式：先输出可审计的场景蓝图，再由 Writer 定点修订并让 Editor 重审新版本；不要验收。`)}>把审查意见交给 Writer 精修</button>}
     <section className="stack-section"><h3>审查记录</h3>{reviews.length === 0 && <p className="empty-mini">还没有审查报告。</p>}{reviews.map((item) => <button className="review-link" key={item.id} onClick={() => void onOpen(item)}><span>✓</span><strong>{item.label}</strong><small>打开报告</small></button>)}</section>
   </div>;
@@ -2410,6 +2621,17 @@ function MemoryPanel({ dashboard, workspace, request, onRefresh }: { dashboard: 
   const [previewChapter, setPreviewChapter] = useState(1);
   const [memoryPreview, setMemoryPreview] = useState<Record<string, unknown> | null>(null);
   const [memoryWorking, setMemoryWorking] = useState(false);
+  const previewSequence = useRef(0);
+  useEffect(() => { previewSequence.current += 1; setMemoryPreview(null); }, [previewChapter, request]);
+  const generateMemoryPreview = async () => {
+    const sequence = ++previewSequence.current;
+    const chapter = previewChapter;
+    setMemoryWorking(true);
+    try {
+      const value = await request<Record<string, unknown>>("memory.preview", { chapter_no: chapter, user_accepted: true });
+      if (sequence === previewSequence.current) setMemoryPreview(value);
+    } finally { setMemoryWorking(false); }
+  };
   const [voicePreferences, setVoicePreferences] = useState<Array<Record<string, unknown>>>([]);
   const [voiceScope, setVoiceScope] = useState("project");
   const [voiceTarget, setVoiceTarget] = useState("");
@@ -2440,7 +2662,7 @@ function MemoryPanel({ dashboard, workspace, request, onRefresh }: { dashboard: 
     {workspace && <ChapterStatusStrip workspace={workspace} />}
     {showAdd && <div className="inline-form"><select value={kind} onChange={(event) => setKind(event.target.value)}><option value="character">人物</option><option value="location">地点</option><option value="organization">组织</option><option value="item">物品</option><option value="lore">世界观</option><option value="style">文风</option></select><input value={name} onChange={(event) => setName(event.target.value)} placeholder="名称" /><textarea value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="稳定设定、声线、禁忌或说明" /><button className="primary" onClick={() => void save()}>保存</button></div>}
     <section className="stack-section"><h3>写作偏好与强制记忆</h3><p className="form-hint">“普通偏好”会按人物、场景和篇章相关度取用；“强制记忆”每次都交给 Writer，并由 Reviewer 核对。它们用于写作方式和长期要求，不会冒充小说正史。</p><div className="inline-form"><select value={voiceScope} onChange={(event) => setVoiceScope(event.target.value)}><option value="project">全书</option><option value="character">人物</option><option value="scene">场景</option><option value="arc">篇章</option></select>{voiceScope !== "project" && <input value={voiceTarget} onChange={(event) => setVoiceTarget(event.target.value)} placeholder={voiceScope === "character" ? "人物名" : voiceScope === "arc" ? "篇章名或编号" : "场景类型"} />}<select value={voiceStrength} onChange={(event) => setVoiceStrength(event.target.value)}><option value="weak">普通偏好：相关时使用</option><option value="hard">强制记忆：始终使用</option></select><textarea value={voiceText} onChange={(event) => setVoiceText(event.target.value)} placeholder="例如：女主紧张时会缩短句子，但不会直说害怕；认可片段……适用于女主视角。" /><button className="primary" onClick={() => void saveVoicePreference()}>保存</button></div><p className="form-hint">强制记忆过多时，墨流只会去除完全重复的副本，不会偷偷删改规则；容量接近上限时会在协作台提醒你暂停过期项或合并同义项。</p>{voicePreferences.map((item) => <article className="memory-card" key={String(item.preference_id)}><span>{String(item.scope)} · {String(item.strength) === "hard" ? "强制记忆" : "普通偏好"}</span><strong>{String(item.status) === "active" ? "正在使用" : "已暂停"}</strong><p>{String(item.text)}</p><div className="settings-inline-actions"><button onClick={async () => { await request("preference.set_status", { preference_id: item.preference_id, status: item.status === "active" ? "paused" : "active" }); await loadVoicePreferences(); }}>{item.status === "active" ? "暂停使用" : "恢复使用"}</button><button onClick={async () => { if (!(await window.inkflow.confirm("删除这条写作记忆吗？删除后，后续章节不会再使用它。"))) return; await request("preference.delete", { preference_id: item.preference_id }); await loadVoicePreferences(); await onRefresh(); }}>删除</button></div></article>)}</section>
-    <section className="stack-section canon-preview"><h3>正史变更预览</h3><p className="form-hint">只针对你已经接受且 Editor 审查已放行的当前草稿。先看事实与伏笔补丁，再决定是否提交 SQLite。</p><div className="settings-inline-actions"><input type="number" min={1} value={previewChapter} onChange={(event) => setPreviewChapter(Number(event.target.value))} /><button disabled={memoryWorking} onClick={async () => { setMemoryWorking(true); try { const value = await request<Record<string, unknown>>("memory.preview", { chapter_no: previewChapter, user_accepted: true }); setMemoryPreview(value); } finally { setMemoryWorking(false); } }}>生成预览</button></div>{memoryPreview && <article className="memory-card"><strong>第 {previewChapter} 章 · 尚未提交</strong><p>新增或更新事实 {Array.isArray(previewData.facts) ? previewData.facts.length : 0} 条，线索变化 {Array.isArray(previewData.threads) ? previewData.threads.length : 0} 条，冲突 {Array.isArray(previewData.unresolved_conflicts) ? previewData.unresolved_conflicts.length : 0} 条。</p><details><summary>查看完整补丁</summary><pre>{JSON.stringify(previewData, null, 2)}</pre></details><button className="primary" disabled={memoryWorking} onClick={async () => { const preview = memoryPreview.preview as Record<string, unknown>; setMemoryWorking(true); try { await request("memory.commit_preview", { chapter_no: previewChapter, artifact_id: preview.artifact_id }); setMemoryPreview(null); await onRefresh(); } finally { setMemoryWorking(false); } }}>确认提交正史</button></article>}</section>
+    <section className="stack-section canon-preview"><h3>正史变更预览</h3><p className="form-hint">只针对你已经接受且 Editor 审查已放行的当前草稿。先看事实与伏笔补丁，再决定是否提交 SQLite。</p><div className="settings-inline-actions"><input type="number" min={1} value={previewChapter} disabled={memoryWorking} onChange={(event) => setPreviewChapter(Number(event.target.value))} /><button disabled={memoryWorking} onClick={() => void generateMemoryPreview()}>生成预览</button></div>{memoryPreview && <article className="memory-card"><strong>第 {String((memoryPreview.preview as Record<string, unknown>).chapter_no)} 章 · 尚未提交</strong><p>新增或更新事实 {Array.isArray(previewData.facts) ? previewData.facts.length : 0} 条，线索变化 {Array.isArray(previewData.threads) ? previewData.threads.length : 0} 条，冲突 {Array.isArray(previewData.unresolved_conflicts) ? previewData.unresolved_conflicts.length : 0} 条。</p><details><summary>查看完整补丁</summary><pre>{JSON.stringify(previewData, null, 2)}</pre></details><button className="primary" disabled={memoryWorking} onClick={async () => { const preview = memoryPreview.preview as Record<string, unknown>; setMemoryWorking(true); try { await request("memory.commit_preview", { chapter_no: Number(preview.chapter_no), artifact_id: preview.artifact_id }); setMemoryPreview(null); await onRefresh(); } finally { setMemoryWorking(false); } }}>确认提交正史</button></article>}</section>
     <section className="stack-section"><h3>人工故事圣经 <small>{dashboard?.bible_entries.length || 0}</small></h3>{dashboard?.bible_entries.map((entry) => <article className="memory-card" key={String(entry.entry_id)}><span>{kindLabel(String(entry.kind))}</span><strong>{String(entry.name)}</strong><p>{String(((entry.data || {}) as Record<string, unknown>).notes || "")}</p></article>)}</section>
     <section className="stack-section"><h3>当前正史事实 <small>{dashboard?.facts.length || 0}</small></h3>{dashboard?.facts.slice(0, 30).map((fact) => <article className="fact-row" key={String(fact.fact_id)}><strong>{String(fact.subject)} · {String(fact.predicate)}</strong><p>{stringifyShort(fact.value)}</p><small>来源第 {String(fact.source_chapter)} 章</small></article>)}</section>
     <section className="stack-section"><h3>开放线索 <small>{dashboard?.threads.length || 0}</small></h3>{dashboard?.threads.map((thread) => <article className="thread-card" key={String(thread.thread_id)}><strong>{String(thread.title)}</strong><p>{String(thread.description)}</p><small>{String(thread.status)} · 预计第 {String(thread.due_chapter || "—")} 章</small></article>)}</section>
@@ -2456,7 +2678,7 @@ function CostSummary({ usage }: { usage?: CollaborationOverview["usage"] }) {
   return <><p>本机新账本已知部分估算 ¥{total.estimated_cost.toFixed(4)} · 本书 {book.calls} 次请求。</p>
     <details><summary>计费说明</summary><p>记录起点：{total.since ? new Date(total.since).toLocaleString() : "尚未开始"}。{total.price_note}</p>
       <p>{total.unknown_cost_calls} 次费用待核算，其中 {total.unknown_usage_calls} 次用量不完整。待返回或未知请求的预估 ¥{total.pending_estimated_cost.toFixed(4)}，没有计作已知费用。</p>
-      <p>本书训练成果远端验证已用 {book.training_validation_calls} / 5 次；日常写作不占这些名额。</p></details></>;
+      </details></>;
 }
 
 function CacheSummary({ usage }: { usage?: CollaborationOverview["usage"] }) {
@@ -2468,6 +2690,9 @@ function CacheSummary({ usage }: { usage?: CollaborationOverview["usage"] }) {
   const recent = usage?.recent_deepseek_cache;
   const recentRate = recent?.hit_rate == null ? null : Math.round(recent.hit_rate * 100);
   const draftFamilies = Object.entries(recent?.by_family || {}).filter(([name]) => name.endsWith(":writer:DraftOutput"));
+  const showCount = (value: number | null | undefined) => value == null ? "未知" : value.toLocaleString();
+  const performance = recent?.performance_diagnostic;
+  const production = recent?.qualified_production;
   const labels: Record<string, string> = { coordinator: "Coordinator", writer: "Writer", editor: "Editor", reviewer: "专项 Reviewer", memory_keeper: "Memory Keeper", legacy: "旧版调用", unknown: "角色未标明" };
   const roleUsage = usage.by_agent_role || {};
   const roleKeys = ["coordinator", "writer", "editor", "reviewer", "memory_keeper", ...(roleUsage.unknown?.calls ? ["unknown"] : [])];
@@ -2475,7 +2700,14 @@ function CacheSummary({ usage }: { usage?: CollaborationOverview["usage"] }) {
   return <article className="cache-summary">
     <header><strong>DeepSeek 输入缓存</strong><span>{recentRate === null ? "最近调用暂无报告" : `最近全部调用 ${recent?.reported_calls} 次 · ${recentRate}% 命中`}</span></header>
     <p>{recentRate === null ? "最近请求没有可计算的缓存用量。" : `最近取样已复用 ${recent!.hit_tokens.toLocaleString()} tokens，未命中 ${recent!.miss_tokens.toLocaleString()} tokens。`}{recent?.unknown_calls ? `另有 ${recent.unknown_calls} 次用量未知。` : ""}{draftFamilies.length === 1 && draftFamilies[0][1].hit_rate != null ? ` 正文 Writer 同类请求 ${draftFamilies[0][1].calls} 次、命中 ${Math.round(draftFamilies[0][1].hit_rate! * 100)}%。` : ""} 全部调用混合规划、正文和审核，不能直接当作连续正文 Writer 命中率。</p>
-    <details><summary>查看最近分角色与历史累计</summary><p>{rate === null ? "旧记录没有完整缓存字段。" : `已记录模型结果累计命中 ${rate}%，复用 ${hit.toLocaleString()} tokens，未命中 ${miss.toLocaleString()} tokens。`} 稳定资料会放在变化的章节要求之前；实际命中由 DeepSeek 返回值确认。</p><div className="cache-role-list">{roles.map(([role, value]) => { const roleHit = Number(value.prompt_cache_hit_tokens || 0); const roleMiss = Number(value.prompt_cache_miss_tokens || 0); const roleTotal = roleHit + roleMiss; const roleRate = roleTotal ? Math.round((roleHit / roleTotal) * 100) : null; const versionedRecent = role !== "editor" && role !== "reviewer"; const recentRole = versionedRecent ? recent?.by_role?.[role] : null; return <div key={role}><strong>{labels[role] || role}</strong><span>{versionedRecent ? recentRole?.hit_rate != null ? `最近 ${Math.round(recentRole.hit_rate * 100)}% · ${recentRole.calls} 次` : recentRole?.calls ? `最近未知 · ${recentRole.calls} 次` : "最近无调用" : "最近账本未分协议"}；累计 {value.calls ? roleRate === null ? `未知 · ${value.calls} 次` : `${roleRate}% · ${value.calls} 次` : "暂无调用"}</span></div>; })}</div></details>
+    <details><summary>查看最近分角色与历史累计</summary><p>{rate === null ? "旧记录没有完整缓存字段。" : `已记录模型结果累计命中 ${rate}%，复用 ${hit.toLocaleString()} tokens，未命中 ${miss.toLocaleString()} tokens。`} 稳定资料会放在变化的章节要求之前；实际命中由 DeepSeek 返回值确认。</p><div className="cache-role-list">{roles.map(([role, value]) => { const roleHit = Number(value.prompt_cache_hit_tokens || 0); const roleMiss = Number(value.prompt_cache_miss_tokens || 0); const roleTotal = roleHit + roleMiss; const roleRate = roleTotal ? Math.round((roleHit / roleTotal) * 100) : null; const recentRole = recent?.by_role?.[role]; return <div key={role}><strong>{labels[role] || role}</strong><span>{recentRole?.hit_rate != null ? `最近 ${Math.round(recentRole.hit_rate * 100)}% · ${recentRole.calls} 次` : recentRole?.calls ? `最近未知 · ${recentRole.calls} 次` : "最近无调用"}；累计 {value.calls ? roleRate === null ? `未知 · ${value.calls} 次` : `${roleRate}% · ${value.calls} 次` : "暂无调用"}</span></div>; })}</div></details>
+    {performance && <details><summary>查看失败、重试与可比较记录</summary>
+      <p>最近记录 {performance.calls} 次尝试、{performance.request_count} 项请求，其中 {performance.failed_calls} 次失败；已发送 {performance.sent_calls} 次、未发出 {performance.not_sent_calls} 次、发送状态未知 {performance.unknown_sent_calls} 次。已知原始输入 {showCount(performance.raw_input_tokens)} token，缓存 {showCount(performance.cached_input_tokens)}、未命中 {showCount(performance.uncached_input_tokens)}，输出 {showCount(performance.output_tokens)}。</p>
+      <p>已记录尝试耗时 {performance.attempt_elapsed_ms == null ? "未知" : `${(performance.attempt_elapsed_ms / 1000).toFixed(1)} 秒`}；{performance.unknown_duration_calls} 次耗时、{performance.unknown_usage_calls} 次用量、{performance.unknown_cost_calls} 次费用未知。{performance.time_note} {performance.quality_note}</p>
+      <div className="cache-role-list">{(performance.same_scope_groups || []).slice(0, 8).map((group, index) => <div key={index}><strong>{group.stage || "阶段未标明"}</strong><span>{group.scope_known ? "同材料与规则" : "比较条件不完整"} · {group.calls} 次 · 输入 {showCount(group.raw_input_tokens)} · 缓存 {showCount(group.cached_input_tokens)} · 未命中 {showCount(group.uncached_input_tokens)} · 输出 {showCount(group.output_tokens)}</span></div>)}</div>
+      {(performance.writer_sequence || []).slice(-6).map(item => <p key={`${item.before_attempt_id}:${item.after_attempt_id}`}>{item.conclusion}</p>)}
+      {production && <p>当前接受凭据关联 {production.accepted_products} 章；{production.estimated_cost_per_product == null ? "每章完整成本暂不可确定" : `每章关联任务成本估算 ¥${production.estimated_cost_per_product.toFixed(4)}`}。{production.limitation}</p>}
+    </details>}
   </article>;
 }
 
@@ -2483,7 +2715,7 @@ type LiveRun = { id: string; steps: EngineEvent[]; method?: string; status: stri
 
 function LiveRunTimeline({ runs, onOpenReference }: { runs: LiveRun[]; onOpenReference: (reference: TraceReference) => void | Promise<void> }) {
   if (!runs.length) return null;
-  return <div className="run-list live-runs"><h3>实时运行过程</h3><p className="process-hint">这里展示公开的步骤、角色、模型、等待参数和文件引用；不会展示模型原始思考内容。</p>{runs.slice(0, 8).map((run) => <details className={`run-card live-run ${run.status}`} open={run.status === "running" || run.status === "waiting"} key={`live-${run.id}`}><summary><strong>{String(run.method ? methodLabel(run.method) : "墨流任务")}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : run.status === "waiting" ? "等待处理" : "进行中"}</span></summary><p>{run.summary}</p><ol className="live-timeline">{run.steps.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; const stepStatus = step.status || "info"; const role = String(step.role || metadata.agent_role || ""); const model = String(step.model || metadata.model || ""); const refs = step.references || []; const publicMetadata = Object.fromEntries(Object.entries(metadata).filter(([key]) => !isSensitivePresentationKey(key))); return <li className={`live-step ${stepStatus}`} key={`${step.timestamp || index}-${index}`}><div className="live-step-main"><span className="live-step-marker">{stepStatus === "completed" ? "✓" : stepStatus === "failed" ? "!" : stepStatus === "started" ? "…" : "·"}</span><div><strong>{eventLabel(step.type || step.stage)}</strong><p>{step.summary || step.stage || "过程"}</p><small>{step.timestamp ? formatTime(step.timestamp) : "刚刚"}{role ? ` · ${agentRoleLabel(role, step.role_protocol_version || 1)}` : ""}{model ? ` · ${model}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small></div></div>{step.details && <p className="live-step-details">{step.details}</p>}{(metadata.timeout_seconds || metadata.max_tokens || typeof metadata.thinking === "boolean") && <small className="live-step-meta">请求参数：{metadata.timeout_seconds ? `超时 ${String(metadata.timeout_seconds)} 秒` : ""}{metadata.max_tokens ? ` · 输出上限 ${Number(metadata.max_tokens).toLocaleString()} tokens` : ""}{typeof metadata.thinking === "boolean" ? ` · 深度推理 ${metadata.thinking ? "开启" : "关闭"}` : ""}</small>}{refs.length > 0 && <div className="settings-inline-actions">{refs.map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {reference.relative_path}</button>)}</div>}{Object.keys(publicMetadata).length > 0 && <details><summary>查看本步公开记录</summary><pre className="compact-json">{JSON.stringify(publicMetadata, null, 2)}</pre></details>}</li>; })}</ol><small className="live-run-footnote">可复核文件由运行记录自动发现；点击文件按钮可在本地打开。</small></details>)}</div>;
+  return <div className="run-list live-runs"><h3>实时运行过程</h3><p className="process-hint">这里展示公开的步骤、角色、模型、等待参数和文件引用；不会展示模型原始思考内容。</p>{runs.slice(0, 8).map((run) => <details className={`run-card live-run ${run.status}`} open={run.status === "running" || run.status === "waiting"} key={`live-${run.id}`}><summary><strong>{String(run.method ? methodLabel(run.method) : "墨流任务")}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : run.status === "waiting" ? "等待处理" : "进行中"}</span></summary><p>{run.summary}</p><ol className="live-timeline">{run.steps.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; const stepStatus = step.status || "info"; const role = String(step.role || metadata.agent_role || ""); const model = String(step.model || metadata.model || ""); const refs = step.references || []; const publicMetadata = Object.fromEntries(Object.entries(metadata).filter(([key]) => !isSensitivePresentationKey(key))); return <li className={`live-step ${stepStatus}`} key={`${step.timestamp || index}-${index}`}><div className="live-step-main"><span className="live-step-marker">{stepStatus === "completed" ? "✓" : stepStatus === "failed" ? "!" : stepStatus === "started" ? "…" : "·"}</span><div><strong>{eventLabel(step.type || step.stage)}</strong><p>{step.summary || step.stage || "过程"}</p><small>{step.timestamp ? formatTime(step.timestamp) : "刚刚"}{role ? ` · ${agentRoleLabel(role)}` : ""}{model ? ` · ${model}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small></div></div>{step.details && <p className="live-step-details">{step.details}</p>}{(metadata.timeout_seconds || metadata.max_tokens || typeof metadata.thinking === "boolean") && <small className="live-step-meta">请求参数：{metadata.timeout_seconds ? `超时 ${String(metadata.timeout_seconds)} 秒` : ""}{metadata.max_tokens ? ` · 输出上限 ${Number(metadata.max_tokens).toLocaleString()} tokens` : ""}{typeof metadata.thinking === "boolean" ? ` · 深度推理 ${metadata.thinking ? "开启" : "关闭"}` : ""}</small>}{refs.length > 0 && <div className="settings-inline-actions">{refs.map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {reference.relative_path}</button>)}</div>}{Object.keys(publicMetadata).length > 0 && <details><summary>查看本步公开记录</summary><pre className="compact-json">{JSON.stringify(publicMetadata, null, 2)}</pre></details>}</li>; })}</ol><small className="live-run-footnote">可复核文件由运行记录自动发现；点击文件按钮可在本地打开。</small></details>)}</div>;
 }
 
 function ReferenceDocumentViewer({ document, onClose }: { document: DocumentData; onClose: () => void }) {
@@ -2541,7 +2773,7 @@ function ProcessPanel({ events, collaboration, context, provider, workspace, req
   const [threadUpdates, setThreadUpdates] = useState<Record<string, Record<string, unknown>>>({});
   const runs = processRuns(events);
   const tasks = collaboration?.tasks || [];
-  const activeTasks = tasks.filter((task) => ["running", "queued", "waiting", "waiting_user", "waiting_condition"].includes(String(task.status))).length;
+  const activeTasks = tasks.filter((task) => !task.historical && ["running", "queued", "waiting", "waiting_user", "waiting_condition"].includes(String(task.status))).length;
   const failedTasks = tasks.filter((task) => !task.historical && ["failed", "interrupted"].includes(String(task.status))).length;
   const messages = collaboration?.messages || [];
   const learning = collaboration?.learning_events || [];
@@ -2558,7 +2790,7 @@ function ProcessPanel({ events, collaboration, context, provider, workspace, req
     <div className="operations-grid">
       <article><header><strong>工作流</strong><span>{runs.length} 项</span></header><p>{runs.length ? "当前安排与每一步进度都记录在下方。" : "发送需求后显示任务安排。"}</p></article>
       <article><header><strong>并发任务</strong><span>{activeTasks} 进行中</span></header><p>{failedTasks ? `${failedTasks} 条失败记录；可在项目页查看原因和下一步。` : "依赖关系由 Coordinator 与 Novel Engine 控制。"}</p></article>
-      <article><header><strong>Agent 讨论</strong><span>{openThreads} 个待处理议题</span></header><p>{messages[0] ? `${agentRoleLabel(messages[0].sender_role, messages[0].role_protocol_version)} → ${agentRoleLabel(messages[0].recipient_role, messages[0].role_protocol_version)}：${messages[0].claim}` : "有疑问、驳回或交接时显示结构化消息。"}</p></article>
+      <article><header><strong>Agent 讨论</strong><span>{openThreads} 个待处理议题</span></header><p>{messages[0] ? `${agentRoleLabel(messages[0].sender_role)} → ${agentRoleLabel(messages[0].recipient_role)}：${messages[0].claim}` : "有疑问、驳回或交接时显示结构化消息。"}</p></article>
       <article><header><strong>Context 检查器</strong><span>{Number(context?.estimated_tokens || 0).toLocaleString()} tokens</span></header><p>{context?.compression_applied ? "已压缩低相关资料，硬事实保持不动。" : "显示本次保留、压缩和舍弃的资料。"}</p></article>
       <article><header><strong>检索诊断</strong><span>{retrieval ? `新增 ${retrievalStats.added} 条` : "暂无记录"}</span></header><p>{retrieval ? `从 ${retrievalStats.candidates} 条候选中取回 ${retrievalStats.retrieved} 条，其中 ${retrievalStats.alreadyLoaded} 条已在正史上下文，避免重复输入。这里不是模型缓存命中率。` : "完成一次章节上下文编译后显示本地检索情况。"}</p></article>
       <article><header><strong>正史变更</strong><span>验收后</span></header><p>记忆服务 的新增、更新和结束事实会先预览，再进入事务提交。</p></article>
@@ -2615,10 +2847,15 @@ function DetailMetric({ label, value, tone = "" }: { label: string; value: React
   return <div className={`detail-metric ${tone}`}><small>{label}</small><strong>{value}</strong></div>;
 }
 
-function ProcessPanelCompact({ events, collaboration, context, provider, workspace, request, referenceDocument, onOpenReference, onCloseReference, onNavigate }: { events: EngineEvent[]; collaboration: CollaborationOverview | null; context: ContextStatus | null; provider: Record<string, unknown> | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; referenceDocument: DocumentData | null; onOpenReference: (reference: TraceReference) => void | Promise<void>; onCloseReference: () => void; onNavigate: (tab: Tab) => void }) {
+function ProcessPanelCompact({ events, collaboration, context, provider, workspace, request, referenceDocument, onOpenReference, onCloseReference, onNavigate, pendingBoard }: { events: EngineEvent[]; collaboration: CollaborationOverview | null; context: ContextStatus | null; provider: Record<string, unknown> | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; referenceDocument: DocumentData | null; onOpenReference: (reference: TraceReference) => void | Promise<void>; onCloseReference: () => void; onNavigate: (tab: Tab) => void; pendingBoard?: ReactNode }) {
   const [threadUpdates, setThreadUpdates] = useState<Record<string, Record<string, unknown>>>({});
+  const [threadErrors, setThreadErrors] = useState<Record<string, string>>({});
+  const [threadPending, setThreadPending] = useState<Record<string, boolean>>({});
+  const threadRepliesRef = useRef(new Set<string>());
   const [detail, setDetail] = useState<ProcessDetailKey | null>(null);
   const [taskSnapshot, setTaskSnapshot] = useState<Array<Record<string, unknown>> | null>(null);
+  const [taskLoadError, setTaskLoadError] = useState("");
+  const [taskReload, setTaskReload] = useState(0);
   const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
   const [taskTitleDraft, setTaskTitleDraft] = useState("");
   const [taskEditError, setTaskEditError] = useState("");
@@ -2626,18 +2863,18 @@ function ProcessPanelCompact({ events, collaboration, context, provider, workspa
   const detailRef = useRef<HTMLElement | null>(null);
   const runs = processRuns(events);
   const tasks = taskSnapshot ?? collaboration?.tasks ?? [];
-  const currentTasks = tasks.filter((task) => ["running", "queued", "waiting", "waiting_user", "waiting_condition"].includes(String(task.status)));
+  const currentTasks = tasks.filter((task) => !task.historical && ["running", "queued", "waiting", "waiting_user", "waiting_condition"].includes(String(task.status)));
   const liveOnlyRuns = runs.filter((run) => run.status === "running" && run.id !== "unknown" && !currentTasks.some((task) => task.run_id === run.id));
   const activeTasks = currentTasks.length + liveOnlyRuns.length;
   const failedTasks = tasks.filter((task) => !task.historical && ["failed", "interrupted"].includes(String(task.status))).length;
-  const pastTasks = tasks.filter((task) => !["running", "queued", "waiting", "waiting_user", "waiting_condition"].includes(String(task.status)));
+  const pastTasks = tasks.filter((task) => task.historical || !["running", "queued", "waiting", "waiting_user", "waiting_condition"].includes(String(task.status)));
   const messages = collaboration?.messages || [];
   const learning = collaboration?.learning_events || [];
   const usage = collaboration?.usage;
   const retrieval = context?.retrieval_diagnostics;
   const retrievalStats = retrievalCounts(retrieval);
   const traceRuns = collaboration?.trace_runs || [];
-  const threads = collaboration?.threads || [];
+  const threads = (collaboration?.threads || []).map(thread => threadUpdates[String(thread.thread_id)] || thread);
   const openThreads = threads.filter((thread) => ["open", "waiting", "escalated"].includes(String(thread.status))).length;
   const latest = runs[0];
   const estimated = Number(context?.estimated_tokens || 0);
@@ -2647,23 +2884,36 @@ function ProcessPanelCompact({ events, collaboration, context, provider, workspa
   const detailSubtitle: Record<ProcessDetailKey, string> = { workflow: "按时间查看公开步骤、阶段状态和可复核文件。", tasks: "只保留当前需要关注的任务，完成项可在详情中回看。", agents: "查看结构化消息、分歧和等待中的回复。", context: "查看容量、预算、压缩和来源保留情况。", retrieval: "查看召回数量、筛选原因和被舍弃的候选。", canon: "正史只在用户验收后生成预览并提交。", versions: "正文、草稿和审查版本分别保留，可从工作区继续处理。", learning: "只展示用户接受、拒绝和重写带来的可复用反馈。", usage: "查看参与角色的调用量、缓存命中和模型信息。" };
 
   const replyToThread = async (threadId: unknown) => {
-    const value = await request<{ thread: Record<string, unknown> }>("collaboration.reply", { thread_id: threadId });
-    setThreadUpdates((items) => ({ ...items, [String(threadId)]: value.thread }));
+    const id = String(threadId);
+    if (threadRepliesRef.current.has(id)) return;
+    threadRepliesRef.current.add(id);
+    setThreadPending(items => ({ ...items, [id]: true }));
+    setThreadErrors(items => ({ ...items, [id]: "" }));
+    try {
+      const value = await request<{ thread: Record<string, unknown> }>("collaboration.reply", { thread_id: id });
+      setThreadUpdates(items => ({ ...items, [id]: value.thread }));
+    } catch (cause) { setThreadErrors(items => ({ ...items, [id]: errorMessage(cause) })); }
+    finally { threadRepliesRef.current.delete(id); setThreadPending(items => ({ ...items, [id]: false })); }
   };
 
   useEffect(() => {
     if (detail !== "tasks") { setTaskSnapshot(null); return; }
     let active = true;
+    let polling = false;
     const loadTasks = async () => {
+      if (!active || polling || !canPollWorkspace(window.document.visibilityState, window.document.hasFocus())) return;
+      polling = true;
       try {
         const value = await request<{ tasks: Array<Record<string, unknown>> }>("task.list", { limit: 30 });
-        if (active) setTaskSnapshot(value.tasks || []);
-      } catch { /* Keep the last visible snapshot; the next refresh can recover. */ }
+        if (active) { setTaskSnapshot(value.tasks || []); setTaskLoadError(""); }
+      } catch (cause) { if (active) setTaskLoadError(errorMessage(cause)); }
+      finally { polling = false; }
     };
     void loadTasks();
-    const timer = window.setInterval(() => void loadTasks(), 15000);
-    return () => { active = false; window.clearInterval(timer); };
-  }, [detail, request]);
+    return () => { active = false; };
+  }, [detail, request, taskReload]);
+
+  useEffect(() => { setTaskSnapshot(null); setTaskLoadError(""); }, [collaboration?.tasks]);
 
   const saveTaskTitle = async (runId: string) => {
     const title = taskTitleDraft.trim();
@@ -2697,6 +2947,7 @@ function ProcessPanelCompact({ events, collaboration, context, provider, workspa
   } else if (detail === "tasks") {
     detailContent = <section className="detail-section">
       <header><h4>当前工作</h4><span>{activeTasks} 项进行中</span></header>
+      {taskLoadError && <div className="form-error" role="status"><p>任务状态读取未完成：{taskLoadError}。当前已显示记录保留。</p><button type="button" onClick={() => setTaskReload(value => value + 1)}>重新读取状态</button></div>}
       {activeTasks === 0 && <p className="empty-mini">当前没有运行中的任务。已完成和失败的记录收在下方。</p>}
       {currentTasks.map((task, index) => {
         const run = runs.find((item) => item.id === task.run_id);
@@ -2738,8 +2989,8 @@ function ProcessPanelCompact({ events, collaboration, context, provider, workspa
     </section>;
   } else if (detail === "agents") {
     detailContent = <>
-      <section className="detail-section"><header><h4>结构化消息</h4><span>{messages.length} 条</span></header>{messages.length === 0 && <p className="empty-mini">暂时没有需要处理的 Agent 消息。</p>}{messages.slice(0, 16).map((message) => <article className="detail-message" key={message.message_id}><div><strong>{agentRoleLabel(String(message.sender_role), message.role_protocol_version)} → {agentRoleLabel(String(message.recipient_role), message.role_protocol_version)}</strong><small>{formatTime(message.created_at)} · {collaborationStatusLabel(String(message.status))}</small></div><p>{message.claim}</p>{message.requested_response && <p className="detail-lead"><strong>要求返回：</strong>{message.requested_response}</p>}<details className="detail-disclosure"><summary>查看输入与证据</summary><dl className="message-audit-grid"><div><dt>章节版本</dt><dd>{message.chapter_no ? `第 ${message.chapter_no} 章${message.chapter_version ? ` · v${message.chapter_version}` : ""}` : "全局任务"}</dd></div><div><dt>Context Packet</dt><dd>{message.context_packet_id || "本步未绑定"}</dd></div><div><dt>输入 / 证据来源</dt><dd>{message.evidence_refs?.length ? message.evidence_refs.join("、") : "无额外文件引用"}</dd></div><div><dt>消息类型</dt><dd>{message.message_type}</dd></div><div><dt>角色协议</dt><dd>v{message.role_protocol_version || 1}</dd></div></dl></details></article>)}</section>
-      <section className="detail-section"><header><h4>定向讨论</h4><span>{openThreads} 待处理</span></header>{threads.slice(0, 10).map((thread) => { const current = threadUpdates[String(thread.thread_id)] || thread; const active = ["open", "waiting"].includes(String(current.status)); return <article className="detail-thread" key={String(thread.thread_id)}><header><strong>{String(thread.topic)}</strong><span>{String(current.status)} · {String(current.current_round || 1)}/{String(current.max_rounds || 2)} 轮</span></header><p>{String(current.resolution || "等待目标 Agent 回答")}</p>{active && <button type="button" onClick={() => void replyToThread(thread.thread_id)}>让目标 Agent 回答</button>}{String(current.status) === "escalated" && <small>已交给 Coordinator 向你提出最小问题。</small>}</article>; })}</section>
+      <section className="detail-section"><header><h4>结构化消息</h4><span>{messages.length} 条</span></header>{messages.length === 0 && <p className="empty-mini">暂时没有需要处理的 Agent 消息。</p>}{messages.slice(0, 16).map((message) => <article className="detail-message" key={message.message_id}><div><strong>{agentRoleLabel(String(message.sender_role))} → {agentRoleLabel(String(message.recipient_role))}</strong><small>{formatTime(message.created_at)} · {collaborationStatusLabel(String(message.status))}</small></div><p>{message.claim}</p>{message.requested_response && <p className="detail-lead"><strong>要求返回：</strong>{message.requested_response}</p>}<details className="detail-disclosure"><summary>查看输入与证据</summary><dl className="message-audit-grid"><div><dt>章节版本</dt><dd>{message.chapter_no ? `第 ${message.chapter_no} 章${message.chapter_version ? ` · v${message.chapter_version}` : ""}` : "全局任务"}</dd></div><div><dt>Context Packet</dt><dd>{message.context_packet_id || "本步未绑定"}</dd></div><div><dt>输入 / 证据来源</dt><dd>{message.evidence_refs?.length ? message.evidence_refs.join("、") : "无额外文件引用"}</dd></div><div><dt>消息类型</dt><dd>{message.message_type}</dd></div></dl></details></article>)}</section>
+      <section className="detail-section"><header><h4>定向讨论</h4><span>{openThreads} 待处理</span></header>{threads.slice(0, 10).map((thread) => { const current = threadUpdates[String(thread.thread_id)] || thread; const active = ["open", "waiting"].includes(String(current.status)); return <article className="detail-thread" key={String(thread.thread_id)}><header><strong>{String(thread.topic)}</strong><span>{String(current.status)} · {String(current.current_round || 1)}/{String(current.max_rounds || 2)} 轮</span></header><p>{String(current.resolution || "等待目标 Agent 回答")}</p>{threadErrors[String(thread.thread_id)] && <p className="form-error" role="status">回应未完成：{threadErrors[String(thread.thread_id)]}。已有成果保留，可先查看任务记录中的恢复条件。</p>}{active && <button type="button" disabled={threadPending[String(thread.thread_id)]} onClick={() => void replyToThread(thread.thread_id)}>{threadPending[String(thread.thread_id)] ? "正在等待回应…" : "让目标 Agent 回答"}</button>}{threadErrors[String(thread.thread_id)] && <button type="button" onClick={() => onNavigate("project")}>查看恢复条件与任务记录</button>}{String(current.status) === "escalated" && <small>已交给 Coordinator 向你提出最小问题。</small>}</article>; })}</section>
     </>;
   } else if (detail === "context") {
     detailContent = <>
@@ -2773,6 +3024,7 @@ function ProcessPanelCompact({ events, collaboration, context, provider, workspa
   }
 
   return <div className="scroll-panel process-panel"><div className="section-heading process-heading"><p className="eyebrow">协作台</p><h2>运行台</h2><div className="process-heading-meta"><span>{latest ? (latest.status === "done" ? "已完成" : latest.status === "failed" ? "需处理" : latest.status === "waiting" ? "等待处理" : "运行中") : "等待任务"}</span><span>{provider?.model ? String(provider.model) : "模型未配置"}</span></div></div>
+    {pendingBoard}
     {workspace && <ChapterStatusStrip workspace={workspace} />}
     {referenceDocument && <ReferenceDocumentViewer document={referenceDocument} onClose={onCloseReference} />}
     <CompactWorkflowStrip runs={runs} onOpen={() => setDetail("workflow")} />
@@ -2967,9 +3219,8 @@ function roleModelsFromProvider(value: unknown): Record<AgentRole, string> {
 
 function agentGenerationFromProvider(value: unknown): AgentGenerationProfiles {
   const source: Partial<Record<AgentRole, Partial<AgentGeneration>>> = value && typeof value === "object" ? value as Partial<Record<AgentRole, Partial<AgentGeneration>>> : {};
-  const legacy = !("editor" in source);
   return Object.fromEntries((Object.keys(DEFAULT_AGENT_GENERATION) as AgentRole[]).map((role) => {
-    const configured = role === "editor" && legacy ? source.reviewer : role === "reviewer" && legacy ? undefined : source[role];
+    const configured = source[role];
     return [role, { ...DEFAULT_AGENT_GENERATION[role], ...(configured || {}) }];
   })) as AgentGenerationProfiles;
 }
@@ -2983,9 +3234,8 @@ function agentContextBudgetsFromProvider(value: unknown): AgentContextBudgets {
     memory_keeper: { soft: 160000, hard: 176000 },
   };
   const source: Partial<AgentContextBudgets> = value && typeof value === "object" ? value as Partial<AgentContextBudgets> : {};
-  const legacy = !("editor" in source);
   return Object.fromEntries((Object.keys(defaults) as AgentRole[]).map((role) => {
-    const configured = role === "editor" && legacy ? source.reviewer : role === "reviewer" && legacy ? undefined : source[role];
+    const configured = source[role];
     return [role, { ...defaults[role], ...(configured || {}) }];
   })) as AgentContextBudgets;
 }
@@ -3017,7 +3267,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   const [section, setSection] = useState<SettingsSection>("appearance");
   const [search, setSearch] = useState("");
   const [remoteModels, setRemoteModels] = useState<string[]>([]);
-  const [learningSettings, setLearningSettings] = useState({ enabled: true, allow_training_exports: false });
+  const [learningSettings, setLearningSettings] = useState({ enabled: true });
   const [learningNotice, setLearningNotice] = useState("");
   const [voiceDevices, setVoiceDevices] = useState<MediaDeviceInfo[]>([]);
   const [mossInstalling, setMossInstalling] = useState(false);
@@ -3025,6 +3275,21 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   const [asrInstalling, setAsrInstalling] = useState(false);
   const [voiceDeleting, setVoiceDeleting] = useState(false);
   const [usageSummary, setUsageSummary] = useState<CollaborationOverview["usage"] | null>(null);
+  const [limitPreview, setLimitPreview] = useState<{ model_limits?: { context_tokens?: number; max_output_tokens?: number }; role_output_limits?: Partial<Record<AgentRole, { model_limits: { context_tokens?: number; max_output_tokens?: number } }>> } | null>(null);
+  const [limitPreviewError, setLimitPreviewError] = useState("");
+  const roleModelsKey = JSON.stringify(form.role_models);
+  useEffect(() => {
+    let active = true;
+    setLimitPreview(null);
+    setLimitPreviewError("");
+    const timer = window.setTimeout(() => {
+      void window.inkflow.request<NonNullable<typeof limitPreview>>("provider.status", {
+        provider_kind: form.provider_kind, base_url: form.base_url, model: form.model,
+        role_models: JSON.parse(roleModelsKey),
+      }).then(value => { if (active) setLimitPreview(value); }).catch(cause => { if (active) setLimitPreviewError(errorMessage(cause)); });
+    }, 200);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [form.provider_kind, form.base_url, form.model, roleModelsKey]);
   const [voiceInstallProgress, setVoiceInstallProgress] = useState<Record<"edge" | "moss" | "asr", VoiceInstallProgress | null>>({ edge: null, moss: null, asr: null });
   const settingsSaveInFlightRef = useRef(false);
   const voiceFormDirtyRef = useRef(false);
@@ -3032,7 +3297,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   const learningSettingsDirtyRef = useRef(false);
   useEffect(() => {
     if (!projectRoot) return;
-    void window.inkflow.request<{ enabled: boolean; allow_training_exports: boolean }>("learning.settings.get", { project_root: projectRoot }).then((value) => {
+    void window.inkflow.request<{ enabled: boolean }>("learning.settings.get", { project_root: projectRoot }).then((value) => {
       if (!learningSettingsDirtyRef.current) setLearningSettings(value);
     }).catch(() => undefined);
   }, [projectRoot]);
@@ -3154,7 +3419,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
         }
       }
       try {
-        const saved = await withDeadline(window.inkflow.request<Record<string, unknown>>("provider.configure", { ...form, role_settings_version: 2 }), 15000, "本机保存没有及时返回。请重新打开设置核对保存结果后再试。");
+        const saved = await withDeadline(window.inkflow.request<Record<string, unknown>>("provider.configure", { ...form }), 15000, "本机保存没有及时返回。请重新打开设置核对保存结果后再试。");
         setForm((value) => ({ ...value, api_key: "" }));
         onSaved({ ...provider, ...saved });
       } catch (cause) {
@@ -3182,7 +3447,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
     settingsSaveInFlightRef.current = true;
     setWorking(true); setError(""); setResult("");
     try {
-      const saved = await withDeadline(window.inkflow.request<Record<string, unknown>>("provider.configure", { ...form, role_settings_version: 2 }), 15000, "本机保存没有及时返回。请重新打开设置核对保存结果后再试。");
+      const saved = await withDeadline(window.inkflow.request<Record<string, unknown>>("provider.configure", { ...form }), 15000, "本机保存没有及时返回。请重新打开设置核对保存结果后再试。");
       setForm((value) => ({ ...value, api_key: "" }));
       onSaved({ ...provider, ...saved });
       try {
@@ -3201,7 +3466,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   };
   const activePreset = SETTINGS_PRESETS.find((preset) => preset.reasoning_effort === form.reasoning_effort && preset.inquiry_frequency === form.inquiry_frequency && preset.context_soft_tokens === form.context_soft_tokens && preset.context_hard_tokens === form.context_hard_tokens)?.id;
   const inferredProvider = form.provider_kind;
-  const settingKeywords: Record<SettingsSection, string> = { story_settings: "本书 设定 人物 场景 道具 世界 模板 资料 记录 证据 分类", author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", layout: "布局 面板 宽度 左右", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", learning: "学习 反馈 偏好 导出", advanced: "高级 temperature top p top k PowerShell" };
+  const settingKeywords: Record<SettingsSection, string> = { story_settings: "本书 设定 人物 场景 道具 世界 模板 资料 记录 证据 分类", author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", layout: "布局 面板 宽度 左右", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", learning: "学习 反馈 偏好 恢复 经验", advanced: "高级 temperature top p top k PowerShell" };
   const visibleSections = SETTINGS_SECTIONS.filter((item) => `${item.label}${item.note}${settingKeywords[item.id]}`.toLowerCase().includes(search.trim().toLowerCase()));
   const chooseProvider = (id: string) => {
     const choice = PROVIDER_OPTIONS.find((item) => item.id === id);
@@ -3318,6 +3583,12 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   const roleBudget = (role: AgentRole) => form.context_budget_mode === "custom"
     ? form.agent_context_budgets[role]
     : { soft: form.context_soft_tokens, hard: form.context_hard_tokens };
+  const modelLimits = limitPreview?.model_limits;
+  const outputCeiling = Math.min(form.context_hard_tokens, modelLimits?.max_output_tokens ?? Infinity);
+  const roleLimits = (role: AgentRole) => limitPreview?.role_output_limits?.[role]?.model_limits;
+  const roleOutput = (role: AgentRole) => Math.min(form.max_output_tokens, roleBudget(role).hard,
+    roleLimits(role)?.context_tokens ?? Infinity, roleLimits(role)?.max_output_tokens ?? Infinity);
+  const limitPreviewWarning = limitPreviewError && <p className="form-error" role="status">模型额度预览未完成：{limitPreviewError}。已填写内容保留，保存时仍会校验。</p>;
   return <Modal title="设置" subtitle="选择左侧项目；复杂信息按需展开。" onClose={onClose} className="settings-modal">
     <form className="settings-shell" onSubmit={(event) => { event.preventDefault(); void persist(); }}>
       <aside className="settings-nav">
@@ -3338,10 +3609,12 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
           <div className="settings-fields"><label>模型名称<input list="provider-models" value={form.model} onChange={(event) => updateForm({ model: event.target.value })} placeholder="填写平台当前模型 ID" /><datalist id="provider-models">{[...PROVIDER_OPTIONS.flatMap((item) => Array.from(item.models)), ...remoteModels].map((model) => <option key={model} value={model} />)}</datalist></label><label>接口地址<input value={form.base_url} onChange={(event) => updateForm({ base_url: event.target.value })} /></label><label>更换密钥 <small>{provider?.api_key_configured ? "留空继续使用当前服务商的已有密钥" : "本机模型可以留空"}</small><input type="password" autoComplete="new-password" value={form.api_key} onChange={(event) => updateForm({ api_key: event.target.value })} placeholder="不会回显" /></label></div>
            <div className="settings-inline-actions"><button type="button" disabled={working} onClick={() => void saveModelSettings()}>保存并读取模型列表</button><span>先保存模型配置，再尝试读取列表；读取失败不会撤销已保存的 Key。</span></div>
           <SettingGroup title="生成参数与实际效率" note="按角色设置；统计来自当前小说的真实调用。">
-            <div className="model-efficiency-head"><div><strong>{form.model || "未选择模型"}</strong><span>思考 {form.reasoning_effort} · 单次输出最多 {form.max_output_tokens.toLocaleString()} tokens</span></div><button type="button" disabled={!projectRoot} onClick={() => void refreshUsage()}>刷新统计</button></div>
-            <div className="settings-fields two"><label>单次输出上限 <small>默认 32K，最高 128K tokens；实际额度取决于模型服务</small><input type="number" min={1000} max={128000} step={1000} value={form.max_output_tokens} onChange={(event) => updateForm({ max_output_tokens: Number(event.target.value) })} /></label><label>缓存解释<input readOnly value={form.provider_kind === "deepseek" ? "按相同输入前缀自动复用" : "按服务商返回值统计"} /></label></div>
+            <div className="model-efficiency-head"><div><strong>{form.model || "未选择模型"}</strong><span>思考 {form.reasoning_effort} · 输出设置 {form.max_output_tokens.toLocaleString()} tokens</span></div><button type="button" disabled={!projectRoot} onClick={() => void refreshUsage()}>刷新统计</button></div>
+            <div className="settings-fields two"><label>单次输出上限 <small>{modelLimits?.max_output_tokens ? `模型已核实上限 ${modelLimits.max_output_tokens.toLocaleString()} tokens` : "模型上限未核实，按已配置上下文约束；服务端仍会校验"}</small><input type="number" min={1} max={outputCeiling} step={1} value={form.max_output_tokens} onChange={(event) => updateForm({ max_output_tokens: Number(event.target.value) })} /></label><label>缓存解释<input readOnly value={form.provider_kind === "deepseek" ? "按相同输入前缀自动复用" : "按服务商返回值统计"} /></label></div>
+            {limitPreviewWarning}
+            <p className="form-hint">输入扣除前，默认模型可用输出至多 {Math.min(form.max_output_tokens, outputCeiling).toLocaleString()} tokens。每次请求再取本步骤额度、输出设置、角色上下文剩余额度和已核实模型上限的较小值；完整输入包含规则与 JSON Schema。保存不会扩张正在运行任务的原配置。</p>
             <p className="form-hint">日常使用 Coordinator + Writer + Editor；Reviewer 与 Memory Keeper 按当前任务模式参加。保存角色模型或参数不会启用角色，也不会改变正在运行的任务。角色模型 ID 必须受当前服务商支持。</p>
-            <section className="agent-tuning compact">{AGENT_TUNING_META.map((meta) => { const values = form.agent_generation[meta.id]; const roleStats = usageSummary?.by_agent_role?.[meta.id]; const budget = roleBudget(meta.id); const hit = roleStats?.prompt_cache_hit_rate; const miss = typeof hit === "number" ? 1 - hit : null; return <details key={meta.id} open={meta.id === "writer"}><summary><span><strong>{meta.label}</strong><small>{meta.note}</small></span><span>{roleStats?.calls ? `${roleStats.calls} 次 · 命中 ${typeof hit === "number" ? `${(hit * 100).toFixed(1)}%` : "未报告"}` : "暂无调用"}</span></summary><div className="agent-efficiency-grid"><div><small>输入 / 输出</small><strong>{roleStats ? `${roleStats.prompt_tokens.toLocaleString()} / ${roleStats.completion_tokens.toLocaleString()}` : "—"}</strong></div><div><small>命中 / 未命中</small><strong>{roleStats && typeof hit === "number" ? `${(hit * 100).toFixed(1)}% / ${((miss || 0) * 100).toFixed(1)}%` : "服务商未报告"}</strong></div><div><small>上下文预算</small><strong>{`${Math.round(budget.soft / 1000)}k / ${Math.round(budget.hard / 1000)}k`}</strong></div><div><small>平均输出</small><strong>{roleStats?.calls ? `${Math.round(roleStats.completion_tokens / roleStats.calls).toLocaleString()} tokens` : "—"}</strong></div></div><div className="agent-tuning-grid"><label>角色模型 <small>留空继承默认模型，共用当前服务商接口和密钥</small><input list="provider-models" value={form.role_models[meta.id]} placeholder={form.model} onChange={(event) => setForm((value) => ({ ...value, role_models: { ...value.role_models, [meta.id]: event.target.value } }))} /></label><label>温度 <small>0～2</small><input type="number" min={0} max={2} step={0.05} value={values.temperature} onChange={(event) => updateAgentGeneration(meta.id, { temperature: Number(event.target.value) })} /></label><label>Top P <small>0.01～1</small><input type="number" min={0.01} max={1} step={0.01} value={values.top_p} onChange={(event) => updateAgentGeneration(meta.id, { top_p: Number(event.target.value) })} /></label><label>Top K <small>接口支持时发送</small><input type="number" min={1} max={200} step={1} value={values.top_k ?? ""} placeholder="自动" onChange={(event) => updateAgentGeneration(meta.id, { top_k: event.target.value === "" ? null : Number(event.target.value) })} /></label></div><button type="button" className="text-button" onClick={() => updateAgentGeneration(meta.id, DEFAULT_AGENT_GENERATION[meta.id])}>恢复该 Agent 默认值</button></details>; })}</section>
+            <section className="agent-tuning compact">{AGENT_TUNING_META.map((meta) => { const values = form.agent_generation[meta.id]; const roleStats = usageSummary?.by_agent_role?.[meta.id]; const budget = roleBudget(meta.id); const hit = roleStats?.prompt_cache_hit_rate; const miss = typeof hit === "number" ? 1 - hit : null; return <details key={meta.id} open={meta.id === "writer"}><summary><span><strong>{meta.label}</strong><small>{meta.note}</small></span><span>{roleStats?.calls ? `${roleStats.calls} 次 · 命中 ${typeof hit === "number" ? `${(hit * 100).toFixed(1)}%` : "未报告"}` : "暂无调用"}</span></summary><div className="agent-efficiency-grid"><div><small>输入 / 输出</small><strong>{roleStats ? `${roleStats.prompt_tokens.toLocaleString()} / ${roleStats.completion_tokens.toLocaleString()}` : "—"}</strong></div><div><small>命中 / 未命中</small><strong>{roleStats && typeof hit === "number" ? `${(hit * 100).toFixed(1)}% / ${((miss || 0) * 100).toFixed(1)}%` : "服务商未报告"}</strong></div><div><small>上下文预算</small><strong>{`${Math.round(budget.soft / 1000)}k / ${Math.round(budget.hard / 1000)}k`}</strong></div><div><small>输入扣除前输出额度</small><strong>{roleOutput(meta.id).toLocaleString()} tokens</strong></div><div><small>平均实际输出</small><strong>{roleStats?.calls ? `${Math.round(roleStats.completion_tokens / roleStats.calls).toLocaleString()} tokens` : "—"}</strong></div></div><div className="agent-tuning-grid"><label>角色模型 <small>留空继承默认模型，共用当前服务商接口和密钥</small><input list="provider-models" value={form.role_models[meta.id]} placeholder={form.model} onChange={(event) => setForm((value) => ({ ...value, role_models: { ...value.role_models, [meta.id]: event.target.value } }))} /></label><label>温度 <small>0～2</small><input type="number" min={0} max={2} step={0.05} value={values.temperature} onChange={(event) => updateAgentGeneration(meta.id, { temperature: Number(event.target.value) })} /></label><label>Top P <small>0.01～1</small><input type="number" min={0.01} max={1} step={0.01} value={values.top_p} onChange={(event) => updateAgentGeneration(meta.id, { top_p: Number(event.target.value) })} /></label><label>Top K <small>接口支持时发送</small><input type="number" min={1} max={200} step={1} value={values.top_k ?? ""} placeholder="自动" onChange={(event) => updateAgentGeneration(meta.id, { top_k: event.target.value === "" ? null : Number(event.target.value) })} /></label></div><button type="button" className="text-button" onClick={() => updateAgentGeneration(meta.id, DEFAULT_AGENT_GENERATION[meta.id])}>恢复该 Agent 默认值</button></details>; })}</section>
             <p className="form-hint">温度和 Top P 影响输出取样，不改变输入缓存是否命中。缓存要靠相同前缀复用；墨流会把稳定规则放在前面，把本章任务放在末尾。未报告缓存数据的调用不会被误算成 0%。</p>
           </SettingGroup>
           <SettingGroup title="费用估算" note="单价单位为人民币 / 百万 Token，仅用于估算，不设置消费上限。两项均大于 0 时采用手填价格；否则仅官方 DeepSeek 已知型号在价格快照有效期内使用高峰参考价，其他情况显示未知。旧设置若填写了外币单价，请先换算为人民币。"><div className="settings-fields two"><label>输入单价 / 百万 Token<input type="number" min={0} step={0.01} value={form.input_price_per_million} onChange={(event) => updateForm({ input_price_per_million: Number(event.target.value) })} /></label><label>输出单价 / 百万 Token<input type="number" min={0} step={0.01} value={form.output_price_per_million} onChange={(event) => updateForm({ output_price_per_million: Number(event.target.value) })} /></label></div></SettingGroup>
@@ -3384,24 +3657,19 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
           <details className="voice-technical"><summary>组件与模型信息</summary><p>语音输入：{voiceForm.voice_input_engine}</p><p>对话朗读：{voiceForm.voice_dialogue_engine}</p><p>文本朗读：{voiceForm.voice_text_engine}</p><p>正文听读：{voiceForm.voice_novel_engine}</p><p>本地目录：{voiceStatus?.data_root || "尚未读取"}</p></details>
         </SettingsPane>}
         {section === "context" && <SettingsPane title="上下文与检索" note="参与角色可共用一套预算，也可按职责分别设置；硬事实固定保留，普通资料按相关度压缩。">
+          {limitPreviewWarning}
           <div className="settings-fields"><label>预算方式<select value={form.context_budget_mode} onChange={(event) => updateForm({ context_budget_mode: event.target.value })}><option value="unified">统一：参与角色共用</option><option value="custom">自定义：按角色分别设置</option></select></label></div>
-          {form.context_budget_mode === "unified" ? <div className="settings-fields two"><label>统一常用上下文<input type="number" min={16000} max={512000} value={form.context_soft_tokens} onChange={(event) => updateForm({ context_soft_tokens: Number(event.target.value) })} /></label><label>统一最大上下文<input type="number" min={16000} max={1000000} value={form.context_hard_tokens} onChange={(event) => updateForm({ context_hard_tokens: Number(event.target.value) })} /></label></div> : <section className="agent-tuning compact">{AGENT_TUNING_META.map((meta) => { const budget = form.agent_context_budgets[meta.id]; return <details key={meta.id} open={meta.id === "writer"}><summary><span><strong>{meta.label}</strong><small>{meta.note}</small></span><span>{Math.round(budget.soft / 1000)}k / {Math.round(budget.hard / 1000)}k</span></summary><div className="agent-tuning-grid"><label>常用上下文<input type="number" min={16000} max={512000} value={budget.soft} onChange={(event) => updateAgentContextBudget(meta.id, { soft: Number(event.target.value) })} /></label><label>最大上下文<input type="number" min={16000} max={1000000} value={budget.hard} onChange={(event) => updateAgentContextBudget(meta.id, { hard: Number(event.target.value) })} /></label></div></details>; })}</section>}
+          {form.context_budget_mode === "unified" ? <div className="settings-fields two"><label>统一常用上下文<input type="number" min={1} max={Math.min(form.context_hard_tokens, modelLimits?.context_tokens ?? Infinity)} value={form.context_soft_tokens} onChange={(event) => updateForm({ context_soft_tokens: Number(event.target.value) })} /></label><label>统一最大上下文<input type="number" min={1} max={modelLimits?.context_tokens} value={form.context_hard_tokens} onChange={(event) => updateForm({ context_hard_tokens: Number(event.target.value) })} /></label></div> : <section className="agent-tuning compact">{AGENT_TUNING_META.map((meta) => { const budget = form.agent_context_budgets[meta.id]; return <details key={meta.id} open={meta.id === "writer"}><summary><span><strong>{meta.label}</strong><small>{meta.note}</small></span><span>{Math.round(budget.soft / 1000)}k / {Math.round(budget.hard / 1000)}k</span></summary><div className="agent-tuning-grid"><label>常用上下文<input type="number" min={1} max={Math.min(budget.hard, roleLimits(meta.id)?.context_tokens ?? Infinity)} value={budget.soft} onChange={(event) => updateAgentContextBudget(meta.id, { soft: Number(event.target.value) })} /></label><label>最大上下文<input type="number" min={1} max={roleLimits(meta.id)?.context_tokens} value={budget.hard} onChange={(event) => updateAgentContextBudget(meta.id, { hard: Number(event.target.value) })} /></label></div></details>; })}</section>}
           <SettingGroup title="混合记忆检索" note="精确查询和本地 BM25 始终可用；召回数量按任务、人物、伏笔与剩余预算动态计算。"><div className="settings-fields two"><label>语义召回模型 <small>可选</small><input value={form.retrieval_embedding_model} onChange={(event) => updateForm({ retrieval_embedding_model: event.target.value })} placeholder="BAAI/bge-m3" /></label><label>精排模型 <small>可选</small><input value={form.retrieval_reranker_model} onChange={(event) => updateForm({ retrieval_reranker_model: event.target.value })} placeholder="BAAI/bge-reranker-v2-m3" /></label></div><p className="form-hint">留空不会下载模型。生成参数里的 Top K 默认也留空，只有接口支持且你明确设置时才发送。</p></SettingGroup>
         </SettingsPane>}
         {section === "review" && <SettingsPane title="Editor · 审查" note="Editor 给出证据化报告，不直接改正文。">
           <SettingGroup title="手动修改自动核对" note="默认开启。只核对实际变化的设定、正文与草稿；后台处理，有冲突才提示。关闭后暂停自动审核，已存在的问题和正史保护仍保留。"><label className="setting-check"><input type="checkbox" checked={form.manual_edit_review_enabled} onChange={event => updateForm({ manual_edit_review_enabled: event.target.checked })} />开启手动修改后台核对</label></SettingGroup>
           <div className="settings-fields"><label>核验模式<select value={form.review_verification_mode} onChange={(event) => updateForm({ review_verification_mode: event.target.value })}><option value="evidence">基础：本地证据门禁</option><option value="assisted">增强：纠错并逐条核验</option><option value="strict">严格：争议时调用裁判</option></select></label><label>阅读体验建议<select value={form.review_experience_detail} onChange={(event) => updateForm({ review_experience_detail: event.target.value })}><option value="concise">精简：只提最重要一项</option><option value="standard">标准：优先 1～3 项</option><option value="detailed">详细：完整说明但不扩大硬门禁</option></select></label><label>本地中文 NLI <small>留空关闭</small><input value={form.review_local_nli_model} onChange={(event) => updateForm({ review_local_nli_model: event.target.value })} placeholder="本机模型路径或名称" /></label><label>争议裁判模型 <small>留空关闭</small><input value={form.review_judge_model} onChange={(event) => updateForm({ review_judge_model: event.target.value })} placeholder="当前兼容接口中的模型 ID" /></label></div><p className="form-hint">钩子的未知项、延后回应和开放问题本身不算表达不清；Editor 只阻止有证据的剧情硬冲突、知识越界和无法成立的因果。</p>
         </SettingsPane>}
-        {section === "learning" && <SettingsPane title="本地学习" note="当前只在项目内记录可复核的反馈信号，不会把小说正文上传为公共训练数据。">
+        {section === "learning" && <SettingsPane title="本地反馈与恢复经验" note="在本书记录有来源的反馈和处理结果，供后续相关任务参考。">
           <SettingGroup title="反馈记录" note={projectRoot ? "当前项目" : "打开项目后可设置"}><label className="setting-check"><input type="checkbox" disabled={!projectRoot} checked={learningSettings.enabled} onChange={(event) => updateLearningSettings({ enabled: event.target.checked })} />记录接受、拒绝、撤回、重写、偏好和检索反馈</label></SettingGroup>
-          <SettingGroup title="反馈导出" note="默认关闭"><label className="setting-check"><input type="checkbox" disabled={!projectRoot} checked={learningSettings.allow_training_exports} onChange={(event) => updateLearningSettings({ allow_training_exports: event.target.checked })} />允许导出本项目反馈</label><p className="form-hint">导出内容是反馈记录，便于检查和整理。</p></SettingGroup>
-          <SettingGroup title="本地学习工具" note="不会自动上传">
-            <div className="settings-inline-actions">
-              <button type="button" disabled={!projectRoot} onClick={async () => { try { await window.inkflow.request("learning.settings.update", { project_root: projectRoot, ...learningSettings }); const value = await window.inkflow.request<{ records: number }>("learning.dataset.export", { project_root: projectRoot, include_prose: false }); setLearningNotice(`已导出 ${value.records} 条结构化反馈`); } catch (cause) { setError(errorMessage(cause)); } }}>导出反馈</button>
-              <button type="button" disabled={!projectRoot} onClick={async () => { try { const value = await window.inkflow.request<{ pairs: number }>("learning.preference.train", { project_root: projectRoot }); setLearningNotice(`本地偏好排序器已更新：${value.pairs} 组比较`); } catch (cause) { setError(errorMessage(cause)); } }}>更新偏好排序器</button>
-            </div>
-            {learningNotice && <p className="form-success">{learningNotice}</p>}
-          </SettingGroup>
+          <p className="form-hint">具体偏好在“作者习惯与记忆”管理；失败恢复与已尝试动作在协作台查看。暂停后不新增隐式反馈，既有记录和必要审计保留。</p>
+          {learningNotice && <p className="form-success">{learningNotice}</p>}
         </SettingsPane>}
         {section === "story_settings" && <SettingsPane title="本书设定" note="持续维护小说资料，模块和记录立即保存；正文与正史保留独立审核。"><StorySettings key={projectRoot} projectRoot={projectRoot} /></SettingsPane>}
         {section === "author" && <SettingsPane title="作者习惯与记忆" note="管理长期习惯，保留每本书自己的声音。"><AuthorPreferences projectRoot={projectRoot} /></SettingsPane>}
@@ -3631,7 +3899,17 @@ function visibleResult(result: unknown): { summary: string; details?: string; re
   const reasoning = collectPublicSummaries(result);
   const safeDetails = JSON.stringify(displaySafeValue(value), null, 2);
   if (value.workflow_failure || value.gate || value.stop_reason) {
-    return { summary: `尚未完成：${String(value.workflow_failure || value.gate || value.stop_reason)}`, reasoning, details: safeDetails };
+    return { summary: `尚未完成：${String(value.workflow_failure || value.gate || value.stop_reason)}${value.next_action ? `\n下一步：${String(value.next_action)}` : ""}`, reasoning, details: safeDetails };
+  }
+  if (["waiting_user", "waiting_condition", "failed", "interrupted"].includes(String(value.status || ""))) {
+    const nested = value.result && typeof value.result === "object" ? visibleResult(value.result).summary : "";
+    const state = value.status === "waiting_user" ? "等待你的选择" : value.status === "failed" ? "本次未完成" : "已保留断点";
+    const summary = String(value.reply || value.reason || value.summary || nested || state);
+    const nextStep = value.next_step && typeof value.next_step === "object" ? (value.next_step as Record<string, unknown>).reason : "";
+    const impact = value.impact && typeof value.impact === "object" ? value.impact as Record<string, unknown> : null;
+    const downstream = impact && Array.isArray(impact.downstream_chapters) ? impact.downstream_chapters as Array<Record<string, unknown>> : [];
+    const affected = downstream.length ? `\n后续待核：${downstream.map((item) => `第 ${String(item.chapter_no)} 章 v${String(item.version)}`).join("、")}。这是潜在影响范围，尚未判定每章都需要改动。` : "";
+    return { summary: `${state}：${summary}${affected}${value.next_action || nextStep ? `\n下一步：${String(value.next_action || nextStep)}` : ""}`, reasoning, details: safeDetails };
   }
   if (value.status === "accepted" && value.chapter_no) {
     const warnings = Array.isArray(value.warnings) ? value.warnings.map(String).join("；") : "";
@@ -3709,9 +3987,9 @@ async function withDeadline<T>(request: Promise<T>, ms: number, message: string)
 }
 function currentChapter(path?: string): number | null { const match = path?.match(/chapter_(\d+)/); return match ? Number(match[1]) : null; }
 function tabLabel(tab: Tab): string { return ({ project: "项目", editor: "正文", chapter: "章工位", review: "审查", memory: "记忆", references: "参考", listen: "听读", process: "协作台" })[tab]; }
-function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "run.cancelled": "任务已停止", "run.waiting_user": "等待你回答", "run.waiting_condition": "等待条件", "recovery.waiting": "自动等待项目空闲", "workflow.waiting_user": "等待你回答", "workflow.waiting_condition": "已保存断点", "model.recovering": "模型步骤自修复", "run.steered": "已接收人工引导", "workflow.started": "工作流启动", "workflow.planned": "真实任务单", "workflow.completed": "工作流完成", "workflow.conflict": "正在处理分歧", "controller.routing": "理解与路由", "coordinator.model.started": "Coordinator 请求模型", "writer.started": "Writer 请求模型", "writer.completed": "Writer 完成", "reviewer.started": "Editor 开始审查", "workflow.stage": "工作流阶段", "outline.model": "Writer 生成独立大纲", "voice.moss.install.queued": "MOSS 已进入后台安装", "voice.asr.install.queued": "语音输入已进入后台安装", "voice.moss.install.progress": "MOSS 安装进度", "voice.asr.install.progress": "语音输入安装进度", "voice.moss.install.failed": "MOSS 安装失败", "voice.asr.install.failed": "语音输入安装失败", "provider.testing": "模型连接" } as Record<string, string>)[value || ""] || value || "过程"; }
-function agentRoleLabel(value: string, protocolVersion = 1): string { if (value === "reviewer" && protocolVersion === 2) return "专项审查"; return ({ coordinator: "调度", writer: "创作", editor: "编辑", reviewer: "编辑", reviewer_verifier: "编辑复核", reviewer_judge: "编辑复核", memory_keeper: "记忆整理", engine: "工作引擎", user: "你" } as Record<string, string>)[value] || value; }
-function operationLabel(value: string): string { return ({ "plan.generate": "生成四级规划", "plan.outline": "生成独立章节大纲", "settings.update": "修改运行设置", "chapter.write": "生成章节草稿", "chapter.review": "审查当前版本", "chapter.revise": "修订为新版本", "chapter.accept": "提交已通过版本的正史补丁", "batch.draft_loop": "逐章写作、审查与临时连续性", "batch.accept_loop": "按顺序提交通过章节", "arc.audit": "复审篇章承诺" } as Record<string, string>)[value] || value; }
+function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "run.cancelled": "任务已停止", "run.waiting_user": "等待你回答", "run.waiting_condition": "等待条件", "recovery.waiting": "自动等待项目空闲", "workflow.waiting_user": "等待你回答", "workflow.waiting_condition": "已保存断点", "model.recovering": "模型步骤自修复", "run.steered": "已接收人工引导", "workflow.started": "工作流启动", "workflow.planned": "真实任务单", "workflow.completed": "工作流完成", "workflow.conflict": "正在处理分歧", "controller.routing": "理解与路由", "coordinator.model.started": "Coordinator 请求模型", "writer.started": "Writer 请求模型", "writer.completed": "Writer 完成", "editor.started": "Editor 开始审查", "reviewer.started": "开始审查", "workflow.stage": "工作流阶段", "outline.model": "Writer 生成独立大纲", "voice.moss.install.queued": "MOSS 已进入后台安装", "voice.asr.install.queued": "语音输入已进入后台安装", "voice.moss.install.progress": "MOSS 安装进度", "voice.asr.install.progress": "语音输入安装进度", "voice.moss.install.failed": "MOSS 安装失败", "voice.asr.install.failed": "语音输入安装失败", "provider.testing": "模型连接" } as Record<string, string>)[value || ""] || value || "过程"; }
+function agentRoleLabel(value: string): string { return ({ coordinator: "调度", writer: "创作", editor: "编辑", reviewer: "专项审查", memory_keeper: "记忆整理", engine: "工作引擎", user: "你" } as Record<string, string>)[value] || value; }
+function operationLabel(value: string): string { return ({ "plan.generate": "生成四级规划", "plan.outline": "生成独立章节大纲", "settings.update": "修改运行设置", "chapter.write": "生成章节草稿", "chapter.review_mode": "按任务模式审查当前版本", "chapter.revise": "修订为新版本", "chapter.accept": "提交已通过版本的正史补丁", "batch.draft_loop": "逐章写作、审查与临时连续性", "batch.accept_loop": "按顺序提交通过章节", "arc.audit": "复审篇章承诺" } as Record<string, string>)[value] || value; }
 function authorizationLabel(value: string): string { return ({ none: "未取得", current_request: "当前明确操作", per_chapter_click: "逐章点击", batch_preapproval: "批次一次确认", settings_auto_accept: "设置中的自动验收" } as Record<string, string>)[value] || value; }
 function acceptanceModeLabel(value: string): string { return ({ per_chapter: "逐章确认", batch_once: "批次确认一次", auto_after_review: "审查通过后自动验收" } as Record<string, string>)[value] || value; }
 function collaborationStatusLabel(value: string): string { return ({ pending: "等待对方", responded: "已回复", resolved: "已完成", escalated: "已升级给用户", expired: "已过期" } as Record<string, string>)[value] || value; }

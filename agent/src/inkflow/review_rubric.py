@@ -77,6 +77,9 @@ def score_review(assessments: list[ReviewAssessment], findings: list[ReviewFindi
             basis.append(f"必需项 {LABELS[name]}：{item.status}；{item.reason}")
             if item.status != "met" and not hard and item.status != "data_missing":
                 errors.append(f"{LABELS[name]}被判未满足，却没有经核实的硬问题；先复核指控，不改正文")
+        basis.append(f"{LABELS[name]}依据：正文“{item.chapter_evidence}”；"
+                     f"来源 {item.source_id or '本章'}“{item.source_evidence}”；"
+                     f"归因 {item.evidence_relation}；另一种解读：{item.alternative}")
     compared = {item.source_id for item in comparisons}
     for item in comparisons:
         if item.evidence_relation in UNRESOLVED_RELATIONS:
@@ -103,5 +106,8 @@ def score_review(assessments: list[ReviewAssessment], findings: list[ReviewFindi
         earned = weight * GRADE_CREDIT[item.grade]
         points += earned
         basis.append(f"{LABELS[name]}：等级{item.grade}对应{GRADE_CREDIT[item.grade]:.0%} × {weight} = {earned:g}分；{item.reason}")
+        if earned < weight:
+            basis.append(f"{LABELS[name]}未获 {weight - earned:g} 分：先按上述原句与另一种解读核对审核是否读对，"
+                         "普通质量差异不直接派 Writer 改稿；只有经定位的必要问题才安排修订")
     basis.append(f"加权符合度：{points:g}/100；硬问题{'未通过，分数不能抵消' if hard else '另行核验'}；不设置95分基准或90分目标")
     return round(points / 100, 4), basis, []

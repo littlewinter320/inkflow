@@ -1,6 +1,6 @@
 {
   "name": "inkflow-desktop",
-  "version": "0.7.2",
+  "version": "0.7.4",
   "private": true,
   "author": "InkFlow contributors",
   "description": "墨流（InkFlow）中文长篇小说桌面工作台",
@@ -8,7 +8,7 @@
   "scripts": {
     "dev:live": "cross-env INKFLOW_LIVE_RELOAD=1 npm run dev",
     "dev": "node scripts/dev.mjs",
-    "dev:services": "concurrently -k \"vite --port %INKFLOW_DEV_PORT%\" \"tsc -p tsconfig.electron.json --watch\" \"wait-on tcp:%INKFLOW_DEV_PORT% file:dist-electron/main.js && cross-env VITE_DEV_SERVER_URL=http://localhost:%INKFLOW_DEV_PORT% electron .\"",
+    "dev:services": "concurrently -k \"vite --port %INKFLOW_DEV_PORT%\" \"wait-on tcp:%INKFLOW_DEV_PORT% file:dist-electron/main.js && cross-env VITE_DEV_SERVER_URL=http://localhost:%INKFLOW_DEV_PORT% electron .\"",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.electron.json --noEmit",
     "build:web": "vite build",
     "build:electron": "tsc -p tsconfig.electron.json",
@@ -47,7 +47,7 @@
       "en-US"
     ],
     "directories": {
-      "output": "D:/墨流/release/0.7.2/desktop"
+      "output": "D:/墨流/release/0.7.4/desktop"
     },
     "files": [
       "dist/**/*",
@@ -60,7 +60,7 @@
         "to": "icon.ico"
       },
       {
-        "from": "D:/墨流/release/0.7.2/engine/inkflow-engine.exe",
+        "from": "D:/墨流/release/0.7.4/engine/inkflow-engine.exe",
         "to": "engine/inkflow-engine.exe"
       },
       {

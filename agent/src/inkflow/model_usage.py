@@ -8,10 +8,9 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 import warnings
 from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, DecimalException, ROUND_CEILING
 from pathlib import Path
@@ -22,22 +21,6 @@ from uuid import uuid4
 from .config import Settings, load_user_settings, user_settings_path
 from .errors import InkFlowError
 from .utils import utc_now
-
-
-class ValidationQuotaExceeded(InkFlowError):
-    """A hard training-validation boundary, never a resumable request slice."""
-
-
-@dataclass(frozen=True)
-class ValidationScope:
-    novel_id: str
-    candidate_id: str
-    evaluation_version: str
-
-
-training_validation_scope: ContextVar[ValidationScope | None] = ContextVar(
-    "inkflow_training_validation", default=None
-)
 
 
 def usage_ledger_path() -> Path:
@@ -121,7 +104,9 @@ def normalized_usage(usage: dict[str, Any], *, anthropic: bool = False) -> dict[
         if prompt is not None and hit is not None and (hit > prompt or (miss is not None and hit + miss != prompt)):
             hit = None
         write = 0
-    return {"input_tokens": prompt, "output_tokens": output, "cache_hit_tokens": hit, "cache_write_tokens": write}
+    miss = prompt - hit - write if None not in (prompt, hit, write) else None
+    return {"input_tokens": prompt, "output_tokens": output, "cache_hit_tokens": hit,
+            "cache_write_tokens": write, "uncached_input_tokens": miss}
 
 
 def _cost_micros(counts: dict[str, int | None], price: dict[str, Any]) -> int | None:
@@ -131,7 +116,10 @@ def _cost_micros(counts: dict[str, int | None], price: dict[str, Any]) -> int | 
     # Generic two-rate settings cannot price Anthropic cache writes reliably.
     if counts.get("cache_write_tokens"):
         return None
-    hit = counts["cache_hit_tokens"] or 0
+    hit = counts["cache_hit_tokens"]
+    if hit is None and str(price.get("input")) != str(price.get("cache_read")):
+        return None  # Unknown cache usage cannot be priced as a zero hit count.
+    hit = hit or 0
     # CNY / million tokens times token count equals micro-CNY; round upward.
     try:
         amount = Decimal(prompt - hit) * Decimal(price["input"]) + Decimal(hit) * Decimal(price["cache_read"]) + Decimal(output) * Decimal(price["output"])
@@ -165,6 +153,9 @@ class UsageLedger:
             columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(model_attempts)")}
             if "prompt_family" not in columns:
                 db.execute("ALTER TABLE model_attempts ADD COLUMN prompt_family TEXT NOT NULL DEFAULT ''")
+            for name, definition in {"diagnostic_json": "TEXT", "duration_ms": "INTEGER", "request_sent": "INTEGER"}.items():
+                if name not in columns:
+                    db.execute(f"ALTER TABLE model_attempts ADD COLUMN {name} {definition}")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -181,32 +172,25 @@ class UsageLedger:
 
     def begin(self, settings: Settings, *, request_id: str, model: str, role: str,
               input_estimate: int, max_output_tokens: int, input_bound: int,
-              task_id: str = "", prompt_family: str = "") -> str:
-        scope = training_validation_scope.get()
+              task_id: str = "", prompt_family: str = "", diagnostic: dict[str, Any] | None = None) -> str:
         novel_id = project_identity(settings)
-        if scope and (not novel_id or novel_id != scope.novel_id or not scope.candidate_id or not scope.evaluation_version):
-            raise ValidationQuotaExceeded("训练验证必须绑定当前小说、冻结候选和评价版本，不能记成日常写作请求。")
-        if scope and input_bound + max_output_tokens > 500_000:
-            raise ValidationQuotaExceeded("训练验证的保守输入边界与最大输出合计超过50万原始token，请缩小验证材料。")
         price = price_snapshot(settings, model)
         pending_cost = _cost_micros({"input_tokens": input_bound, "output_tokens": max_output_tokens,
                                     "cache_hit_tokens": 0, "cache_write_tokens": 0}, price)
         attempt_id = uuid4().hex
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if scope:
-                used = db.execute("SELECT COUNT(*) FROM model_attempts WHERE novel_id=? AND purpose='training_validation'", (novel_id,)).fetchone()[0]
-                if used >= 5:
-                    raise ValidationQuotaExceeded("这部小说的5次远端训练验证请求已用完；日常写作和本地训练仍可继续。")
             db.execute("""INSERT INTO model_attempts
                 (attempt_id,request_id,task_id,novel_id,purpose,candidate_id,evaluation_version,
                  provider,endpoint,model,role,prompt_family,started_at,input_estimate,max_output_tokens,price_json,pending_estimate_micros)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (attempt_id, request_id, task_id, novel_id, "training_validation" if scope else "production",
-                 scope.candidate_id if scope else "", scope.evaluation_version if scope else "",
+                (attempt_id, request_id, task_id, novel_id, "production", "", "",
                  settings.provider_kind, urlparse(settings.base_url).hostname or "", model, role,
                  prompt_family, utc_now(),
                  input_estimate, max_output_tokens, json.dumps(price), pending_cost))
+            safe = {key: str(value) for key, value in (diagnostic or {}).items() if key in {
+                "system_contract_hash", "user_prefix_4096_hash", "materials_hash", "quality_hash", "stage"}}
+            db.execute("UPDATE model_attempts SET diagnostic_json=? WHERE attempt_id=?", (json.dumps(safe), attempt_id))
         return attempt_id
 
     def settle(self, attempt_id: str, usage: dict[str, Any], *, anthropic: bool = False) -> None:
@@ -231,10 +215,11 @@ class UsageLedger:
                 (json.dumps(raw), "reported" if known else "partial", counts["input_tokens"], counts["output_tokens"],
                  counts["cache_hit_tokens"], counts["cache_write_tokens"], cost, known, attempt_id))
 
-    def finish(self, attempt_id: str, outcome: str, error_type: str = "") -> None:
+    def finish(self, attempt_id: str, outcome: str, error_type: str = "", *, duration_ms: int | None = None,
+               request_sent: bool | None = None) -> None:
         with self._connect() as db:
-            db.execute("UPDATE model_attempts SET finished_at=?,outcome=?,error_type=? WHERE attempt_id=? AND outcome='pending'",
-                       (utc_now(), outcome, error_type, attempt_id))
+            db.execute("UPDATE model_attempts SET finished_at=?,outcome=?,error_type=?,duration_ms=?,request_sent=? WHERE attempt_id=? AND outcome='pending'",
+                       (utc_now(), outcome, error_type, _count(duration_ms), int(request_sent) if type(request_sent) is bool else None, attempt_id))
 
     def summary(self, novel_id: str | None = None) -> dict[str, Any]:
         where, params = (" WHERE novel_id=?", (novel_id,)) if novel_id is not None else ("", ())
@@ -246,8 +231,7 @@ class UsageLedger:
                 COALESCE(SUM(usage_state!='reported'),0) AS unknown_usage_calls,
                 COALESCE(SUM(cost_estimate_micros IS NULL),0) AS unknown_cost_calls,
                 COALESCE(SUM(cost_estimate_micros),0) AS estimated_micros,
-                COALESCE(SUM(pending_estimate_micros),0) AS pending_estimated_micros,
-                COALESCE(SUM(purpose='training_validation'),0) AS training_validation_calls
+                COALESCE(SUM(pending_estimate_micros),0) AS pending_estimated_micros
                 FROM model_attempts""" + where, params).fetchone()
         return {**dict(row), "currency": "CNY", "hard_limit_cny": None,
                 "estimated_cost": row["estimated_micros"] / 1_000_000,
@@ -255,11 +239,14 @@ class UsageLedger:
                 "scope": "novel" if novel_id is not None else "all_projects",
                 "price_note": "按请求时价格快照估算；内置DeepSeek参考采用高峰价，未配置或缺失usage不计作零费用。"}
 
-    def recent_deepseek_cache(self, novel_id: str, limit: int = 20) -> dict[str, Any]:
+    def recent_deepseek_cache(self, novel_id: str, limit: int = 20,
+                              *, qualified_task_products: dict[str, int] | None = None) -> dict[str, Any]:
         """Recent actual HTTP attempts, separate from lifetime trace averages."""
         with self._connect() as db:
             rows = db.execute(
-                """SELECT role,prompt_family,input_tokens,cache_hit_tokens,started_at FROM model_attempts
+                """SELECT attempt_id,request_id,task_id,role,prompt_family,model,input_tokens,output_tokens,
+                          cache_hit_tokens,cache_write_tokens,started_at,outcome,usage_state,error_type,
+                          duration_ms,cost_estimate_micros,diagnostic_json,request_sent FROM model_attempts
                    WHERE novel_id=? AND provider='deepseek'
                    ORDER BY started_at DESC,rowid DESC LIMIT ?""",
                 (novel_id, max(1, min(int(limit), 100))),
@@ -297,19 +284,121 @@ class UsageLedger:
             "last_at": rows[0]["started_at"] if rows else None,
             "by_role": by_role,
             "by_family": by_family,
+            "performance_diagnostic": self._performance_diagnostic([dict(row) for row in rows]),
+            "qualified_production": self._qualified_production_cost(novel_id, qualified_task_products),
         }
+
+    @staticmethod
+    def _attempt_totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        raw = [row for row in rows if row["input_tokens"] is not None]
+        output = [row for row in rows if row["output_tokens"] is not None]
+        cache = [row for row in raw if row["cache_hit_tokens"] is not None and row["cache_write_tokens"] is not None]
+        cost = [row for row in rows if row["cost_estimate_micros"] is not None]
+        timed = [row for row in rows if row["duration_ms"] is not None]
+        return {"calls": len(rows), "request_count": len({row["request_id"] for row in rows}),
+                "sent_calls": sum(row.get("request_sent") == 1 for row in rows),
+                "not_sent_calls": sum(row.get("request_sent") == 0 for row in rows),
+                "unknown_sent_calls": sum(row.get("request_sent") is None for row in rows),
+                "failed_calls": sum(row["outcome"] == "failed" for row in rows),
+                "cancelled_calls": sum(row["outcome"] == "cancelled" for row in rows),
+                "parsed_output_calls": sum(row["outcome"] == "completed" for row in rows),
+                "unknown_usage_calls": sum(row["usage_state"] != "reported" for row in rows),
+                "cache_unknown_calls": len(rows) - len(cache),
+                "raw_input_tokens": sum(row["input_tokens"] for row in raw) if raw else None,
+                "cached_input_tokens": sum(row["cache_hit_tokens"] for row in cache) if cache else None,
+                "uncached_input_tokens": sum(row["input_tokens"] - row["cache_hit_tokens"] - row["cache_write_tokens"] for row in cache) if cache else None,
+                "output_tokens": sum(row["output_tokens"] for row in output) if output else None,
+                "attempt_elapsed_ms": sum(row["duration_ms"] for row in timed) if timed else None,
+                "unknown_duration_calls": len(rows) - len(timed),
+                "known_estimated_cost": sum(row["cost_estimate_micros"] for row in cost) / 1_000_000,
+                "unknown_cost_calls": len(rows) - len(cost)}
+
+    @classmethod
+    def _performance_diagnostic(cls, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+        for row in rows:
+            try:
+                diagnostic = json.loads(row["diagnostic_json"] or "{}")
+            except (ValueError, TypeError):
+                diagnostic = {}
+            row["diagnostic"] = diagnostic if isinstance(diagnostic, dict) else {}
+            key = tuple(str(row["diagnostic"].get(name) or "") for name in
+                        ("stage", "materials_hash", "quality_hash", "system_contract_hash"))
+            groups.setdefault((str(row["prompt_family"]), *key), []).append(row)
+        comparisons = []
+        writers = [row for row in reversed(rows) if row["role"] == "writer"]
+        for before, after in zip(writers, writers[1:]):
+            b, a = before["diagnostic"], after["diagnostic"]
+            same = before["prompt_family"] == after["prompt_family"] and all(
+                a.get(name) and a.get(name) == b.get(name) for name in
+                ("stage", "materials_hash", "quality_hash", "system_contract_hash"))
+            rates = [row["cache_hit_tokens"] / row["input_tokens"]
+                     if row["input_tokens"] and row["cache_hit_tokens"] is not None else None for row in (before, after)]
+            comparisons.append({"before_attempt_id": before["attempt_id"], "after_attempt_id": after["attempt_id"],
+                "same_request_retry": before["request_id"] == after["request_id"], "same_scope": bool(same),
+                "before_hit_rate": rates[0], "after_hit_rate": rates[1],
+                "observed_decline": None if None in rates else rates[1] < rates[0],
+                "system_changed": a.get("system_contract_hash") != b.get("system_contract_hash"),
+                "early_prefix_changed": a.get("user_prefix_4096_hash") != b.get("user_prefix_4096_hash"),
+                "materials_changed": a.get("materials_hash") != b.get("materials_hash"),
+                "quality_changed": a.get("quality_hash") != b.get("quality_hash"),
+                "conclusion": "同材料与质量范围的实际缓存变化，仍需核查合格产物" if same and None not in rates else
+                              "材料、质量范围或usage不足，不能据此判定性能退化或提升"})
+        return {**cls._attempt_totals(rows), "same_scope_groups": [
+                    {"prompt_family": key[0], "stage": key[1], "materials_hash": key[2],
+                     "quality_hash": key[3], "system_contract_hash": key[4],
+                     "scope_known": all(key), **cls._attempt_totals(value)} for key, value in groups.items()],
+                "writer_sequence": comparisons, "attempts": [
+                    {key: value for key, value in row.items() if key != "diagnostic_json"} for row in rows],
+                "scope": "recent_actual_attempts", "performance_improvement": None,
+                "time_note": "attempt_elapsed_ms 是尝试生命周期总耗时，含排队和退避；并发时不能当作端到端墙钟时间。",
+                "quality_note": "结构解析成功仅表示 parsed_output_calls；合格产物另需真实正史接受凭据。"}
+
+    def _qualified_production_cost(self, novel_id: str, products: dict[str, int] | None) -> dict[str, Any]:
+        if products is None:
+            return {"status": "qualification_not_supplied", "accepted_products": None,
+                    "estimated_cost_per_product": None, "reason": "未提供核验后的正史接受任务凭据，不以模型输出成功代替合格产物。"}
+        products = {task: count for task, count in products.items() if task and type(count) is int and count > 0}
+        rows: list[dict[str, Any]] = []
+        with self._connect() as db:
+            tasks = list(products)
+            for start in range(0, len(tasks), 500):
+                chunk = tasks[start:start + 500]
+                rows.extend(dict(row) for row in db.execute(
+                    "SELECT task_id,request_id,input_tokens,output_tokens,cache_hit_tokens,cache_write_tokens,"
+                    "outcome,usage_state,duration_ms,cost_estimate_micros,request_sent FROM model_attempts "
+                    "WHERE novel_id=? AND task_id IN (" + ",".join("?" for _ in chunk) + ")",
+                    (novel_id, *chunk)))
+        totals = self._attempt_totals(rows)
+        count = sum(products.values())
+        missing_tasks = sorted(set(products) - {row["task_id"] for row in rows})
+        return {"status": "reported" if rows and not totals["unknown_cost_calls"] and not missing_tasks else "insufficient_usage",
+                "accepted_products": count, **totals,
+                "missing_usage_task_ids": missing_tasks,
+                "estimated_cost_per_product": totals["known_estimated_cost"] / count if count and rows and not totals["unknown_cost_calls"] and not missing_tasks else None,
+                "scope": "all_recorded_attempts_of_verified_acceptance_tasks",
+                "limitation": "接受任务之外的前置独立写作/审核不自动归入成本；未知用量、缺账本与未关联任务不算零费用。"}
 
 
 class ModelAttempt:
-    """Accounting failure warns during writing; validation quotas stay fail-closed."""
+    """Accounting failures remain visible without inventing zero-cost usage."""
 
     def __init__(self, settings: Settings, **fields: Any):
+        from .runtime import active_runtime
+        self.runtime = active_runtime.get()
+        self.started = time.monotonic()
+        self.fields = fields
+        self.model = fields.get("model", "")
+        self.provider = settings.provider_kind
+        self.counts = normalized_usage({})
+        self.finished = False
+        self.request_sent = False
         self.ledger: UsageLedger | None = None
         self.attempt_id = ""
         self.failure = ""
         self.outcome = "failed"
         if settings.provider_kind == "ollama" and urlparse(settings.base_url).hostname in {"localhost", "127.0.0.1", "::1"}:
-            return  # Local inference does not spend a remote validation slot.
+            return  # Local inference is not a remote billing request.
         try:
             self.ledger = UsageLedger()
             self.attempt_id = self.ledger.begin(settings, **fields)
@@ -318,8 +407,6 @@ class ModelAttempt:
 
     def _unavailable(self, exc: Exception) -> None:
         message = f"用量账本暂不可用（{type(exc).__name__}），本次费用可能缺失；没有把它记作零费用。"
-        if training_validation_scope.get():
-            raise ValidationQuotaExceeded("训练验证名额无法可靠读取，暂不发送验证请求。") from exc
         warnings.warn(message, RuntimeWarning, stacklevel=2)
         from .runtime import active_runtime
         runtime = active_runtime.get()
@@ -328,15 +415,42 @@ class ModelAttempt:
         self.ledger = None
 
     def settle(self, usage: dict[str, Any], *, anthropic: bool = False) -> None:
+        self.counts = normalized_usage(usage, anthropic=anthropic)
         if self.ledger:
             try:
                 self.ledger.settle(self.attempt_id, usage, anthropic=anthropic)
             except (OSError, sqlite3.Error) as exc:
                 self._unavailable(exc)
 
+    def mark_request_sent(self) -> None:
+        self.request_sent = True
+
     def finish(self) -> None:
+        if self.finished:
+            return
+        self.finished = True
+        duration_ms = max(0, round((time.monotonic() - self.started) * 1000))
+        fragment = {"attempt_id": self.attempt_id or "unrecorded-" + uuid4().hex,
+                    "request_id": self.fields.get("request_id", ""), "task_id": self.fields.get("task_id", ""),
+                    "role": self.fields.get("role", "unspecified"), "model": self.model, "provider": self.provider,
+                    "prompt_family": self.fields.get("prompt_family", ""), "outcome": self.outcome,
+                    "error_type": self.failure, "duration_ms": duration_ms, **self.counts,
+                    "usage_state": "reported" if self.counts["input_tokens"] is not None and self.counts["output_tokens"] is not None else "unknown_or_partial",
+                    "ledger_available": self.ledger is not None,
+                    "request_sent": self.request_sent,
+                    "diagnostic": {key: str(value) for key, value in self.fields.get("diagnostic", {}).items()
+                                   if key in {"system_contract_hash", "user_prefix_4096_hash", "materials_hash", "quality_hash", "stage"}}}
         if self.ledger:
             try:
-                self.ledger.finish(self.attempt_id, self.outcome, self.failure)
+                self.ledger.finish(self.attempt_id, self.outcome, self.failure, duration_ms=duration_ms,
+                                   request_sent=self.request_sent)
             except (OSError, sqlite3.Error) as exc:
                 self._unavailable(exc)
+        if self.runtime:
+            fragment["ledger_available"] = self.ledger is not None
+            try:
+                self.runtime.record_attempt(fragment)
+            except Exception as exc:
+                # A diagnostics consumer must not turn a paid, completed model
+                # response into a provider retry. The fragment was appended first.
+                warnings.warn(f"用量片段通知暂未送达（{type(exc).__name__}）；未重试模型请求。", RuntimeWarning, stacklevel=2)

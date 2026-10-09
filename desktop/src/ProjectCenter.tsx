@@ -151,6 +151,27 @@ export function ProjectCenter({
     }
   };
 
+  const rejectHold = async () => {
+    const hold = dashboard?.quality_hold;
+    const reason = holdReason.trim();
+    if (!hold || !reason || working) return;
+    setWorking(true);
+    try {
+      const result = await request<{ summary: string; decision_id: string }>("chapter.quality_hold.reject", {
+        chapter_no: hold.chapter_no, expected_hash: hold.source_hash, reason,
+      });
+      onNotice(result.summary);
+      setRejectingHold(false);
+      setHoldReason("");
+      await onRefresh();
+      onSend(`第 ${hold.chapter_no} 章这处问题我不通过。用户决定 ID：${result.decision_id}。原因：${reason}。请按这个原因局部修复并重新审核；保留旧版，先别写下一章。`);
+    } catch (cause) {
+      onError(errorMessage(cause));
+    } finally {
+      setWorking(false);
+    }
+  };
+
   const load = useCallback(async () => {
     try {
       const [taskResult, checkpointResult] = await Promise.all([
@@ -454,7 +475,7 @@ export function ProjectCenter({
               if (item) onOpen(item);
             }}>查看正文</button>
           </div>
-          {rejectingHold && <div className="quality-hold-reason"><label>哪里不合适？<textarea value={holdReason} onChange={(event) => setHoldReason(event.target.value)} placeholder="例如：草表回到台面后，章末的收盒顺序仍对不上。" /></label><button disabled={!holdReason.trim()} onClick={() => { onSend(`第 ${dashboard.quality_hold?.chapter_no} 章这处问题我不通过。原因：${holdReason.trim()}。请你自己读完整章，按这个原因局部修复并重新审核；保留旧版，不要撤回整章，也先别写下一章。`); setRejectingHold(false); setHoldReason(""); }}>按这个原因修复</button></div>}
+          {rejectingHold && <div className="quality-hold-reason"><label>哪里不合适？<textarea value={holdReason} onChange={(event) => setHoldReason(event.target.value)} placeholder="例如：草表回到台面后，章末的收盒顺序仍对不上。" /></label><button disabled={working || !holdReason.trim()} onClick={() => void rejectHold()}>按这个原因修复</button></div>}
         </section>
       )}
 

@@ -11,19 +11,19 @@ from .provider import ProviderResult
 from .schemas import ConflictRecord
 from .utils import atomic_write_text, json_dumps, utc_now
 from .runtime import active_runtime
-from .role_protocol import normalize_role
+from .role_protocol import normalize_role, adapt_role
 
 
-def _versioned_role_metadata(metadata: dict[str, Any], protocol_version: int) -> dict[str, Any]:
-    """Annotate a view without renaming historical role fields or rewriting logs."""
+def _canonical_role_metadata(metadata: dict[str, Any], *, legacy: bool = False) -> dict[str, Any]:
     result = dict(metadata)
-    role = result.get("agent_role")
+    role = result.get("canonical_agent_role") or result.get("agent_role")
     if role:
         try:
-            result["canonical_agent_role"] = normalize_role(role, protocol_version)
+            canonical = adapt_role(role, legacy=legacy and not result.get("canonical_agent_role"))
+            result["agent_role"] = result["canonical_agent_role"] = canonical
         except ValueError:
-            # Service events and future protocol versions remain readable.
             result.pop("canonical_agent_role", None)
+    result.pop("role_protocol_version", None)
     return result
 
 
@@ -55,8 +55,10 @@ def recent_trace_runs(project_root: str | Path, limit: int = 12) -> list[dict[st
             except json.JSONDecodeError:
                 continue
             metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
-            protocol_version = event.setdefault("role_protocol_version", 1)
-            metadata = _versioned_role_metadata(metadata, protocol_version)
+            marker = event.pop("role_protocol_version", None)
+            metadata = _canonical_role_metadata(metadata, legacy=type(marker) is int and marker == 1)
+            if metadata.get("canonical_agent_role"):
+                event["role"] = metadata["canonical_agent_role"]
             references = _trace_file_references(root, metadata)
             event["metadata"] = metadata
             event["references"] = references
@@ -127,16 +129,13 @@ class TraceEvent:
     summary: str
     details: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
-    role_protocol_version: int = 1
 
 
 class TraceRecorder:
     def __init__(
         self, project_root: str | Path, operation: str, trace_level: str = "full",
-        *, role_protocol_version: int = 1,
+        *, role_protocol_version: int | None = None,
     ):
-        normalize_role("coordinator", role_protocol_version)
-        self.role_protocol_version = role_protocol_version
         self.project_root = Path(project_root).resolve()
         stamp = utc_now().replace(":", "").replace("+00:00", "Z").replace("-", "")
         self.run_id = f"{stamp}-{operation}-{uuid.uuid4().hex[:8]}"
@@ -163,8 +162,7 @@ class TraceRecorder:
             status=status,
             summary=summary,
             details=details,
-            metadata=_versioned_role_metadata(metadata or {}, self.role_protocol_version),
-            role_protocol_version=self.role_protocol_version,
+            metadata=_canonical_role_metadata(metadata or {}),
         )
         self.events.append(event)
         with self.events_path.open("a", encoding="utf-8", newline="\n") as handle:
@@ -173,7 +171,6 @@ class TraceRecorder:
         runtime = active_runtime.get()
         if runtime and not stage.endswith("provider_reasoning"):
             runtime.publish({"type": "workflow.stage", "trace_id": self.run_id,
-                             "role_protocol_version": self.role_protocol_version,
                              "stage": stage, "status": status, "summary": summary,
                              "details": details, "role": event.metadata.get("agent_role", ""),
                              "model": event.metadata.get("model", ""), "metadata": event.metadata,
@@ -181,8 +178,6 @@ class TraceRecorder:
 
     def record_conflict(self, conflict: ConflictRecord) -> None:
         """Persist the focused evidence locally; publish only an actionable summary."""
-        if conflict.role_protocol_version != self.role_protocol_version:
-            raise ValueError("冲突记录与运行任务的角色协议版本不一致。")
         safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", conflict.conflict_id)[:80]
         record_path = self.run_dir / f"conflict-{safe_id}-{len(self.events) + 1:03d}.json"
         atomic_write_text(record_path, json_dumps(conflict.model_dump(mode="json")))

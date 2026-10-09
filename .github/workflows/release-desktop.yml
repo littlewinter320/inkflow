@@ -15,12 +15,25 @@ jobs:
       - name: Checkout tagged source
         uses: actions/checkout@v4
 
+      - name: Check whether release assets are already uploaded
+        id: uploaded
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content -Raw -LiteralPath ./desktop/package.json | ConvertFrom-Json).version
+          $names = @(gh release view $env:GITHUB_REF_NAME --json assets --jq '.assets[].name' 2>$null)
+          $complete = $LASTEXITCODE -eq 0 -and $names -contains "InkFlow-Setup-$version.exe" -and $names -contains "InkFlow-Setup-$version.exe.blockmap" -and $names -contains 'latest.yml'
+          "complete=$($complete.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
       - name: Set up Python
+        if: steps.uploaded.outputs.complete != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Set up Node.js
+        if: steps.uploaded.outputs.complete != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -41,6 +54,7 @@ jobs:
           }
 
       - name: Build local engine
+        if: steps.uploaded.outputs.complete != 'true'
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
@@ -54,6 +68,7 @@ jobs:
             --collect-submodules mcp.server `
             --collect-submodules mcp.shared `
             --collect-data mcp `
+            --collect-all edge_tts `
             --hidden-import mcp.types `
             --exclude-module mcp.cli `
             --distpath ./dist/engine `
@@ -62,21 +77,28 @@ jobs:
             ./agent/scripts/inkflow_app_server_entry.py
 
       - name: Install desktop dependencies
+        if: steps.uploaded.outputs.complete != 'true'
         working-directory: desktop
         run: npm ci
 
       - name: Publish Windows installer and updater metadata
+        if: steps.uploaded.outputs.complete != 'true'
         working-directory: desktop
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           npm run build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          npx electron-builder --win nsis --publish never
+          $buildConfig = (Get-Content -Raw -LiteralPath ./package.json | ConvertFrom-Json).build
+          $buildConfig.directories.output = '../artifacts/desktop'
+          ($buildConfig.extraResources | Where-Object { $_.to -eq 'engine/inkflow-engine.exe' }).from = '../dist/engine/inkflow-engine.exe'
+          New-Item -ItemType Directory -Force -Path ../artifacts | Out-Null
+          $buildConfig | ConvertTo-Json -Depth 50 | Set-Content -Encoding utf8 -LiteralPath ../artifacts/desktop-build.json
+          npx electron-builder --config ../artifacts/desktop-build.json --win nsis --publish never
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $tag = $env:GITHUB_REF_NAME
           $version = (Get-Content -Raw -LiteralPath ./package.json | ConvertFrom-Json).version
-          $output = [System.IO.Path]::GetFullPath((Join-Path "..\artifacts\desktop" $version))
+          $output = [System.IO.Path]::GetFullPath('..\artifacts\desktop')
           $assets = @(Get-ChildItem -LiteralPath $output -File | Where-Object {
             $_.Name -eq "InkFlow-Setup-$version.exe" -or
             $_.Name -eq "InkFlow-Setup-$version.exe.blockmap" -or

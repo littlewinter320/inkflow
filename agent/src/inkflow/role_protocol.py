@@ -1,4 +1,4 @@
-"""Versioned role names and explicit, side-effect-free settings migration."""
+"""One role contract; legacy labels are consumed only when importing input."""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -10,9 +10,7 @@ LEGACY_ROLE_PROTOCOL_VERSION = 1
 ROLE_PROTOCOL_VERSION = 2
 
 AgentRole = Literal["coordinator", "writer", "editor", "reviewer", "memory_keeper"]
-CollaborationMode = Literal[
-    "everyday", "review_boost", "memory_boost", "deep", "full_specialist"
-]
+CollaborationMode = Literal["everyday", "review_boost", "memory_boost", "full_specialist"]
 
 AGENT_ROLES: tuple[AgentRole, ...] = (
     "coordinator", "writer", "editor", "reviewer", "memory_keeper"
@@ -21,7 +19,6 @@ MODE_ROLES: Mapping[CollaborationMode, tuple[AgentRole, ...]] = MappingProxyType
     "everyday": ("coordinator", "writer", "editor"),
     "review_boost": ("coordinator", "writer", "editor", "reviewer"),
     "memory_boost": ("coordinator", "writer", "editor", "memory_keeper"),
-    "deep": ("coordinator", "writer", "reviewer", "memory_keeper"),
     "full_specialist": AGENT_ROLES,
 })
 MODE_CHECK_OWNERS: Mapping[CollaborationMode, Mapping[str, AgentRole]] = MappingProxyType({
@@ -30,60 +27,52 @@ MODE_CHECK_OWNERS: Mapping[CollaborationMode, Mapping[str, AgentRole]] = Mapping
         "general": "editor", "logic_continuity": "reviewer", "memory": "editor"
     }),
     "memory_boost": MappingProxyType({"general": "editor", "memory": "memory_keeper"}),
-    "deep": MappingProxyType({"general": "reviewer", "memory": "memory_keeper"}),
     "full_specialist": MappingProxyType({
         "expression": "editor", "logic_continuity": "reviewer", "memory": "memory_keeper"
     }),
 })
-# Keep deep's original owners only for frozen tasks and historical records.
-ACTIVE_COLLABORATION_MODES = tuple(mode for mode in MODE_ROLES if mode != "deep")
+ACTIVE_COLLABORATION_MODES = tuple(MODE_ROLES)
 _LEGACY_EDITOR_NAMES = frozenset({"reviewer", "reviewer_verifier", "reviewer_judge"})
 
 
-def _protocol_version(value: int | None) -> int:
-    if value is None:
-        return LEGACY_ROLE_PROTOCOL_VERSION
-    # bool is an int subclass, and 1.0 == 1; neither is a protocol version.
-    if type(value) is not int or value not in {LEGACY_ROLE_PROTOCOL_VERSION, ROLE_PROTOCOL_VERSION}:
-        raise ValueError("角色协议版本必须是整数 1 或 2。")
-    return value
-
-
-def normalize_role(role: str, protocol_version: int | None = 1) -> AgentRole:
-    """Interpret a stored role using its version; engine services are never agents."""
-    version = _protocol_version(protocol_version)
+def normalize_role(role: str, protocol_version: int | None = None) -> AgentRole:
+    """Resolve a canonical role; the obsolete argument never changes its meaning."""
     if not isinstance(role, str):
         raise ValueError("Agent 角色必须是受支持的角色名称。")
-    if version == LEGACY_ROLE_PROTOCOL_VERSION and role in _LEGACY_EDITOR_NAMES:
-        return "editor"
     if role not in AGENT_ROLES:
         raise ValueError(f"不支持的 Agent 角色：{role}。")
     return cast(AgentRole, role)
 
 
+def adapt_role(role: str, *, legacy: bool = False) -> AgentRole:
+    """Consume an explicitly identified old input once, without runtime dispatch."""
+    if legacy and isinstance(role, str) and role in _LEGACY_EDITOR_NAMES:
+        return "editor"
+    return normalize_role(role)
+
+
+def new_task_mode(mode: str) -> CollaborationMode:
+    """Accept the retired spelling at an input boundary and return one of four modes."""
+    canonical = "memory_boost" if mode == "deep" else mode
+    if not isinstance(canonical, str) or canonical not in MODE_ROLES:
+        raise ValueError(f"不支持的协作模式：{mode}。")
+    return cast(CollaborationMode, canonical)
+
+
 def roles_for_mode(mode: str) -> tuple[AgentRole, ...]:
     """Return eligible participants, not a requirement to call every role."""
-    if not isinstance(mode, str) or mode not in MODE_ROLES:
-        raise ValueError(f"不支持的协作模式：{mode}。")
-    return MODE_ROLES[cast(CollaborationMode, mode)]
+    return MODE_ROLES[new_task_mode(mode)]
 
 
 def check_owners_for_mode(mode: str) -> dict[str, AgentRole]:
     """Return an independent copy of the mode's unique check ownership."""
-    roles_for_mode(mode)
-    return dict(MODE_CHECK_OWNERS[cast(CollaborationMode, mode)])
-
-
-def new_task_mode(mode: str) -> CollaborationMode:
-    """Merge the retired name before freezing a new task; never rewrite old snapshots."""
-    roles_for_mode(mode)
-    return cast(CollaborationMode, "memory_boost" if mode == "deep" else mode)
+    return dict(MODE_CHECK_OWNERS[new_task_mode(mode)])
 
 
 def migrate_role_settings(
     values: Mapping[str, Mapping[str, Any]],
     *,
-    protocol_version: int | None = 1,
+    protocol_version: int | None = None,
 ) -> tuple[dict[str, dict[str, Any]], tuple[str, ...]]:
     """Map generation/context setting keys without defaults, validation or writes.
 
@@ -91,19 +80,15 @@ def migrate_role_settings(
     retained, while conflicting aliases without an explicit choice are rejected.
     The caller still validates setting values and chooses the task mode.
     """
-    version = _protocol_version(protocol_version)
+    if protocol_version is not None and (type(protocol_version) is not int or protocol_version not in {1, 2}):
+        raise ValueError("导入设置中的旧角色标签无效。")
+    legacy = protocol_version == LEGACY_ROLE_PROTOCOL_VERSION
     if not isinstance(values, Mapping):
         raise ValueError("Agent 角色设置必须是对象。")
     warnings: list[str] = []
-    if protocol_version is None and any(role in values for role in ("editor", "memory_keeper")):
-        warnings.append(
-            "未声明角色协议版本，按旧版解释 reviewer 为 Editor；"
-            "保留显式角色设置，不据此启用专项角色或加强模式。"
-        )
-
     grouped: dict[AgentRole, list[tuple[str, dict[str, Any]]]] = {}
     for source_role, raw in values.items():
-        target_role = normalize_role(source_role, version)
+        target_role = adapt_role(source_role, legacy=legacy)
         if not isinstance(raw, Mapping):
             raise ValueError(f"{source_role} 的角色设置必须是对象。")
         grouped.setdefault(target_role, []).append((source_role, dict(raw)))

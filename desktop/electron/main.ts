@@ -158,7 +158,7 @@ class UpdateManager {
     this.updater.on("update-available", (info: { version: string }) => this.setState({ status: "available", availableVersion: info.version, message: `发现新版本 ${info.version}，正在自动下载。` }));
     this.updater.on("update-not-available", () => this.setState({ status: "current", availableVersion: undefined, message: "当前已经是最新版本。" }));
     this.updater.on("download-progress", (progress: { percent: number }) => this.setState({ status: "downloading", progress: Math.round(progress.percent), message: `正在下载更新：${Math.round(progress.percent)}%` }));
-    this.updater.on("update-downloaded", (info: { version: string }) => this.setState({ status: "downloaded", availableVersion: info.version, progress: 100, message: "更新已经下载完成；关闭墨流或点击重启后会自动安装。" }));
+    this.updater.on("update-downloaded", (info: { version: string }) => this.setState({ status: "downloaded", availableVersion: info.version, progress: 100, message: "更新已经下载完成；点击重启安装后应用更新，关闭墨流会保留下载结果。" }));
     this.updater.on("error", (cause: Error) => this.setState({ status: "error", message: `更新失败：${cause.message}` }));
     this.window.webContents.once("did-finish-load", () => {
       setTimeout(() => {
@@ -579,9 +579,7 @@ function applicationIconPath(): string {
 }
 
 function developmentLaunchDetails(): { target: string; args: string } {
-  const wscript = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "wscript.exe");
-  const launcher = path.resolve(app.getAppPath(), "..", "scripts", "start-desktop-hidden.vbs");
-  return { target: wscript, args: `"${launcher}"` };
+  return { target: "D:\\墨流\\dev-launcher\\墨流 InkFlow.exe", args: "" };
 }
 
 function applicationRelaunchCommand(): string {
@@ -590,28 +588,6 @@ function applicationRelaunchCommand(): string {
   // Launching electron.exe alone opens Electron's default welcome screen.
   const launch = developmentLaunchDetails();
   return `"${launch.target}" ${launch.args}`;
-}
-
-function updateDevelopmentShortcut(): void {
-  if (app.isPackaged || process.platform !== "win32") return;
-  try {
-    const shortcutPath = path.join(app.getPath("appData"), "Microsoft", "Windows", "Start Menu", "Programs", "墨流（本地开发）.lnk");
-    if (!existsSync(shortcutPath)) return;
-    const shortcut = shell.readShortcutLink(shortcutPath);
-    const launch = developmentLaunchDetails();
-    // Only update the entry registered by this checkout's hidden launcher.
-    if (path.resolve(shortcut.target).toLowerCase() !== path.resolve(launch.target).toLowerCase() || shortcut.args !== launch.args) return;
-    const updated = shell.writeShortcutLink(shortcutPath, "update", {
-      target: shortcut.target,
-      appUserModelId: applicationId,
-      icon: applicationIconPath(),
-      iconIndex: 0,
-      description: "墨流 · 墨宝小说工作台（本机开发版）",
-    });
-    if (!updated) logLifecycle("app.shortcut-branding-failed", { reason: "shortcut-update-returned-false" });
-  } catch (cause) {
-    logLifecycle("app.shortcut-branding-failed", { reason: cause instanceof Error ? cause.message : String(cause) });
-  }
 }
 
 function projectArgument(argv = process.argv): string | null {
@@ -636,6 +612,32 @@ function rememberConversationWindow(projectRoot: string, conversationId: string)
   writeFileSync(temporary, JSON.stringify([{ conversationId, projectRoot, openedAt: new Date().toISOString() }, ...recentConversationWindows().filter(item => item.conversationId !== conversationId || !sameProjectRoot(item.projectRoot, projectRoot))].slice(0, 40)), "utf8");
   renameSync(temporary, file);
 }
+
+function loadWorkspace(window: BrowserWindow, conversationId?: string): void {
+  const developmentUrl = process.env.VITE_DEV_SERVER_URL;
+  const loading = developmentUrl
+    ? window.loadURL(conversationId ? `${developmentUrl}/?conversation_id=${encodeURIComponent(conversationId)}` : developmentUrl)
+    : window.loadFile(path.join(__dirname, "..", "dist", "index.html"), conversationId ? { query: { conversation_id: conversationId } } : {});
+  void loading.then(() => {
+    if (window.isDestroyed()) return;
+    if (window.isMinimized()) window.restore();
+    window.show();
+    window.focus();
+    logLifecycle("window.loaded", { windowId: window.id });
+  }).catch((cause) => {
+    logLifecycle("window.load-failed", { windowId: window.id, reason: redactEngineDiagnostics(String(cause)) });
+    if (window.isDestroyed()) return;
+    window.show();
+    void dialog.showMessageBox(window, {
+      type: "error", title: "墨流界面加载失败", message: "窗口已经打开，但工作台未能载入。",
+      detail: `${redactEngineDiagnostics(String(cause))}\n启动记录保存在 ${path.join(app.getPath("userData"), "logs")}。`,
+      buttons: ["重新载入", "查看启动日志"], defaultId: 0, cancelId: 1,
+    }).then(({ response }) => {
+      if (response === 0 && !window.isDestroyed()) loadWorkspace(window, conversationId);
+      else void shell.openPath(path.join(app.getPath("userData"), "logs"));
+    }).catch(() => undefined);
+  });
+}
 function createConversationWindow(projectRoot: string, requestedId?: string): { conversationId: string } {
   if (!mainWindow || mainWindow.isDestroyed()) throw new Error("主工作区已关闭，请重新打开墨流。");
   if (requestedId && !recentConversationWindows(projectRoot).some(item => item.conversationId === requestedId)) throw new Error("这份对话不在当前小说的窗口记录中。");
@@ -649,7 +651,7 @@ function createConversationWindow(projectRoot: string, requestedId?: string): { 
   rememberConversationWindow(projectRoot, conversationId);
   const window = new BrowserWindow({
     width: 1160, height: 820, minWidth: 960, minHeight: 650,
-    title: "墨流 · 独立对话", icon: applicationIconPath(), backgroundColor: "#11110f", show: false, autoHideMenuBar: true,
+    title: "墨流 · 独立对话", icon: applicationIconPath(), backgroundColor: "#11110f", show: true, autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
   conversationWindows.set(window.id, { projectRoot, conversationId });
@@ -662,12 +664,7 @@ function createConversationWindow(projectRoot: string, requestedId?: string): { 
     void dialog.showMessageBox(window, { type: "question", title: "这份对话还有请求未返回", message: "关闭窗口后，当前任务仍会在后台继续，已保存的记录保留。", detail: "重新打开对话历史可核对结果；关闭主工作区会按全应用退出流程处理所有任务。", buttons: ["继续查看", "关闭这份窗口"], defaultId: 0, cancelId: 0, noLink: true }).then(result => { if (result.response === 1 && !window.isDestroyed()) { closeConfirmed = true; window.close(); } }).finally(() => { asking = false; });
   });
   window.once("closed", () => conversationWindows.delete(window.id));
-  window.once("ready-to-show", () => window.show());
-  const developmentUrl = process.env.VITE_DEV_SERVER_URL;
-  if (developmentUrl) {
-    const url = new URL(developmentUrl); url.searchParams.set("conversation_id", conversationId);
-    void window.loadURL(url.toString());
-  } else void window.loadFile(path.join(__dirname, "..", "dist", "index.html"), { query: { conversation_id: conversationId } });
+  loadWorkspace(window, conversationId);
   return { conversationId };
 }
 
@@ -681,7 +678,7 @@ function createWindow(): void {
     backgroundColor: "#11110f",
     title: applicationName,
     icon: windowIcon,
-    show: false,
+    show: true,
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -944,7 +941,7 @@ function createWindow(): void {
     const result = await dialog.showOpenDialog(mainWindow!, {
       title,
       properties: ["openFile"],
-      filters: [{ name: "文本资料与训练样本", extensions: ["txt", "md", "markdown", "jsonl"] }],
+      filters: [{ name: "文本资料", extensions: ["txt", "md", "markdown", "jsonl"] }],
     });
     return result.canceled ? null : result.filePaths[0];
   });
@@ -1004,10 +1001,7 @@ function createWindow(): void {
   ipcMain.handle("app:update-check", () => updates?.check());
   ipcMain.handle("app:update-download", () => updates?.download());
   ipcMain.handle("app:update-install", () => updates?.install());
-  mainWindow.once("ready-to-show", () => mainWindow?.show());
-  const developmentUrl = process.env.VITE_DEV_SERVER_URL;
-  if (developmentUrl) void mainWindow.loadURL(developmentUrl);
-  else void mainWindow.loadFile(path.join(__dirname, "..", "dist", "index.html"));
+  loadWorkspace(affectedWindow);
   affectedWindow.on("closed", () => {
     clearUnresponsiveTimer();
     if (unresponsiveSince !== null) {
@@ -1033,19 +1027,22 @@ if (!singleInstance) {
 } else {
   app.on("second-instance", (_event, argv) => {
     if (!mainWindow) return;
-    updateDevelopmentShortcut();
+    mainWindow.show();
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();
     const root = projectArgument(argv);
     if (root) mainWindow.webContents.send("app:open-project", root);
   });
   app.whenReady().then(() => {
-    updateDevelopmentShortcut();
     logLifecycle("app.started", { version: app.getVersion(), packaged: app.isPackaged });
     createWindow();
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
+  }).catch((cause) => {
+    logLifecycle("app.startup-failed", { reason: redactEngineDiagnostics(String(cause)) });
+    dialog.showErrorBox("墨流启动失败", `未能创建工作台：${redactEngineDiagnostics(String(cause))}\n请查看 ${path.join(app.getPath("userData"), "logs")} 中的启动记录。`);
+    app.quit();
   });
 }
 
