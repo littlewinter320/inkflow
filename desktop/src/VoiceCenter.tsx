@@ -256,17 +256,6 @@ export function VoiceCenter({
     }
   };
 
-  const prepareFinetune = async (profile: VoiceProfile) => {
-    const folder = await window.inkflow.chooseFolder("选择已获授权的语音微调数据集");
-    if (!folder) return;
-    try {
-      const result = await request<{ message: string }>("voice.profile.prepare_finetune", { profile_id: profile.profile_id, dataset_path: folder });
-      onNotice(result.message);
-    } catch (cause) {
-      onError(cause instanceof Error ? cause.message : String(cause));
-    }
-  };
-
   if (!projectRoot) return <section className="empty"><h2>听读中心</h2><p>先打开一本小说，再选择正文、草稿或文字开始转换。</p></section>;
 
   return <section className="voice-center">
@@ -295,7 +284,7 @@ export function VoiceCenter({
 
     <section className="voice-section">
       <div className="voice-card-title"><strong>声音库</strong><span>{profiles.length} 个</span></div>
-      <div className="voice-profile-grid">{profiles.map((profile) => <article className="voice-profile" key={profile.profile_id}><span>{profile.gender === "male" ? "男声" : profile.gender === "female" ? "女声" : "自定义"}</span><strong>{profile.name}</strong><p>{profile.description}</p>{profile.kind === "clone" && <button onClick={() => void prepareFinetune(profile)}>准备本地微调</button>}</article>)}</div>
+      <div className="voice-profile-grid">{profiles.map((profile) => <article className="voice-profile" key={profile.profile_id}><span>{profile.gender === "male" ? "男声" : profile.gender === "female" ? "女声" : "自定义"}</span><strong>{profile.name}</strong><p>{profile.description}</p></article>)}</div>
     </section>
 
     <section className="voice-section">
@@ -393,7 +382,7 @@ function VoiceCloneDialog({ projectRoot, request, onClose, onCreated, onNotice, 
       setReferenceText(script.reading_text);
       setAudioPath("");
       setScriptInfo(script);
-      onNotice("Writer 已生成朗读稿。请照读后录音；文字可以在下方按实际录音微调。");
+      onNotice("Writer 已生成朗读稿。请照读后录音；文字可以在下方按实际录音调整。");
     } catch (cause) {
       onError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -409,7 +398,7 @@ function VoiceCloneDialog({ projectRoot, request, onClose, onCreated, onNotice, 
     {scriptInfo && <p className="form-hint">发音覆盖：{scriptInfo.coverage_summary.join("；")}。</p>}
     <label>照读文字 / 录音原文 <small>{referenceText.length}/400 字</small><textarea maxLength={400} value={referenceText} disabled={recording || scriptWorking} onChange={(event) => { setReferenceText(event.target.value); setScriptInfo(null); }} placeholder="可以让 Writer 先生成朗读稿，也可以填写已有录音的准确原文；留空时使用本地识别。" /></label>
     <section className="voice-clone-recording"><strong>二、参考录音</strong><p>只负责采集声音，限制为 3～120 秒；达到 120 秒自动停止。请在安静环境用平常声音朗读，并确保录音与上方文字一致。</p><div className="clone-source"><button disabled={recording || working} onClick={() => void choose()}>上传语音</button><button disabled={working || scriptWorking} className={recording ? "recording" : ""} onClick={() => void toggleRecording()}>{recording ? "■ 停止录音" : "● 照稿录音"}</button><span>{audioPath || "尚未选择录音"}</span></div></section>
-    <p className="form-hint">重写朗读稿后需要重新录音。声音克隆需在语音设置中选用本地 MOSS；Edge 在线朗读只使用预设声音。朗读稿只是参考材料，不是训练。</p>
+    <p className="form-hint">重写朗读稿后需要重新录音。声音克隆需在语音设置中选用本地 MOSS；Edge 在线朗读只使用预设声音。</p>
     <label>声音名称<input value={name} onChange={(event) => setName(event.target.value)} /></label>
     <label>声音类型<select value={gender} onChange={(event) => setGender(event.target.value)}><option value="female">女声</option><option value="male">男声</option><option value="other">其他 / 不指定</option></select></label>
     <label>朗读要求<input value={instruction} onChange={(event) => setInstruction(event.target.value)} /></label>

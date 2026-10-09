@@ -6,7 +6,8 @@
 $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
-$releaseRoot = 'D:\墨流\release\0.7.2'
+$desktopVersion = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $repositoryRoot 'desktop\package.json') | ConvertFrom-Json).version
+$releaseRoot = Join-Path 'D:\墨流\release' $desktopVersion
 $python = Join-Path $releaseRoot 'venv\Scripts\python.exe'
 $pyinstaller = Join-Path $releaseRoot 'venv\Scripts\pyinstaller.exe'
 $engineOutput = Join-Path $releaseRoot 'engine'

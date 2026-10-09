@@ -144,7 +144,11 @@ def _try_acquire(path: Path, lock_token: str) -> bool:
                         _abandoned_tokens.discard(_abandoned_key(path, abandoned_token))
         except FileNotFoundError:
             pass
-        return False
+        # Reclaiming a dead owner also works for nonblocking async callers.
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return False
     try:
         os.write(descriptor, payload)
     finally:
@@ -192,7 +196,9 @@ def _wait_error(path: Path, access_error: PermissionError | None) -> ProjectErro
             "本次失败没有自动删除锁或放宽权限，也不会强行接管仍在运行的任务。"
             "请确认其他墨流窗口已完成操作后重试；若持续出现，请检查项目目录访问权限。"
         )
-    return ProjectBusyError("当前项目正在执行另一项写作、审查或正史操作，请等待它完成后重试。")
+    stage = ("共享文件或正史写回" if path.name == "project.write.lock" else
+             "批次工作流协调" if path.name == "batch.workflow.lock" else "同章操作协调")
+    return ProjectBusyError(f"当前项目的{stage}暂被其他操作占用。本步骤尚未写入；保留当前成果，等待占用解除后从此步骤续接。")
 
 
 @contextmanager
@@ -253,6 +259,7 @@ async def _named_project_lock(root: str | Path, lock_name: str, *, timeout: floa
     wait_timeout = min(timeout, policy[0]) if policy else timeout
     lock_token = uuid4().hex
     deadline = time.monotonic() + wait_timeout
+    final_deadline = time.monotonic() + timeout
     wait_attempt = 0
     retry_delay = 0.5
     while True:
@@ -265,13 +272,13 @@ async def _named_project_lock(root: str | Path, lock_name: str, *, timeout: floa
             # being deleted. Retry within the same deadline, never change ACLs.
             access_error = exc
         if time.monotonic() >= deadline:
-            if policy is None or access_error is not None:
+            if policy is None or access_error is not None or time.monotonic() >= final_deadline:
                 raise _wait_error(path, access_error)
             wait_attempt += 1
             await policy[1](wait_attempt, retry_delay)
-            await asyncio.sleep(retry_delay)
+            await asyncio.sleep(min(retry_delay, max(0, final_deadline - time.monotonic())))
             retry_delay = min(retry_delay * 2, 10.0)
-            deadline = time.monotonic() + wait_timeout
+            deadline = min(final_deadline, time.monotonic() + wait_timeout)
             continue
         await asyncio.sleep(0.1)
     state = _owned.set({**ownership, project_key: (owner_id, 1)})
@@ -298,7 +305,12 @@ def project_write_lock_sync(root: str | Path, *, timeout: float = _WAIT_SECONDS)
         return
 
     lock_token = uuid4().hex
-    deadline = time.monotonic() + timeout
+    try:
+        asyncio.get_running_loop()
+        wait_seconds = 0.0  # A synchronous wait must never freeze the app event loop.
+    except RuntimeError:
+        wait_seconds = timeout
+    deadline = time.monotonic() + wait_seconds
     while True:
         access_error = None
         try:

@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+SOURCE_RECOVERY_TOKEN_LIMIT = 40_000
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -39,9 +41,11 @@ def workflow_result_status(result: Any) -> str:
     """Classify explicit workflow outcomes without guessing from prose."""
     if not isinstance(result, dict):
         return "completed"
-    if result.get("needs_clarification") is True:
-        return "waiting_user"
     status = result.get("status")
+    if result.get("post_commit_status") == "waiting_condition":
+        return "waiting_condition"
+    if result.get("verdict") in {"unknown", "patch", "replan", "revise", "insufficient_context"}:
+        return "waiting_condition"
     if status == "needs_input":
         return "waiting_user"
     if status in {"waiting_user", "waiting_condition"}:
@@ -61,6 +65,8 @@ def workflow_result_status(result: Any) -> str:
         return "waiting_user"
     if "waiting_condition" in child_statuses:
         return "waiting_condition"
+    if result.get("needs_clarification") is True or result.get("questions"):
+        return "waiting_user"
     return "completed"
 
 

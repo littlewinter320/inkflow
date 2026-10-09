@@ -4,7 +4,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from uuid import uuid4
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import time
 from typing import Any, Callable
 
 from .errors import ProviderError
@@ -27,6 +28,8 @@ class RunRuntime:
     unknown_calls: int = 0
     task_id: str = ""
     run_id: str = ""
+    attempt_fragments: list[dict[str, Any]] = field(default_factory=list)
+    started: float = field(default_factory=time.monotonic)
 
     def reserve(self, estimated_tokens: int) -> int:
         if self.calls >= self.max_calls or (self.max_tokens is not None and self.tokens + estimated_tokens > self.max_tokens):
@@ -47,9 +50,24 @@ class RunRuntime:
             self.unknown_calls -= 1
         self.publish({"type": "usage.updated", "summary": f"本次已请求 {self.calls} 次模型", "metadata": self.snapshot()})
 
-    def snapshot(self) -> dict[str, int | None]:
+    def record_attempt(self, fragment: dict[str, Any]) -> None:
+        """Expose unsuccessful/unknown attempts without modifying the reserved budget."""
+        if any(item["attempt_id"] == fragment["attempt_id"] for item in self.attempt_fragments):
+            return
+        self.attempt_fragments.append(fragment)
+        self.publish({"type": "usage.attempt_finished", "summary": "模型尝试已记录，失败与未知用量保留",
+                      "metadata": fragment})
+
+    def snapshot(self) -> dict[str, Any]:
         return {"calls": self.calls, "tokens": self.tokens, "unknown_calls": self.unknown_calls,
-                "max_calls": self.max_calls, "max_tokens": self.max_tokens}
+                "max_calls": self.max_calls, "max_tokens": self.max_tokens,
+                "failed_calls": sum(item["outcome"] == "failed" for item in self.attempt_fragments),
+                "cancelled_calls": sum(item["outcome"] == "cancelled" for item in self.attempt_fragments),
+                "sent_calls": sum(item.get("request_sent") is True for item in self.attempt_fragments),
+                "not_sent_calls": sum(item.get("request_sent") is False for item in self.attempt_fragments),
+                "elapsed_ms": max(0, round((time.monotonic() - self.started) * 1000)),
+                "attempt_fragments": list(self.attempt_fragments),
+                "token_note": "unknown_calls 保留预算估计；未知实际用量不算零费用。"}
 
 
 active_runtime: ContextVar[RunRuntime | None] = ContextVar("inkflow_runtime", default=None)

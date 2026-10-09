@@ -9,14 +9,14 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .database import ProjectDatabase
-from .errors import ProjectError
+from .errors import ProjectError, ValidationGateError
 from .project_lock import project_write_lock_sync
 from .render import render_state
 from .review_verifier import legacy_accepted_conflict
-from .schemas import BookBrief
+from .schemas import BookBrief, TerminalIntent
 from .utils import atomic_write_json, atomic_write_text, content_hash, safe_filename, utc_now
 
 
@@ -45,6 +45,209 @@ class InkFlowProject:
                 *self.recover_pending_commits(),
                 *self.recover_accepted_chapter_projections(),
             ]
+            from .planning_pipeline import recover_planning_publication
+            warning = recover_planning_publication(self)
+            if warning:
+                self.recovery_warnings.append(warning)
+        self.db.reconcile_collaboration_queue()
+        self.reconcile_pending_work()
+
+    def pending_work(self, *, chapter_no: int | None = None) -> list[dict[str, Any]]:
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                "SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%' ORDER BY updated_at DESC"
+            ).fetchall()
+        items = [json.loads(row["value_json"]) for row in rows]
+        native: list[dict[str, Any]] = []
+        jobs = self.db.get_metadata("manual_edit_jobs", {})
+        if isinstance(jobs, dict):
+            for job in jobs.values():
+                if job.get("status") in {"pending", "reviewing", "awaiting_confirmation", "needs_evidence", "failed", "revision_requested", "paused"}:
+                    native.append({"id": "manual-" + str(job["job_id"]), "kind": "manual_edit",
+                        "status": job["status"], "chapter_no": job.get("chapter_no"),
+                        "reason": job.get("summary") or "手动修改候选仍需核对",
+                        "next_action": "按候选原快照与来源续核；需要创作选择时先询问，不直接覆盖已接受正文。",
+                        "source": {key: job.get(key) for key in ("job_id", "relative_path", "current_hash", "attempts")}})
+        with self.db.connect() as connection:
+            revisions = connection.execute("SELECT key,value_json FROM metadata WHERE key LIKE 'pending_plan_revision:%'").fetchall()
+        for row in revisions:
+            revision = json.loads(row["value_json"])
+            if revision.get("status") in {"needs_writer", "awaiting_review"}:
+                number = int(row["key"].split(":", 1)[1])
+                native.append({"id": "plan-" + content_hash(row["value_json"])[:24], "kind": "plan_revision",
+                    "status": revision["status"], "chapter_no": number,
+                    "reason": revision.get("instruction") or "执行卡已改变，关联草稿尚未完成修订和复审",
+                    "next_action": "按当前新卡核对草稿，再按已授权范围定向修订和复审。",
+                    "intent": TerminalIntent(action="revise_review" if revision["status"] == "needs_writer" else "review",
+                        chapter_no=number, authorization="proposed", visible_reason="仅处理这章执行卡修订交接",
+                        operation_instruction=revision.get("instruction") or "按当前章节卡修订并复审；保留其他章节和已接受正文。",
+                        forbidden_actions=["accept"]).model_dump(mode="json"),
+                    "source": revision})
+        native_ids = {item["id"] for item in native}
+        items = [item for item in items if item["kind"] not in {"manual_edit", "plan_revision"}
+                 or item["id"] in native_ids]
+        saved = {item["id"]: item for item in items}
+        items = [item for item in items if item["id"] not in native_ids]
+        for item in native:
+            decision = saved.get(item["id"], {})
+            items.append({**decision, **item, **({"status": "deferred"} if decision.get("status") == "deferred" else {})})
+        workflows = {item["source"]["task_id"]: item for item in items if item["kind"] == "workflow" and item.get("source", {}).get("task_id")}
+        for item in items:
+            parent = workflows.get(item.get("source", {}).get("task_id"))
+            if parent and parent["id"] != item["id"]:
+                item["parent_id"] = parent["id"]
+            handling = "resume" if item.get("intent") else "blocked"
+            if item["kind"] in {"accepted_projection", "planning_publication"}:
+                handling = "local"
+            elif item["kind"] == "manual_edit":
+                handling = "manual" if item["status"] in {"pending", "failed", "deferred"} and int(item["source"].get("attempts") or 0) < 2 else "decision"
+            elif item["kind"] in {"review_gate", "review_evidence", "chapter_gate"} and item.get("chapter_no"):
+                chapter = self.db.get_chapter(int(item["chapter_no"]))
+                handling = "review" if chapter and chapter["status"] == "draft" else "blocked"
+            if item["status"] == "running" or (item["kind"] == "manual_edit" and item["status"] == "reviewing"):
+                handling = "running"
+            if int(item.get("processing_attempts", 0)) >= 2:
+                handling = "blocked"
+            if item["kind"] in {"workflow", "accept_finalization"} and not (item.get("run_id") and item.get("source", {}).get("task_id")):
+                handling = "blocked"
+            task_id = item.get("source", {}).get("task_id")
+            if task_id and handling == "resume":
+                with self.db.connect() as connection:
+                    records = connection.execute("SELECT value_json FROM metadata WHERE key LIKE ?", (f"coordinator_recovery:{task_id}:%",)).fetchall()
+                if any(len(record.get("attempts", [])) >= 2 or record.get("status") == "waiting_user"
+                       for row in records if isinstance(record := json.loads(row["value_json"]), dict)):
+                    handling = "blocked"
+            item["handling"] = "deferred" if item["status"] == "deferred" else handling
+            item["can_process"] = handling in {"resume", "local", "manual", "review"}
+        return [item for item in items if item["status"] not in {"completed", "superseded"}
+                and (chapter_no is None or item.get("chapter_no") in {None, chapter_no})]
+
+    def record_pending_work(self, *, kind: str, reason: str, next_action: str,
+                            source: dict[str, Any], intent: dict[str, Any] | None = None,
+                            run_id: str = "", status: str = "pending",
+                            chapter_no: int | None = None) -> dict[str, Any]:
+        identity = content_hash(json.dumps([kind, source, reason if kind == "optimization" else ""],
+                                          ensure_ascii=False, sort_keys=True))[:24]
+        key = f"pending_work:{identity}"
+        with project_write_lock_sync(self.root):
+            previous = self.db.get_metadata(key, {})
+            item = {**previous, "id": identity, "kind": kind, "reason": reason,
+                    "next_action": next_action, "source": source, "chapter_no": chapter_no,
+                    "status": previous.get("status", status) if previous.get("status") not in {"completed", "superseded"} else status,
+                    "created_at": previous.get("created_at", utc_now()),
+                    "updated_at": utc_now()}
+            if intent is not None:
+                item["intent"] = intent
+            if run_id:
+                item["run_id"] = run_id
+            self.db.set_metadata(key, item)
+        return item
+
+    def update_pending_work(self, identity: str, **changes: Any) -> dict[str, Any]:
+        with project_write_lock_sync(self.root):
+            key = f"pending_work:{identity}"
+            item = self.db.get_metadata(key)
+            if not isinstance(item, dict) or item.get("id") != identity:
+                item = next((value for value in self.pending_work() if value["id"] == identity), None)
+                if item is None:
+                    raise ProjectError("待处理事项不存在，请刷新后选择具体事项。")
+            item = {**item, **changes, "updated_at": utc_now()}
+            self.db.set_metadata(key, item)
+            return item
+
+    def reconcile_pending_work(self, *, current_pass: Callable[[int], dict[str, Any] | None] | None = None,
+                               current_source: dict[str, Any] | None = None) -> None:
+        """Close only issues whose concrete source/output now proves resolution."""
+        validated: dict[int, dict[str, Any] | None] = {}
+        with self.db.connect() as connection:
+            rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
+        finished_tasks = {item["source"].get("task_id"): item for row in rows
+                          if (item := json.loads(row["value_json"])).get("kind") == "workflow" and item.get("status") == "completed" and item.get("source", {}).get("task_id")}
+        for item in self.pending_work():
+            if item["kind"] == "plan_revision":
+                number = int(item["chapter_no"])
+                chapter = self.db.get_chapter(number)
+                marker = self.db.get_metadata(f"pending_plan_revision:{number}", {})
+                if chapter and chapter["status"] == "accepted" and marker == item["source"]:
+                    self.update_pending_work(item["id"], status="superseded", resolution="目标章节已接受，旧执行卡修订不再用于改写正史。")
+                    self.db.set_metadata(f"pending_plan_revision:{number}", {**marker, "status": "superseded"})
+                    continue
+            if item["kind"] == "plan_revision" and item["source"].get("status") == "awaiting_review" and current_pass is not None:
+                number = int(item["chapter_no"])
+                reviewed = current_pass(number)
+                marker = self.db.get_metadata(f"pending_plan_revision:{number}", {})
+                if reviewed is not None and marker == item["source"]:
+                    self.update_pending_work(item["id"], status="completed", resolution={"review_id": reviewed["id"]})
+                    self.db.set_metadata(f"pending_plan_revision:{number}", {**marker, "status": "completed", "review_id": reviewed["id"]})
+                continue
+            parent = finished_tasks.get(item.get("source", {}).get("task_id"))
+            if parent and item["kind"] in {"coordinator_recovery", "development_repair", "recovery_decision"}:
+                self.update_pending_work(item["id"], status="completed",
+                    resolution={"workflow_id": parent["id"], "progress": parent.get("progress", {})})
+                continue
+            if item["kind"] == "optimization" and current_source is not None and item["source"] != current_source:
+                self.update_pending_work(item["id"], status="superseded", resolution="提出建议时的来源已变化；旧建议保留历史，不再反复安排。")
+                continue
+            if item["kind"] == "context_source":
+                number = item.get("source", {}).get("chapter_no")
+                chapter = self.db.get_chapter(int(number)) if number else None
+                if chapter and chapter["status"] == "accepted":
+                    text_path = self.resolve_user_path(chapter["path"])
+                    if text_path.is_file() and content_hash(text_path.read_text(encoding="utf-8")) == chapter["content_hash"]:
+                        self.update_pending_work(item["id"], status="completed", resolution={"version": chapter["version"], "content_hash": chapter["content_hash"]})
+                continue
+            if item["kind"] == "planning_dependency" and self.db.get_current_plan_bundle() is not None:
+                self.update_pending_work(item["id"], status="completed", resolution="当前规划记录已恢复，原缺失依赖已解除。")
+                continue
+            if item["kind"] in {"chapter_gate", "review_gate", "review_evidence"} and item.get("chapter_no"):
+                chapter = self.db.get_chapter(item["chapter_no"])
+                review = self.db.latest_review_record(item["chapter_no"])
+                if not chapter or not review:
+                    continue
+                text_path = self.resolve_user_path(chapter["path"])
+                if item["source"].get("content_hash") != chapter["content_hash"]:
+                    self.update_pending_work(item["id"], status="superseded", resolution="正文已有新版本，旧问题来源仅保留审计。")
+                    continue
+                if (chapter["status"] == "accepted" and text_path.is_file()
+                        and content_hash(text_path.read_text(encoding="utf-8")) == chapter["content_hash"]):
+                    self.update_pending_work(item["id"], status="completed",
+                        resolution={"version": chapter["version"], "content_hash": chapter["content_hash"], "review_id": review["id"]})
+                elif item["kind"] in {"review_gate", "review_evidence"}:
+                    if item["source"].get("content_hash") != chapter["content_hash"]:
+                        self.update_pending_work(item["id"], status="superseded", resolution="正文已有新版本，旧报告仅保留审计。")
+                    else:
+                        number = item["chapter_no"]
+                        if current_pass is not None and number not in validated:
+                            try:
+                                validated[number] = current_pass(number)
+                            except (ProjectError, ValidationGateError, ValueError, OSError):
+                                validated[number] = None
+                        if validated.get(number) is not None:
+                            self.update_pending_work(item["id"], status="completed", resolution={"review_id": review["id"], "version": chapter["version"]})
+                        elif item["kind"] == "review_gate" and item["source"].get("review_id") != review["id"]:
+                            self.update_pending_work(item["id"], status="superseded", resolution="由当前版本的新审查接管问题，保留原报告。")
+            elif item["kind"] == "accepted_projection" and item.get("chapter_no"):
+                chapter = self.db.get_chapter(int(item["chapter_no"]))
+                if not chapter or chapter["status"] != "accepted":
+                    continue
+                source = {key: chapter[key] for key in ("chapter_no", "version", "content_hash", "path")}
+                try:
+                    if item["source"] != source:
+                        self.update_pending_work(item["id"], status="superseded", resolution={
+                            "source": source, "reason": "已接受正史来源已变化；旧问题和恢复日志保留审计，不套用旧恢复动作。"})
+                    else:
+                        self._finish_projection_pending_work(chapter)
+                except (OSError, UnicodeError, ValueError, KeyError, TypeError, sqlite3.Error, ProjectError) as exc:
+                    self.recovery_warnings.append(f"第 {chapter['chapter_no']} 章投影待办核验未完成：{exc}")
+            elif item["kind"] == "planning_source":
+                from .planning_pipeline import load_active_planning
+                try:
+                    active = load_active_planning(self)
+                except (ProjectError, ValidationGateError, ValueError, OSError):
+                    continue
+                if active:
+                    self.update_pending_work(item["id"], status="completed",
+                        resolution={"run_id": active[0]["trace_id"], "revision_no": active[0].get("revision_no", 1)})
 
     @classmethod
     def create(cls, root: str | Path, brief: BookBrief) -> "InkFlowProject":
@@ -122,6 +325,11 @@ class InkFlowProject:
                     and data.get("new_hash") == chapter["content_hash"]):
                 if artifact["status"] == "user_approved":
                     return None
+                if artifact["status"] == "user_rejected":
+                    return {"chapter_no": chapter_no, "source_hash": chapter["content_hash"],
+                        "stage": "user_rejected", "first_evidence": "", "second_evidence": "",
+                        "reason": "你已拒绝当前修订版，等待按理由续修和复核。",
+                        "detail": data["reason"], "decision_id": artifact["artifact_id"]}
                 if artifact["status"] == "verified":
                     current_resolution = artifact
         if review["chapter_version"] == int(chapter["version"]):
@@ -173,76 +381,180 @@ class InkFlowProject:
             artifact = self.db.save_agent_artifact(
                 artifact_type="accepted_continuity_resolution",
                 run_id=f"user-hold-{chapter_no}-{uuid.uuid4().hex[:8]}",
-                role="coordinator", role_protocol_version=2,
+                role="coordinator",
                 chapter_no=chapter_no, chapter_version=int(chapter["version"]),
                 dimension="continuity", status="user_approved",
                 data={"source_review_id": review["id"], "old_hash": expected_hash,
                       "new_hash": expected_hash, "decision_by": "user",
                       "decision": "keep_current_text", "hold": hold},
             )
+            resolutions = self.db.list_agent_artifacts(chapter_no=chapter_no,
+                artifact_type="accepted_continuity_resolution", limit=200)
+            for item in self.pending_work(chapter_no=chapter_no):
+                if item["kind"] != "accepted_repair" or item.get("chapter_no") != chapter_no:
+                    continue
+                if hold.get("decision_id") and item["source"].get("decision_id") != hold["decision_id"]:
+                    continue
+                origin = next((value for value in resolutions
+                    if value["artifact_id"] == item["source"].get("decision_id")
+                    and value["status"] == "user_rejected"), None)
+                if origin is None or origin["data"].get("source_review_id") != review["id"]:
+                    continue
+                hashes = {origin["data"]["new_hash"]}
+                # ponytail: bounded artifact history; explicit audit lookup if more than 200 repairs are needed.
+                for repair in reversed(resolutions):
+                    data = repair["data"]
+                    if (repair["status"] == "verified" and data.get("source_review_id") == review["id"]
+                            and repair["chapter_version"] >= origin["chapter_version"]
+                            and data.get("old_hash") in hashes):
+                        hashes.add(data.get("new_hash"))
+                if expected_hash in hashes:
+                    self.update_pending_work(item["id"], status="completed",
+                        resolution={"decision_by": "user", "decision": "keep_current_text",
+                            "decision_id": artifact["artifact_id"], "source_decision_id": origin["artifact_id"],
+                            "version": chapter["version"], "content_hash": expected_hash})
             return {"chapter_no": chapter_no, "version": int(chapter["version"]),
                     "content_hash": expected_hash, "decision": "user_approved",
                     "artifact_id": artifact["artifact_id"],
                     "summary": "已按你的选择保留当前正文并解除这处提醒；这不是模型复核通过。"}
 
-    def canonical_content_migration_status(self) -> dict[str, Any]:
-        """Describe the additive accepted-text migration without applying it."""
+    def reject_accepted_quality_hold(self, chapter_no: int, expected_hash: str, reason: str) -> dict[str, Any]:
+        reason = reason.strip()
+        if not reason or len(reason) > 4000:
+            raise ProjectError("请填写 1～4000 字的明确拒绝理由。")
+        with project_write_lock_sync(self.root):
+            hold = self.latest_accepted_quality_hold()
+            chapter = self.db.get_chapter(chapter_no)
+            review = self.db.latest_review_record(chapter_no)
+            if (not hold or hold["chapter_no"] != chapter_no or not chapter or not review
+                    or chapter["status"] != "accepted" or chapter["content_hash"] != expected_hash):
+                raise ProjectError("待核问题或当前正文已变化，请刷新后重新决定。")
+            content = self.db.canonical_chapter_content(chapter_no)
+            path = self.resolve_user_path(chapter["path"])
+            if (content is None or content_hash(content) != expected_hash or not path.is_file()
+                    or content_hash(path.read_text(encoding="utf-8")) != expected_hash):
+                raise ProjectError("正文来源不一致，未按旧版本记录拒绝。")
+            artifact = self.db.save_agent_artifact(artifact_type="accepted_continuity_resolution",
+                run_id=f"user-reject-{uuid.uuid4().hex}", role="coordinator", chapter_no=chapter_no,
+                chapter_version=chapter["version"], dimension="continuity", status="user_rejected",
+                data={"decision_by": "user", "decision": "reject_current_repair", "reason": reason,
+                      "source_review_id": review["id"], "old_hash": expected_hash, "new_hash": expected_hash,
+                      "hold": hold})
+            self.record_pending_work(kind="accepted_repair", reason=reason,
+                next_action="按用户拒绝理由定向续修并复核，保留旧版；必要创作选择先询问。",
+                source={"decision_id": artifact["artifact_id"], "version": chapter["version"], "content_hash": expected_hash,
+                        "source_review_id": review["id"]},
+                intent={"action": "repair_accepted", "chapter_no": chapter_no, "authorization": "proposed",
+                        "requested_outcome": "按用户拒绝理由定向修复已接受章节并复核",
+                        "visible_reason": "已有独立用户拒绝决定，等待明确续修授权。",
+                        "operation_instruction": f"用户决定 ID：{artifact['artifact_id']}。请按以下拒绝理由局部修复并重新审核，保留旧版：{reason}"[:4000]},
+                chapter_no=chapter_no, status="waiting_condition")
+            return {"chapter_no": chapter_no, "version": chapter["version"], "content_hash": expected_hash,
+                    "decision_id": artifact["artifact_id"], "summary": "已单独记录你的拒绝理由，当前正文保留，继续等待续修和复核。"}
 
-        required = self.db.canonical_content_migration_required()
-        accepted = self.db.accepted_chapters()
-        token = f"canon-migration-{content_hash(self.project_id + str(len(accepted)))[:16]}"
-        return {
+    def accepted_revision_impact(self, chapter_no: int) -> dict[str, Any]:
+        chapter = self.db.get_chapter(chapter_no)
+        later = [{key: row[key] for key in ("chapter_no", "version", "content_hash", "path")}
+                 for row in self.db.accepted_chapters() if row["chapter_no"] > chapter_no]
+        with self.db.connect() as connection:
+            own_facts = [row["fact_id"] for row in connection.execute("SELECT fact_id FROM facts WHERE source_chapter=?", (chapter_no,))]
+            evidence_rows = connection.execute("SELECT key,value_json FROM metadata WHERE key LIKE 'memory.evidence:%'").fetchall()
+        references = [row["key"].split(":", 1)[1] for row in evidence_rows
+                      if any(ref.get("source_chapter") == chapter_no for ref in json.loads(row["value_json"]))]
+        return {"source": {key: chapter[key] for key in ("chapter_no", "version", "content_hash", "path")} if chapter else None,
+                "downstream_chapters": later, "source_fact_ids": own_facts, "referencing_fact_ids": references,
+                "coverage": "direct_evidence_and_conservative_later_chapters",
+                "explanation": "直接证据引用可定位；后续章是待核范围，不表示已证实每章都依赖这处改动。"}
+
+    def _canonical_content_migration_preflight(self) -> tuple[dict[str, Any], dict[str, Any], dict[int, str]]:
+        snapshot = self.db.canonical_content_sources()
+        checks: list[dict[str, Any]] = []
+        verified: dict[int, str] = {}
+        for source in snapshot["sources"]:
+            if not source["canonical_missing"]:
+                continue
+            check = {**source, "observed_hash": None, "reason": ""}
+            try:
+                path = self.resolve_user_path(str(source["path"]))
+                if not path.is_file():
+                    raise ProjectError("正文文件不存在或不是普通文件")
+                text = path.read_text(encoding="utf-8")
+                check["observed_hash"] = content_hash(text)
+                if check["observed_hash"] == source["content_hash"]:
+                    verified[int(source["chapter_no"])] = text
+                else:
+                    check["reason"] = "当前 Markdown 与已接受版本哈希不同，保留改稿，不自动回填"
+            except (OSError, UnicodeError, ProjectError) as exc:
+                check["reason"] = str(exc)
+            checks.append(check)
+        required = bool(snapshot["schema_required"] or checks)
+        token = "canon-migration-" + content_hash(json.dumps(
+            {"project_id": self.project_id, "snapshot": snapshot, "checks": checks},
+            ensure_ascii=False, sort_keys=True,
+        ))[:24]
+        unresolved = [check for check in checks if check["reason"]]
+        impact = (
+            "会先在 .inkflow/backups 创建并核验 SQLite 备份，再在同一事务内增补正文列及回填缺失正文；"
+            f"仅回填与原已接受版本哈希一致的 {len(verified)} 章，不修改章节版本、审查、事实或用户文件。"
+            + ("不能自动回填：" + "；".join(f"第 {row['chapter_no']} 章：{row['reason']}" for row in unresolved) + "。可修复原文件后重新确认。" if unresolved else "")
+            if required else "当前项目已具备可恢复的 SQLite 正史正文，无需升级。"
+        )
+        status = {
             "required": required,
             "confirmation_token": token if required else "",
-            "accepted_chapter_count": len(accepted),
-            "impact": (
-                "会先在 .inkflow/backups 创建 SQLite 备份，再为 chapters 表增加 content_text 字段；"
-                "随后仅在正文哈希一致时把已接受 Markdown 回填到数据库。"
-                if required
-                else "当前项目已经具备 SQLite 正史正文列，无需升级。"
-            ),
+            "accepted_chapter_count": len(snapshot["sources"]),
+            "schema_required": snapshot["schema_required"],
+            "missing_content_count": len(checks),
+            "verified_chapter_count": len(verified),
+            "source_checks": checks,
+            "impact": impact,
         }
+        return status, snapshot, verified
+
+    def canonical_content_migration_status(self) -> dict[str, Any]:
+        """Describe sources, hash mismatches and backup impact without applying changes."""
+        return self._canonical_content_migration_preflight()[0]
 
     def apply_canonical_content_migration(self, confirmation_token: str) -> dict[str, Any]:
         """Back up and upgrade legacy projects after the user has explicitly confirmed."""
 
         with project_write_lock_sync(self.root):
-            status = self.canonical_content_migration_status()
+            status, snapshot, verified = self._canonical_content_migration_preflight()
             if not status["required"]:
                 return {**status, "applied": False, "message": "当前项目无需升级。"}
             if confirmation_token != status["confirmation_token"]:
-                raise ProjectError("正史正文数据库升级尚未确认；请先阅读影响并在界面中确认。")
-            backups = self.internal / "backups"
+                raise ProjectError("正史正文升级确认缺失或来源已变化；请重新查看逐章影响并确认。")
+            backups = self.resolve_user_path(".inkflow/backups", allow_internal=True)
             backups.mkdir(parents=True, exist_ok=True)
-            backup_path = backups / f"inkflow-before-canon-content-{utc_now().replace(':', '').replace('+00:00', 'Z')}.db"
+            backup_path = backups / f"inkflow-before-canon-content-{utc_now().replace(':', '').replace('+00:00', 'Z')}-{uuid.uuid4().hex[:8]}.db"
             # A raw file copy can miss uncheckpointed WAL pages.  SQLite's
             # backup API creates a transactionally consistent local snapshot.
             with self.db.connect() as source:
                 destination = sqlite3.connect(backup_path)
                 try:
                     source.backup(destination)
+                    integrity = destination.execute("PRAGMA quick_check").fetchall()
+                    if integrity != [("ok",)]:
+                        raise ProjectError(f"正史数据库备份未通过完整性核验：{integrity}；未执行迁移。")
                 finally:
                     destination.close()
-            self.db.migrate_canonical_content()
-            backfilled = 0
-            unresolved: list[int] = []
-            for chapter in self.db.accepted_chapters():
-                chapter_no = int(chapter["chapter_no"])
-                projection = self.root / str(chapter["path"])
-                if projection.is_file() and self.db.backfill_canonical_chapter_content(
-                    chapter_no, projection.read_text(encoding="utf-8")
-                ):
-                    backfilled += 1
-                elif self.db.canonical_chapter_content(chapter_no) is None:
-                    unresolved.append(chapter_no)
+            refreshed, refreshed_snapshot, refreshed_verified = self._canonical_content_migration_preflight()
+            if refreshed["confirmation_token"] != status["confirmation_token"]:
+                raise ProjectError("备份期间正史来源或文件变化，备份已保留，尚未迁移；请重新确认。")
+            backfilled = self.db.migrate_canonical_content(
+                expected_sources=refreshed_snapshot, verified_contents=refreshed_verified,
+                audit={"backup_path": str(backup_path), "confirmed_token": confirmation_token,
+                       "sources": snapshot, "source_checks": status["source_checks"], "applied_at": utc_now()},
+            )
+            unresolved = [int(row["chapter_no"]) for row in status["source_checks"] if row["reason"]]
             self.recovery_warnings = self.recover_accepted_chapter_projections()
             return {
                 **self.canonical_content_migration_status(),
                 "applied": True,
                 "backup_path": str(backup_path),
-                "backfilled_chapters": backfilled,
+                "backfilled_chapters": len(backfilled),
                 "unresolved_chapters": unresolved,
-                "message": "已创建本地备份并完成可恢复正史正文升级。" if not unresolved else "升级已完成，但部分旧章节无法从现有 Markdown 验证回填。",
+                "message": "已核验本地备份并完成可恢复正史正文升级。" if not unresolved else "已完成可验证正文回填；未解决章节保留断点与原因，修复原文件后可再次确认回填。",
             }
 
     def resolve_user_path(self, relative_path: str | Path, *, allow_internal: bool = False) -> Path:
@@ -388,6 +700,13 @@ class InkFlowProject:
         state_path = self.resolve_user_path("STATE.md")
         previous_file_hash = self._projection_hash(final_path)
         previous_state_hash = self._projection_hash(state_path)
+        chapter_no = int(final_path.stem.split("_")[-1])
+        source_chapter = self.db.get_chapter(chapter_no)
+        if not source_chapter:
+            raise ProjectError("正史投影缺少已登记章节，未创建提交日志。")
+        # Ordinary acceptance keeps the draft version; the sole accepted-repair
+        # caller creates the next version in its guarded SQLite transaction.
+        chapter_version = int(source_chapter["version"]) + (source_chapter["status"] == "accepted")
         atomic_write_text(staged_path, content)
         journal = {
             "transaction_id": transaction_id,
@@ -395,6 +714,10 @@ class InkFlowProject:
             "final_path": final_path.relative_to(self.root).as_posix(),
             "staged_path": staged_path.relative_to(self.root).as_posix(),
             "content_hash": content_hash(content),
+            "chapter_no": chapter_no,
+            "chapter_version": chapter_version,
+            "source_version": int(source_chapter["version"]),
+            "source_hash": str(source_chapter["content_hash"]),
             "previous_file_hash": previous_file_hash,
             "previous_state_hash": previous_state_hash,
             "created_at": utc_now(),
@@ -413,9 +736,16 @@ class InkFlowProject:
         """Finish only the projections whose pre-commit versions still match."""
         journal_path = Path(transaction["journal_path"])
         if not journal_path.exists():
-            final_path = Path(transaction.get("final_path", ""))
+            final_path = self.resolve_user_path(str(transaction.get("final_path", "")))
             expected_hash = str(transaction.get("content_hash", ""))
-            if final_path.is_file() and expected_hash and self._projection_hash(final_path) == expected_hash:
+            chapter_no = int(final_path.stem.split("_")[-1])
+            chapter = self.db.get_chapter(chapter_no)
+            canonical = self.db.canonical_chapter_content(chapter_no)
+            if (chapter and chapter["status"] == "accepted" and chapter["content_hash"] == expected_hash
+                    and ("chapter_version" not in transaction or int(chapter["version"]) == int(transaction["chapter_version"]))
+                    and self.resolve_user_path(str(chapter["path"])) == final_path
+                    and canonical is not None and content_hash(canonical) == expected_hash
+                    and final_path.is_file() and expected_hash and self._projection_hash(final_path) == expected_hash):
                 desired_state = render_state(self.db.current_facts(), self.db.open_threads(), self.db.project_status())
                 if self._projection_hash(self.resolve_user_path("STATE.md")) == content_hash(desired_state):
                     return
@@ -432,6 +762,8 @@ class InkFlowProject:
         canonical_content = self.db.canonical_chapter_content(chapter_no)
         if (
             not chapter or chapter["status"] != "accepted"
+            or ("chapter_no" in journal and int(journal["chapter_no"]) != chapter_no)
+            or ("chapter_version" in journal and int(chapter["version"]) != int(journal["chapter_version"]))
             or str(chapter["path"]).replace("\\", "/") != str(journal["final_path"]).replace("\\", "/")
             or chapter["content_hash"] != expected_hash
             or canonical_content is None or content_hash(canonical_content) != expected_hash
@@ -502,6 +834,7 @@ class InkFlowProject:
             return []
         warnings: list[str] = []
         for journal_path in sorted(transactions.glob("chapter-*.json")):
+            chapter = None
             try:
                 journal = json.loads(journal_path.read_text(encoding="utf-8"))
                 staged_path = (self.root / journal["staged_path"]).resolve()
@@ -511,15 +844,65 @@ class InkFlowProject:
                     continue
                 chapter_no = int(Path(journal["final_path"]).stem.split("_")[-1])
                 chapter = self.db.get_chapter(chapter_no)
-                accepted = bool(chapter and chapter["status"] == "accepted" and chapter["path"] == journal["final_path"])
+                accepted = bool(chapter and chapter["status"] == "accepted")
                 if not accepted:
+                    if journal.get("status") != "prepared":
+                        raise ProjectError("日志记录已入库，但当前数据库无对应正史；保留日志及暂存等待核对数据库来源。")
+                    if (not chapter or chapter["status"] != "draft"
+                            or chapter["content_hash"] != journal.get("source_hash", journal.get("content_hash"))
+                            or ("source_version" in journal and int(chapter["version"]) != int(journal["source_version"]))):
+                        raise ProjectError("未提交日志的原草稿来源已变化或缺失，保留日志及暂存等待核对。")
+                    if staged_path.exists() and self._projection_hash(staged_path) != journal.get("content_hash"):
+                        raise ProjectError("未提交暂存正文已变化，保留文件及日志等待核对。")
                     staged_path.unlink(missing_ok=True)
                     journal_path.unlink(missing_ok=True)
                     continue
                 self.finalize_file_commit({"journal_path": journal_path})
-            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, ProjectError) as exc:
-                warnings.append(f"正史事务恢复失败（{journal_path.name}）：{exc}")
+                self._finish_projection_pending_work(chapter)
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, sqlite3.Error, ProjectError) as exc:
+                warning = f"正史事务恢复失败（{journal_path.name}）：{exc}"
+                warnings.append(warning)
+                self._record_projection_pending_work(chapter, warning, warnings)
         return warnings
+
+    def _record_projection_pending_work(self, chapter: dict[str, Any] | None, reason: str, warnings: list[str]) -> None:
+        if not chapter or chapter["status"] != "accepted":
+            return
+        try:
+            self.record_pending_work(
+                kind="accepted_projection", chapter_no=int(chapter["chapter_no"]), status="waiting_condition",
+                source={key: chapter[key] for key in ("chapter_no", "version", "content_hash", "path")},
+                reason=reason,
+                next_action="核对原事务日志与原接受任务凭据，仅恢复本地投影；保留用户改稿，不重复接受或提交记忆。缺原数据库正文时先查看备份迁移影响。",
+            )
+        except (OSError, sqlite3.Error, ProjectError) as exc:
+            warnings.append(f"投影待处理事项暂未保存：{exc}；请保留原事务日志。")
+
+    def _finish_projection_pending_work(self, chapter: dict[str, Any]) -> None:
+        source = {key: chapter[key] for key in ("chapter_no", "version", "content_hash", "path")}
+        pending = [item for item in self.pending_work(chapter_no=int(chapter["chapter_no"]))
+                   if item["kind"] == "accepted_projection" and item["source"] == source]
+        if not pending:
+            return
+        current = self.db.get_chapter(int(chapter["chapter_no"]))
+        if not current or current["status"] != "accepted" or any(current[key] != value for key, value in source.items()):
+            return
+        # An unresolved journal is still a recovery dependency, even when a
+        # different journal has already made this chapter's projection match.
+        for path in (self.internal / "transactions").glob("chapter-*.json"):
+            journal = json.loads(path.read_text(encoding="utf-8"))
+            if int(Path(journal["final_path"]).stem.split("_")[-1]) == int(chapter["chapter_no"]):
+                return
+        if self._projection_hash(self.resolve_user_path(str(chapter["path"]))) != chapter["content_hash"]:
+            return
+        canonical = self.db.canonical_chapter_content(int(chapter["chapter_no"]))
+        if canonical is None or content_hash(canonical) != chapter["content_hash"]:
+            return
+        state = render_state(self.db.current_facts(), self.db.open_threads(), self.db.project_status())
+        if self._projection_hash(self.resolve_user_path("STATE.md")) != content_hash(state):
+            return
+        for item in pending:
+            self.update_pending_work(item["id"], status="completed", resolution={"source": source, "projection_status": "synced"})
 
     def recover_accepted_chapter_projections(self) -> list[str]:
         """Report projection drift; only a verified pending journal may auto-repair it."""
@@ -530,23 +913,34 @@ class InkFlowProject:
             try:
                 final_path = self.resolve_user_path(str(chapter["path"]))
             except ProjectError as exc:
-                warnings.append(f"第 {chapter_no} 章投影路径无效：{exc}；未改动文件。")
+                warning = f"第 {chapter_no} 章投影路径无效：{exc}；未改动文件。"
+                warnings.append(warning)
+                self._record_projection_pending_work(chapter, warning, warnings)
                 continue
             canonical_content = self.db.canonical_chapter_content(chapter_no)
             if canonical_content is None:
-                warnings.append(f"第 {chapter_no} 章数据库中没有可恢复正文；请保留当前 Markdown 并走备份迁移。")
+                warning = f"第 {chapter_no} 章数据库中没有可恢复正文；请保留当前 Markdown 并走备份迁移。"
+                warnings.append(warning)
+                self._record_projection_pending_work(chapter, warning, warnings)
                 continue
             expected_hash = content_hash(canonical_content)
             if expected_hash != chapter["content_hash"]:
-                warnings.append(f"第 {chapter_no} 章数据库正文与版本哈希不一致，已停止自动同步。")
+                warning = f"第 {chapter_no} 章数据库正文与版本哈希不一致，已停止自动同步。"
+                warnings.append(warning)
+                self._record_projection_pending_work(chapter, warning, warnings)
                 continue
             try:
                 if self._projection_hash(final_path) == expected_hash:
+                    self._finish_projection_pending_work(chapter)
                     continue
-            except (OSError, ProjectError) as exc:
-                warnings.append(f"第 {chapter_no} 章 Markdown 无法读取：{exc}；未改动该文件。")
+            except (OSError, UnicodeError, ValueError, KeyError, TypeError, sqlite3.Error, ProjectError) as exc:
+                warning = f"第 {chapter_no} 章投影恢复核验未完成：{exc}；未改动该文件。"
+                warnings.append(warning)
+                self._record_projection_pending_work(chapter, warning, warnings)
                 continue
-            warnings.append(f"第 {chapter_no} 章 Markdown 与正史数据库不一致或已被删除；未覆盖用户文件，请核对后恢复。")
+            warning = f"第 {chapter_no} 章 Markdown 与正史数据库不一致或已被删除；未覆盖用户文件，请核对后恢复。"
+            warnings.append(warning)
+            self._record_projection_pending_work(chapter, warning, warnings)
         return warnings
 
     def run_powershell(self, command: str, timeout_seconds: int = 60) -> dict[str, Any]:

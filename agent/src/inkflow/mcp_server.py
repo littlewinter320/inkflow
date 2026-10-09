@@ -385,8 +385,7 @@ def novel_reference_import(source_path: str, project_root: str | None = None) ->
     """导入本地 TXT/MD 等文本参考资料。"""
 
     project = InkFlowProject(_root(project_root))
-    with project_write_lock_sync(project.root):
-        return ReferenceService(project).import_text(source_path)
+    return ReferenceService(project).import_text(source_path)
 
 
 @mcp.tool(annotations=EXTERNAL_READ)
@@ -394,8 +393,7 @@ async def novel_reference_fetch(url: str, project_root: str | None = None) -> di
     """读取无需登录即可访问的公开网页并保存清洗文本。"""
 
     project = InkFlowProject(_root(project_root))
-    async with project_write_lock(project.root):
-        return await ReferenceService(project).fetch_url(url)
+    return await ReferenceService(project).fetch_url(url)
 
 
 @mcp.tool(annotations=EXTERNAL_READ)
@@ -403,8 +401,7 @@ async def novel_reference_fetch_fanqie(url: str, project_root: str | None = None
     """抓取无需登录的番茄公开页并标记适配器版本；不会绕过访问控制或登录。"""
 
     project = InkFlowProject(_root(project_root))
-    async with project_write_lock(project.root):
-        return await ReferenceService(project).fetch_fanqie_public(url)
+    return await ReferenceService(project).fetch_fanqie_public(url)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -412,8 +409,7 @@ def novel_reference_analyze(reference_id: str, project_root: str | None = None) 
     """为已导入参考文本生成确定性节奏与文本特征卡。"""
 
     project = InkFlowProject(_root(project_root))
-    with project_write_lock_sync(project.root):
-        return ReferenceService(project).analyze(reference_id)
+    return ReferenceService(project).analyze(reference_id)
 
 
 @mcp.tool(annotations=READ_ONLY)

@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .errors import ValidationGateError
-from .role_protocol import AGENT_ROLES, LEGACY_ROLE_PROTOCOL_VERSION, ROLE_PROTOCOL_VERSION, normalize_role
-from .schemas import BookBrief, MemoryPatch, PlanBundle, ReviewReport
+from .role_protocol import ROLE_PROTOCOL_VERSION, adapt_role, normalize_role
+from .schemas import BookBrief, MemoryPatch, MemorySummaryRebuild, PlanBundle, ReviewReport
 from .utils import content_hash, json_dumps, utc_now
 
 
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS reviews (
     data_json TEXT NOT NULL,
     path TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    role_protocol_version INTEGER NOT NULL DEFAULT 1,
+    role_protocol_version INTEGER NOT NULL DEFAULT 2,
     review_role TEXT NOT NULL DEFAULT 'reviewer'
 );
 
@@ -125,7 +125,7 @@ CREATE TABLE IF NOT EXISTS collaboration_messages (
     run_id TEXT NOT NULL,
     sender_role TEXT NOT NULL,
     recipient_role TEXT NOT NULL,
-    role_protocol_version INTEGER NOT NULL DEFAULT 1,
+    role_protocol_version INTEGER NOT NULL DEFAULT 2,
     message_type TEXT NOT NULL,
     chapter_no INTEGER,
     chapter_version INTEGER,
@@ -165,7 +165,7 @@ CREATE TABLE IF NOT EXISTS agent_artifacts (
     chapter_no INTEGER,
     chapter_version INTEGER,
     role TEXT NOT NULL,
-    role_protocol_version INTEGER NOT NULL DEFAULT 1,
+    role_protocol_version INTEGER NOT NULL DEFAULT 2,
     dimension TEXT,
     status TEXT NOT NULL,
     data_json TEXT NOT NULL,
@@ -249,20 +249,19 @@ CREATE TABLE IF NOT EXISTS preference_pairs (
 """
 
 
-def _checked_role_protocol_version(value: int) -> int:
-    if type(value) is not int or value not in {LEGACY_ROLE_PROTOCOL_VERSION, ROLE_PROTOCOL_VERSION}:
-        raise ValueError("角色协议版本必须是整数 1 或 2。")
-    return value
+def _stored_role(role: str, protocol_version: int | None = None) -> str:
+    return role if role in {"engine", "user"} else normalize_role(role)
 
 
-def _stored_role(role: str, protocol_version: int) -> str:
-    if role in {"engine", "user"}:
-        return role
-    if protocol_version == LEGACY_ROLE_PROTOCOL_VERSION and role not in {"coordinator", "writer", "reviewer"}:
-        raise ValueError("旧版协作记录只能使用已启用的 Agent 角色。")
-    if protocol_version == ROLE_PROTOCOL_VERSION and role not in AGENT_ROLES:
-        raise ValueError("新版协作记录使用了不支持的 Agent 角色。")
-    return normalize_role(role, protocol_version)
+def _adapt_stored_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Consume an old storage envelope once; the returned view is canonical."""
+    item = dict(record)
+    marker = item.pop("role_protocol_version", ROLE_PROTOCOL_VERSION)
+    legacy = type(marker) is int and marker == 1
+    for key in ("role", "sender_role", "recipient_role", "review_role"):
+        if key in item and item[key] not in {"engine", "user"}:
+            item[key] = adapt_role(item[key], legacy=legacy)
+    return item
 
 
 class ProjectDatabase:
@@ -346,16 +345,54 @@ class ProjectDatabase:
             }
         return "content_text" not in columns
 
-    def migrate_canonical_content(self) -> None:
-        """Perform the confirmed, additive legacy schema upgrade."""
+    @staticmethod
+    def _canonical_content_sources(connection: sqlite3.Connection) -> dict[str, Any]:
+        columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(chapters)")}
+        missing = "content_text IS NULL" if "content_text" in columns else "1"
+        rows = connection.execute(
+            f"SELECT chapter_no,version,content_hash,path,{missing} AS canonical_missing "
+            "FROM chapters WHERE status='accepted' ORDER BY chapter_no"
+        ).fetchall()
+        return {"schema_required": "content_text" not in columns, "sources": [dict(row) for row in rows]}
 
+    def canonical_content_sources(self) -> dict[str, Any]:
+        """Read the exact sources needing an explicitly confirmed text recovery."""
         with self.connect() as connection:
-            columns = {
-                str(row["name"]) for row in connection.execute("PRAGMA table_info(chapters)").fetchall()
-            }
-            if "content_text" not in columns:
+            return self._canonical_content_sources(connection)
+
+    def migrate_canonical_content(
+        self, *, expected_sources: dict[str, Any], verified_contents: dict[int, str], audit: dict[str, Any]
+    ) -> list[int]:
+        """Add the column and backfill verified text in one confirmed transaction."""
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if self._canonical_content_sources(connection) != expected_sources:
+                raise ValueError("正史来源在迁移确认后变化，请重新查看影响并确认；数据库未升级。")
+            sources = {int(row["chapter_no"]): row for row in expected_sources["sources"]}
+            for chapter_no, text in verified_contents.items():
+                source = sources.get(chapter_no)
+                if not source or not source["canonical_missing"] or content_hash(text) != source["content_hash"]:
+                    raise ValueError(f"第 {chapter_no} 章回填正文未通过原版本哈希核验。")
+            if expected_sources["schema_required"]:
                 connection.execute("ALTER TABLE chapters ADD COLUMN content_text TEXT")
+            backfilled: list[int] = []
+            for chapter_no, text in verified_contents.items():
+                source = sources[chapter_no]
+                updated = connection.execute(
+                    "UPDATE chapters SET content_text=? WHERE chapter_no=? AND status='accepted' "
+                    "AND version=? AND content_hash=? AND path=? AND content_text IS NULL",
+                    (text, chapter_no, source["version"], source["content_hash"], source["path"]),
+                )
+                if updated.rowcount != 1:
+                    raise ValueError(f"第 {chapter_no} 章回填目标变化；本次迁移已回滚。")
+                backfilled.append(chapter_no)
+            connection.execute(
+                "INSERT INTO metadata(key,value_json,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                ("canon.content_migration", json_dumps({**audit, "backfilled_chapters": backfilled}, indent=None), utc_now()),
+            )
             connection.commit()
+        return backfilled
 
     def _require_canonical_content_schema(self) -> None:
         if self.canonical_content_migration_required():
@@ -376,6 +413,70 @@ class ProjectDatabase:
         with self.connect() as connection:
             row = connection.execute("SELECT value_json FROM metadata WHERE key=?", (key,)).fetchone()
         return json.loads(row["value_json"]) if row else default
+
+    @staticmethod
+    def _summary_cache_matches(cache: Any, source: Any) -> bool:
+        """Locate identity and quotes; semantic adequacy belongs to the memory owner."""
+        return bool(isinstance(cache, dict) and source and source["status"] == "accepted"
+            and type(cache.get("chapter_no")) is int and cache["chapter_no"] == source["chapter_no"]
+            and type(cache.get("source_version")) is int and cache["source_version"] == source["version"]
+            and cache.get("source_hash") == source["content_hash"]
+            and isinstance(source["content_text"], str)
+            and content_hash(source["content_text"]) == source["content_hash"]
+            and isinstance(cache.get("chapter_summary"), str) and cache["chapter_summary"].strip()
+            and isinstance(cache.get("evidence_quotes"), list) and cache["evidence_quotes"]
+            and all(isinstance(quote, str) and quote.strip() and quote in source["content_text"]
+                    for quote in cache["evidence_quotes"]))
+
+    def save_rebuilt_chapter_summary(self, proposal: dict[str, Any] | MemorySummaryRebuild, *, actor: str,
+                                     task_id: str, run_id: str) -> dict[str, Any]:
+        """Save an independently derived cache; never alter accepted prose or its memory patch."""
+        self._require_canonical_content_schema()
+        proposal = MemorySummaryRebuild.model_validate(proposal).model_dump(mode="json")
+        if (actor not in {"editor", "reviewer", "memory_keeper"}
+                or not isinstance(task_id, str) or not task_id.strip()
+                or not isinstance(run_id, str) or not run_id.strip()):
+            raise ValueError("摘要重建须绑定有效源章、记忆责任角色和原任务运行。")
+        cache = {key: proposal.get(key) for key in
+                 ("chapter_no", "source_version", "source_hash", "chapter_summary", "evidence_quotes")}
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            source = connection.execute(
+                "SELECT chapter_no,status,version,content_hash,content_text FROM chapters WHERE chapter_no=?",
+                (cache["chapter_no"],)).fetchone()
+            if not self._summary_cache_matches(cache, source):
+                raise ValueError("摘要重建来源版本、正文哈希或原句已失效；缓存未保存，正史未改动。")
+            cache = {**cache, "actor": actor, "task_id": task_id, "run_id": run_id,
+                     "authority": "derived_summary", "created_at": utc_now()}
+            connection.execute(
+                "INSERT INTO metadata(key,value_json,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                (f"memory_summary_rebuild:{cache['chapter_no']}", json_dumps(cache, indent=None), cache["created_at"]))
+            connection.commit()
+        return cache
+
+    def rebuilt_chapter_summary(self, chapter_no: int) -> dict[str, Any] | None:
+        """Read only caches still supported by the current accepted source version."""
+        if self.canonical_content_migration_required():
+            return None
+        with self.connect() as connection:
+            row = connection.execute("SELECT value_json FROM metadata WHERE key=?",
+                                     (f"memory_summary_rebuild:{chapter_no}",)).fetchone()
+            if row is None:
+                return None
+            try:
+                cache = json.loads(row["value_json"])
+            except (TypeError, json.JSONDecodeError):
+                return None
+            source = connection.execute(
+                "SELECT chapter_no,status,version,content_hash,content_text FROM chapters WHERE chapter_no=?",
+                (chapter_no,)).fetchone()
+            if (not self._summary_cache_matches(cache, source)
+                    or cache.get("authority") != "derived_summary"
+                    or cache.get("actor") not in {"editor", "reviewer", "memory_keeper"}
+                    or not cache.get("task_id") or not cache.get("run_id")):
+                return None
+        return cache
 
     def set_brief(self, brief: BookBrief) -> None:
         self.set_metadata("book_brief", brief.model_dump(mode="json"))
@@ -460,7 +561,9 @@ class ProjectDatabase:
                 # A reviewed v2 publication replaces every unaccepted legacy
                 # execution card. Accepted chapters keep their source cards.
                 connection.execute(
-                    "DELETE FROM plans WHERE kind='chapter' AND CAST(SUBSTR(plan_key, 9) AS INTEGER)>?",
+                    "DELETE FROM plans WHERE kind='chapter' AND CAST(SUBSTR(plan_key, 9) AS INTEGER)>? "
+                    "AND NOT EXISTS (SELECT 1 FROM chapters WHERE status='accepted' "
+                    "AND chapter_no=CAST(SUBSTR(plans.plan_key,9) AS INTEGER))",
                     (supersede_after_chapter,),
                 )
                 connection.execute(
@@ -474,6 +577,11 @@ class ProjectDatabase:
                     "AND arc.parent_key=plans.plan_key)"
                 )
             for kind, key, parent, data in rows:
+                if supersede_after_chapter is not None and kind == "chapter":
+                    number = int(key.split(":", 1)[1])
+                    if number in previous_cards and connection.execute(
+                            "SELECT 1 FROM chapters WHERE chapter_no=? AND status='accepted'", (number,)).fetchone():
+                        continue
                 connection.execute(
                     """
                     INSERT INTO plans(kind, plan_key, parent_key, data_json, updated_at)
@@ -652,7 +760,8 @@ class ProjectDatabase:
             }
         )
 
-    def upsert_draft(self, chapter_no: int, title: str, path: str, content: str) -> int:
+    def upsert_draft(self, chapter_no: int, title: str, path: str, content: str,
+                     *, workflow_step: dict[str, Any] | None = None) -> int:
         with self.connect() as connection:
             existing = connection.execute(
                 "SELECT version,status FROM chapters WHERE chapter_no=?", (chapter_no,)
@@ -675,6 +784,14 @@ class ProjectDatabase:
                 """,
                 (chapter_no, title, version, path, content_hash(content), utc_now()),
             )
+            if workflow_step:
+                receipt = {**workflow_step, "chapter_no": chapter_no, "version": version,
+                           "content_hash": content_hash(content), "path": path}
+                connection.execute(
+                    "INSERT INTO metadata(key,value_json,updated_at) VALUES (?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                    (f"workflow_writer:{workflow_step['task_id']}:{chapter_no}:{workflow_step['step']}",
+                     json.dumps(receipt, ensure_ascii=False), utc_now()))
             connection.commit()
         return version
 
@@ -781,9 +898,9 @@ class ProjectDatabase:
 
     def save_review(
         self, chapter_no: int, chapter_version: int, report: ReviewReport, path: str,
-        *, role_protocol_version: int = LEGACY_ROLE_PROTOCOL_VERSION, review_role: str = "reviewer",
+        *, role_protocol_version: int | None = None, review_role: str = "editor",
     ) -> int:
-        protocol_version = _checked_role_protocol_version(role_protocol_version)
+        protocol_version = ROLE_PROTOCOL_VERSION
         _stored_role(review_role, protocol_version)
         with self.connect() as connection:
             cursor = connection.execute(
@@ -811,9 +928,9 @@ class ProjectDatabase:
         self, chapter_no: int, chapter_version: int, report: ReviewReport, path: str,
         *, run_id: str, primary_role: str, bundle: dict[str, Any],
     ) -> tuple[int, str]:
-        """Atomically bind a v2 merged review to its check-coverage record."""
+        """Atomically bind a merged review to its check-coverage record."""
         if primary_role not in {"editor", "reviewer"}:
-            raise ValueError("新版综合审查必须注明负责表达或逻辑的主要审查角色。")
+            raise ValueError("综合审查必须注明负责表达或逻辑的主要审查角色。")
         artifact_id = f"artifact-{uuid.uuid4().hex}"
         now = utc_now()
         with self.connect() as connection:
@@ -848,30 +965,22 @@ class ProjectDatabase:
             ).fetchone()
         if not row:
             return None
-        protocol_version = int(row["role_protocol_version"])
+        stored = _adapt_stored_record(dict(row))
         mode_bundle = None
-        if protocol_version == ROLE_PROTOCOL_VERSION:
-            # A v2 specialist candidate lives in agent_artifacts, never in
-            # reviews. Only the Engine's merged and version-bound report may
-            # be consumed by revision or acceptance as the current review.
-            for item in self.list_agent_artifacts(
-                chapter_no=chapter_no, artifact_type="mode_review_bundle", limit=50,
-            ):
-                data = item["data"]
-                if item["status"] == "verified" and data.get("review_id") == int(row["id"]):
-                    mode_bundle = data
-                    break
-            if mode_bundle is None:
-                raise ValueError("新版审查缺少引擎汇合的检查覆盖记录，不能作为可接受的综合报告。")
+        for item in self.list_agent_artifacts(
+            chapter_no=chapter_no, artifact_type="mode_review_bundle", limit=50,
+        ):
+            data = item["data"]
+            if item["status"] == "verified" and data.get("review_id") == int(row["id"]):
+                mode_bundle = data
+                break
+        # Readable legacy reports without coverage are reference material.
+        # Only the Engine can establish the required checks for acceptance.
         return {
-            "id": int(row["id"]),
-            "chapter_version": int(row["chapter_version"]),
+            "id": int(row["id"]), "chapter_version": int(row["chapter_version"]),
             "report": ReviewReport.model_validate_json(row["data_json"]),
-            "path": str(row["path"]),
-            "role_protocol_version": protocol_version,
-            "review_role": str(row["review_role"]),
-            "canonical_role": _stored_role(str(row["review_role"]), protocol_version),
-            "mode_bundle": mode_bundle,
+            "path": str(row["path"]), "review_role": stored["review_role"],
+            "canonical_role": stored["review_role"], "mode_bundle": mode_bundle,
         }
 
     def current_facts(self) -> list[dict[str, Any]]:
@@ -977,30 +1086,21 @@ class ProjectDatabase:
         return attach_evidence(self, result, boundary=chapter_no)
 
     def open_threads(self) -> list[dict[str, Any]]:
-        with self.connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT thread.* FROM plot_threads AS thread
-                JOIN chapters AS source ON source.chapter_no=thread.last_advanced_chapter
-                LEFT JOIN memory_patches AS patch ON patch.chapter_no=source.chapter_no
-                WHERE thread.status IN ('open', 'advanced', 'delayed')
-                  AND thread.branch_id='main' AND source.status='accepted'
-                  AND (thread.source_version IS NULL OR thread.source_version=source.version)
-                  AND (thread.source_hash IS NULL OR thread.source_hash=source.content_hash)
-                  AND (source.version=1 OR patch.committed_at=source.updated_at)
-                ORDER BY COALESCE(due_chapter, 999999), thread_id
-                """
-            ).fetchall()
-        return [dict(row) for row in rows]
+        boundary = max((int(item["chapter_no"]) for item in self.accepted_chapters()), default=0)
+        return self.threads_as_of(boundary)
 
     def threads_as_of(self, chapter_no: int) -> list[dict[str, Any]]:
+        return self.threads_state_as_of(chapter_no)["threads"]
+
+    def threads_state_as_of(self, chapter_no: int) -> dict[str, Any]:
         """Replay accepted memory patches to recover threads at a chapter boundary.
 
         plot_threads is only the latest projection: a mystery paid off in a
         later chapter was still open when an earlier chapter was written.
         """
+        result: dict[str, Any] = {"threads": [], "coverage_gaps": [], "recovery_sources": []}
         if chapter_no < 1:
-            return []
+            return result
         with self.connect() as connection:
             rows = connection.execute(
                 """SELECT patch.chapter_no,patch.data_json,patch.committed_at,
@@ -1011,13 +1111,37 @@ class ProjectDatabase:
                    ORDER BY patch.chapter_no""",
                 (chapter_no,),
             ).fetchall()
+            projections = connection.execute(
+                "SELECT * FROM plot_threads WHERE branch_id='main' ORDER BY thread_id"
+            ).fetchall()
         latest: dict[str, dict[str, Any]] = {}
         tainted: set[str] = set()
         for row in rows:
-            patch = MemoryPatch.model_validate_json(row["data_json"])
+            try:
+                patch = MemoryPatch.model_validate_json(row["data_json"])
+            except ValueError:
+                result["coverage_gaps"].append({"kind": "thread_history", "chapter_no": int(row["chapter_no"]),
+                    "boundary_chapter": chapter_no, "state": "unknown", "owner": "memory_owner",
+                    "reason": "已接受记忆补丁无法解析，不能据此确认本章的线索状态。"})
+                # Isolate known affected IDs without interpreting damaged events.
+                try:
+                    raw_threads = json.loads(row["data_json"]).get("threads", [])
+                    for raw in raw_threads:
+                        if isinstance(raw, dict) and isinstance(raw.get("thread_id"), str):
+                            latest.pop(raw["thread_id"], None)
+                            tainted.add(raw["thread_id"])
+                except (ValueError, TypeError, AttributeError):
+                    pass
+                continue
             if patch.chapter_no != int(row["chapter_no"]):
-                raise ValueError(f"第 {row['chapter_no']} 章记忆补丁的章节编号不一致")
-            current_patch = int(row["version"]) == 1 or row["committed_at"] == row["updated_at"]
+                for thread in patch.threads:
+                    latest.pop(thread.thread_id, None)
+                    tainted.add(thread.thread_id)
+                result["coverage_gaps"].append({"kind": "thread_history", "chapter_no": int(row["chapter_no"]),
+                    "boundary_chapter": chapter_no, "state": "unknown", "owner": "memory_owner",
+                    "reason": "记忆补丁章节身份不一致，相关线索状态已隔离。"})
+                continue
+            current_patch = (int(row["version"]) == 1 or row["committed_at"] == row["updated_at"])
             for thread in patch.threads:
                 if not current_patch:
                     # A later repair changed the source chapter without
@@ -1034,18 +1158,75 @@ class ProjectDatabase:
                     "branch_id": "main",
                     "updated_at": str(row["committed_at"]),
                 }
-        # Older imported projects may have no memory patch for some threads.
-        # Preserve valid earlier projections without overriding replayed events.
-        for thread in self.open_threads():
-            if (thread["thread_id"] not in latest
-                    and thread["thread_id"] not in tainted
-                    and int(thread["last_advanced_chapter"]) <= chapter_no):
-                latest[str(thread["thread_id"])] = thread
-        return sorted(
+        # Latest projections cannot prove a past lifecycle without committed
+        # events. Supply bounded canon to the memory owner, never invent events.
+        recovery_numbers: set[int] = set()
+        for row in projections:
+            advanced = int(row["last_advanced_chapter"])
+            known = latest.get(str(row["thread_id"]))
+            if known and (advanced > chapter_no or advanced <= int(known["last_advanced_chapter"])):
+                continue
+            planted = row["planted_chapter"]
+            if advanced <= chapter_no:
+                recovery_numbers.add(advanced)
+            elif planted and int(planted) <= chapter_no:
+                recovery_numbers.add(int(planted))
+        sources: dict[int, dict[str, Any]] = {}
+        if recovery_numbers:
+            with self.connect() as connection:
+                placeholders = ",".join("?" for _ in recovery_numbers)
+                sources = {int(row["chapter_no"]): dict(row) for row in connection.execute(
+                    f"SELECT * FROM chapters WHERE status='accepted' AND chapter_no IN ({placeholders}) AND chapter_no<=?",
+                    (*sorted(recovery_numbers), chapter_no))}
+        recovered: set[int] = set()
+        for raw in projections:
+            thread = dict(raw)
+            thread_id = str(thread["thread_id"])
+            advanced = int(thread["last_advanced_chapter"])
+            if thread_id in latest:
+                if advanced <= chapter_no and advanced > int(latest[thread_id]["last_advanced_chapter"]):
+                    # A newer legacy event is missing: the earlier proven open
+                    # state cannot silently remain current past this event.
+                    latest.pop(thread_id)
+                else:
+                    continue
+            planted = thread.get("planted_chapter")
+            if advanced > chapter_no and (not planted or int(planted) > chapter_no):
+                continue
+            source_no = advanced if advanced <= chapter_no else int(planted)
+            gap: dict[str, Any] = {"kind": "thread_history", "thread_id": thread_id,
+                "chapter_no": source_no, "boundary_chapter": chapter_no, "state": "unknown",
+                "lifecycle_state": "unknown", "owner": "memory_owner",
+                "reason": ("原记忆补丁与已接受正文版本不一致，历史状态已隔离。" if thread_id in tainted
+                           else "缺少该时点的已接受记忆事件，当前投影不能证明历史线索状态。")}
+            source = sources.get(source_no)
+            text = str(source.get("content_text") or "") if source else ""
+            if source and text and content_hash(text) == source["content_hash"]:
+                matches_projection = (advanced <= chapter_no
+                    and thread.get("source_version") == source["version"]
+                    and thread.get("source_hash") == source["content_hash"])
+                quote = str(thread.get("description") or "") if matches_projection else ""
+                if quote and quote in text:
+                    gap["evidence_quote"] = quote
+                    gap["evidence_start"] = text.index(quote)
+                    gap["evidence_end"] = text.index(quote) + len(quote)
+                gap.update(state="canonical_source_available", source_version=int(source["version"]),
+                           source_hash=source["content_hash"])
+                if source_no not in recovered:
+                    recovered.add(source_no)
+                    result["recovery_sources"].append({"chapter_no": source_no,
+                        "title": str(source["title"]), "content": text,
+                        "source_version": int(source["version"]), "source_hash": source["content_hash"],
+                        "authority": "已接受正文；历史线索生命周期待核，原句命中不等于状态证实"})
+            else:
+                gap["source_problem"] = "边界内已接受原文缺失或哈希不匹配，需定点恢复来源。"
+            result["coverage_gaps"].append(gap)
+        result["threads"] = sorted(
             (thread for thread in latest.values()
              if thread["status"] in {"open", "advanced", "delayed"}),
             key=lambda item: (item.get("due_chapter") or 999999, item["thread_id"]),
         )
+        return result
 
     def save_provisional_memory_patch(
         self,
@@ -1146,7 +1327,7 @@ class ProjectDatabase:
         self, chapter_no: int, content: str, *, expected_version: int,
         expected_hash: str, expected_review_id: int, run_id: str,
         diagnosis: dict[str, Any], verification: dict[str, Any],
-        review_role: str, role_protocol_version: int,
+        review_role: str, role_protocol_version: int | None = None,
         previous_memory_json: str | None = None,
         revised_memory: MemoryPatch | None = None,
     ) -> int:
@@ -1155,7 +1336,8 @@ class ProjectDatabase:
         new_hash = content_hash(content)
         if new_hash == expected_hash:
             raise ValueError("修订没有改变正文。")
-        _stored_role(review_role, _checked_role_protocol_version(role_protocol_version))
+        _stored_role(review_role)
+        role_protocol_version = ROLE_PROTOCOL_VERSION
         now = utc_now()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1303,11 +1485,28 @@ class ProjectDatabase:
         expected_draft_hash: str,
         expected_review_id: int,
         provisional_batch_id: str | None = None,
+        task_id: str = "",
+        preview_artifact_id: str | None = None,
+        preview_source_binding: dict[str, Any] | None = None,
     ) -> None:
         self._require_canonical_content_schema()
         now = utc_now()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if preview_artifact_id:
+                artifact = connection.execute("SELECT * FROM agent_artifacts WHERE artifact_id=?", (preview_artifact_id,)).fetchone()
+                data = json.loads(artifact["data_json"]) if artifact else {}
+                binding = data.get("preview_binding", {})
+                if (provisional_batch_id or not artifact or artifact["artifact_type"] != "memory_patch_preview"
+                        or artifact["status"] != "awaiting_commit" or artifact["chapter_no"] != chapter_no
+                        or artifact["chapter_version"] != expected_draft_version
+                        or not preview_source_binding or binding != preview_source_binding
+                        or binding.get("task_id") != task_id or not binding.get("snapshot_hash") or not binding.get("run_id")
+                        or binding.get("chapter_no") != chapter_no or binding.get("chapter_version") != expected_draft_version
+                        or binding.get("content_hash") != expected_draft_hash or binding.get("review_id") != expected_review_id
+                        or MemoryPatch.model_validate({key: value for key, value in data.items()
+                            if key != "preview_binding"}).model_dump(mode="json") != patch.model_dump(mode="json")):
+                    raise ValueError("正史预览的状态、原配置或正文/补丁来源已变化，没有提交记忆。")
             current = connection.execute(
                 "SELECT status, version, content_hash FROM chapters WHERE chapter_no=?", (chapter_no,)
             ).fetchone()
@@ -1459,6 +1658,16 @@ class ProjectDatabase:
                     """,
                     (now, now, provisional_batch_id, chapter_no),
                 )
+            if task_id:
+                connection.execute(
+                    "INSERT INTO metadata(key,value_json,updated_at) VALUES (?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                    (f"workflow_accept:{task_id}:{chapter_no}", json.dumps({"chapter_no": chapter_no,
+                        "version": expected_draft_version, "content_hash": content_hash(content),
+                        "review_id": expected_review_id, "path": final_path,
+                        "post_commit": {"settings": "pending", "checkpoint": "pending"}}, ensure_ascii=False), now))
+            if preview_artifact_id:
+                connection.execute("UPDATE agent_artifacts SET status='committed' WHERE artifact_id=?", (preview_artifact_id,))
             connection.commit()
 
     def canonical_chapter_content(self, chapter_no: int) -> str | None:
@@ -1503,9 +1712,9 @@ class ProjectDatabase:
         status: str = "pending",
         expires_at: str | None = None,
         response_to: str | None = None,
-        role_protocol_version: int = LEGACY_ROLE_PROTOCOL_VERSION,
+        role_protocol_version: int | None = None,
     ) -> dict[str, Any]:
-        protocol_version = _checked_role_protocol_version(role_protocol_version)
+        protocol_version = ROLE_PROTOCOL_VERSION
         message_types = {"task_assignment", "fact_query", "handoff", "review_issue", "revision_request", "objection", "risk", "memory_sync", "answer"}
         statuses = {"pending", "responded", "resolved", "escalated", "expired"}
         _stored_role(sender_role, protocol_version)
@@ -1548,7 +1757,6 @@ class ProjectDatabase:
         return {
             "message_id": message_id, "thread_id": thread_id, "run_id": run_id,
             "sender_role": sender_role, "recipient_role": recipient_role,
-            "role_protocol_version": protocol_version,
             "message_type": message_type, "chapter_no": chapter_no,
             "chapter_version": chapter_version, "context_packet_id": context_packet_id,
             "claim": claim, "evidence_refs": sorted(set(evidence_refs or [])),
@@ -1640,9 +1848,9 @@ class ProjectDatabase:
         chapter_version: int | None = None,
         dimension: str = "",
         status: str = "candidate",
-        role_protocol_version: int = LEGACY_ROLE_PROTOCOL_VERSION,
+        role_protocol_version: int | None = None,
     ) -> dict[str, Any]:
-        protocol_version = _checked_role_protocol_version(role_protocol_version)
+        protocol_version = ROLE_PROTOCOL_VERSION
         _stored_role(role, protocol_version)
         artifact_id = f"artifact-{uuid.uuid4().hex}"
         now = utc_now()
@@ -1657,7 +1865,7 @@ class ProjectDatabase:
             )
             connection.commit()
         return {"artifact_id": artifact_id, "artifact_type": artifact_type, "run_id": run_id, "role": role,
-                "role_protocol_version": protocol_version, "chapter_no": chapter_no,
+                "chapter_no": chapter_no,
                 "chapter_version": chapter_version, "dimension": dimension, "status": status,
                 "data": data, "created_at": now}
 
@@ -1676,7 +1884,7 @@ class ProjectDatabase:
             rows = connection.execute("SELECT * FROM agent_artifacts" + where + " ORDER BY created_at DESC LIMIT ?", params).fetchall()
         result = []
         for row in rows:
-            item = dict(row)
+            item = _adapt_stored_record(dict(row))
             item["data"] = json.loads(item.pop("data_json"))
             result.append(item)
         return result
@@ -1691,7 +1899,7 @@ class ProjectDatabase:
                 (artifact_id, row["run_id"], row["artifact_type"]),
             )
             connection.commit()
-        result = dict(row)
+        result = _adapt_stored_record(dict(row))
         result["data"] = json.loads(result.pop("data_json"))
         result["status"] = "selected"
         return result
@@ -1716,25 +1924,24 @@ class ProjectDatabase:
         if chapter_no is not None:
             clauses.append("(chapter_no IS NULL OR chapter_no=?)")
             params.append(chapter_no)
-        if recipient_role:
-            clauses.append("recipient_role=?")
-            params.append(recipient_role)
         if active_only:
             clauses.append("status IN ('pending','responded','escalated')")
             clauses.append("(expires_at IS NULL OR expires_at>?)")
             params.append(utc_now())
+            clauses.append("NOT EXISTS (SELECT 1 FROM collaboration_threads t WHERE t.thread_id=collaboration_messages.thread_id AND t.status='resolved')")
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         params.append(max(1, min(limit, 500)))
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM collaboration_messages" + where + " ORDER BY created_at DESC LIMIT ?",
+                "SELECT * FROM collaboration_messages" + where + " ORDER BY created_at DESC,rowid DESC LIMIT ?",
                 params,
             ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
-            item = dict(row)
+            item = _adapt_stored_record(dict(row))
             item["evidence_refs"] = json.loads(item.pop("evidence_refs_json"))
-            result.append(item)
+            if not recipient_role or item["recipient_role"] == _stored_role(recipient_role):
+                result.append(item)
         return result
 
     def reconcile_collaboration_queue(self) -> dict[str, int]:
@@ -1746,13 +1953,9 @@ class ProjectDatabase:
         """
 
         active = self.list_collaboration_messages(active_only=True, limit=500)
-        if not active:
-            return {"resolved": 0, "remaining": 0}
         with self.connect() as connection:
             chapter_rows = connection.execute("SELECT * FROM chapters").fetchall()
         chapters = {int(item["chapter_no"]): dict(item) for item in chapter_rows}
-        current_plan_exists = self.get_current_plan_bundle() is not None
-        keep: set[str] = set()
         newest: dict[tuple[Any, ...], str] = {}
         stale_ids: list[str] = []
         for item in active:
@@ -1761,42 +1964,32 @@ class ProjectDatabase:
             chapter = chapters.get(int(chapter_no)) if chapter_no is not None else None
             chapter_version = item.get("chapter_version")
             if chapter is None:
-                if current_plan_exists and item.get("message_type") == "task_assignment":
-                    stale_ids.append(message_id)
-                    continue
                 key = (
                     "global",
-                    item.get("role_protocol_version"),
                     item.get("recipient_role"),
                     item.get("message_type"),
                 )
             else:
                 current_version = int(chapter.get("version") or 0)
-                if chapter.get("status") == "accepted":
+                if chapter.get("status") == "accepted" and item.get("message_type") == "task_assignment":
                     stale_ids.append(message_id)
                     continue
                 if chapter_version is not None and int(chapter_version) != current_version:
                     stale_ids.append(message_id)
                     continue
-                review = self.latest_review_record(int(chapter_no))
-                if review and int(review["chapter_version"]) == current_version and review["report"].verdict == "pass":
-                    if int(item.get("role_protocol_version") or 1) == LEGACY_ROLE_PROTOCOL_VERSION and (
-                        item.get("recipient_role") == "reviewer" or item.get("message_type") == "task_assignment"
-                    ):
-                        stale_ids.append(message_id)
-                        continue
                 key = (
                     int(chapter_no),
                     current_version,
-                    item.get("role_protocol_version"),
                     item.get("recipient_role"),
                     item.get("message_type"),
                 )
-            previous = newest.get(key)
-            if previous:
-                stale_ids.append(previous)
+            key += (item.get("thread_id"), item.get("context_packet_id"))
+            if item.get("message_type") != "task_assignment":
+                key += (item.get("claim"), item.get("requested_response"))
+            if key in newest:
+                stale_ids.append(message_id)
+                continue
             newest[key] = message_id
-            keep.add(message_id)
         if stale_ids:
             # stale_ids 只记录已经被新一条替代或明确过期的消息；
             # 当前 key 的最后一条不会进入这个集合。
@@ -1828,35 +2021,61 @@ class ProjectDatabase:
             resolved = len(unique)
         else:
             resolved = 0
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE collaboration_messages SET status='resolved',resolved_at=?
+                   WHERE status IN ('pending','responded','escalated')
+                   AND EXISTS (SELECT 1 FROM collaboration_threads t
+                               WHERE t.thread_id=collaboration_messages.thread_id AND t.status='resolved')""", (utc_now(),))
+            connection.execute(
+                """UPDATE collaboration_messages SET status='resolved',resolved_at=?
+                   WHERE status IN ('pending','responded','escalated')
+                   AND expires_at IS NOT NULL AND expires_at<=?""", (utc_now(), utc_now()))
+            closed = connection.execute(
+                """UPDATE collaboration_threads SET status='resolved',updated_at=?,
+                   resolution=COALESCE(NULLIF(resolution,''),'来源版本已更新或关联消息已处理；原记录保留历史。')
+                   WHERE status IN ('open','waiting','escalated') AND (
+                       EXISTS (SELECT 1 FROM chapters c WHERE c.chapter_no=collaboration_threads.chapter_no
+                               AND collaboration_threads.chapter_version IS NOT NULL
+                               AND c.version<>collaboration_threads.chapter_version)
+                       OR (EXISTS (SELECT 1 FROM collaboration_messages m
+                                   WHERE m.thread_id=collaboration_threads.thread_id)
+                           AND NOT EXISTS (SELECT 1 FROM collaboration_messages m
+                                           WHERE m.thread_id=collaboration_threads.thread_id
+                                           AND m.status IN ('pending','responded','escalated'))))""", (utc_now(),))
+            connection.commit()
+            closed_threads = closed.rowcount
         remaining = len(self.list_collaboration_messages(active_only=True, limit=500))
-        return {"resolved": resolved, "remaining": remaining}
+        return {"resolved": resolved, "closed_threads": closed_threads, "remaining": remaining}
 
     def resolve_pending_collaboration(
         self,
         *,
         chapter_no: int,
         recipient_role: str,
-        role_protocol_version: int = LEGACY_ROLE_PROTOCOL_VERSION,
+        role_protocol_version: int | None = None,
     ) -> int:
-        protocol_version = _checked_role_protocol_version(role_protocol_version)
+        recipient = _stored_role(recipient_role)
+        matching = [item["message_id"] for item in self.list_collaboration_messages(
+            chapter_no=chapter_no, active_only=True, limit=500)
+            if item.get("chapter_no") == chapter_no and item["recipient_role"] == recipient
+            and item["status"] in {"pending", "responded"}]
+        if not matching:
+            return 0
         with self.connect() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE collaboration_messages SET status='resolved', resolved_at=?
-                WHERE chapter_no=? AND recipient_role=? AND role_protocol_version=?
-                  AND status IN ('pending','responded')
-                """,
-                (utc_now(), chapter_no, recipient_role, protocol_version),
+            connection.executemany(
+                "UPDATE collaboration_messages SET status='resolved', resolved_at=? WHERE message_id=?",
+                [(utc_now(), message_id) for message_id in matching],
             )
             connection.commit()
-        return int(cursor.rowcount)
+        return len(matching)
 
     def resolve_collaboration_thread(self, thread_id: str) -> int:
         with self.connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE collaboration_messages SET status='resolved', resolved_at=?
-                WHERE thread_id=? AND status IN ('pending','responded')
+                WHERE thread_id=? AND status IN ('pending','responded','escalated')
                 """,
                 (utc_now(), thread_id),
             )
@@ -1907,9 +2126,11 @@ class ProjectDatabase:
         learning_settings = self.get_metadata("learning_settings", {"enabled": True})
         if isinstance(learning_settings, dict) and learning_settings.get("enabled") is False:
             return ""
-        if event_type not in {"accepted", "rejected", "revised", "rolled_back", "preference_changed", "comparison"}:
+        if event_type not in {"accepted", "rejected", "revised", "rolled_back", "preference_changed", "comparison", "review_recovery"}:
             raise ValueError("学习事件类型不受支持")
-        if event_type == "rejected":
+        if event_type == "review_recovery":
+            signal_origin = "workflow_recovery"
+        elif event_type == "rejected":
             signal_origin = "machine_review"
         elif event_type == "accepted":
             signal_origin = "canon_commit"
@@ -1952,17 +2173,50 @@ class ProjectDatabase:
             result.append(item)
         return result
 
-    def learning_guidance(self) -> dict[str, Any]:
-        """Derive small, explainable local signals; this is not model training."""
+    def learning_guidance(self, *, chapter_no: int | None = None, role: str | None = None) -> dict[str, Any]:
+        """Derive small, explainable signals from attributable runtime records."""
 
         events = self.list_learning_events(80)
         counts = Counter(str(item["signal_origin"]) for item in events)
+        remedies = {
+            "source_reread": "必要资料缺失时，按当前对象与事件拆短查询，定点回读有效原文，再由原责任角色核对。",
+            "claim_attribution": "指控未获支持时，先定位各自来源引文，区分状态变化、人物观点和排他矛盾；不据此改正文或降低资料权重。",
+        }
+        cases = []
+        seen = set()
+        for event in events:
+            payload = event["payload"]
+            if (event["signal_origin"] != "workflow_recovery" or not event["chapter_no"]
+                    or (chapter_no is not None and event["chapter_no"] > chapter_no)
+                    or (role not in {None, "coordinator"} and payload.get("role") != role)
+                    or payload.get("action") not in remedies):
+                continue
+            chapter = self.get_chapter(event["chapter_no"])
+            review = self.latest_review_record(event["chapter_no"])
+            if (not chapter or not review or review["id"] != payload.get("review_id")
+                    or chapter["version"] != event["chapter_version"]
+                    or chapter["content_hash"] != payload.get("source_hash")
+                    or review["report"].source_hash != payload.get("source_hash")):
+                continue
+            verified = payload.get("status") == "verified" and review["report"].verdict == "pass"
+            key = (payload.get("role"), payload["action"], verified)
+            if key in seen:
+                continue
+            seen.add(key)
+            cases.append({"event_id": event["event_id"], "chapter_no": event["chapter_no"],
+                "role": payload.get("role"), "status": "verified" if verified else "unresolved",
+                "action": payload["action"], "guidance": remedies[payload["action"]],
+                "gap_count": payload.get("gap_count", 0)})
+            if len(cases) == 5:
+                break
         return {
             "window_events": len(events),
             "explicit_user_feedback": sum(counts[key] for key in ("user_preference", "user_comparison", "user_revision")),
             "machine_review_events": counts["machine_review"],
             "canon_commits": counts["canon_commit"],
             "legacy_unclassified": counts["legacy_unclassified"],
+            "recovery_cases": cases,
+            "recovery_policy": "只参考处理方法，不复用旧章资料或事实，不提高硬门槛。未解决案例不是成功经验；本次仍查源并核门禁，沿原授权和预算限次恢复。",
             "notice": "只把用户明确偏好、比较或选区修订视为写法反馈；机器审核、正史提交和旧版来源不作为文风样本。",
         }
 

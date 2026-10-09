@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .errors import ValidationGateError
 from .project_lock import project_write_lock_sync, _pid_alive
 from .studio import StudioService
-from .utils import content_hash, utc_now
+from .utils import SOURCE_RECOVERY_TOKEN_LIMIT, content_hash, utc_now
 
 def _book_brief_from_document(text):
     """Import only the existing BOOK projection format; ambiguous Markdown stays pending."""
@@ -252,12 +252,20 @@ class ManualEditsService:
         boundary = int(job.get("chapter_no") or self.project.db.latest_accepted_chapter_no() + 1)
         return InkFlowEngine._planning_source_fingerprint(self.project, boundary, boundary)
 
-    async def review(self, job_id, engine):
+    async def review(self, job_id, engine, *, resume=False):
         from .config import Settings
         from .task_settings import active_task_settings
         job = self.jobs().get(job_id)
         if not job:
             raise ValidationGateError("找不到这次手动编辑。")
+        if resume and job["status"] == "failed" and int(job.get("attempts", 0)) < 2:
+            with project_write_lock_sync(self.project.root):
+                jobs = self.jobs()
+                current = jobs.get(job_id)
+                if current and current["status"] == "failed" and current["current_hash"] == job["current_hash"]:
+                    jobs[job_id] = {**current, "status": "pending", "updated_at": utc_now()}
+                    self.project.db.set_metadata("manual_edit_jobs", jobs)
+                    job = jobs[job_id]
         if job["status"] != "pending":
             return job
         if not Settings.from_env(self.project.root).manual_edit_review_enabled:
@@ -267,7 +275,6 @@ class ManualEditsService:
         try:
             scope = self.studio.db.prepare_task_settings(run_id, novel_id=self.project.project_id,
                 settings=lambda: engine.settings, workspace_root=self.project.root,
-                role_protocol_version=None if job.get("task_id") else original_scope.role_protocol_version if original_scope else 1,
                 collaboration_mode=None if job.get("task_id") else original_scope.collaboration_mode if original_scope else "everyday")
         except Exception as exc:
             with project_write_lock_sync(self.project.root):
@@ -317,8 +324,9 @@ class ManualEditsService:
             if job["kind"] == "setting_record":
                 from .story_settings import StorySettingsService
                 scope = active_task_settings.get()
-                role = (check_owners_for_mode(scope.collaboration_mode).get("general") or "reviewer") if scope and scope.role_protocol_version == 2 else "reviewer"
-                canonical_role = "editor" if not scope or scope.role_protocol_version == 1 else role
+                owners = check_owners_for_mode(scope.collaboration_mode if scope else "everyday")
+                role = owners["memory"] if job["kind"] == "setting_record" else owners.get("general") or owners.get("logic_continuity")
+                canonical_role = role
                 record_id = job["relative_path"].split(":", 1)[1]
                 collection = next((item for item in StorySettingsService(self.project).list_collections()
                     if any(record["record_id"] == record_id for record in item["records"])), None)
@@ -333,12 +341,7 @@ class ManualEditsService:
                     raise ValidationGateError("候选对应的文件版本已变化，未消耗模型重审旧候选。")
             source_hash = self.source_hash(job)
             if job["kind"] == "draft":
-                scope = active_task_settings.get()
-                if scope and scope.role_protocol_version == 2:
-                    result = await engine.review_chapter_mode(self.project.root, int(job["chapter_no"]),
-                                                             mode=scope.collaboration_mode)
-                else:
-                    result = await engine.review_chapter(self.project.root, int(job["chapter_no"]))
+                result = await engine.review_chapter(self.project.root, int(job["chapter_no"]))
                 verdict = result.get("verdict")
                 issues = result.get("issues", result.get("findings", []))
                 outcome = "passed" if verdict == "pass" else "needs_evidence" if verdict in {"insufficient_context", "unknown"} else "awaiting_confirmation"
@@ -352,8 +355,9 @@ class ManualEditsService:
                            "text": (self.project.db.canonical_chapter_content(int(ch["chapter_no"])) or "")[:10000]}
                           for ch in accepted[-3:]]
                 scope = active_task_settings.get()
-                role = (check_owners_for_mode(scope.collaboration_mode).get("general") or "reviewer") if scope and scope.role_protocol_version == 2 else "reviewer"
-                canonical_role = "editor" if not scope or scope.role_protocol_version == 1 else role
+                owners = check_owners_for_mode(scope.collaboration_mode if scope else "everyday")
+                role = owners["memory"] if job["kind"] == "setting_record" else owners.get("general") or owners.get("logic_continuity")
+                canonical_role = role
                 sources = json.dumps({"book":self.project.db.get_brief().model_dump(mode="json"),
                     "facts":self.project.db.current_facts()[:128],"threads":self.project.db.open_threads()[:64],
                     "recent_canon":recent},ensure_ascii=False)
@@ -383,17 +387,17 @@ class ManualEditsService:
                 recovered, retrieval_trace = HybridRetriever(self.project).recover_review_sources(
                     queries[:4], chapter_no=boundary)
                 included = []
-                remaining = min(8000, max(0, engine.settings.context_budget_for(
-                    role, scope.role_protocol_version if scope else 1)[1] -
+                remaining = min(SOURCE_RECOVERY_TOKEN_LIMIT, max(0, engine.settings.context_budget_for(
+                    role)[1] -
                     estimate_tokens(packet.to_model_prompt() + content) - 5000))
                 for candidate in recovered[:6]:
                     body = candidate["content"]
-                    parts = [{"source_id": str(offset), "title": "", "body": body[offset:offset+1400]}
+                    parts = [{"source_id": str(offset), "title": "", "body": body[offset:offset+5000]}
                         for offset in range(0, len(body), 1000)]
                     ranking = HybridRetriever(self.project)._bm25_ranking(" ".join(queries[:4]), parts)
                     start = int(ranking[0][0]) if ranking else 0
-                    candidate = {**candidate, "content": body[start:start+1400], "start": start,
-                        "end": min(start+1400, len(body)), "excerpt_only": True}
+                    candidate = {**candidate, "content": body[start:start+5000], "start": start,
+                        "end": min(start+5000, len(body)), "excerpt_only": True}
                     text = json.dumps(candidate, ensure_ascii=False)
                     tokens = estimate_tokens(text)
                     if tokens <= remaining:
@@ -403,11 +407,12 @@ class ManualEditsService:
                     packet.sections.append(ContextSection(key="RECOVERED", title="本地补读线索：需语义核对",
                         content=json.dumps(included, ensure_ascii=False), hard=False))
                 job["retrieval"] = {**retrieval_trace, "included_count": len(included),
-                                    "limit_queries": 4, "limit_sources": 6, "max_tokens": 8000}
-                if estimate_tokens(packet.to_model_prompt()+content)>max(1000,engine.settings.context_budget_for(role,scope.role_protocol_version if scope else 1)[1]-5000):
+                                    "limit_queries": 4, "limit_sources": 6, "max_tokens": SOURCE_RECOVERY_TOKEN_LIMIT}
+                if estimate_tokens(packet.to_model_prompt()+content)>max(1000,engine.settings.context_budget_for(role)[1]-5000):
                     raise ValidationGateError("手动候选与核对来源超过当前上下文预算，请拆分需要核对的修改范围。")
                 scope = active_task_settings.get()
-                role = (check_owners_for_mode(scope.collaboration_mode).get("general") or "reviewer") if scope and scope.role_protocol_version == 2 else "reviewer"
+                owners = check_owners_for_mode(scope.collaboration_mode if scope else "everyday")
+                role = owners["memory"] if job["kind"] == "setting_record" else owners.get("general") or owners.get("logic_continuity")
                 result = await engine.provider.generate_json(system_prompt=(
                     "你审核用户手动变更。设定是可调整假设与证据参考，不是正史；合理新增、人物信念和谎言不算硬矛盾。"
                     "不得修改文本。pass仅表示参考内容可用，不授权正文或记忆提交。疑似硬矛盾必须给候选原句、"

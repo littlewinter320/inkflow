@@ -6,8 +6,10 @@ import getpass
 import json
 import os
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .config import Settings, save_api_key_to_keyring
 from .engine import InkFlowEngine
@@ -16,10 +18,16 @@ from .provider import create_provider
 from .schemas import BookBrief
 from .terminal_session import TerminalSession
 from .runtime import ensure_run_runtime
+from .project import InkFlowProject
+from .studio import StudioService
+from .task_settings import active_task_settings, use_task_settings
 
 
 def _engine(root: str | Path) -> InkFlowEngine:
-    settings = Settings.from_env(root)
+    scope = active_task_settings.get()
+    if scope is not None and Path(root).resolve() != scope.settings.workspace_root:
+        raise InkFlowError("当前任务快照不属于这部小说，未执行跨作品调用。")
+    settings = scope.settings if scope is not None else Settings.from_env(root)
     return InkFlowEngine(create_provider(settings), settings)
 
 
@@ -177,7 +185,7 @@ def _write(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _review(args: argparse.Namespace) -> dict[str, Any]:
-    return asyncio.run(_engine(args.root).review_chapter(args.root, args.chapter))
+    return asyncio.run(_engine(args.root).review_chapter_mode(args.root, args.chapter, mode="everyday"))
 
 
 def _revise(args: argparse.Namespace) -> dict[str, Any]:
@@ -293,6 +301,7 @@ def _chat(args: argparse.Namespace) -> dict[str, Any]:
             message = input("墨流> ")
         except EOFError:
             return {"ended": True, "message": "终端输入已结束。"}
+        session = TerminalSession(_engine(args.root))
         with ensure_run_runtime() as runtime:
             response = asyncio.run(session.handle(args.root, message))
             if runtime.calls:
@@ -313,7 +322,17 @@ def main() -> None:
         if args.command == "chat":
             result = args.handler(args)
         else:
-            with ensure_run_runtime() as runtime:
+            with ensure_run_runtime() as runtime, ExitStack() as task_scopes:
+                if args.command in {
+                    "plan", "plan-advance", "plan-brief", "write", "review", "revise", "accept",
+                    "continue-until", "batch-draft", "batch-repair", "batch-accept", "arc-audit",
+                }:
+                    project = InkFlowProject(args.root)
+                    scope = StudioService(project).db.prepare_task_settings(
+                        f"cli-{uuid4().hex}", novel_id=project.project_id,
+                        settings=lambda: Settings.from_env(project.root), workspace_root=project.root,
+                    )
+                    task_scopes.enter_context(use_task_settings(scope))
                 result = args.handler(args)
                 if isinstance(result, dict) and runtime.calls:
                     result = {**result, "runtime_usage": runtime.snapshot()}

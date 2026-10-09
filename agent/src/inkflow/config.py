@@ -11,7 +11,6 @@ from urllib.parse import urlparse
 
 from .errors import ConfigurationError
 from .role_protocol import (
-    LEGACY_ROLE_PROTOCOL_VERSION,
     ROLE_PROTOCOL_VERSION,
     migrate_role_settings,
     normalize_role,
@@ -42,7 +41,6 @@ PERSISTED_SETTING_NAMES = {
     "context_hard_tokens",
     "context_budget_mode",
     "agent_context_budgets",
-    "role_settings_version",
     "max_output_tokens",
     "max_concurrent_model_requests",
     "request_timeout_seconds",
@@ -96,31 +94,33 @@ PERSISTED_SETTING_NAMES = {
 DEFAULT_AGENT_GENERATION: dict[str, dict[str, float | int | None]] = {
     "coordinator": {"temperature": 0.25, "top_p": 0.8, "top_k": None},
     "writer": {"temperature": 0.85, "top_p": 0.95, "top_k": None},
+    "editor": {"temperature": 0.2, "top_p": 0.8, "top_k": None},
     "reviewer": {"temperature": 0.2, "top_p": 0.8, "top_k": None},
+    "memory_keeper": {"temperature": 0.2, "top_p": 0.8, "top_k": None},
 }
 
 DEFAULT_AGENT_CONTEXT_BUDGETS: dict[str, dict[str, int]] = {
     "coordinator": {"soft": 96_000, "hard": 160_000},
     "writer": {"soft": 192_000, "hard": 208_000},
+    "editor": {"soft": 160_000, "hard": 176_000},
     "reviewer": {"soft": 160_000, "hard": 176_000},
+    "memory_keeper": {"soft": 160_000, "hard": 176_000},
 }
 
-# The old three-role attributes remain a compatibility projection. Canonical
-# settings distinguish Editor from the optional specialist Reviewer.
-DEFAULT_ROLE_GENERATION: dict[str, dict[str, float | int | None]] = {
-    "coordinator": dict(DEFAULT_AGENT_GENERATION["coordinator"]),
-    "writer": dict(DEFAULT_AGENT_GENERATION["writer"]),
-    "editor": dict(DEFAULT_AGENT_GENERATION["reviewer"]),
-    "reviewer": dict(DEFAULT_AGENT_GENERATION["reviewer"]),
-    "memory_keeper": dict(DEFAULT_AGENT_GENERATION["reviewer"]),
-}
-DEFAULT_ROLE_CONTEXT_BUDGETS: dict[str, dict[str, int]] = {
-    "coordinator": dict(DEFAULT_AGENT_CONTEXT_BUDGETS["coordinator"]),
-    "writer": dict(DEFAULT_AGENT_CONTEXT_BUDGETS["writer"]),
-    "editor": dict(DEFAULT_AGENT_CONTEXT_BUDGETS["reviewer"]),
-    "reviewer": dict(DEFAULT_AGENT_CONTEXT_BUDGETS["reviewer"]),
-    "memory_keeper": dict(DEFAULT_AGENT_CONTEXT_BUDGETS["reviewer"]),
-}
+# Import-name compatibility only; there is no second settings projection.
+DEFAULT_ROLE_GENERATION = DEFAULT_AGENT_GENERATION
+DEFAULT_ROLE_CONTEXT_BUDGETS = DEFAULT_AGENT_CONTEXT_BUDGETS
+
+
+def _official_model_limits(base_url: str, model: str) -> dict[str, Any]:
+    # Official API limits checked 2026-10-09; proxies do not inherit these limits.
+    if urlparse(base_url).hostname != "api.deepseek.com" or model not in {
+        "deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro",
+    }:
+        return {}
+    return {"model": model, "context_tokens": 1_000_000, "max_output_tokens": 393_216,
+            "source": "https://api-docs.deepseek.com/api/create-chat-completion/",
+            "checked_at": "2026-10-09"}
 
 # Settings can be written by the voice and provider routes at the same time.
 # Serializing the read/validate/replace sequence prevents a fast toggle from
@@ -150,36 +150,50 @@ def load_user_settings() -> dict[str, Any]:
         raise ConfigurationError(f"墨流用户设置无法读取：{exc}") from exc
     if not isinstance(value, dict):
         raise ConfigurationError("墨流用户设置格式无效，应为 JSON 对象。")
-    return {key: value[key] for key in PERSISTED_SETTING_NAMES if key in value}
+    return adapt_settings({key: value[key] for key in PERSISTED_SETTING_NAMES | {"role_settings_version"}
+                           if key in value})
 
 
-def save_user_settings(updates: dict[str, Any]) -> dict[str, Any]:
-    """Merge the caller's versioned patch and atomically persist canonical v2.
+def adapt_settings(value: dict[str, Any]) -> dict[str, Any]:
+    """Consume explicit old role labels once; unlabelled input is canonical."""
+    if not isinstance(value, dict):
+        raise ConfigurationError("设置必须是对象。")
+    result = dict(value)
+    old_label = result.pop("role_settings_version", None)
+    # Validate an obsolete label even when this particular patch has no role fields.
+    _migrate_settings_roles({}, old_label)
+    for name in ("agent_generation", "agent_context_budgets"):
+        if name in result:
+            result[name], _ = _migrate_settings_roles(result[name], old_label)
+    if "role_models" in result:
+        result["role_models"] = _role_models(result["role_models"], old_label)
+    return result
 
-    Unversioned callers still edit the legacy three-role view. Their reviewer
-    fields belong to Editor and cannot overwrite specialist Reviewer settings.
-    """
+
+def save_user_settings(updates: dict[str, Any], *, validate_only: bool = False) -> dict[str, Any]:
+    """Import a patch once and atomically persist the unified role settings."""
 
     forbidden = {key for key in updates if "key" in key.lower() or "secret" in key.lower()}
     if forbidden:
         raise ConfigurationError("API Key 或其他密钥不能写入设置文件。")
+    updates = adapt_settings(updates)
     unknown = set(updates) - PERSISTED_SETTING_NAMES
     if unknown:
         raise ConfigurationError(f"不支持的设置项：{', '.join(sorted(unknown))}")
     with _SETTINGS_WRITE_LOCK:
-        caller_version = _settings_protocol_version(updates.get("role_settings_version"))
         current = Settings.from_mapping(load_user_settings()).to_mapping()
         for key, value in updates.items():
             if key in {"agent_generation", "agent_context_budgets"}:
-                migrated, _ = _migrate_settings_roles(value, updates.get("role_settings_version"))
-                for role, fields in migrated.items():
+                for role, fields in value.items():
                     current[key].setdefault(role, {}).update(fields)
             elif key == "role_models":
-                current[key].update(_role_models(value, updates.get("role_settings_version")))
-            elif key != "role_settings_version":
+                current[key].update(value)
+            else:
                 current[key] = value
         validated = Settings.from_mapping(current)
         clean = validated.to_mapping()
+        if validate_only:
+            return clean
         path = user_settings_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         handle, temporary_name = tempfile.mkstemp(prefix="settings-", suffix=".tmp", dir=path.parent)
@@ -192,7 +206,7 @@ def save_user_settings(updates: dict[str, Any]) -> dict[str, Any]:
         finally:
             if temporary.exists():
                 temporary.unlink()
-    return validated.to_mapping(protocol_version=caller_version)
+    return validated.to_mapping()
 
 
 @dataclass(slots=True)
@@ -262,29 +276,17 @@ class Settings:
     input_price_per_million: float = 0.0
     output_price_per_million: float = 0.0
     workspace_root: Path | None = None
-    role_settings_version: int = field(default=ROLE_PROTOCOL_VERSION, init=False)
     role_settings_warnings: tuple[str, ...] = field(default_factory=tuple)
-    role_generation: dict[str, dict[str, float | int | None]] = field(default_factory=dict, repr=False)
-    role_context_budgets: dict[str, dict[str, int]] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
-        # Direct Settings(agent_generation=...) construction retains its legacy
-        # meaning; from_mapping supplies canonical groups explicitly.
-        self.role_models = _role_models(self.role_models, ROLE_PROTOCOL_VERSION)
-        warnings = list(self.role_settings_warnings)
-        generation = self.role_generation
-        if not generation:
-            generation, notices = _migrate_settings_roles(self.agent_generation, LEGACY_ROLE_PROTOCOL_VERSION)
-            warnings.extend(notices)
-        budgets = self.role_context_budgets
-        if not budgets:
-            budgets, notices = _migrate_settings_roles(self.agent_context_budgets, LEGACY_ROLE_PROTOCOL_VERSION)
-            warnings.extend(notices)
-        self.role_generation = _agent_generation(generation)
-        self.role_context_budgets = _agent_context_budgets(budgets)
-        self.role_settings_warnings = tuple(dict.fromkeys(warnings))
-        self.agent_generation = _legacy_role_view(self.role_generation)
-        self.agent_context_budgets = _legacy_role_view(self.role_context_budgets)
+        self.role_models = _role_models(self.role_models, None)
+        self.agent_generation = _agent_generation(self.agent_generation)
+        self.agent_context_budgets = _agent_context_budgets(self.agent_context_budgets)
+
+    @property
+    def role_settings_version(self) -> int:
+        """Read-only compatibility for obsolete call signatures; never persisted."""
+        return ROLE_PROTOCOL_VERSION
 
     def model_for(self, role: str | None, protocol_version: int = 1) -> str:
         if role is None:
@@ -293,36 +295,49 @@ class Settings:
 
     def generation_for(self, role: str, protocol_version: int = 1) -> dict[str, float | int | None]:
         canonical = _settings_role(role, protocol_version)
-        return dict(self.role_generation[canonical])
+        return dict(self.agent_generation[canonical])
 
-    def context_budget_for(self, role: str, protocol_version: int = 1) -> tuple[int, int]:
-        """返回一次 Agent 调用可用的上下文预算；统一模式保持旧行为。"""
+    def model_limits(self, model_override: str | None = None) -> dict[str, Any]:
+        return _official_model_limits(self.base_url, model_override or self.model)
 
-        canonical = _settings_role(role, protocol_version)
-        if self.context_budget_mode != "custom":
-            return self.context_soft_tokens, self.context_hard_tokens
-        selected = self.role_context_budgets[canonical]
-        return int(selected["soft"]), int(selected["hard"])
+    def context_budget_for(self, role: str | None, protocol_version: int = 1,
+                           model_override: str | None = None) -> tuple[int, int]:
+        """返回当前角色配置与已核实模型共同允许的上下文预算。"""
+        if role is not None and self.context_budget_mode == "custom":
+            selected = self.agent_context_budgets[_settings_role(role, protocol_version)]
+            soft, hard = int(selected["soft"]), int(selected["hard"])
+        else:
+            soft, hard = self.context_soft_tokens, self.context_hard_tokens
+        limits = self.model_limits(model_override or self.model_for(role, protocol_version))
+        hard = min(hard, limits.get("context_tokens", hard))
+        return min(soft, hard), hard
+
+    def effective_output_tokens(self, requested: int, role: str | None = None,
+                                model_override: str | None = None, input_tokens: int = 0) -> int:
+        requested = _positive_int(requested, "本次请求输出额度")
+        selected = model_override or self.model_for(role)
+        _, hard = self.context_budget_for(role, model_override=selected)
+        remaining = hard - max(0, int(input_tokens))
+        if remaining <= 0:
+            raise ConfigurationError(f"{role or '本次请求'} 的模型 {selected} 上下文额度已用尽："
+                                     f"完整输入约 {input_tokens:,} tokens，可用上下文 {hard:,} tokens。"
+                                     "请调整该角色预算或缩小本次输入后继续。")
+        limits = self.model_limits(selected)
+        return min(requested, self.max_output_tokens, remaining, limits.get("max_output_tokens", requested))
 
     def role_settings_view(self, protocol_version: int = 1) -> dict[str, Any]:
-        version = _settings_protocol_version(protocol_version)
-        legacy = version == LEGACY_ROLE_PROTOCOL_VERSION
         return {
-            "role_settings_version": version,
-            "role_models": ({role: self.role_models["editor" if role == "reviewer" else role]
-                             for role in DEFAULT_AGENT_GENERATION
-                             if ("editor" if role == "reviewer" else role) in self.role_models}
-                            if legacy else dict(self.role_models)),
-            "agent_generation": _legacy_role_view(self.role_generation) if legacy else {
-                role: dict(values) for role, values in self.role_generation.items()
+            "role_models": dict(self.role_models),
+            "agent_generation": {
+                role: dict(values) for role, values in self.agent_generation.items()
             },
-            "agent_context_budgets": _legacy_role_view(self.role_context_budgets) if legacy else {
-                role: dict(values) for role, values in self.role_context_budgets.items()
+            "agent_context_budgets": {
+                role: dict(values) for role, values in self.agent_context_budgets.items()
             },
         }
 
     def to_mapping(self, protocol_version: int = ROLE_PROTOCOL_VERSION) -> dict[str, Any]:
-        """Serialize one explicit role view, excluding internal canonical copies."""
+        """Serialize canonical settings; the obsolete argument does not select a view."""
         values = {key: value for key, value in asdict(self).items() if key in PERSISTED_SETTING_NAMES}
         values.update(self.role_settings_view(protocol_version))
         return values
@@ -333,7 +348,7 @@ class Settings:
         value: dict[str, Any],
         workspace_root: str | Path | None = None,
     ) -> "Settings":
-        value = dict(value)
+        value = adapt_settings(value)
         # Normalize legacy model IDs even when they come from workspace settings
         # or environment variables, rather than only the global settings file.
         for key, previous, current in (
@@ -376,13 +391,16 @@ class Settings:
             "上下文预算模式",
             {"unified", "custom"},
         )
-        source_version = value.get("role_settings_version")
         raw_agent_budgets, context_warnings = _migrate_settings_roles(
-            value.get("agent_context_budgets", {}), source_version
+            value.get("agent_context_budgets", {}), None
         )
         agent_context_budgets = _agent_context_budgets(raw_agent_budgets)
-        if output > 128_000:
-            raise ConfigurationError("单次模型输出上限不能超过 128K tokens。")
+        if output > hard:
+            raise ConfigurationError("单次模型输出上限不能大于已配置的最大上下文。")
+        limits = _official_model_limits(base_url, model)
+        if limits and output > limits["max_output_tokens"]:
+            raise ConfigurationError(f"模型 {model} 的已核实输出上限为 {limits['max_output_tokens']:,} tokens；"
+                                     "请调整输出设置或选择支持更大输出的模型。")
         timeout = _positive_float(
             value.get("request_timeout_seconds", defaults.request_timeout_seconds), "普通请求超时"
         )
@@ -440,7 +458,7 @@ class Settings:
             1000,
         )
         raw_generation, generation_warnings = _migrate_settings_roles(
-            value.get("agent_generation", {}), source_version
+            value.get("agent_generation", {}), None
         )
         agent_generation = _agent_generation(raw_generation)
         review_verification_mode = str(
@@ -455,7 +473,7 @@ class Settings:
         )
         return cls(
             manual_edit_review_enabled=_as_bool(value.get("manual_edit_review_enabled", True)),
-            role_models=_role_models(value.get("role_models", {}), source_version),
+            role_models=_role_models(value.get("role_models", {}), None),
             provider_kind=provider_kind,
             base_url=base_url,
             model=model,
@@ -463,7 +481,7 @@ class Settings:
             context_soft_tokens=soft,
             context_hard_tokens=hard,
             context_budget_mode=context_budget_mode,
-            role_context_budgets=agent_context_budgets,
+            agent_context_budgets=agent_context_budgets,
             role_settings_warnings=tuple(dict.fromkeys((*context_warnings, *generation_warnings))),
             max_output_tokens=output,
             max_concurrent_model_requests=max_concurrent_model_requests,
@@ -483,7 +501,7 @@ class Settings:
             dialogue_history_mode=dialogue_history_mode,
             dialogue_history_interval=dialogue_history_interval,
             dialogue_history_limit=dialogue_history_limit,
-            role_generation=agent_generation,
+            agent_generation=agent_generation,
             review_verification_mode=review_verification_mode,
             review_experience_detail=review_experience_detail,
             review_local_nli_model=str(
@@ -749,17 +767,9 @@ def _as_bool(value: Any) -> bool:
     return str(value).strip().casefold() not in {"0", "false", "no", "off"}
 
 
-def _settings_protocol_version(value: Any) -> int:
-    try:
-        normalize_role("writer", value)
-    except ValueError as exc:
-        raise ConfigurationError(str(exc)) from exc
-    return LEGACY_ROLE_PROTOCOL_VERSION if value is None else value
-
-
 def _settings_role(role: str, protocol_version: int) -> str:
     try:
-        return normalize_role(role, protocol_version)
+        return normalize_role(role)
     except ValueError as exc:
         raise ConfigurationError(str(exc)) from exc
 
@@ -769,14 +779,6 @@ def _migrate_settings_roles(value: Any, version: int | None) -> tuple[dict[str, 
         return migrate_role_settings(value, protocol_version=version)
     except ValueError as exc:
         raise ConfigurationError(str(exc)) from exc
-
-
-def _legacy_role_view(values: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    return {
-        "coordinator": dict(values["coordinator"]),
-        "writer": dict(values["writer"]),
-        "reviewer": dict(values["editor"]),
-    }
 
 
 def _agent_context_budgets(value: Any) -> dict[str, dict[str, int]]:

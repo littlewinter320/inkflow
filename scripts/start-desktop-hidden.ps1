@@ -12,16 +12,13 @@ New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
 $inkflowPrograms = [Environment]::GetFolderPath('Programs')
 $inkflowIcon = Join-Path $desktopRoot 'resources\icon.ico'
 $inkflowElectron = Join-Path $desktopRoot 'node_modules\electron\dist\electron.exe'
-$inkflowLaunchScript = Join-Path $PSScriptRoot 'start-desktop-hidden.ps1'
-$inkflowSilentLauncher = Join-Path $PSScriptRoot 'start-desktop-hidden.vbs'
-$inkflowWScript = Join-Path $env:SystemRoot 'System32\wscript.exe'
-$inkflowPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$inkflowNativeLauncher = & (Join-Path $PSScriptRoot 'build-development-launcher.ps1')
 $inkflowShortcutPath = Join-Path $inkflowPrograms '墨流（本地开发）.lnk'
 if ((Test-Path -LiteralPath $inkflowPrograms) -and (Test-Path -LiteralPath $inkflowIcon)) {
     $inkflowShortcutShell = New-Object -ComObject WScript.Shell
     $inkflowShortcut = $inkflowShortcutShell.CreateShortcut($inkflowShortcutPath)
-    $inkflowShortcut.TargetPath = $inkflowWScript
-    $inkflowShortcut.Arguments = "`"$inkflowSilentLauncher`""
+    $inkflowShortcut.TargetPath = $inkflowNativeLauncher
+    $inkflowShortcut.Arguments = ''
     $inkflowShortcut.WorkingDirectory = $repositoryRoot
     $inkflowShortcut.IconLocation = "$inkflowIcon,0"
     $inkflowShortcut.Description = '墨流 · 墨宝小说工作台（本机开发版）'
@@ -46,7 +43,7 @@ if ($UseDesktopShortcut) {
     $inkflowShortcutShell = New-Object -ComObject WScript.Shell
     if (Test-Path -LiteralPath $inkflowDesktopShortcutPath) {
         $existingShortcut = $inkflowShortcutShell.CreateShortcut($inkflowDesktopShortcutPath)
-        if (-not [string]::Equals($existingShortcut.TargetPath, $inkflowWScript, [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not [string]::Equals($existingShortcut.TargetPath, $inkflowNativeLauncher, [StringComparison]::OrdinalIgnoreCase)) {
             $inkflowShortcutBackup = Join-Path $logRoot 'shortcut-backup'
             New-Item -ItemType Directory -Force -Path $inkflowShortcutBackup | Out-Null
             $inkflowBackupPath = Join-Path $inkflowShortcutBackup ('墨流 InkFlow-before-local-' + [DateTime]::Now.ToString('yyyyMMdd-HHmmss-fff') + '.lnk')
@@ -55,8 +52,8 @@ if ($UseDesktopShortcut) {
         }
     }
     $desktopShortcut = $inkflowShortcutShell.CreateShortcut($inkflowDesktopShortcutPath)
-    $desktopShortcut.TargetPath = $inkflowWScript
-    $desktopShortcut.Arguments = "`"$inkflowSilentLauncher`""
+    $desktopShortcut.TargetPath = $inkflowNativeLauncher
+    $desktopShortcut.Arguments = ''
     $desktopShortcut.WorkingDirectory = $repositoryRoot
     $desktopShortcut.IconLocation = "$inkflowIcon,0"
     $desktopShortcut.Description = '墨流 · 墨宝小说工作台（本机开发版，跟随当前源码）'

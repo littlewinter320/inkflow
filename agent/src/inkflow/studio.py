@@ -17,7 +17,7 @@ from .project_lock import project_write_lock_sync
 from .config import Settings
 from .task_settings import (
     TaskSettingsError, TaskSettingsScope, active_task_settings, capture_task_settings,
-    restore_task_settings, validate_task_settings_snapshot,
+    adapt_task_reference, restore_task_settings, validate_task_settings_snapshot,
 )
 from .utils import atomic_write_text, content_hash, effective_character_count, json_dumps, utc_now
 from .writer_notes import approved_notes, notes_hash, version_notes
@@ -632,7 +632,7 @@ class StudioDatabase:
                     raise TaskSettingsError("批次引用的配置快照缺失，不能用当前设置回填。")
                 snapshot = self._task_settings_record(row, novel_id)
                 scope = restore_task_settings(snapshot, novel_id=novel_id, workspace_root=root)
-                if type(reference.get("schema_version")) is not int or reference != scope.public_summary():
+                if type(reference.get("schema_version")) is not int or adapt_task_reference(reference) != scope.public_summary():
                     raise TaskSettingsError("批次配置引用与原快照不一致，未恢复执行。")
                 return scope
             if not isinstance(settings, Settings):
@@ -643,7 +643,6 @@ class StudioDatabase:
             inherit_mode = parent is not None and parent.novel_id == novel_id and not legacy
             snapshot = capture_task_settings(
                 settings, novel_id=novel_id, source="legacy_recovery" if legacy else "task_start",
-                role_protocol_version=parent.role_protocol_version if inherit_mode else 1,
                 collaboration_mode=parent.collaboration_mode if inherit_mode else "everyday",
             )
             scope = restore_task_settings(snapshot, novel_id=novel_id, workspace_root=root)
@@ -680,10 +679,7 @@ class StudioDatabase:
         root = Path(workspace_root).resolve() if workspace_root is not None else self.path.resolve().parent.parent
 
         def requested_mode_matches(scope: TaskSettingsScope) -> TaskSettingsScope:
-            if role_protocol_version is not None and role_protocol_version != scope.role_protocol_version:
-                raise TaskSettingsError("恢复任务不能切换角色协议；请新建任务并明确选择模式。")
-            requested_mode = (new_task_mode(collaboration_mode)
-                if collaboration_mode == "deep" and scope.collaboration_mode != "deep" else collaboration_mode)
+            requested_mode = new_task_mode(collaboration_mode) if collaboration_mode is not None else None
             if requested_mode is not None and requested_mode != scope.collaboration_mode:
                 raise TaskSettingsError("恢复任务不能切换协作模式；请新建任务并明确选择模式。")
             return scope
@@ -717,7 +713,7 @@ class StudioDatabase:
                 ).fetchone()
                 if original is None:
                     raise TaskSettingsError("找不到要恢复的原运行，不能创建替代配置。")
-                if original["status"] not in {"failed", "cancelled", "interrupted", "waiting_condition"}:
+                if original["status"] not in {"failed", "cancelled", "interrupted", "waiting_condition", "waiting_user"}:
                     raise TaskSettingsError("原运行尚未停止或已完成，不能作为恢复任务重新启动。")
                 previous = linked(resume_run_id)
                 if previous is None:
@@ -745,8 +741,6 @@ class StudioDatabase:
                     raise TaskSettingsError("当前配置的工作区与小说任务不一致。")
                 snapshot = capture_task_settings(
                     current_settings, novel_id=novel_id, source=source,
-                    role_protocol_version=(role_protocol_version if role_protocol_version is not None
-                                           else 2 if source == "task_start" else 1),
                     collaboration_mode=collaboration_mode if collaboration_mode is not None else "everyday",
                 )
 

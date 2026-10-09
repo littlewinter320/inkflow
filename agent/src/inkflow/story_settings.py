@@ -483,6 +483,40 @@ class StorySettingsService:
                 item["live_evidence"] = self._live_refs(item["evidence_refs"], cache)
         return content_hash(json_dumps(items, indent=None))
 
+    def _context_record(self, record: dict[str, Any], collection: dict[str, Any],
+                        chapter_no: int | None, cache: dict) -> dict[str, Any] | None:
+        if chapter_no and record.get("source_chapter") and record["source_chapter"] > chapter_no:
+            return None
+        refs = self._live_refs(record["evidence_refs"], cache)
+        if chapter_no and any(ref.get("chapter_no", 0) > chapter_no or
+                (ref.get("chapter_no", 0) == chapter_no and
+                 ref.get("current_source_kind", ref["source_kind"]) == "canonical") for ref in refs):
+            return None
+        item = {key: value for key, value in record.items()
+                if key not in {"history", "updated_at", "entry_status"}}
+        item["evidence_refs"] = refs
+        if any(not ref["source_current"] for ref in refs):
+            item["status"] = "stale_evidence"
+        elif record["collection_revision"] != collection["revision"]:
+            item["status"] = "configuration_changed"
+        return item
+
+    def retrieval_records(self, *, chapter_no: int, actor: str) -> list[dict[str, Any]]:
+        """Expose the same permitted, time-bounded reference records to local retrieval."""
+        if actor not in READ_ROLES:
+            raise ProjectError("读取设定的角色不被允许。")
+        result = []
+        cache: dict = {}
+        for collection in self.list_collections():
+            if actor not in collection["read_roles"]:
+                continue
+            for record in collection["records"]:
+                item = self._context_record(record, collection, chapter_no, cache)
+                if item is not None:
+                    result.append({**item, "collection_name": collection["name"],
+                                   "authority": "reference_only"})
+        return result
+
     def context(self, chapter_no: int | None = None, query: str = "", actor: str = "writer", max_chars: int = 16000) -> str:
         if actor not in READ_ROLES:
             raise ProjectError("读取设定的角色不被允许。")
@@ -504,20 +538,9 @@ class StorySettingsService:
                 continue
             records = sorted(collection["records"], key=lambda item: not (item["title"].casefold() in query))
             for record in records:
-                if chapter_no and record.get("source_chapter") and record["source_chapter"] > chapter_no:
+                item = self._context_record(record, collection, chapter_no, cache)
+                if item is None:
                     continue
-                refs = self._live_refs(record["evidence_refs"], cache)
-                if chapter_no and any(ref.get("chapter_no", 0) > chapter_no or
-                                     (ref.get("chapter_no", 0) == chapter_no and
-                                      ref.get("current_source_kind", ref["source_kind"]) == "canonical")
-                                     for ref in refs):
-                    continue
-                item = {key: value for key, value in record.items() if key not in {"history", "updated_at", "entry_status"}}
-                item["evidence_refs"] = refs
-                if any(not ref["source_current"] for ref in refs):
-                    item["status"] = "stale_evidence"
-                elif record["collection_revision"] != collection["revision"]:
-                    item["status"] = "configuration_changed"
                 trial = {**payload, "records": [*payload["records"], item]}
                 if len(json_dumps(trial)) > remaining:
                     omitted = True

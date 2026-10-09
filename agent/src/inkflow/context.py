@@ -9,16 +9,39 @@ from typing import Any, Literal
 from .craft import select_craft_guides
 from .errors import ValidationGateError
 from .project import InkFlowProject
-from .planning_pipeline import load_active_planning
+from .planning_pipeline import load_active_planning, synchronize_v2_projection
+from .project_lock import project_write_lock_sync
 from .outline_context import outline_sections
-from .retrieval import HybridRetriever
+from .retrieval import HybridRetriever, load_reference_cards
 from .schemas import ArcPlan, ContextPacket, ContextSection, PlanBundle, VolumePlan
 from .studio import StudioDatabase
-from .utils import atomic_write_text, content_hash, estimate_tokens, json_dumps, project_source_revision, utc_now
+from .utils import SOURCE_RECOVERY_TOKEN_LIMIT, atomic_write_text, content_hash, estimate_tokens, json_dumps, project_source_revision, utc_now
 from .writer_notes import recent_approved_notes
 
 
 _COMPRESSED_NOTE = "（已按完整条目压缩；完整资料仍保存在本地）"
+
+
+def named_prior_chapters(task: str, before_chapter: int, loaded: set[int]) -> list[int]:
+    """Keep task order, excluding loaded/current/future chapters before any budget decision."""
+    return [number for number in dict.fromkeys(int(value) for value in
+            re.findall(r"第\s*(\d+)\s*章", task))
+            if 0 < number < before_chapter and number not in loaded]
+
+
+def _chapter_history_query(task: str, card: dict[str, Any], mode: str, protected_input: str) -> str:
+    query = "\n".join([task, *[str(card.get(key) or "") for key in
+        ("title_working", "function", "goal", "obstacle", "information_release")],
+        *[" ".join(str(value) for value in card.get(key) or []) for key in ("foreshadow_advance", "payoff")]])
+    if mode in {"review", "revise"} and protected_input:
+        # This material is supplied by the current task caller, including prose,
+        # selection surroundings or its same-version review. It is never canon.
+        query += "\n" + protected_input
+    return query
+
+
+def _packet_input_tokens(packet: ContextPacket, protected_input: str = "") -> int:
+    return estimate_tokens(packet.to_model_prompt() + ("\n\n" + protected_input if protected_input else ""))
 
 
 def planning_bundle_for_chapter(project: InkFlowProject, chapter_no: int) -> PlanBundle | None:
@@ -27,6 +50,10 @@ def planning_bundle_for_chapter(project: InkFlowProject, chapter_no: int) -> Pla
     ManualEditsService(project).assert_planning_ready(chapter_no)
     current = project.db.get_current_plan_bundle()
     active_v2 = load_active_planning(project)
+    if active_v2 is not None and current is None:
+        with project_write_lock_sync(project.root):
+            synchronize_v2_projection(project)
+        current = project.db.get_current_plan_bundle()
     if active_v2 is not None and chapter_no > active_v2[3].anchor_chapter:
         expected_prefix = f"v2:{active_v2[0]['trace_id']}:"
         if current is None or not current.current_arc.arc_id.startswith(expected_prefix):
@@ -155,34 +182,34 @@ def _fit_soft_content(content: str, limit: int, *, keep_tail: bool = False) -> s
     return json.dumps(empty, ensure_ascii=False, indent=2)
 
 
+def _voice_preferences_content(items: list[dict[str, Any]]) -> str:
+    return json.dumps({
+        "本章可用偏好": [{"编号": item["preference_id"], "范围": item["scope"],
+            "层级": item.get("level", "project"), "状态": item.get("status", "active"),
+            "要求": item["text"], "来源原话": item.get("source_quote", ""),
+            "修订号": item.get("revision", 0)} for item in items],
+        "使用边界": "当前指令和本书要求优先于作者默认；仅采用适用偏好，普通偏好不是硬门禁，不移植其他书剧情。"
+                    "candidate仅作未确认的相关参考，不覆盖已确认要求，不升级为硬规则。",
+    }, ensure_ascii=False, indent=2)
+
+
 def _voice_preferences_for_context(
     preferences: list[dict[str, Any]], task: str, card: dict[str, Any], limit: int | None = None
 ) -> list[dict[str, Any]]:
-    haystack = (task + "\n" + json.dumps(card, ensure_ascii=False)).casefold()
-    ranked: list[tuple[int, int, dict[str, Any]]] = []
+    """Budget the exact JSON for upstream scope-filtered preferences and candidates."""
+    ranked = []
     for index, item in enumerate(preferences):
-        if item.get("strength") != "weak":
+        candidate = item.get("status") == "candidate"
+        if item.get("strength") != "weak" and not candidate:
             continue
-        scope = str(item.get("scope") or "project")
-        scope_kind, _, target = scope.partition(":")
-        if scope_kind == "project":
-            score = 2
-        elif target and target.casefold() in haystack:
-            score = 4
-        elif not target:
-            score = 1
-        else:
-            continue
-        ranked.append((score, -index, item))
-    ranked.sort(key=lambda row: (-row[0], -row[1]))
+        targeted = str(item.get("scope") or "project").partition(":")[0] != "project"
+        ranked.append((not candidate, targeted, -index, item))
+    ranked.sort(key=lambda row: row[:3], reverse=True)
     selected = []
-    remaining = 3000
-    for _, _, item in ranked:
-        cost = estimate_tokens(str(item["text"]))
-        if cost > remaining:
+    for _, _, _, item in ranked:
+        if estimate_tokens(_voice_preferences_content([*selected, item])) > 8_000:
             continue
         selected.append(item)
-        remaining -= cost
         if limit is not None and len(selected) >= limit:
             break
     return selected
@@ -202,6 +229,7 @@ class ContextBuilder:
         hook_strategy: str = "most_chapters",
         review_experience_detail: str = "standard",
         actor: str = "writer",
+        output_reserve_tokens: int = 32_000,
     ):
         self.project = project
         self.actor = actor
@@ -209,7 +237,7 @@ class ContextBuilder:
         self.hard_token_limit = hard_token_limit or max(soft_token_limit, 512_000)
         self.configured_soft_token_limit = self.soft_token_limit
         self.configured_hard_token_limit = self.hard_token_limit
-        self.output_reserve_tokens = 16_000
+        self.output_reserve_tokens = max(1, int(output_reserve_tokens))
         self.retriever = HybridRetriever(
             project,
             embedding_model=embedding_model,
@@ -228,16 +256,10 @@ class ContextBuilder:
         provisional_chapters: list[dict[str, Any]] | None = None,
         protected_input: str = "",
     ) -> ContextPacket:
-        task_budget = {
-            "draft": (192_000, 208_000),
-            "review": (160_000, 176_000),
-            "revise": (192_000, 208_000),
-        }[mode]
-        self.soft_token_limit = min(self.configured_soft_token_limit, task_budget[0])
-        self.hard_token_limit = min(
-            max(self.soft_token_limit, self.configured_hard_token_limit - self.output_reserve_tokens),
-            task_budget[1],
-        )
+        self.hard_token_limit = self.configured_hard_token_limit - self.output_reserve_tokens
+        if self.hard_token_limit <= 0:
+            raise ValidationGateError("当前角色的输出预留已占满上下文，请调整该角色预算或单次输出上限。")
+        self.soft_token_limit = min(self.configured_soft_token_limit, self.hard_token_limit)
         database = self.project.db
         brief = database.get_brief()
         bundle = planning_bundle_for_chapter(self.project, chapter_no)
@@ -248,13 +270,20 @@ class ContextBuilder:
             raise ValidationGateError(f"缺少第 {chapter_no} 章章节卡，写作门禁拒绝继续。")
 
         facts = database.facts_as_of(chapter_no - 1)
-        threads = database.threads_as_of(chapter_no - 1)
-        preferences = database.effective_preferences()
-        from .preferences import applicable_preferences
-        preferences = applicable_preferences(preferences, task, {**card, "genre": brief.genre, "chapter_no": chapter_no})
+        thread_state = database.threads_state_as_of(chapter_no - 1)
+        threads = thread_state["threads"]
+        available_preferences = database.effective_preferences()
+        from .preferences import applicable_preferences, apply_preference_decisions, preference_candidates
+        available_candidates = preference_candidates(database)
+        preference_scope = {**card, "genre": brief.genre, "chapter_no": chapter_no}
+        available_pool = [*available_preferences, *available_candidates]
+        task_preferences = apply_preference_decisions(available_pool)
+        applicable = applicable_preferences(task_preferences, task, preference_scope)
+        preferences = [item for item in applicable if item.get("status") != "candidate"]
+        candidates = [item for item in applicable if item.get("status") == "candidate"]
         forced_preferences = [item for item in preferences if item["strength"] == "hard"]
         forced_texts = list(dict.fromkeys(str(item["text"]).strip() for item in forced_preferences if str(item["text"]).strip()))
-        voice_preferences = _voice_preferences_for_context(preferences, task, {**card, "genre": brief.genre})
+        voice_preferences = _voice_preferences_for_context([*preferences, *candidates], task, preference_scope)
         studio_context = self._studio_context(chapter_no, task, card)
         pinned_sources = {str(item["source_id"]) for item in studio_context["pins"]}
         effective_recent_limit = recent_limit if recent_limit is not None else {
@@ -285,21 +314,23 @@ class ContextBuilder:
             recent_parts.append(f"### 第 {item['chapter_no']} 章\n\n{item['content']}")
             recent_ids.append(f"chapter:{item['chapter_no']:05d}")
         cited_chapters = []
-        for number in list(dict.fromkeys(int(value) for value in re.findall(r"第\s*(\d+)\s*章", task)))[:3]:
-            if number >= chapter_no or f"chapter:{number:05d}" in recent_ids:
-                continue
-            source = database.get_chapter(number)
-            if not source or source["status"] != "accepted":
-                continue
-            text = database.canonical_chapter_content(number)
-            if text is None:
-                path = self.project.root / source["path"]
-                text = path.read_text(encoding="utf-8") if path.is_file() else None
-            if text is None or content_hash(text) != source["content_hash"]:
-                raise ValidationGateError(f"第 {number} 章正史版本不符，不能用作本次明确指定的依据。")
+        named_numbers = named_prior_chapters(task, chapter_no, set())
+        named_source_tokens = {int(item["chapter_no"]): estimate_tokens(item["content"])
+                               for item in recent if int(item["chapter_no"]) in named_numbers}
+        for number in named_prior_chapters(task, chapter_no, {int(item["chapter_no"]) for item in recent}):
+            try:
+                source = self.retriever._accepted_source(number, before_chapter=chapter_no)
+            except (ValueError, OSError) as exc:
+                reason = f"本次点名的第 {number} 章依据无法读取：{exc}"
+                self.project.record_pending_work(kind="context_source", reason=reason,
+                    source={"chapter_no": number, "boundary_chapter": chapter_no - 1},
+                    next_action="恢复点名源章的已接受正文及版本后，从资料读取节点续接；不派 Writer 改稿。",
+                    status="waiting_condition")
+                raise ValidationGateError(reason) from exc
+            named_source_tokens[number] = estimate_tokens(source["content"])
             cited_chapters.append(ContextSection(
                 key=f"E-cited-{number}", title=f"用户点名的第 {number} 章已接受正文",
-                content=text, source_ids=[f"chapter:{number:05d}"], hard=True, cache_scope="chapter",
+                content=source["content"], source_ids=[f"chapter:{number:05d}"], hard=True, cache_scope="chapter",
             ))
         ending_pattern_inputs = [*recent_for_patterns]
         ending_pattern_ids = [f"chapter:{item['chapter_no']:05d}" for item in recent_for_patterns]
@@ -344,28 +375,27 @@ class ContextBuilder:
                 f"batch-memory:{item.get('batch_id', 'current')}:chapter:{provisional_no:05d}"
             )
 
-        history_query = "\n".join(
-            [
-                task,
-                str(card.get("title_working") or ""),
-                str(card.get("function") or ""),
-                str(card.get("goal") or ""),
-                str(card.get("obstacle") or ""),
-                str(card.get("information_release") or ""),
-                " ".join(str(value) for value in card.get("foreshadow_advance") or []),
-                " ".join(str(value) for value in card.get("payoff") or []),
-            ]
-        )
-        if mode == "review" and protected_input:
-            # Retrieve for what the Writer actually wrote, not just the old card.
-            history_query += "\n" + protected_input
+        history_query = _chapter_history_query(task, card, mode, protected_input)
+        reference_cards = self._load_reference_cards(limit=6)
         chapter = database.get_chapter(chapter_no)
         retrieval_hits = self.retriever.retrieve(
             history_query,
-            role="reviewer" if mode == "review" else "writer",
+            role=self.actor,
             chapter_no=chapter_no,
             chapter_version=int(chapter["version"]) if chapter else None,
         )
+        current_material_in_query = bool(mode in {"review", "revise"} and protected_input.strip())
+        query_input = {"mode": mode, "actor": self.actor, "chapter_no": chapter_no,
+            "chapter_version": int(chapter["version"]) if chapter else None,
+            "current_material_in_query": current_material_in_query,
+            "current_material_hash": content_hash(protected_input) if current_material_in_query else None,
+            "current_material_characters": len(protected_input) if current_material_in_query else 0,
+            "query_hash": content_hash(history_query),
+            "meaning": "当前材料来自本次调用，包括正文/选区及同版说明或报告；仅用于取材，不成为正史或已核验依据。"}
+        # The retriever already consumed the full query. Diagnostics retain only
+        # a locator and identity, not a second copy of protected prose.
+        self.retriever.last_diagnostics["query"] = _chapter_history_query(task, card, "draft", "")[:512]
+        self.retriever.last_diagnostics["query_input"] = query_input
         def required_now(item: dict[str, Any]) -> bool:
             subject = str(item["subject"]).strip()
             predicate = str(item["predicate"])
@@ -385,24 +415,44 @@ class ContextBuilder:
             *[str(item["fact_id"]) for item in mandatory_facts],
             *[str(item["thread_id"]) for item in threads],
             *[str(item["preference_id"]) for item in [*forced_preferences, *voice_preferences]],
+            *[f"reference:{item['reference_id']}" for item in reference_cards],
+            *recent_ids,
+            *[source_id for section in cited_chapters for source_id in section.source_ids],
         }
         duplicate_retrieval_ids = sorted(
             str(item["source_id"]) for item in retrieval_hits
             if str(item["source_id"]) in already_loaded
         )
-        retrieval_hits = [
-            item for item in retrieval_hits
-            if str(item["source_id"]) not in already_loaded
-        ]
+        eligible_preference_ids = {str(item["preference_id"]) for item in applicable}
+        preference_retrieval_omissions = []
+        selected_hits = []
+        preference_tokens = estimate_tokens(_voice_preferences_content(voice_preferences))
+        for item in retrieval_hits:
+            identity = str(item["source_id"])
+            if identity in already_loaded:
+                continue
+            if item.get("source_type") == "user_preference":
+                if identity not in eligible_preference_ids:
+                    preference_retrieval_omissions.append({"source_id": identity, "reason": "本任务范围或已核验偏好取舍不适用"})
+                    continue
+                tokens = estimate_tokens(json.dumps(item, ensure_ascii=False, indent=2))
+                if preference_tokens + tokens > 8_000:
+                    preference_retrieval_omissions.append({"source_id": identity, "reason": "完整检索偏好条目超过本轮声音段共享8,000 token预算"})
+                    continue
+                preference_tokens += tokens
+            selected_hits.append(item)
+        retrieval_hits = selected_hits
         retrieved_canon = [item for item in retrieval_hits if item.get("source_type") == "canon_fact"]
         supplemental_hits = [item for item in retrieval_hits if item.get("source_type") != "canon_fact"]
-        if duplicate_retrieval_ids:
-            self.retriever.last_diagnostics["selected"] = retrieval_hits
+        self.retriever.last_diagnostics["selected"] = [{key: item.get(key) for key in
+            ("source_id", "source_type", "score", "reasons", "retrieval_reasons", "body_kind", "identity", "resolved_source")}
+            for item in retrieval_hits]
+        if duplicate_retrieval_ids or preference_retrieval_omissions:
             self.retriever.last_diagnostics["deduplicated_source_ids"] = duplicate_retrieval_ids
+            self.retriever.last_diagnostics["preference_omissions"] = preference_retrieval_omissions
         self.retriever.last_diagnostics["already_in_context_count"] = len(duplicate_retrieval_ids)
         self.retriever.last_diagnostics["additional_selected_count"] = len(retrieval_hits)
 
-        reference_cards = self._load_reference_cards(limit=6)
         craft_guides = select_craft_guides(task=task, genre=brief.genre, card=card, limit=1)
         plan_view = _plan_for_model(bundle, card)
         from .story_settings import StorySettingsService
@@ -514,6 +564,7 @@ class ContextBuilder:
                 title="最近已接受章节与批次临时草稿",
                 content="\n\n".join(recent_parts) or "尚无前章。",
                 source_ids=recent_ids,
+                hard=bool(set(named_numbers) & {int(item["chapter_no"]) for item in recent}),
                 cache_scope="chapter",
             ),
             *cited_chapters,
@@ -538,6 +589,7 @@ class ContextBuilder:
                     {
                         "检索链": "精确查询 → 本地 BM25 → 可选 BGE-M3 → 融合 → 可选 reranker → 一跳关系扩展 → 权限/章节/版本过滤",
                         "自适应结果": supplemental_hits,
+                        "参考身份": "story_reference/expression_reference 属于参考与设计记忆；引文和核对状态随条目提供，不能冒充已发生正史。",
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -563,7 +615,7 @@ class ContextBuilder:
             ),
             ContextSection(
                 key="H",
-                title="参考作品特征卡",
+                title="参考与设计记忆：作品表达特征",
                 content=json.dumps(reference_cards, ensure_ascii=False, indent=2) if reference_cards else "本章未加载参考作品。",
                 source_ids=[
                     f"reference:{item['reference_id']}"
@@ -602,17 +654,7 @@ class ContextBuilder:
             ContextSection(
                 key="J2",
                 title="作品声音契约（非正史）",
-                content=json.dumps(
-                    {
-                        "本章可用偏好": [
-                            {"编号": item["preference_id"], "范围": item["scope"], "层级": item.get("level", "project"), "要求": item["text"]}
-                            for item in voice_preferences
-                        ],
-                        "使用边界": "当前指令和本书要求优先于作者默认；仅采用适用偏好，普通偏好不是硬门禁，不移植其他书剧情。",
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
+                content=_voice_preferences_content(voice_preferences),
                 source_ids=[
                     str(item["preference_id"])
                     for item in voice_preferences
@@ -646,8 +688,12 @@ class ContextBuilder:
             if overlapping_manual
             else []
         )
+        if mode in {"review", "revise"} and not current_material_in_query:
+            warnings.append("本次审查或续修未提供当前正文/选区材料，检索仅依据用户任务与章节卡；不能据此声称已按实际正文取材。")
+        sections.extend(self._recovery_guidance(chapter_no))
         stale_summaries = [int(item["chapter_no"]) for item in recent_for_patterns
-                           if item.get("summary_stale")]
+                           if item.get("summary_stale") and
+                           not database.rebuilt_chapter_summary(int(item["chapter_no"]))]
         if stale_summaries:
             warnings.append(
                 "以下已接受章节的旧摘要或线索补丁与当前正文版本不同，"
@@ -660,6 +706,57 @@ class ContextBuilder:
                 "强制记忆数量或体积偏大：已安全去除完全重复项，但没有删改任何原始记录；"
                 "Writer 仍会读取全部内容，Reviewer 会核对冲突。建议在记忆页暂停过期项或合并同义规则。"
             )
+        thread_recovery = self._thread_history_context(thread_state, sections,
+            boundary=chapter_no - 1, protected_input=protected_input)
+        source_gaps = self.retriever.last_diagnostics.get("source_gaps", [])
+        for gap in source_gaps:
+            if gap.get("kind") != "chapter_summary" or any(gap.get(key) is None
+                    for key in ("chapter_no", "version", "source_hash")):
+                # A missing source or unknown thread lifecycle is not an identified
+                # stale summary. Preserve its diagnostic instead of inventing identity.
+                continue
+            work = self.project.record_pending_work(kind="memory_summary", reason=gap["reason"],
+                source={key: gap.get(key) for key in ("chapter_no", "version", "source_hash", "owner")},
+                next_action=("已本地回源到同版正史正文，记忆责任角色定向重核摘要；不为此重写正文。"
+                             if gap["state"] == "canonical_source_available" else
+                             "先恢复此源章的正史正文投影，再由记忆责任角色重核摘要；不能采用旧摘要。"),
+                status="waiting_condition")
+            self.project.update_pending_work(work["id"], progress={"step": "canonical_source_lookup",
+                "status": gap["state"], "reason": gap.get("source_problem", gap["reason"] )})
+        for work in self.project.pending_work():
+            if work["kind"] != "memory_summary":
+                continue
+            source = work["source"]
+            current = database.get_chapter(source["chapter_no"])
+            if current and (current["version"] != source["version"] or current["content_hash"] != source["source_hash"]):
+                self.project.update_pending_work(work["id"], status="superseded", resolution="源章版本已变化，旧摘要任务不沿用。")
+            elif current and ((not current.get("summary_stale") and current.get("summary"))
+                             or database.rebuilt_chapter_summary(source["chapter_no"])):
+                self.project.update_pending_work(work["id"], status="completed",
+                    resolution="同版正文已有有效原摘要或记忆责任角色核证的派生摘要缓存，正史未改动。")
+        sections.append(ContextSection(key="MEMORY", title="本次四层记忆读取与回源诊断",
+            content=json_dumps({"layers": ["正史", "任务临时", "作者偏好", "参考与设计"],
+                "boundary_chapter": chapter_no - 1, "source_gaps": source_gaps,
+                "query_input": query_input,
+                "thread_history": thread_recovery,
+                "retrieval": {**{key: self.retriever.last_diagnostics.get(key) for key in
+                    ("query", "candidate_count", "retrieved_count", "already_in_context_count",
+                     "additional_selected_count", "discarded", "discarded_display_limit", "source_reads", "preference_omissions")},
+                    "branches": self.retriever.last_diagnostics.get("branches", {}),
+                    "overlaps": self.retriever.last_diagnostics.get("overlaps", []),
+                    "source_conflicts": self.retriever.last_diagnostics.get("source_conflicts", []),
+                    "selected": [{key: item.get(key) for key in
+                        ("source_id", "source_type", "score", "reasons", "retrieval_reasons",
+                         "body_kind", "identity", "resolved_source")}
+                        for item in self.retriever.last_diagnostics.get("selected", [])]},
+                "meaning": "候选、检索命中、装入上下文和模型采用是不同阶段；未命中不表示不存在。"}),
+            cache_scope="chapter"))
+        pending = self.project.pending_work(chapter_no=chapter_no)
+        if pending:
+            sections.append(ContextSection(key="WORK", title="本章进度与待处理工作（不是正史或放行结论）",
+                content=json_dumps([{key: item.get(key) for key in
+                    ("id", "kind", "status", "reason", "next_action", "progress", "source", "resolution")}
+                    for item in pending]), hard=True, cache_scope="chapter"))
         packet = ContextPacket(
             project_id=self.project.project_id,
             chapter_no=chapter_no,
@@ -668,46 +765,150 @@ class ContextBuilder:
             estimated_tokens=estimate_tokens("\n".join([*[item.content for item in sections], protected_input])),
             warnings=warnings,
         )
+        packet.estimated_tokens = _packet_input_tokens(packet, protected_input)
         before_compression = packet.estimated_tokens
         if packet.estimated_tokens >= int(self.soft_token_limit * 0.9):
             compressed = self._shrink_soft_sections(packet, protected_input=protected_input)
-            packet.estimated_tokens = estimate_tokens(
-                "\n".join([*[item.content for item in packet.sections], protected_input])
-            )
+            packet.estimated_tokens = _packet_input_tokens(packet, protected_input)
             if compressed:
                 packet.warnings.append(
                     "接近软预算，已按相关性和资料权限压缩：" + "、".join(compressed) + "；硬约束未动。"
                 )
-        self._publish_context_status(packet, before_compression, has_protected_input=bool(protected_input), role="editor" if mode == "review" else "writer")
+                packet.estimated_tokens = _packet_input_tokens(packet, protected_input)
+        self._publish_context_status(packet, before_compression, has_protected_input=bool(protected_input),
+                                     protected_input=protected_input, role=self.actor)
         if packet.estimated_tokens > self.hard_token_limit:
+            if named_numbers:
+                required = [{"chapter_no": number,
+                             "estimated_tokens": named_source_tokens[number]} for number in named_numbers]
+                reason = (f"任务点名的旧章全文与必要材料合计 {packet.estimated_tokens} token，"
+                          f"超过当前输入上限 {self.hard_token_limit}；点名来源："
+                          + "、".join(f"第{item['chapter_no']}章（约{item['estimated_tokens']} token）" for item in required))
+                self.project.record_pending_work(kind="context_source", reason=reason,
+                    source={"required_chapters": required, "boundary_chapter": chapter_no - 1},
+                    next_action="明确缩小本次必要点名范围或提高当前角色上下文容量后续接资料节点；不得静默只读前三章。",
+                    status="waiting_condition")
+                raise ValidationGateError(reason)
             raise ValidationGateError(
                 "硬约束本身已超过最大上下文容量，墨流没有静默删除正史或用户指令；"
                 "请在上下文面板查看占用并缩小任务范围。"
             )
-        selected_ids = {ref for section in packet.sections for ref in section.source_ids}
-        database.set_metadata("preference.selection", {
-            "chapter_no": chapter_no, "task": task,
-            "selected": [item for item in preferences if item["preference_id"] in selected_ids],
-            "omitted": [{"preference_id": item["preference_id"], "text": item["text"],
-                         "reason": "范围不适用或本次相关性与上下文预算未选中"}
-                        for item in database.effective_preferences() if item["preference_id"] not in selected_ids],
-        })
+        available_by_id = {str(item["preference_id"]): item for item in available_pool}
+        eligible_ids = {str(item["preference_id"]) for item in applicable}
+        task_ids = {str(item["preference_id"]) for item in task_preferences}
+        preloaded_ids = {str(item["preference_id"]) for item in [*forced_preferences, *voice_preferences]}
+        preloaded_ids.update(str(item["source_id"]) for item in supplemental_hits
+                             if item.get("source_type") == "user_preference")
+        usage_sources = {str(item["preference_id"]): "硬要求" for item in forced_preferences}
+        voice_content = next((section.content for section in packet.sections if section.key == "J2"), "{}")
+        final_voice = json.loads(voice_content).get("本章可用偏好", [])
+        for item in final_voice:
+            identity = str(item.get("编号", ""))
+            if identity in available_by_id and item.get("要求") == available_by_id[identity]["text"]:
+                usage_sources[identity] = "声音段"
+        for section in packet.sections:
+            if section.key != "F":
+                continue
+            for hit in json.loads(section.content).get("自适应结果", []):
+                identity = str(hit.get("source_id", ""))
+                if (hit.get("source_type") == "user_preference" and identity in eligible_ids
+                        and identity in available_by_id
+                        and available_by_id[identity]["text"] in str(hit.get("body", ""))):
+                    usage_sources.setdefault(identity, "补充检索")
+        omitted = []
+        for identity, item in available_by_id.items():
+            if identity in usage_sources:
+                continue
+            if identity not in task_ids:
+                reason = "本任务已核验的偏好冲突取舍，保存条目仍保留"
+            elif identity not in eligible_ids:
+                reason = "本章适用范围不匹配，或被当前适用的本书同主题偏好覆盖"
+            elif identity in preloaded_ids:
+                reason = "整体上下文压缩后未完整装入；不计作已使用"
+            else:
+                reason = "完整条目超出8,000 token声音段预算，且本轮补充检索未选中"
+            omitted.append({"preference_id": identity, "text": item["text"],
+                            "status": item.get("status", "active"), "reason": reason})
+        selection = {"chapter_no": chapter_no, "mode": mode, "actor": self.actor, "task": task,
+            "recorded_at": utc_now(), "context_packet_id": content_hash(packet.to_model_prompt()),
+            "voice_budget_tokens": 8_000, "voice_selected_tokens": estimate_tokens(voice_content),
+            "selected": [{**item, "usage_source": usage_sources[str(item["preference_id"])]}
+                         for item in available_by_id.values() if str(item["preference_id"]) in usage_sources],
+            "omitted": omitted,
+            "meaning": "已完整装入最终编译上下文，不表示模型已经正确采用；candidate仍是未确认参考。"}
+        database.set_metadata("preference.selection", selection)
+        database.set_metadata(f"preference.selection:{chapter_no}:{mode}:{self.actor}", selection)
         return packet
 
-    def _load_reference_cards(self, limit: int) -> list[dict]:
-        folder = self.project.internal / "references" / "features"
-        result: list[dict] = []
-        for path in sorted(folder.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:limit]:
-            try:
-                card = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(card, dict):
-                    # 兼容旧特征卡，但不再把可复用的原文结尾片段送进 Context Packet。
-                    card.pop("sample_chapter_endings", None)
-                    card.pop("samples", None)
-                    result.append(card)
-            except (OSError, json.JSONDecodeError):
+    def _recovery_guidance(self, chapter_no: int) -> list[ContextSection]:
+        guidance = self.project.db.learning_guidance(chapter_no=chapter_no, role=self.actor)
+        cases = guidance.get("recovery_cases", [])
+        if not cases:
+            return []
+        return [ContextSection(key="RECOVERY", title="已核来源的流程恢复经验（非本章事实）",
+            content=json_dumps({"cases": cases, "policy": guidance.get("recovery_policy", {})}),
+            hard=False, cache_scope="chapter")]
+
+    def _thread_history_context(self, state: dict[str, Any], sections: list[ContextSection], *,
+                                boundary: int, protected_input: str = "") -> dict[str, Any]:
+        """Read valid boundary-local prose for unknown history without guessing lifecycle."""
+        loaded_ids = {source_id for section in sections for source_id in section.source_ids}
+        hard_tokens = estimate_tokens("\n".join([protected_input,
+            *[section.content for section in sections if section.hard]]))
+        budget = min(SOURCE_RECOVERY_TOKEN_LIMIT, max(0, self.hard_token_limit - hard_tokens - 4096))
+        # Adaptive retrieval excerpts and history recovery share the supplement cap.
+        supplement = next((section for section in sections if section.key == "F"), None)
+        if supplement and supplement.title == "分层混合检索结果":
+            budget = max(0, budget - estimate_tokens(supplement.content))
+        reads = []
+        remaining_sources = max(0, 6 - sum(section.key.startswith("TH-source-") for section in sections))
+        recovery = {int(item["chapter_no"]): item for item in state.get("recovery_sources", [])}
+        for gap in state.get("coverage_gaps", []):
+            number = gap.get("chapter_no")
+            if number is not None and 0 < int(number) <= boundary and int(number) not in recovery:
+                # Older DB rows may need the accepted Markdown projection. The
+                # shared reader checks the managed path and hash before loading.
+                recovery[int(number)] = {"chapter_no": int(number),
+                    "source_version": gap.get("source_version"), "source_hash": gap.get("source_hash")}
+        for item in recovery.values():
+            number = int(item["chapter_no"])
+            source_id = f"chapter:{number:05d}"
+            record = {"chapter_no": number, "source_id": source_id,
+                      "source_version": item.get("source_version"), "source_hash": item.get("source_hash")}
+            if number > boundary:
+                reads.append({**record, "state": "omitted", "reason": "超出本次正史回放边界"})
                 continue
-        return result
+            if source_id in loaded_ids:
+                reads.append({**record, "state": "already_in_context"})
+                continue
+            try:
+                source = self.retriever._accepted_source(number, before_chapter=boundary + 1)
+                if ((item.get("source_version") is not None and source["version"] != item["source_version"])
+                        or (item.get("source_hash") is not None and source["content_hash"] != item["source_hash"])):
+                    raise ValueError("回放来源版本已变化")
+                record.update(source_version=source["version"], source_hash=source["content_hash"])
+            except (ValueError, OSError, UnicodeError) as exc:
+                reads.append({**record, "state": "source_unavailable", "reason": str(exc)})
+                continue
+            body = (f"来源 {source_id}，版本 {source['version']}，hash {source['content_hash']}。"
+                    "原文供当前记忆责任角色核对；未重建的伏笔生命周期仍是 unknown。\n\n" + source["content"])
+            tokens = estimate_tokens(body)
+            if tokens > budget or remaining_sources <= 0:
+                reads.append({**record, "state": "omitted", "reason": "完整原文超过六来源、剩余补读或当前角色输入预算",
+                              "required_tokens": tokens, "remaining_tokens": budget})
+                continue
+            sections.append(ContextSection(key=f"TH-source-{number}", title=f"伏笔历史缺口回源：已接受第 {number} 章",
+                content=body, source_ids=[source_id], hard=True, cache_scope="chapter"))
+            loaded_ids.add(source_id)
+            budget -= tokens
+            remaining_sources -= 1
+            reads.append({**record, "state": "canonical_source_loaded", "estimated_tokens": tokens})
+        return {"boundary_chapter": boundary, "coverage_gaps": state.get("coverage_gaps", []),
+                "source_reads": reads,
+                "meaning": "unknown不是未结或已结；已读取原文只补依据，当前记忆责任角色同次核证候选，不据此改写正史。"}
+
+    def _load_reference_cards(self, limit: int) -> list[dict]:
+        return load_reference_cards(self.project, limit)
 
     def _studio_context(
         self,
@@ -830,7 +1031,9 @@ class ContextBuilder:
             source_ids.append(f"chapter:{chapter_no:05d}")
 
         facts = database.facts_as_of(end_chapter_no)
-        threads = database.threads_as_of(end_chapter_no)
+        root_thread_state = database.threads_state_as_of(start_chapter_no - 1)
+        end_thread_state = database.threads_state_as_of(end_chapter_no)
+        threads = end_thread_state["threads"]
         reference_cards = self._load_reference_cards(limit=6)
         task = f"复审第 {start_chapter_no}～{end_chapter_no} 章，并判断能否作为下一篇章可靠起点。"
         planning_documents = []
@@ -956,6 +1159,22 @@ class ContextBuilder:
                 hard=True,
             ),
         ]
+        history = self._thread_history_context(root_thread_state, sections, boundary=start_chapter_no - 1)
+        sections.append(ContextSection(key="TH", title="篇章起点前的伏笔回放与范围内历史缺口",
+            content=json_dumps({"root_history": history,
+                "root_threads": [_thread_for_model(item) for item in root_thread_state["threads"]],
+                "range": {"start": start_chapter_no, "end": end_chapter_no,
+                          "end_boundary_chapter": end_chapter_no,
+                          "coverage_gaps": end_thread_state["coverage_gaps"]},
+                "meaning": "起点前回放与待复审范围正文分别读取；临时章仍不是正史，unknown不得按未结线索推断。"}),
+            hard=True, cache_scope="chapter"))
+        work = [item for item in self.project.pending_work()
+                if item.get("chapter_no") is None or start_chapter_no <= item["chapter_no"] <= end_chapter_no]
+        if work:
+            sections.append(ContextSection(key="WORK", title="复审范围内的进度与待处理工作",
+                content=json.dumps([{key: item.get(key) for key in ("id", "kind", "status", "reason", "next_action", "source", "progress")}
+                                    for item in work], ensure_ascii=False), hard=True))
+        sections.extend(self._recovery_guidance(end_chapter_no))
         packet = ContextPacket(
             project_id=self.project.project_id,
             chapter_no=end_chapter_no,
@@ -964,13 +1183,15 @@ class ContextBuilder:
             estimated_tokens=estimate_tokens("\n".join(item.content for item in sections)),
             warnings=[],
         )
+        packet.estimated_tokens = _packet_input_tokens(packet)
         before_compression = packet.estimated_tokens
         if packet.estimated_tokens >= int(self.soft_token_limit * 0.9):
             compressed = self._shrink_soft_sections(packet)
-            packet.estimated_tokens = estimate_tokens("\n".join(item.content for item in packet.sections))
+            packet.estimated_tokens = _packet_input_tokens(packet)
             if compressed:
                 packet.warnings.append("篇章复审接近软预算，已压缩：" + "、".join(compressed) + "；硬约束未动。")
-        self._publish_context_status(packet, before_compression)
+                packet.estimated_tokens = _packet_input_tokens(packet)
+        self._publish_context_status(packet, before_compression, role=self.actor)
         if packet.estimated_tokens > self.hard_token_limit:
             raise ValidationGateError("篇章复审的硬材料超过最大上下文容量；请缩小复审章节范围。")
         return packet
@@ -979,17 +1200,27 @@ class ContextBuilder:
         """只压缩低权威软资料；顺序固定且优先保留高相关候选和最近正文。"""
 
         actions: list[str] = []
-        targets = {"H": 4_000, "I": 4_000, "J1": 2_000, "J2": 4_000, "E1": 4_000, "F": 10_000, "E": 24_000, "D1": 8_000}
-        for key in ("H", "J1", "I", "J2", "E1", "F", "E", "D1"):
-            if estimate_tokens(
-                "\n".join([*[item.content for item in packet.sections], protected_input])
-            ) <= int(self.soft_token_limit * 0.82):
+        targets = {"RECOVERY": 4_000, "H": 4_000, "I": 4_000, "J1": 2_000, "J2": 4_000, "E1": 4_000, "F": 10_000, "E": 24_000, "D1": 8_000}
+        for key in ("RECOVERY", "H", "J1", "I", "J2", "E1", "F", "E", "D1"):
+            if _packet_input_tokens(packet, protected_input) <= int(self.soft_token_limit * 0.82):
                 break
             section = next((item for item in packet.sections if item.key == key and not item.hard), None)
             if section is None:
                 continue
             original = section.content
-            if key == "F":
+            if key in {"J2", "RECOVERY"}:
+                value = json.loads(original)
+                field = "本章可用偏好" if key == "J2" else "cases"
+                kept = []
+                for item in value.get(field, []):
+                    trial = {**value, field: [*kept, item]}
+                    if len(json.dumps(trial, ensure_ascii=False, indent=2)) <= targets[key]:
+                        kept.append(item)
+                value[field] = kept
+                section.content = json.dumps(value, ensure_ascii=False, indent=2)
+                if key == "J2":
+                    section.source_ids = [str(item["编号"]) for item in kept]
+            elif key == "F":
                 try:
                     value = json.loads(original)
                     hits = value.get("自适应结果") if isinstance(value, dict) else None
@@ -1006,7 +1237,7 @@ class ContextBuilder:
                 except json.JSONDecodeError:
                     pass
             limit = targets[key]
-            if len(section.content) > limit:
+            if key not in {"J2", "RECOVERY"} and len(section.content) > limit:
                 section.content = _fit_soft_content(section.content, limit, keep_tail=key == "E")
             if section.content != original:
                 actions.append(section.title)
@@ -1018,6 +1249,7 @@ class ContextBuilder:
         before_compression: int,
         *,
         has_protected_input: bool = False,
+        protected_input: str = "",
         role: str = "planner",
     ) -> None:
         soft_sections = [item for item in packet.sections if not item.hard]
@@ -1059,8 +1291,12 @@ class ContextBuilder:
             "source_revision": project_source_revision(self.project.root, self.project.internal),
             "updated_at": updated_at,
             "chapter_no": packet.chapter_no,
+            "actor": role,
             "task": packet.task,
             "estimated_tokens": packet.estimated_tokens,
+            "input_budget_scope": "to_model_prompt编译资料及调用者protected_input；Provider另核系统契约、Schema、追加指令和输出预算。",
+            "protected_input_tokens": estimate_tokens(protected_input) if protected_input else 0,
+            "protected_input_hash": content_hash(protected_input) if protected_input else None,
             "before_compression_tokens": before_compression,
             "previous_updated_at": previous_updated_at,
             "previous_estimated_tokens": previous_estimated if previous_updated_at else None,
@@ -1106,7 +1342,7 @@ class ContextBuilder:
                 {
                     "key": item.key,
                     "title": item.title,
-                    "estimated_tokens": max(1, len(item.content) // 4),
+                    "estimated_tokens": estimate_tokens(item.content),
                     "hard": item.hard,
                     "source_count": len(item.source_ids),
                 }

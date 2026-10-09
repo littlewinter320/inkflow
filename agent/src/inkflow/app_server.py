@@ -17,26 +17,26 @@ from typing import Any, Awaitable, Callable
 from pydantic import ValidationError
 
 from . import __version__
-from .config import Settings, api_key_status, save_api_key_to_keyring, save_user_settings
+from .config import Settings, adapt_settings, api_key_status, save_api_key_to_keyring, save_user_settings
 from .coordinator import Coordinator
 from .engine import InkFlowEngine
-from .errors import InkFlowError, ProjectBusyError, ProjectError, ProviderError
+from .errors import ConfigurationError, InkFlowError, ProjectBusyError, ProjectError, ProviderError
 from .learning import LearningService
 from .project import InkFlowProject
 from .project_lock import project_lock_wait_policy, project_write_lock, project_write_lock_sync
 from .provider import create_provider
 from .references import ReferenceService
-from .role_protocol import ACTIVE_COLLABORATION_MODES, new_task_mode, normalize_role
-from .schemas import BookBrief, CollaborationReply, ContextPacket, ContextSection, MemoryPatch, NovelIdeaBundle, NovelIdeaCandidate, PrefillSuggestion, PromptOptimization, ProviderProbe, ReviewReport, SuggestedPrompt, TerminalIntent, WriterDirectionSet
+from .role_protocol import ACTIVE_COLLABORATION_MODES, adapt_role, new_task_mode, normalize_role, roles_for_mode
+from .schemas import BookBrief, CollaborationReply, ContextPacket, ContextSection, MemoryPatch, ModeCheckOutput, NovelIdeaBundle, NovelIdeaCandidate, PrefillSuggestion, PromptOptimization, ProviderProbe, ReviewReport, SuggestedPrompt, TerminalIntent, WriterDirectionSet
 from .review_verifier import verify_review
 from .studio import StudioDatabase, StudioService, chapter_retry_state, text_statistics
 from .terminal_session import TerminalSession
 from .trace import TraceRecorder, recent_trace_runs
 from .runtime import RunRuntime, active_runtime
-from .model_usage import UsageLedger, ValidationQuotaExceeded
+from .model_usage import UsageLedger
 from .planning_cleanup import cleanup_apply, cleanup_keep, cleanup_preview
 from .conversation_scope import active_conversation, conversation_id, conversation_key
-from .task_settings import active_task_settings
+from .task_settings import active_task_settings, capture_task_settings, restore_task_settings, use_task_settings
 from .utils import content_hash, estimate_tokens, project_source_revision, workflow_failure_reason, workflow_result_status
 from .voice import VOICE_SETTING_NAMES, VoiceRuntime, _project_key
 
@@ -61,7 +61,7 @@ _SPOKEN_MODES = {
 }
 
 
-def _requested_task_mode(method: str, params: dict[str, Any]) -> tuple[int, str] | None:
+def _requested_task_mode(method: str, params: dict[str, Any]) -> str | None:
     """Choose a mode only from an explicit request, never from risk keywords."""
     if method not in {"conversation.send", "workflow.run"}:
         return None
@@ -70,26 +70,12 @@ def _requested_task_mode(method: str, params: dict[str, Any]) -> tuple[int, str]
         match = _EXPLICIT_MODE_PREFIX.match(str(params.get("message") or ""))
         if match:
             raw_mode = _SPOKEN_MODES[match.group(1)]
-    raw_version = params.get("role_protocol_version")
-    if raw_mode is None and raw_version is None:
+    if raw_mode is None:
         return None
     mode = str(raw_mode or "everyday")
     if mode not in _COLLABORATION_MODES:
         raise InkFlowError("未知协作模式；没有启动专项模型调用。")
-    if raw_version is not None and type(raw_version) is not int:
-        raise InkFlowError("角色协议版本必须是明确的整数；没有启动专项模型调用。")
-    task_scope = active_task_settings.get()
-    # A fresh capture resolves deep; an already frozen deep task keeps its owner.
-    if task_scope is not None and task_scope.collaboration_mode != "deep":
-        mode = new_task_mode(mode)
-    version = (
-        task_scope.role_protocol_version
-        if raw_version is None and mode == "everyday" and task_scope is not None
-        else 2 if raw_version is None else raw_version
-    )
-    if version not in {1, 2} or (version == 1 and mode != "everyday"):
-        raise InkFlowError("角色协议与协作模式不匹配；没有启动专项模型调用。")
-    return version, mode
+    return new_task_mode(mode)
 
 
 def _task_rows_with_history(project: InkFlowProject, limit: int, instance_id: str) -> list[dict[str, Any]]:
@@ -101,6 +87,12 @@ def _task_rows_with_history(project: InkFlowProject, limit: int, instance_id: st
     except sqlite3.OperationalError:
         reconciliation_pending = True
     tasks = studio.db.list_tasks(limit)
+    with project.db.connect() as connection:
+        work_rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
+    completed_tasks = {item["source"]["task_id"]: item for row in work_rows
+                       if (item := json.loads(row["value_json"])).get("kind") == "workflow"
+                       and item.get("status") == "completed" and item.get("progress", {}).get("status") == "completed"
+                       and item.get("source", {}).get("task_id")}
     pending = project.db.get_metadata(conversation_key("pending_creation_task"))
     if isinstance(pending, dict) and pending.get("status") == "running" and pending.get("run_id"):
         # A process exit or an older error path may leave a stale "running"
@@ -137,7 +129,7 @@ def _task_rows_with_history(project: InkFlowProject, limit: int, instance_id: st
     chapters: dict[int, dict[str, Any] | None] = {}
     resumable_id = (
         str(pending.get("run_id") or "")
-        if isinstance(pending, dict) and pending.get("status") in {"interrupted", "waiting_condition", "waiting_user"}
+        if isinstance(pending, dict) and pending.get("status") in {"interrupted", "failed", "waiting_condition", "waiting_user"}
         and TerminalSession.pending_resume(project, "继续上次任务") is not None
         else ""
     )
@@ -157,6 +149,9 @@ def _task_rows_with_history(project: InkFlowProject, limit: int, instance_id: st
                 task["retry_note"] = "无法核实目标章节版本，因此没有开放整条任务重放。"
                 task["next_step"] = "请刷新项目并核对当前草稿；确认版本后再从未完成步骤续接。"
         if task["status"] in {"failed", "cancelled", "interrupted", "waiting_condition", "waiting_user"}:
+            if task.get("task_id") in completed_tasks:
+                task.update(historical=True, retryable=False,
+                    next_step="原任务后续已完成并保存实际进度，旧断点留作历史；当前无需重试此记录。")
             original = task.get("params") or {}
             value = original.get("chapter_no")
             if value is None:
@@ -266,7 +261,6 @@ class InkFlowAppService:
         from .config import Settings
         from .manual_edits import ManualEditsService
         from .runtime import RunRuntime
-        from .task_settings import capture_task_settings, restore_task_settings
         settings = Settings.from_env(project.root)
         key = str(project.root)
         if not settings.manual_edit_review_enabled or (key in self._manual_workers and not self._manual_workers[key].done()):
@@ -277,7 +271,7 @@ class InkFlowAppService:
             return
         async def work():
             scope = StudioService(project).db.prepare_task_settings(f"manual-run-{uuid.uuid4().hex}",
-                novel_id=project.project_id, settings=settings, workspace_root=project.root, role_protocol_version=2)
+                novel_id=project.project_id, settings=settings, workspace_root=project.root)
             settings_token = active_task_settings.set(scope)
             runtime_token = active_runtime.set(RunRuntime(publish=lambda event: None,task_id=scope.task_id,run_id=scope.task_id))
             conversation_token = active_conversation.set("manual-review")
@@ -306,6 +300,23 @@ class InkFlowAppService:
         emit: EventSink,
         consume_steering: Callable[[], Awaitable[list[str]]] | None = None,
     ) -> Any:
+        if method in _TASK_SETTINGS_METHODS and active_task_settings.get() is None:
+            if method in {"project.ideate", "prompt.optimize", "provider.test"}:
+                root = Path(str(params.get("project_root") or params.get("workspace_root") or Path.cwd())).resolve()
+                settings = Settings.from_env(root)
+                snapshot = capture_task_settings(settings, novel_id=f"aux-{uuid.uuid4().hex}")
+                scope = restore_task_settings(
+                    snapshot, novel_id=snapshot["novel_id"], workspace_root=root,
+                )
+            else:
+                project = await asyncio.to_thread(self._project, params)
+                scope = StudioService(project).db.prepare_task_settings(
+                    f"app-{uuid.uuid4().hex}", novel_id=project.project_id,
+                    settings=lambda: Settings.from_env(project.root), workspace_root=project.root,
+                    collaboration_mode=_requested_task_mode(method, params) or "everyday",
+                )
+            with use_task_settings(scope):
+                return await self.dispatch(method, params, emit, consume_steering)
         if method == "story_settings.templates":
             from .story_settings import StorySettingsService
             return {"templates": StorySettingsService.templates()}
@@ -320,7 +331,7 @@ class InkFlowAppService:
             if level not in {"author", "project"}:
                 raise ValueError("请选择作者默认习惯或本书偏好")
             preference_db = None
-            if level == "project" or action in {"override", "usage"}:
+            if level == "project" or action in {"override", "usage", "learning"}:
                 preference_db = InkFlowProject(self._validated_project_root(params), recover_on_open=False).db
             if action == "override":
                 with project_write_lock_sync(self._validated_project_root(params)):
@@ -333,8 +344,20 @@ class InkFlowAppService:
                     preference_db.set_metadata("author_preferences_disabled", sorted(disabled))
                 return {"disabled": sorted(disabled)}
             if action == "usage":
+                with preference_db.connect() as connection:
+                    decisions = [json.loads(row[0]) for row in connection.execute(
+                        "SELECT value_json FROM metadata WHERE key LIKE 'preference.decisions:%' ORDER BY updated_at DESC LIMIT 10")]
                 return {"selection": preference_db.get_metadata("preference.selection", {}),
-                        "disabled": preference_db.get_metadata("author_preferences_disabled", [])}
+                        "disabled": preference_db.get_metadata("author_preferences_disabled", []),
+                        "learning_enabled": preference_db.get_metadata("learning_settings", {}).get("enabled", True),
+                        "decisions": sorted(decisions, key=lambda item: item.get("created_at", ""), reverse=True)[:10]}
+            if action == "learning":
+                if type(params.get("enabled")) is not bool:
+                    raise ValueError("学习开关必须明确为开启或关闭")
+                with project_write_lock_sync(self._validated_project_root(params)):
+                    settings = preference_db.get_metadata("learning_settings", {})
+                    preference_db.set_metadata("learning_settings", {**settings, "enabled": params["enabled"]})
+                return {"learning_enabled": params["enabled"]}
             with (author_connection() if level == "author" else preference_db.connect()) as connection:
                 if action == "list":
                     return {"preferences": list_items(connection, active_only=False, level=level)}
@@ -351,9 +374,6 @@ class InkFlowAppService:
                 "product": "墨流（InkFlow）",
                 "version": __version__,
                 "protocol_version": 1,
-                "role_protocol_version": 1,
-                "role_contract_versions": [1, 2],
-                "role_execution_versions": [1, 2],
                 "capabilities": {
                     "desktop": True,
                     "mcp": True,
@@ -361,7 +381,7 @@ class InkFlowAppService:
                     "agents": ["Coordinator", "Writer", "Editor"],
                     "formal_agents": ["Coordinator", "Writer", "Editor"],
                     "novel_production_agents": ["Writer", "Editor"],
-                    "role_pool": Coordinator.capabilities(protocol_version=2),
+                    "role_pool": Coordinator.capabilities(),
                     "enabled_collaboration_modes": list(ACTIVE_COLLABORATION_MODES),
                     "services": ["memory", "context", "runtime"],
                     "raw_chain_of_thought": False,
@@ -376,6 +396,12 @@ class InkFlowAppService:
             }
         if method == "provider.status":
             settings = Settings.from_env(params.get("workspace_root"))
+            if any(key in params for key in ("provider_kind", "base_url", "model", "role_models")):
+                from dataclasses import replace
+                names = ("provider_kind", "base_url", "model", "role_models")
+                preview = Settings.from_mapping({**{key: getattr(settings, key) for key in names},
+                    **{key: params[key] for key in names if key in params}, "max_output_tokens": 1})
+                settings = replace(settings, **{key: getattr(preview, key) for key in names})
             return {
                 **api_key_status(settings.provider_kind),
                 "provider_kind": settings.provider_kind,
@@ -387,6 +413,13 @@ class InkFlowAppService:
                 "context_budget_mode": settings.context_budget_mode,
                 "agent_context_budgets": settings.agent_context_budgets,
                 "max_output_tokens": settings.max_output_tokens,
+                "model_limits": settings.model_limits(),
+                "effective_output_tokens": settings.effective_output_tokens(settings.max_output_tokens),
+                "role_output_limits": {role: {"model": settings.model_for(role),
+                    "model_limits": settings.model_limits(settings.model_for(role)),
+                    "context_tokens": settings.context_budget_for(role)[1],
+                    "max_output_tokens": settings.effective_output_tokens(settings.max_output_tokens, role)}
+                    for role in settings.agent_generation},
                 "inquiry_frequency": settings.inquiry_frequency,
                 "hook_strategy": settings.hook_strategy,
                 "chapter_length_tolerance": settings.chapter_length_tolerance,
@@ -409,21 +442,20 @@ class InkFlowAppService:
                 "input_price_per_million": settings.input_price_per_million,
                 "output_price_per_million": settings.output_price_per_million,
                 "capabilities": create_provider(settings).capabilities(),
-                "role_execution_version": 1,
                 "active_collaboration_mode": "everyday",
                 "enabled_collaboration_modes": list(ACTIVE_COLLABORATION_MODES),
-                **settings.role_settings_view(params.get("role_settings_version", 1)),
+                **settings.role_settings_view(),
                 "role_settings_warnings": list(settings.role_settings_warnings),
             }
         if method == "provider.configure":
+            settings_params = adapt_settings(params)
             provider_kind = str(params.get("provider_kind") or Settings.from_env().provider_kind).lower()
-            key = str(params.get("api_key", "")).strip()
-            if key:
-                # Windows credential APIs can be slow or show a system prompt;
-                # never make the asyncio loop wait for them.
-                await asyncio.to_thread(save_api_key_to_keyring, key, provider_kind)
+            raw_key = params.get("api_key")
+            if raw_key is not None and not isinstance(raw_key, str):
+                raise ConfigurationError("API Key 必须是文本，未修改已保存凭据。")
+            key = (raw_key or "").strip()
             allowed = {
-                name: params[name]
+                name: settings_params[name]
                 for name in (
                     "provider_kind",
                     "base_url",
@@ -447,7 +479,6 @@ class InkFlowAppService:
                     "agent_generation",
                     "role_models",
                     "manual_edit_review_enabled",
-                    "role_settings_version",
                     "review_verification_mode",
                     "review_experience_detail",
                     "review_local_nli_model",
@@ -458,7 +489,7 @@ class InkFlowAppService:
                     "input_price_per_million",
                     "output_price_per_million",
                 )
-                if name in params
+                if name in settings_params
                 and (
                     name in {
                         "review_local_nli_model",
@@ -467,9 +498,13 @@ class InkFlowAppService:
                         "retrieval_reranker_model",
                         "powershell_enabled",
                     }
-                    or params[name] not in (None, "")
+                    or settings_params[name] not in (None, "")
                 )
             }
+            # Reject invalid imports before touching shared provider credentials.
+            await asyncio.to_thread(save_user_settings, allowed, validate_only=True)
+            if key:
+                await asyncio.to_thread(save_api_key_to_keyring, key, provider_kind)
             if allowed:
                 await asyncio.to_thread(save_user_settings, allowed)
                 if allowed.get("manual_edit_review_enabled") is False:
@@ -485,7 +520,7 @@ class InkFlowAppService:
             settings = Settings.from_env(params.get("workspace_root"))
             return {"models": await create_provider(settings).list_models()}
         if method == "provider.test":
-            settings = Settings.from_env(params.get("workspace_root"))
+            settings = active_task_settings.get().settings
             await emit({"type": "provider.testing", "summary": "正在验证密钥、接口与模型名称"})
             result = await create_provider(settings).generate_json(
                 system_prompt="你只负责返回 API 连通性检查结果。",
@@ -547,11 +582,6 @@ class InkFlowAppService:
             return await self.voice.create_clone(params)
         if method == "voice.profile.update":
             return self.voice.update_profile(str(params.get("profile_id") or ""), params)
-        if method == "voice.profile.prepare_finetune":
-            return self.voice.prepare_finetune(
-                str(params.get("profile_id") or ""),
-                str(params.get("dataset_path") or ""),
-            )
         if method == "voice.transcribe":
             text = await self.voice.transcribe(str(params.get("audio_path") or ""))
             return {"text": text, "language": "zh-CN", "mode": "local_mandarin"}
@@ -567,7 +597,7 @@ class InkFlowAppService:
                 raise ValueError("请先输入需要优化的提示词。")
             if len(prompt) > 8_000:
                 raise ValueError("提示词超过 8000 字，请先缩小范围后再优化。")
-            settings = Settings.from_env(params.get("workspace_root") or params.get("project_root"))
+            settings = active_task_settings.get().settings
             await emit({"type": "prompt.optimizing", "summary": "正在核对目标、约束与交付格式"})
             result = await create_provider(settings).generate_json(
                 system_prompt=(
@@ -603,7 +633,7 @@ class InkFlowAppService:
             }
         if method == "project.ideate":
             from .preferences import preference_prompt
-            settings = Settings.from_env(params.get("workspace_root"))
+            settings = active_task_settings.get().settings
             preferences = str(params.get("preferences") or "").strip() + preference_prompt()
             fast = bool(params.get("fast", True))
             requested_count = 1 if fast else 3
@@ -862,6 +892,7 @@ class InkFlowAppService:
                     "messages": project.db.list_collaboration_messages(active_only=False, limit=int(params.get("limit", 80))),
                     "tasks": _task_rows_with_history(project, int(params.get("task_limit", 30)), self.instance_id),
                     "batches": _list_batch_summaries(project),
+                    "pending_work": project.pending_work(),
                     "learning_events": project.db.list_learning_events(int(params.get("learning_limit", 12))),
                     "artifacts": project.db.list_agent_artifacts(limit=30),
                     "trace_runs": recent_trace_runs(root, int(params.get("trace_limit", 12))),
@@ -940,6 +971,11 @@ class InkFlowAppService:
                     manual.acknowledge_hypothesis(str(params["record_id"]), str(params.get("reason") or ""))
                 return result
 
+        if method == "chapter.quality_hold.reject":
+            return await asyncio.to_thread(project.reject_accepted_quality_hold,
+                int(params["chapter_no"]), str(params["expected_hash"]), str(params.get("reason") or ""))
+        if method == "chapter.revision_impact":
+            return await asyncio.to_thread(project.accepted_revision_impact, int(params["chapter_no"]))
         if method == "chapter.quality_hold.approve":
             return await asyncio.to_thread(
                 project.approve_accepted_quality_hold,
@@ -1206,34 +1242,52 @@ class InkFlowAppService:
         if method == "chapter.review_panel":
             chapter_no = int(params["chapter_no"])
             chapter = project.db.get_chapter(chapter_no)
-            if not chapter or chapter["status"] != "draft":
-                raise ValueError("当前章节没有待审草稿")
-            content = (project.root / chapter["path"]).read_text(encoding="utf-8")
+            if not chapter or chapter["status"] not in {"draft", "accepted"}:
+                raise ValueError("当前章节没有可审查正文")
+            content = (project.db.canonical_chapter_content(chapter_no) if chapter["status"] == "accepted" else None)
+            if content is None:
+                content = (project.root / chapter["path"]).read_text(encoding="utf-8")
+            if content_hash(content) != chapter["content_hash"]:
+                raise ValueError("目标章正文与记录哈希不符，请先恢复正文来源")
             dimensions = list(params.get("dimensions") or ["continuity", "character", "narrative", "style"])
             allowed_dimensions = {"continuity", "character", "narrative", "style"}
             dimensions = [item for item in dimensions if item in allowed_dimensions][:4]
-            packet = self._engine(project.root)._context_builder(project, "reviewer").build(
-                chapter_no, "多维审查当前草稿", mode="review", protected_input=content
+            packet = self._engine(project.root)._context_builder(project, "editor").build(
+                chapter_no, "多维审查当前正文", mode="review", protected_input=content
             )
             reports = []
             merged: dict[tuple[str, str, str], dict[str, Any]] = {}
             run_id = str(params.get("run_id") or uuid.uuid4().hex)
             for dimension in dimensions:
                 result = await create_provider(self._engine(project.root).settings).generate_json(
-                    system_prompt="你是墨流的 Editor，当前处于审查模式。只审查指定维度，逐条引用当前正文或 Context Packet；不直接修改正文，不以投票代替证据。",
+                    system_prompt="你是墨流的 Editor，当前进行辅助维度预审。按 ModeCheckOutput 返回，只审查指定维度，逐条引用当前正文或 Context Packet；不直接修改正文，不产出 memory_patch 或设定认可，不以投票代替证据。本次结果不代替模式要求的完整审查。",
                     user_prompt=packet.to_model_prompt() + f"\n\n# 审查维度\n{dimension}\n\n# 当前正文\n{content}",
-                    output_model=ReviewReport, max_tokens=5_000, thinking=False, agent_role="reviewer",
+                    output_model=ModeCheckOutput, max_tokens=5_000, thinking=False, agent_role="editor",
                 )
-                verified, verdict = verify_review(result.data, content, packet)
+                raw = result.data.model_dump(mode="json")
+                report = ReviewReport.model_validate({
+                    key: value for key, value in raw.items() if key in ReviewReport.model_fields
+                })
+                verified, verdict = verify_review(report, content, packet)
                 payload = result.data.model_dump(mode="json")
                 payload["verdict"] = verdict
+                payload["source_hash"] = content_hash(content)
+                payload["chapter_no"] = chapter_no
+                payload["chapter_version"] = int(chapter["version"])
+                payload["auxiliary_only"] = True
+                payload["memory_patch"] = None
+                payload["approved_setting_proposals"] = []
+                payload["setting_updates"] = []
                 payload["findings"] = [item.model_dump(mode="json") for item in verified]
                 with project_write_lock_sync(project.root):
                     current = project.db.get_chapter(chapter_no)
-                    if not current or int(current["version"]) != int(chapter["version"]) or (project.root / current["path"]).read_text(encoding="utf-8") != content:
+                    current_content = project.db.canonical_chapter_content(chapter_no) if current and current["status"] == "accepted" else None
+                    if current and current_content is None:
+                        current_content = (project.root / current["path"]).read_text(encoding="utf-8")
+                    if not current or int(current["version"]) != int(chapter["version"]) or current["content_hash"] != content_hash(content) or current_content != content:
                         raise ValueError("多维预审期间正文版本已经变化，请重新运行")
                     artifact = project.db.save_agent_artifact(
-                        artifact_type="review_dimension", run_id=run_id, role="reviewer", dimension=dimension,
+                        artifact_type="review_dimension", run_id=run_id, role="editor", dimension=dimension,
                         chapter_no=chapter_no, chapter_version=int(chapter["version"]), data=payload, status="evidence_checked",
                     )
                 reports.append(artifact)
@@ -1242,7 +1296,8 @@ class InkFlowAppService:
                     merged.setdefault(key, finding)
             severity_rank = {"blocking": 0, "major": 1, "minor": 2, "info": 3}
             findings = sorted(merged.values(), key=lambda item: severity_rank.get(str(item.get("severity")), 9))
-            return {"reports": reports, "merged_findings": findings, "merge_method": "evidence_keyed_no_voting", "next_action": "由 Editor 对当前版本执行最终审查门禁"}
+            return {"chapter_no": chapter_no, "chapter_version": int(chapter["version"]), "source_hash": content_hash(content),
+                    "reports": reports, "merged_findings": findings, "merge_method": "evidence_keyed_no_voting", "next_action": "由引擎按当前任务模式完成正式审查；本次维度预审不代替检查覆盖或接受授权"}
         if method == "scene_note.upsert":
             return studio.upsert_scene_note(
                 int(params["chapter_no"]), int(params["scene_no"]), dict(params.get("data") or {})
@@ -1268,28 +1323,82 @@ class InkFlowAppService:
             chapter = project.db.get_chapter(chapter_no)
             if not chapter or chapter["status"] != "draft":
                 raise ValueError("当前章节没有可验收草稿")
-            review = project.db.latest_review_record(chapter_no)
-            if not review or review["chapter_version"] != int(chapter["version"]) or review["report"].verdict != "pass":
-                raise ValueError("当前草稿版本尚未通过 Editor 审查，不能准备正史预览")
+            scope = active_task_settings.get()
+            task_db = StudioService(project).db
+            linked_run = task_db.latest_task_run_for_settings(scope.task_id) if scope else None
+            if scope is None or linked_run is None:
+                raise ValueError("记忆预览缺少已登记的原任务配置与运行来源，请重新从当前任务生成预览。")
+            reviewed = self._engine(project.root).current_pass_review(project, chapter_no)
+            if reviewed is None:
+                raise ValueError("当前草稿尚未完成本次模式要求的有效审查，不能准备正史预览")
+            review_record = project.db.latest_review_record(chapter_no)
             content = (project.root / chapter["path"]).read_text(encoding="utf-8")
+            if content_hash(content) != chapter["content_hash"] or not review_record or review_record["report"].memory_patch is None:
+                raise ValueError("正文或已审记忆交接来源不一致，请核对当前版本后重新预览。")
+            binding = {"task_id": scope.task_id, "snapshot_hash": scope.snapshot_hash,
+                "run_id": linked_run["run_id"], "chapter_no": chapter_no,
+                "chapter_version": int(chapter["version"]), "content_hash": content_hash(content),
+                "review_id": int(review_record["id"]),
+                "review_patch_hash": content_hash(review_record["report"].memory_patch.model_dump_json())}
             trace = TraceRecorder(project.root, f"memory-preview-{chapter_no:05d}", self._engine(project.root).settings.trace_level)
             patch, _, _ = await self._engine(project.root)._extract_memory_patch(project, chapter_no, content, trace, source_status="accepted")
-            artifact = project.db.save_agent_artifact(
-                artifact_type="memory_patch_preview", run_id=trace.run_id, role="engine",
-                chapter_no=chapter_no, chapter_version=int(chapter["version"]), data=patch.model_dump(mode="json"), status="awaiting_commit",
-            )
+            with project_write_lock_sync(project.root):
+                current = project.db.get_chapter(chapter_no)
+                current_review = project.db.latest_review_record(chapter_no)
+                if (not current or current["status"] != "draft" or current["version"] != binding["chapter_version"]
+                        or current["content_hash"] != binding["content_hash"] or not current_review
+                        or current_review["id"] != binding["review_id"]
+                        or content_hash((project.root / current["path"]).read_text(encoding="utf-8")) != binding["content_hash"]
+                        or self._engine(project.root).current_pass_review(project, chapter_no) is None):
+                    raise ValueError("准备预览期间正文或审查来源已变化，未保存旧预览，请核对后重做预览。")
+                artifact = project.db.save_agent_artifact(
+                    artifact_type="memory_patch_preview", run_id=linked_run["run_id"], role="engine",
+                    chapter_no=chapter_no, chapter_version=int(chapter["version"]),
+                    data=patch.model_dump(mode="json") | {"preview_binding": binding}, status="awaiting_commit",
+                )
             trace.finish(summary="正史变更预览已生成，尚未提交 SQLite")
-            return {"preview": artifact, "facts": len(patch.facts), "threads": len(patch.threads), "notice": "正文已经由用户接受；当前只生成变更预览，尚未提交正史。"}
+            return {"preview": artifact, "status": "waiting_user", "facts": len(patch.facts), "threads": len(patch.threads),
+                "next_action": "核对本章记忆预览后确认提交；沿用预览的原配置与已审候选。",
+                "notice": "用户已确认准备接受当前正文；此处只生成变更预览，尚未提交正史。"}
         if method == "memory.commit_preview":
-            artifacts = project.db.list_agent_artifacts(chapter_no=int(params["chapter_no"]), artifact_type="memory_patch_preview", limit=20)
-            artifact = next((item for item in artifacts if item["artifact_id"] == str(params["artifact_id"]) and item["status"] == "awaiting_commit"), None)
-            if artifact is None:
+            with project.db.connect() as connection:
+                row = connection.execute("SELECT * FROM agent_artifacts WHERE artifact_id=?", (str(params["artifact_id"]),)).fetchone()
+            if (not row or row["artifact_type"] != "memory_patch_preview" or row["chapter_no"] != int(params["chapter_no"])
+                    or row["status"] not in {"awaiting_commit", "committed"}):
                 raise ValueError("正史预览不存在或已经失效")
-            chapter = project.db.get_chapter(int(params["chapter_no"]))
-            if not chapter or int(chapter["version"]) != int(artifact["chapter_version"]):
-                raise ValueError("正文版本已经变化，请重新生成正史预览")
-            result = await self._engine(project.root).accept_chapter(project.root, int(params["chapter_no"]), _prepared_patch=MemoryPatch.model_validate(artifact["data"]))
-            project.db.set_agent_artifact_status(artifact["artifact_id"], "committed")
+            data = json.loads(row["data_json"])
+            binding = data.get("preview_binding", {})
+            if not isinstance(binding, dict) or not all(binding.get(key) for key in
+                    ("task_id", "snapshot_hash", "run_id", "content_hash", "review_patch_hash", "review_id")):
+                raise ValueError("这份旧预览缺少原任务快照或审查来源，请重新生成当前版本预览；没有用当前设置回填。")
+            task_db = StudioService(project).db
+            with task_db.connect() as connection:
+                linked = connection.execute("SELECT link.task_id,s.snapshot_hash FROM task_run_settings link "
+                    "JOIN task_settings_snapshots s ON s.task_id=link.task_id JOIN task_runs r ON r.run_id=link.run_id "
+                    "WHERE link.run_id=?", (binding["run_id"],)).fetchone()
+            if not linked or linked["task_id"] != binding["task_id"] or linked["snapshot_hash"] != binding["snapshot_hash"]:
+                raise ValueError("预览关联的原始任务配置已缺失或损坏，请重新预览；没有用当前设置替代。")
+            runtime = active_runtime.get()
+            commit_run_id = runtime.run_id if runtime and runtime.run_id != binding["run_id"] else f"preview-commit-{uuid.uuid4().hex}"
+            restored = (task_db.prepare_task_settings(binding["run_id"], novel_id=project.project_id,
+                workspace_root=project.root) if row["status"] == "committed" else
+                task_db.prepare_task_settings(commit_run_id, novel_id=project.project_id,
+                    resume_run_id=binding["run_id"], workspace_root=project.root))
+            if restored.task_id != binding["task_id"] or restored.snapshot_hash != binding["snapshot_hash"]:
+                raise ValueError("恢复的原预览配置身份不一致，请重新预览。")
+            with use_task_settings(restored):
+                engine = InkFlowEngine(create_provider(restored.settings), restored.settings)
+                result = await engine.accept_chapter(project.root, int(params["chapter_no"]),
+                    _prepared_patch=MemoryPatch.model_validate({key: value for key, value in data.items() if key != "preview_binding"}),
+                    _preview_artifact_id=str(row["artifact_id"]))
+            try:
+                task_db.finish_task(binding["run_id"],
+                    status="waiting_condition" if result.get("post_commit_status") == "waiting_condition" else "completed",
+                    summary="原预览正文与记忆已提交，复用原回执；附属收尾状态见结果。")
+            except Exception as exc:
+                result.setdefault("warnings", []).append(f"正史已提交，原预览任务显示状态待同步：{type(exc).__name__}：{exc}")
+                result["post_commit_status"] = "waiting_condition"
+            _acceptance_result_reply(result)
             return result
         if method == "preference.list":
             return {"preferences": project.db.list_preferences(active_only=bool(params.get("active_only", True)))}
@@ -1347,20 +1456,34 @@ class InkFlowAppService:
                 )
             return {"thread": thread, "message": message}
         if method == "collaboration.reply":
+            project.db.reconcile_collaboration_queue()
             thread = project.db.get_collaboration_thread(str(params["thread_id"]))
+            if thread["status"] == "resolved":
+                return {"thread": thread, "status": "completed", "reply": "这项议题已处理或已由当前版本替代，历史记录保留。"}
+            attempt_key = "collaboration_reply_attempts:" + thread["thread_id"]
+            with project_write_lock_sync(project.root):
+                attempts = int(project.db.get_metadata(attempt_key, int(thread["current_round"]) - 1))
+                if thread["status"] == "escalated" or attempts >= int(thread["max_rounds"]):
+                    thread = project.db.advance_collaboration_thread(thread["thread_id"], resolution=thread.get("resolution") or "定向核对机会已耗尽，请补充具体取舍或来源。")
+                    return {"thread": thread, "status": "waiting_user", "reply": thread.get("resolution") or "定向核对已达到两次上限。",
+                            "next_action": "请在对话中说明这项分歧的具体取舍或补充来源，再从原节点继续；不会重复调用角色。"}
             messages = project.db.list_collaboration_messages(limit=100)
             scoped = [item for item in messages if item["thread_id"] == thread["thread_id"]]
-            pending = next((item for item in scoped if item["status"] == "pending"), scoped[-1] if scoped else None)
-            if pending and int(pending.get("role_protocol_version") or 1) != 1:
-                raise ValueError("该协作议题属于新版角色协议；当前旧版回复入口不能调用专项角色。")
-            recipient = str(params.get("recipient_role") or (pending["recipient_role"] if pending else "writer"))
+            pending = next((item for item in scoped if item["status"] in {"pending", "responded"}), None)
+            if pending is None:
+                return {"thread": thread, "status": "waiting_condition", "reply": "此议题没有可定位的待答内容。",
+                        "next_action": "请在对话中点名原任务和具体问题；不会猜测角色或新增模型调用。"}
+            recipient = normalize_role(str(params.get("recipient_role") or pending["recipient_role"]))
             role_boundaries = {
                 "writer": "只回答规划、写作或修订问题，不审批，不提交正史。",
-                "reviewer": "只进行证据化审查，不直接修改正文。",
+                "editor": "只解释当前模式内的综合审查，不直接修改正文或提交正史。",
+                "reviewer": "只回答当前模式内的专项证据问题，不重复综合编辑、不写记忆补丁。",
+                "memory_keeper": "只核对有证据的记忆候选与归类，不批准正文或提交正史。",
                 "coordinator": "只澄清目标、依赖和分工，不写正文、不审批、不提交正史。",
             }
-            if recipient not in role_boundaries:
-                raise ValueError("只能向协调者、写作者或编辑者请求模型回复；记忆保存是引擎服务。")
+            scope = active_task_settings.get()
+            if scope is None or recipient not in roles_for_mode(scope.collaboration_mode):
+                raise ValueError("只能向当前任务模式已启用的角色请求回复，不能借协作议题扩权。")
             allowed_evidence = {str(ref) for item in scoped for ref in item.get("evidence_refs", [])}
             discussion_content = json.dumps({"thread": thread, "messages": scoped, "question": params.get("question", "")}, ensure_ascii=False)
             discussion_packet = ContextPacket(
@@ -1370,18 +1493,38 @@ class InkFlowAppService:
                 sections=[ContextSection(key="A", title="议题、版本与证据", content=discussion_content, source_ids=sorted(allowed_evidence), hard=True)],
                 estimated_tokens=estimate_tokens(discussion_content),
             )
-            result = await create_provider(Settings.from_env(project.root)).generate_json(
-                system_prompt=f"你是墨流的 {recipient}。{role_boundaries.get(recipient, '')} 最多两轮定向交流，不得自由群聊。",
-                user_prompt=discussion_packet.to_model_prompt(),
-                output_model=CollaborationReply,
-                max_tokens=2_000,
-                thinking=False,
-                agent_role=recipient,
-            )
+            with project_write_lock_sync(project.root):
+                attempts = int(project.db.get_metadata(attempt_key, int(thread["current_round"]) - 1))
+                if attempts >= int(thread["max_rounds"]):
+                    return {"thread": thread, "status": "waiting_user", "reply": "本议题核对机会已用完，已停止追加模型调用。"}
+                attempts += 1
+                project.db.set_metadata(attempt_key, attempts)
+                with project.db.connect() as connection:
+                    connection.execute("UPDATE collaboration_threads SET current_round=? WHERE thread_id=? AND status IN ('open','waiting')",
+                        (attempts, thread["thread_id"]))
+                    connection.commit()
+            try:
+                result = await create_provider(scope.settings).generate_json(
+                    system_prompt=f"你是墨流的 {recipient}。{role_boundaries.get(recipient, '')} 最多两轮定向交流，不得自由群聊。",
+                    user_prompt=discussion_packet.to_model_prompt(),
+                    output_model=CollaborationReply,
+                    max_tokens=2_000,
+                    thinking=False,
+                    agent_role=recipient,
+                )
+            except (Exception, asyncio.CancelledError):
+                if attempts >= int(thread["max_rounds"]):
+                    project.db.advance_collaboration_thread(thread["thread_id"], resolution="定向核对含中断已达到两次上限，当前记录保留，需先补充具体取舍或修复来源。")
+                raise
             evidence_refs = [ref for ref in result.data.evidence_refs if ref in allowed_evidence]
             if result.data.evidence_refs and len(evidence_refs) != len(result.data.evidence_refs):
                 raise ValueError("目标 Agent 引用了本议题 Context Packet 之外的证据，回复已拒绝")
             with project_write_lock_sync(project.root):
+                chapter = project.db.get_chapter(int(thread["chapter_no"])) if thread.get("chapter_no") else None
+                current = project.db.get_collaboration_thread(thread["thread_id"])
+                if current["status"] == "resolved" or (chapter and thread.get("chapter_version") is not None
+                        and chapter["version"] != thread["chapter_version"]):
+                    return {"thread": current, "status": "waiting_condition", "reply": "回复期间来源已变化，旧回复未写回。"}
                 response = project.db.append_collaboration_message(
                     thread_id=thread["thread_id"], run_id=thread["run_id"], sender_role=recipient,
                     recipient_role="coordinator", message_type="answer", claim=result.data.answer,
@@ -1404,9 +1547,10 @@ class InkFlowAppService:
         if method == "usage.overview":
             return _usage_overview(project, Settings.from_env(project.root))
         if method == "learning.settings.get":
-            return project.db.get_metadata("learning_settings", {"enabled": True, "allow_training_exports": False})
+            saved = project.db.get_metadata("learning_settings", {})
+            return {"enabled": saved.get("enabled", True) is not False}
         if method == "learning.settings.update":
-            value = {"enabled": bool(params.get("enabled", True)), "allow_training_exports": bool(params.get("allow_training_exports", False))}
+            value = {"enabled": bool(params.get("enabled", True))}
             with project_write_lock_sync(project.root):
                 project.db.set_metadata("learning_settings", value)
             return value
@@ -1420,12 +1564,6 @@ class InkFlowAppService:
                 return {"pair_id": project.db.save_preference_pair(str(params["chosen_artifact_id"]), str(params["rejected_artifact_id"]), dict(params.get("features") or {}))}
         if method == "learning.overview":
             return LearningService(project).overview()
-        if method == "learning.dataset.export":
-            with project_write_lock_sync(project.root):
-                return LearningService(project).export_dataset(include_prose=bool(params.get("include_prose", False)))
-        if method == "learning.preference.train":
-            with project_write_lock_sync(project.root):
-                return LearningService(project).train_preference_model()
         if method == "retrieval.feedback":
             with project_write_lock_sync(project.root):
                 return {
@@ -1443,7 +1581,7 @@ class InkFlowAppService:
             task_scope = active_task_settings.get()
             if requested_mode and (
                 task_scope is None
-                or (task_scope.role_protocol_version, task_scope.collaboration_mode) != requested_mode
+                or task_scope.collaboration_mode != requested_mode
             ):
                 raise InkFlowError("专项模式必须先绑定本次任务快照，不能临时切换。")
             message = str(params.get("message") or "").strip()
@@ -1476,8 +1614,9 @@ class InkFlowAppService:
         if method == "workflow.run":
             return await self._run_workflow(project, params, emit)
         if method == "reference.import":
-            with project_write_lock_sync(project.root):
+            def import_reference() -> dict:
                 return ReferenceService(project).import_text(str(params["source_path"]))
+            return await asyncio.to_thread(import_reference)
         if method == "reference.list":
             return ReferenceService(project).list_references()
         if method == "reference.search":
@@ -1488,13 +1627,13 @@ class InkFlowAppService:
             )
         if method == "reference.fetch":
             url = str(params["url"])
-            async with project_write_lock(project.root):
-                if "fanqienovel.com" in url:
-                    return await ReferenceService(project).fetch_fanqie_public(url)
-                return await ReferenceService(project).fetch_url(url)
+            if "fanqienovel.com" in url:
+                return await ReferenceService(project).fetch_fanqie_public(url)
+            return await ReferenceService(project).fetch_url(url)
         if method == "reference.analyze":
-            with project_write_lock_sync(project.root):
+            def analyze_reference() -> dict:
                 return ReferenceService(project).analyze(str(params["reference_id"]))
+            return await asyncio.to_thread(analyze_reference)
         if method == "task.dismiss":
             with project_write_lock_sync(project.root):
                 return studio.db.finish_task(str(params["task_id"]), status="dismissed")
@@ -1549,30 +1688,26 @@ class InkFlowAppService:
                 manifest = engine._load_batch_manifest(project, batch_id)
                 source_run = _batch_source_run(project, db, manifest)
                 status = str(manifest.get("status") or "unknown")
-                if status == "drafting":
+                repair_status = (manifest.get("last_repair") or {}).get("status")
+                if status == "waiting_suffix_review" or repair_status == "waiting_suffix_review":
+                    return {**engine._batch_result(project, manifest), "status": "waiting_user"}
+                if status in {"drafting", "repairing"}:
                     if not source_run or source_run.get("status") not in {"interrupted", "cancelled", "failed"}:
                         raise InkFlowError("批次仍显示写作中，且没有确认原任务已结束；请刷新状态，不要重复启动。")
                     manifest["status"] = "interrupted"
                     manifest["stop_reason"] = manifest.get("stop_reason") or "原写作进程已结束；保留已保存章节并从批次断点继续。"
                     engine._save_batch_manifest(project, manifest)
-                elif status not in {"failed", "interrupted"}:
+                elif status not in {"failed", "interrupted"} and not (
+                    status == "needs_revision" and repair_status in {"failed", "interrupted"}
+                ):
                     raise InkFlowError("该批次当前不是可续接状态；已保留现有章节，请先查看批次状态。")
                 if source_run and source_run.get("status") == "running":
                     raise InkFlowError("原批次仍有运行中的任务，未重复启动。请刷新任务状态后再决定。")
                 if not db.claim_batch_resume(batch_id, runtime.run_id):
                     raise InkFlowError("另一项任务已领取这个批次，或本次任务记录尚未就绪；没有重复启动。")
-            resumed_params = {
-                **params,
-                "action": "batch_draft",
-                "batch_id": batch_id,
-                "start_chapter_no": int(manifest["start_chapter_no"]),
-                "end_chapter_no": int(manifest["end_chapter_no"]),
-                "instruction": str(manifest.get("instruction") or ""),
-                "max_revision_rounds": int(manifest.get("max_revision_rounds", 2)),
-                "draft_only": True,
-            }
+            resumed_params = {**params, **_batch_resume_params(project, manifest, source_run)}
             return await self._run_workflow(project, resumed_params, emit)
-        if action in {"batch_draft", "batch_accept"}:
+        if action in {"batch_draft", "batch_accept", "batch_repair"}:
             async with engine.batch_operation_async(
                 project.root, action,
                 start_chapter_no=int(params["start_chapter_no"]) if params.get("start_chapter_no") is not None else None,
@@ -1594,7 +1729,7 @@ class InkFlowAppService:
         task_scope = active_task_settings.get()
         if requested_mode and (
             task_scope is None
-            or (task_scope.role_protocol_version, task_scope.collaboration_mode) != requested_mode
+            or task_scope.collaboration_mode != requested_mode
         ):
             raise InkFlowError("专项模式必须先绑定本次任务快照，不能临时切换。")
         settings = engine.settings
@@ -1612,6 +1747,7 @@ class InkFlowAppService:
                 else "batch_draft"
             ),
             "batch_accept": "batch_accept",
+            "batch_repair": "batch_repair",
             "arc_audit": "arc_audit",
             "checkpoint_create": "checkpoint_create",
             "checkpoint_list": "checkpoint_list",
@@ -1623,8 +1759,6 @@ class InkFlowAppService:
         dispatch_plan = None
         if workflow_action:
             task_scope = active_task_settings.get()
-            if task_scope and task_scope.role_protocol_version == 2 and workflow_action == "arc_audit":
-                raise InkFlowError("篇章复审尚未接入专项模式；请另起日常模式任务执行。")
             authorization_source = str(params.get("authorization_source") or "current_request")
             if authorization_source not in {
                 "none", "current_request", "per_chapter_click", "batch_preapproval", "settings_auto_accept"
@@ -1657,6 +1791,7 @@ class InkFlowAppService:
                     else None
                 ),
                 batch_id=str(params.get("batch_id") or "") or None,
+                batch_review_only=bool(params.get("review_only", False)),
                 max_revision_rounds=int(params.get("max_revision_rounds", 1)),
                 operation_instruction=str(params.get("instruction") or ""),
                 visible_reason=f"按用户当前操作执行{action}工作流。",
@@ -1664,7 +1799,6 @@ class InkFlowAppService:
             task_scope = active_task_settings.get()
             ticket, dispatch_plan = Coordinator(project).compile(
                 intent,
-                role_protocol_version=task_scope.role_protocol_version if task_scope else 1,
                 collaboration_mode=task_scope.collaboration_mode if task_scope else "everyday",
                 task_snapshot_hash=task_scope.snapshot_hash if task_scope else None,
             )
@@ -1748,27 +1882,20 @@ class InkFlowAppService:
             )
         elif action == "review":
             task_scope = active_task_settings.get()
-            specialist = task_scope is not None and task_scope.role_protocol_version == 2
             await emit(
                 {
-                    "type": "workflow.stage" if specialist else "reviewer.started",
-                    "stage": "review.mode" if specialist else "review.model",
-                    "role": "engine" if specialist else "reviewer",
+                    "type": "workflow.stage",
+                    "stage": "review.mode",
+                    "role": "engine",
                     "model": settings.model,
-                    "summary": (
-                        "引擎正在按本次任务模式执行当前版本的检查覆盖；检查完成前不会验收"
-                        if specialist else "Editor 正在审查当前草稿版本；不会直接修改正文"
-                    ),
+                    "summary": "引擎正在按本次任务模式执行当前版本的检查覆盖；检查完成前不会验收",
                 }
             )
-            if specialist:
-                result = await engine.review_chapter_mode(
-                    project.root, int(params["chapter_no"]),
-                    mode=task_scope.collaboration_mode,
-                    instruction=str(params.get("instruction") or ""),
-                )
-            else:
-                result = await engine.review_chapter(project.root, int(params["chapter_no"]))
+            result = await engine.review_chapter_mode(
+                project.root, int(params["chapter_no"]),
+                mode=task_scope.collaboration_mode if task_scope else "everyday",
+                instruction=str(params.get("instruction") or ""),
+            )
             if settings.acceptance_confirmation_mode == "auto_after_review" and result.get("verdict") == "pass":
                 acceptance = await engine.accept_chapter(project.root, int(params["chapter_no"]), force=False)
                 result = {
@@ -1817,6 +1944,15 @@ class InkFlowAppService:
                     "batch_draft": drafted,
                     "authorization_source": authorization_source,
                 }
+        elif action == "batch_repair":
+            result = await engine.repair_batch(
+                project.root, str(params["batch_id"]),
+                start_chapter_no=int(params["start_chapter_no"]) if params.get("start_chapter_no") is not None else None,
+                end_chapter_no=int(params["end_chapter_no"]) if params.get("end_chapter_no") is not None else None,
+                instruction=str(params.get("instruction") or ""),
+                max_additional_revision_rounds=int(params.get("max_revision_rounds", 1)),
+                review_only=bool(params.get("review_only", False)),
+            )
         elif action == "batch_accept":
             result = await engine.accept_batch(project.root, str(params["batch_id"]))
         elif action == "arc_audit":
@@ -1847,6 +1983,14 @@ class InkFlowAppService:
             result = engine.rollback_recover(project.root)
         else:
             raise ValueError(f"不支持的工作流动作：{action}")
+        if isinstance(result, dict):
+            acceptance = result.get("automatic_acceptance") or result
+            if isinstance(acceptance, dict):
+                _acceptance_result_reply(acceptance)
+                if acceptance is not result and acceptance.get("reply"):
+                    result["reply"] = acceptance["reply"]
+                    if acceptance.get("post_commit_status") == "waiting_condition":
+                        result["next_action"] = acceptance.get("next_action", "继续原任务，仅恢复未完成投影与本地收尾。")
         if isinstance(result, dict) and not workflow_failure_reason(result):
             recommendation = _workflow_next_step(action, result)
             if recommendation:
@@ -1862,7 +2006,7 @@ class InkFlowAppService:
         """Let Writer create a read-aloud aid without touching novel production data."""
 
         project = self._project(params)
-        settings = Settings.from_env(project.root)
+        settings = self._engine(project.root).settings
         intent = TerminalIntent(
             action="voice_clone_script",
             requested_outcome="生成本地声音克隆参考朗读稿",
@@ -1871,7 +2015,11 @@ class InkFlowAppService:
             acceptance_confirmation_mode=settings.acceptance_confirmation_mode,
             visible_reason="按用户当前点击生成仅用于本地声音克隆的朗读稿。",
         )
-        ticket, dispatch_plan = Coordinator(project).compile(intent)
+        scope = active_task_settings.get()
+        ticket, dispatch_plan = Coordinator(project).compile(
+            intent, collaboration_mode=scope.collaboration_mode if scope else "everyday",
+            task_snapshot_hash=scope.snapshot_hash if scope else None,
+        )
         await emit(
             {
                 "type": "voice.clone_script.started",
@@ -2005,7 +2153,8 @@ class InkFlowAppService:
         value = params.get("project_root")
         if not value:
             raise ValueError("请求缺少 project_root。")
-        return InkFlowProject(Path(str(value)).resolve())
+        # Engine mutations recover at their own entry; status polling must not replay recovery.
+        return InkFlowProject(Path(str(value)).resolve(), recover_on_open=False)
 
     @staticmethod
     def _try_project(root: str | Path | None) -> InkFlowProject | None:
@@ -2065,7 +2214,7 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
                 continue
             raw_role = str(metadata.get("agent_role") or "unknown")
             try:
-                role = normalize_role(raw_role, event.get("role_protocol_version", 1))
+                role = adapt_role(raw_role, legacy=event.get("role_protocol_version") == 1)
             except ValueError:
                 role = "unknown"
             bucket = by_agent_role.setdefault(role, empty_bucket())
@@ -2119,7 +2268,29 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
         ledger = UsageLedger()
         accounting = {"available": True, "project": ledger.summary(getattr(project, "project_id", "")),
                       "all_projects": ledger.summary()}
-        recent_deepseek_cache = ledger.recent_deepseek_cache(getattr(project, "project_id", ""))
+        qualified_task_products: dict[str, int] = {}
+        accepted_sources = {row["chapter_no"]: row for row in project.db.accepted_chapters()}
+        accepted_tasks: dict[int, set[str]] = {}
+        with project.db.connect() as connection:
+            receipts = connection.execute("SELECT key,value_json FROM metadata WHERE key LIKE 'workflow_accept:%'").fetchall()
+        for row in receipts:
+            try:
+                receipt = json.loads(row["value_json"])
+                number = int(receipt["chapter_no"])
+                current = accepted_sources.get(number)
+                task_id, suffix = row["key"][len("workflow_accept:"):].rsplit(":", 1)
+                if (not task_id or int(suffix) != number or not current
+                        or any(receipt.get(key) != current[key] for key in ("version", "content_hash", "path"))):
+                    continue
+                accepted_tasks.setdefault(number, set()).add(task_id)
+            except (KeyError, TypeError, ValueError):
+                continue
+        for task_ids in accepted_tasks.values():
+            if len(task_ids) == 1:
+                task_id = next(iter(task_ids))
+                qualified_task_products[task_id] = qualified_task_products.get(task_id, 0) + 1
+        recent_deepseek_cache = ledger.recent_deepseek_cache(getattr(project, "project_id", ""),
+            qualified_task_products=qualified_task_products)
     except (OSError, sqlite3.Error):
         accounting = {"available": False, "warning": "本地用量账本暂不可读，金额未知；不影响查看或编辑正文。"}
         recent_deepseek_cache = None
@@ -2201,7 +2372,7 @@ class JsonLineServer:
                                 status="pending", data={
                                     "message": message, "sequence": sequence,
                                     # Receipt is not permission to alter the
-                                    # active task. Its initial ticket is v1;
+                                    # active task. Its initial revision is 1;
                                     # only a later routed target change may
                                     # advance the applied task revision.
                                     "task_revision": 1, "proposed_task_revision": sequence + 1,
@@ -2496,6 +2667,8 @@ class JsonLineServer:
                         source_run = _batch_source_run(project, task_db, manifest)
                         if source_run:
                             resume_run_id = str(source_run["run_id"])
+                            if manifest.get("status") != "waiting_suffix_review":
+                                recorded_params.update(_batch_resume_params(project, manifest, source_run))
                             suggested_title = _follow_up_task_title("继续", str(source_run["title"]), manifest)
                         else:
                             capture_source = "legacy_recovery"
@@ -2532,11 +2705,7 @@ class JsonLineServer:
                             workspace_root=project.root,
                             capture_source=capture_source,
                             registered_now=True,
-                            **({
-                                "role_protocol_version": requested_mode[0],
-                                "collaboration_mode": requested_mode[1],
-                            } if requested_mode else ({"role_protocol_version": 1}
-                                if recorded_method not in {"conversation.send", "workflow.run", "document.revise_selection"} else {})),
+                            **({"collaboration_mode": requested_mode} if requested_mode else {}),
                         )
                         settings_token = active_task_settings.set(scope)
                         runtime.task_id = scope.task_id
@@ -2885,6 +3054,19 @@ def _short_provider_error(error: ProviderError) -> str:
     return "模型未能返回可解析方案，已切换为可编辑保底提案。"
 
 
+def _acceptance_result_reply(result: dict[str, Any]) -> None:
+    if result.get("status") != "accepted":
+        return
+    number = result.get("chapter_no", "")
+    if result.get("post_commit_status") == "waiting_condition" or result.get("projection_status") == "pending":
+        warnings = "；".join(str(value) for value in result.get("warnings", []) if value)
+        result["reply"] = (f"第 {number} 章正文与记忆已进入正史，投影或本地收尾等待恢复。"
+            + (f"原因：{warnings}。" if warnings else "请查看原接受任务的具体断点。")
+            + "继续原任务时只从未完成节点恢复，复用原提交回执，不重复接受正文或提交记忆。")
+    else:
+        result["reply"] = f"第 {number} 章正文与记忆已进入正史，文件投影及本地收尾已完成。"
+
+
 def _visible_result_summary(result: Any) -> str:
     if isinstance(result, dict) and result.get("unapplied_user_updates"):
         return f"本次阶段已结束，但有 {len(result['unapplied_user_updates'])} 条中途补充尚未应用；原话已保存供继续处理。"
@@ -2910,6 +3092,11 @@ def _visible_result_summary(result: Any) -> str:
 def _workflow_next_step(action: str, result: dict[str, Any]) -> dict[str, str] | None:
     """给桌面按钮触发的固定工作流也提供同一套用户可控引导。"""
 
+    acceptance = result.get("automatic_acceptance") or result
+    if (isinstance(acceptance, dict) and acceptance.get("status") == "accepted"
+            and (acceptance.get("post_commit_status") == "waiting_condition" or acceptance.get("projection_status") == "pending")):
+        return {"label": "恢复接受收尾", "reason": "正史与记忆已入库；按原任务断点恢复尚未完成的投影或本地收尾，不重复接受。",
+                "prompt": f"查看第 {acceptance.get('chapter_no', '')} 章接受收尾的绑定待处理事项，仅从原任务未完成节点恢复。"}
     if action == "review" and result.get("automatic_acceptance"):
         return {"label": "继续下一章", "reason": "本次审查已通过且当前设置已自动验收，可以继续安排下一章。", "prompt": "推荐下一章安排"}
     if action == "review":
@@ -2939,6 +3126,32 @@ def _workflow_next_step(action: str, result: dict[str, Any]) -> dict[str, str] |
     return {"label": label, "reason": reason, "prompt": prompt}
 
 
+def _batch_resume_params(project: InkFlowProject, manifest: dict[str, Any], source_run: dict[str, Any] | None) -> dict[str, Any]:
+    """Restore the recorded workflow rather than guessing it from a repair history."""
+    original = (source_run or {}).get("params") or {}
+    action = original.get("action") if (source_run or {}).get("method") == "workflow.run" else None
+    if action not in {"batch_draft", "batch_repair"}:
+        saved = next((item.get("intent") for item in project.pending_work()
+            if item["kind"] == "workflow" and item.get("run_id") == (source_run or {}).get("run_id")
+            and item.get("intent", {}).get("batch_id") == manifest["batch_id"]), None)
+        if saved and saved.get("action") in {"batch_draft", "batch_draft_accept", "batch_repair"}:
+            action = "batch_repair" if saved["action"] == "batch_repair" else "batch_draft"
+            original = {"start_chapter_no": saved.get("chapter_no"), "end_chapter_no": saved.get("end_chapter_no"),
+                        "instruction": saved.get("operation_instruction", ""), "review_only": saved.get("batch_review_only", False),
+                        "max_revision_rounds": saved.get("max_revision_rounds", 1)}
+    if action not in {"batch_draft", "batch_repair"}:
+        raise InkFlowError("无法核实批次原任务的动作和范围；请从原对话的绑定待办继续，未猜测改写或补审。")
+    repair = manifest.get("last_repair") or {}
+    fallback = repair.get("requested_chapter_range") if action == "batch_repair" else None
+    first, last = fallback if isinstance(fallback, list) and len(fallback) == 2 else (manifest["start_chapter_no"], manifest["end_chapter_no"])
+    return {"action": action, "batch_id": manifest["batch_id"],
+            "start_chapter_no": original.get("start_chapter_no") if original.get("start_chapter_no") is not None else first,
+            "end_chapter_no": original.get("end_chapter_no") if original.get("end_chapter_no") is not None else last,
+            "instruction": str(original.get("instruction", repair.get("instruction", "") if action == "batch_repair" else manifest.get("instruction", ""))),
+            "max_revision_rounds": int(original.get("max_revision_rounds", repair.get("max_additional_revision_rounds", 1) if action == "batch_repair" else manifest.get("max_revision_rounds", 2))),
+            "review_only": bool(original.get("review_only", False)), "draft_only": True}
+
+
 def _list_batch_summaries(project: InkFlowProject) -> list[dict[str, Any]]:
     """Read visible batch state for the desktop board; malformed files stay invisible."""
 
@@ -2952,39 +3165,35 @@ def _list_batch_summaries(project: InkFlowProject) -> list[dict[str, Any]]:
             value = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(value, dict) or not value.get("batch_id"):
                 continue
-            entries = value.get("chapters") if isinstance(value.get("chapters"), list) else []
-            status = str(value.get("status") or "unknown")
+            projected = InkFlowEngine._batch_result(project, value)
+            status = str(projected.get("status") or "unknown")
             source_run = _batch_source_run(project, db, value)
-            resumable = status in {"failed", "interrupted"}
-            if status == "drafting" and source_run and source_run.get("status") in {"interrupted", "cancelled", "failed"}:
+            repair_status = (value.get("last_repair") or {}).get("status")
+            resumable = status in {"failed", "interrupted"} or (
+                status == "needs_revision" and repair_status in {"failed", "interrupted"}
+            )
+            if repair_status == "waiting_suffix_review":
+                resumable = False
+            if status in {"drafting", "repairing"} and source_run and source_run.get("status") in {"interrupted", "cancelled", "failed"}:
                 status = "interrupted"
                 resumable = True
             if source_run and source_run.get("status") == "running":
                 resumable = False
-            result.append(
-                {
-                    "batch_id": str(value["batch_id"]),
-                    "status": status,
-                    "run_id": value.get("last_run_id"),
-                    "resume_available": resumable,
-                    "stop_reason": str(value.get("stop_reason") or ""),
-                    "stopped_at_chapter": value.get("stopped_at_chapter"),
-                    "start_chapter_no": value.get("start_chapter_no"),
-                    "end_chapter_no": value.get("end_chapter_no"),
-                    "chapters": [
-                        {
-                            "chapter_no": item.get("chapter_no"),
-                            "version": item.get("version"),
-                            "review_verdict": item.get("verdict"),
-                            "memory_status": item.get("memory_status"),
-                        }
-                        for item in entries
-                        if isinstance(item, dict)
-                    ],
-                    "updated_at": value.get("updated_at") or value.get("accepted_at") or "",
-                }
-            )
-        except (OSError, json.JSONDecodeError):
+            if resumable:
+                try:
+                    _batch_resume_params(project, value, source_run)
+                except (InkFlowError, ValueError, TypeError):
+                    resumable = False
+            result.append({
+                **projected,
+                "status": status,
+                "run_id": value.get("last_run_id"),
+                "resume_available": resumable,
+                "start_chapter_no": value.get("start_chapter_no"),
+                "end_chapter_no": value.get("end_chapter_no"),
+                "updated_at": value.get("updated_at") or value.get("accepted_at") or "",
+            })
+        except (OSError, ValueError, KeyError, TypeError, InkFlowError):
             continue
     return result
 
@@ -3087,13 +3296,14 @@ def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
     """只记录恢复任务所需的小参数，不复制正文、API Key 或模型输出。"""
 
     allowed_by_method = {
-        "conversation.send": {"message", "role_protocol_version", "collaboration_mode"},
+        "conversation.send": {"message", "collaboration_mode"},
         "workflow.run": {
             "action",
             "chapter_no",
             "start_chapter_no",
             "end_chapter_no",
             "draft_only",
+            "review_only",
             "start_chapter",
             "end_chapter",
             "instruction",
@@ -3102,7 +3312,6 @@ def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
             "label",
             "checkpoint_id",
             "boundary_chapter",
-            "role_protocol_version",
             "collaboration_mode",
         },
         "document.prefill": {"relative_path", "chapter_no", "cursor_offset", "length", "expected_hash"},
@@ -3110,6 +3319,11 @@ def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
         "chapter.review_panel": {"chapter_no", "dimensions"},
         "memory.preview": {"chapter_no", "user_accepted"},
         "manual_edits.review": {"job_id"},
+        "collaboration.reply": {"thread_id", "recipient_role", "question"},
+        "voice.clone_script.generate": set(),
+        "project.ideate": {"preferences", "fast"},
+        "prompt.optimize": {"prompt"},
+        "provider.test": {"model", "model_override"},
         "reference.fetch": {"url"},
         "reference.search": {"query", "limit"},
         "reference.analyze": {"reference_id"},
@@ -3130,6 +3344,8 @@ def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
 _TASK_SETTINGS_METHODS = frozenset({
     "conversation.send", "workflow.run", "document.revise_selection",
     "document.prefill", "chapter.writer_candidates", "chapter.review_panel", "memory.preview", "manual_edits.review",
+    "collaboration.reply", "voice.clone_script.generate", "reference.analyze",
+    "project.ideate", "prompt.optimize", "provider.test",
 })
 
 
@@ -3158,10 +3374,6 @@ def _error_payload(exc: Exception) -> dict[str, Any]:
         "actions": [{"id": "open_process", "label": "查看协作台最后阶段"}],
         "retryable": False,
     }
-    if isinstance(exc, ValidationQuotaExceeded):
-        payload.update(title="训练验证边界需要处理", impact="没有继续发送训练验证请求；日常写作和本地训练不受次数限制。",
-                       retryable=False, actions=[{"id": "open_learning", "label": "查看训练验证记录"}])
-        return payload
     if isinstance(exc, ProjectBusyError):
         payload.update(
             title="项目写入暂时繁忙",

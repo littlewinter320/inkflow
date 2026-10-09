@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 
 from .errors import ProjectError
 from .project import InkFlowProject
+from .project_lock import project_write_lock, project_write_lock_sync
 from .utils import atomic_write_json, atomic_write_text, content_hash, read_text_fallback, safe_filename, utc_now
 
 
@@ -27,8 +28,9 @@ class ReferenceService:
         text = read_text_fallback(source)
         reference_id = content_hash(text)[:16]
         destination = self.raw_dir / f"{reference_id}-{safe_filename(source.stem)}.txt"
-        atomic_write_text(destination, text)
-        self._update_manifest(reference_id, "local_file", str(source), destination)
+        with project_write_lock_sync(self.project.root):
+            atomic_write_text(destination, text)
+            self._update_manifest(reference_id, "local_file", str(source), destination)
         return {"reference_id": reference_id, "path": str(destination), "characters": len(text)}
 
     async def fetch_url(
@@ -56,14 +58,17 @@ class ReferenceService:
             raise ProjectError("网页正文过短，可能是动态空壳、登录页或错误页。")
         reference_id = content_hash(response.url.__str__() + text)[:16]
         destination = self.raw_dir / f"{reference_id}-{safe_filename(title)}.txt"
-        atomic_write_text(destination, text)
-        self._update_manifest(
-            reference_id,
-            source_type,
-            str(response.url),
-            destination,
-            source_metadata=source_metadata,
-        )
+        # Fetch and parse without holding the shared project write lock. Only
+        # the raw file and its manifest need a single coordinated publication.
+        async with project_write_lock(self.project.root):
+            atomic_write_text(destination, text)
+            self._update_manifest(
+                reference_id,
+                source_type,
+                str(response.url),
+                destination,
+                source_metadata=source_metadata,
+            )
         return {
             "reference_id": reference_id,
             "title": title,
@@ -198,6 +203,7 @@ class ReferenceService:
         feature = {
             "reference_id": reference_id,
             "source_file": matches[0].name,
+            "source_hash": content_hash(text),
             "analyzed_at": utc_now(),
             "characters": len(text),
             "paragraph_count": len(paragraphs),
@@ -215,7 +221,10 @@ class ReferenceService:
             "note": "MVP 确定性特征；后续可增加分层模型分析，不直接把全文送入写作上下文。",
         }
         path = self.feature_dir / f"{reference_id}.json"
-        atomic_write_json(path, feature)
+        with project_write_lock_sync(self.project.root):
+            if not matches[0].is_file() or content_hash(matches[0].read_text(encoding="utf-8")) != feature["source_hash"]:
+                raise ProjectError("参考原文在分析期间已变化，旧特征未发布；请从当前原文重新分析。")
+            atomic_write_json(path, feature)
         return feature
 
     def list_references(self) -> list[dict]:
@@ -267,7 +276,6 @@ class ReferenceService:
             "source": source,
             "stored_path": str(destination.relative_to(self.project.root)),
             "imported_at": utc_now(),
-            "training_allowed": False,
             "context_mode": "abstract_features_only",
         }
         if source_metadata:

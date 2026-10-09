@@ -11,19 +11,20 @@ import asyncio
 import difflib
 import json
 import re
+import sqlite3
 from uuid import uuid4
 from pathlib import Path
 from typing import Any
 
-from .errors import ValidationGateError
+from .errors import InkFlowError, ValidationGateError
 from .project import InkFlowProject, render_book_brief
 from .project_lock import project_write_lock, project_write_lock_sync
 from .schemas import (ArcPlan, ArcSummary, BookOutlineV2, BookPlan, ChapterCard,
                       PlanBundle, PlanningReviewV2, RollingPlanV2, VolumeCompass,
                       VolumeDetailV2, VolumePlan)
 from .trace import TraceRecorder
-from .task_settings import active_task_settings
-from .utils import atomic_write_text, content_hash, estimate_tokens, utc_now
+from .task_settings import active_task_settings, capture_task_settings, validate_task_settings_snapshot
+from .utils import SOURCE_RECOVERY_TOKEN_LIMIT, atomic_write_text, content_hash, estimate_tokens, utc_now
 
 
 _WRITER_SYSTEM = """你是墨流 Writer。依照任务指明的层级写小说规划，只输出要求的 JSON。
@@ -127,11 +128,11 @@ def _planning_thread_evidence(project: InkFlowProject, accepted: list[dict[str, 
         if not text:
             missing.append({"chapter_no": number, "reason": "已接受原文缺失或哈希不符"})
             continue
-        parts = [{"source_id": str(offset), "title": "", "body": text[offset:offset + 1400]}
+        parts = [{"source_id": str(offset), "title": "", "body": text[offset:offset + 5000]}
                  for offset in range(0, len(text), 1000)]
         ranking = retriever._bm25_ranking(query, parts)
         start = int(ranking[0][0]) if ranking else 0
-        excerpt = text[start:start + 1400]
+        excerpt = text[start:start + 5000]
         label = f"【第 {number} 章已接受原文；版本 {row['version']}；位置 {start}:{start + len(excerpt)}；哈希 {row['content_hash']}】\n"
         if spent + estimate_tokens(label + excerpt) > excerpt_limit:
             missing.append({"chapter_no": number, "reason": "补读上下文预算不足，未作为已读来源"})
@@ -207,6 +208,14 @@ def _render_window(value: RollingPlanV2) -> str:
     lines = [f"# 第 {value.anchor_chapter}～{value.chapters[-1].chapter_no} 章近期规划", "", "> 规划协议 v2；已接受的衔接章只读，以下未来章节尚不是正史。", "", f"## 第 {value.anchor_chapter} 章 · 已接受正文衔接", "", value.anchor_summary.strip(), ""]
     for chapter in value.chapters:
         lines += [f"## 第 {chapter.chapter_no} 章 · {chapter.title}", "", chapter.body.strip(), ""]
+        for field, label in (("time_location", "时地"), ("goal", "目标"), ("obstacle", "阻力"),
+                             ("decision", "选择"), ("consequence", "后果"), ("hook_question", "钩子")):
+            if getattr(chapter, field):
+                lines += [f"- {label}：{getattr(chapter, field)}"]
+        if chapter.scenes:
+            lines += ["- 场景：" + "；".join(chapter.scenes)]
+        if any((chapter.goal, chapter.scenes, chapter.hook_question, chapter.time_location)):
+            lines.append("")
     return "\n".join(lines).strip() + "\n"
 
 
@@ -227,9 +236,161 @@ def _cleanup_suggestions(project: InkFlowProject) -> list[dict[str, str]]:
     return suggestions
 
 
+def recover_planning_publication(project: InkFlowProject, *, user_retry: bool = False) -> str:
+    """Replay only a hash-bound, already authorized publication; never call a model."""
+    path = project.root / "planning/publication-recovery.json"
+    if not path.is_file():
+        return ""
+    journal: dict[str, Any] = {}
+    with project_write_lock_sync(project.root):
+        try:
+            journal = json.loads(_read(path))
+            if not isinstance(journal, dict):
+                journal = {}
+                raise ValueError("恢复记录不是有效对象")
+            if journal.get("status") == "completed":
+                return ""
+            if journal.get("attempts", 0) >= 2 and not user_retry:
+                return str(journal.get("last_error") or "规划恢复次数已用尽；修复后请明确继续原任务。")
+            journal.update(status="recovering", attempts=journal.get("attempts", 0) + 1, stage="source_preflight")
+            atomic_write_text(path, json.dumps(journal, ensure_ascii=False, indent=2))
+            payload = journal["payload"]
+            if not isinstance(payload, dict) or content_hash(json.dumps(payload, ensure_ascii=False, sort_keys=True)) != journal["payload_hash"]:
+                raise ValueError("恢复记录哈希不符")
+            validate_task_settings_snapshot(payload["snapshot"], novel_id=project.project_id)
+            if payload.get("snapshot_linked"):
+                from .studio import StudioService
+                with StudioService(project).db.connect() as connection:
+                    row = connection.execute("SELECT snapshot_json FROM task_settings_snapshots WHERE task_id=?",
+                                             (payload["snapshot"]["task_id"],)).fetchone()
+                if row is None or json.loads(row["snapshot_json"]) != payload["snapshot"]:
+                    raise ValueError("原任务配置快照缺失或变化")
+            # Preflight every source and target before making any recovery write.
+            for relative, value in payload["files"].items():
+                target = project.resolve_user_path(relative)
+                current = _read(target) if target.is_file() else None
+                if current not in (value["before"], value["after"]):
+                    raise ValueError(f"{relative} 在中断后另有修改，未覆盖")
+            for relative, digest in payload["sources"].items():
+                if content_hash(_read(project.resolve_user_path(relative, allow_internal=True))) != digest:
+                    raise ValueError(f"来源 {relative} 已变化，须定点重新审核")
+            accepted = [[row["chapter_no"], row["version"], row["content_hash"]]
+                        for row in project.db.accepted_chapters()]
+            if accepted != payload["accepted"]:
+                raise ValueError("已接受正史已变化，不能重放旧发布")
+            from .story_settings import StorySettingsService
+            from .preferences import preference_prompt
+            if (StorySettingsService(project).source_fingerprint() != payload["settings_source_hash"]
+                    or content_hash(preference_prompt(project.db)) != payload["preferences_hash"]):
+                raise ValueError("设定或偏好来源已变化，须定点重新审核")
+            bundle = PlanBundle.model_validate(payload["bundle"])
+            desired = bundle.model_dump(mode="json")
+            current_bundle = project.db.get_current_plan_bundle()
+            accepted_numbers = {row[0] for row in accepted}
+            db_ready = bool(current_bundle and current_bundle.model_dump(mode="json") == desired
+                            and all((existing := project.db.get_chapter_card(card.chapter_no)) == card.model_dump(mode="json")
+                                    or (card.chapter_no in accepted_numbers and existing is not None)
+                                    for card in bundle.current_arc.chapter_cards))
+            if not db_ready:
+                with project.db.connect() as connection:
+                    rows = [dict(row) for row in connection.execute("SELECT * FROM plans ORDER BY kind,plan_key")]
+                if rows != payload["old_plans"]:
+                    raise ValueError("数据库规划已被其他任务改变，未覆盖")
+            brief = project.db.get_brief().model_dump(mode="json")
+            if brief not in (payload["prior_brief"], payload["brief"]):
+                raise ValueError("书籍简报已被另一个任务修改，未覆盖")
+            def stage(name: str) -> None:
+                journal["stage"] = name
+                atomic_write_text(path, json.dumps(journal, ensure_ascii=False, indent=2))
+
+            for name, value in payload["files"].items():
+                if name == "planning/active-v2.json":
+                    continue
+                stage(name)
+                target = project.resolve_user_path(name)
+                current_text = _read(target) if target.is_file() else None
+                if current_text not in (value["before"], value["after"]):
+                    raise ValueError(f"{name} 在恢复期间被修改，未覆盖")
+                if current_text != value["after"]:
+                    atomic_write_text(target, value["after"])
+            stage("database.execution_projection")
+            if brief != payload["brief"]:
+                from .schemas import BookBrief
+                project.db.set_brief(BookBrief.model_validate(payload["brief"]))
+            if not db_ready:
+                project.db.save_plan_bundle(bundle, supersede_after_chapter=payload["manifest"]["accepted_anchor"])
+            stage("planning/active-v2.json")
+            for relative, digest in payload["sources"].items():
+                if content_hash(_read(project.resolve_user_path(relative, allow_internal=True))) != digest:
+                    raise ValueError(f"来源 {relative} 在恢复期间变化，尚未发布清单")
+            manifest_text = payload["files"]["planning/active-v2.json"]["after"]
+            manifest_path = project.resolve_user_path("planning/active-v2.json")
+            current_manifest_text = _read(manifest_path) if manifest_path.is_file() else None
+            if current_manifest_text not in (payload["files"]["planning/active-v2.json"]["before"], manifest_text):
+                raise ValueError("生效清单在恢复期间被修改，未覆盖")
+            if current_manifest_text != manifest_text:
+                atomic_write_text(manifest_path, manifest_text)
+            stage("publication.finalize")
+            from .manual_edits import ManualEditsService
+            manual = ManualEditsService(project)
+            if payload["focus"] != "chapter-window":
+                manual.reconcile_planning(payload["source_hashes"], payload["manifest"]["trace_id"])
+            for name in ("OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md", "BOOK.md"):
+                manual.note_engine_write(name, payload["files"][name]["after"])
+            pending = project.db.get_metadata("pending_planning_publication", {})
+            if isinstance(pending, dict) and pending.get("run_id") in {payload["approved_run_id"], payload["manifest"]["trace_id"]}:
+                project.db.set_metadata("pending_planning_publication", {})
+            journal.update(status="completed", last_error="", stage="completed")
+            audit_path = project.internal / "runs" / payload["manifest"]["trace_id"] / "publication-record.json"
+            atomic_write_text(audit_path, json.dumps(journal, ensure_ascii=False, indent=2))
+            # Keep startup reads small; the complete recovery record remains auditable in its run.
+            atomic_write_text(path, json.dumps({"status": "completed", "manifest": payload["manifest"],
+                "task_id": payload["snapshot"]["task_id"], "history_choice": payload["history_choice"],
+                "audit_record": str(audit_path.relative_to(project.root)), "payload_hash": journal["payload_hash"]},
+                ensure_ascii=False, indent=2))
+            for item in project.pending_work():
+                if item["kind"] == "planning_publication" and item["source"].get("run_id") == payload["manifest"]["trace_id"]:
+                    project.update_pending_work(item["id"], status="completed", resolution_run_id=payload["manifest"]["trace_id"])
+            project.planning_recovery_result = {"status": "planned", "trace_id": payload["manifest"]["trace_id"],
+                "revision_no": payload["manifest"]["revision_no"], "recovered": True,
+                "chapter_range": payload["manifest"]["chapter_window"],
+                "pending_history_choice": bool(payload["history_choice"])}
+            return ""
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, sqlite3.Error, InkFlowError) as exc:
+            message = f"规划发布未完成：步骤 {journal.get('stage', '恢复记录读取')}；{type(exc).__name__}：{exc}。"
+            journal.update(status="failed", last_error=message)
+            if journal.get("payload"):
+                try:
+                    atomic_write_text(path, json.dumps(journal, ensure_ascii=False, indent=2))
+                except OSError:
+                    pass  # The original durable journal still records the interrupted stage.
+            failed_payload = journal.get("payload")
+            failed_manifest = failed_payload.get("manifest") if isinstance(failed_payload, dict) else None
+            try:
+                project.record_pending_work(kind="planning_publication", reason=message,
+                    next_action="核对上述位置并修复文件、权限或来源；明确继续原任务后重核，再续接未完成步骤。",
+                    source={"run_id": failed_manifest.get("trace_id", "unknown") if isinstance(failed_manifest, dict) else "unknown"},
+                    status="failed")
+            except (sqlite3.Error, OSError):
+                pass  # Return the original cause even if diagnostic storage is also unavailable.
+            return message
+
+
 def load_active_planning(project: InkFlowProject, *, allow_document_edits: bool = False) -> tuple[dict[str, Any], BookOutlineV2, VolumeDetailV2, RollingPlanV2] | None:
     """Resolve the active v2 hierarchy by manifest and content, never by file age."""
     manifest_path = project.root / "planning" / "active-v2.json"
+    journal_path = project.root / "planning" / "publication-recovery.json"
+    if journal_path.is_file():
+        try:
+            journal = json.loads(_read(journal_path))
+            if not isinstance(journal, dict):
+                raise ValueError("恢复记录不是有效对象")
+        except (OSError, ValueError, TypeError) as exc:
+            raise PlanningNeedsAttention(f"规划恢复记录无法读取：{exc}", "请先恢复 planning/publication-recovery.json，再核对发布步骤。") from exc
+        if journal.get("status") != "completed":
+            raise PlanningNeedsAttention(
+                "规划发布仍有未完成恢复步骤：" + str(journal.get("last_error") or journal.get("stage")),
+                "修复提示中的文件或环境后继续原规划任务；不会使用半套规划写后章。")
     if not manifest_path.is_file():
         return None
     try:
@@ -259,11 +420,38 @@ def load_active_planning(project: InkFlowProject, *, allow_document_edits: bool 
                 or content_hash(_render_window(window)) != manifest["recent_plan_hash"]):
             raise ValueError("planning range changed")
         return manifest, outline, detail, window
-    except (OSError, KeyError, TypeError, ValueError) as exc:
+    except (OSError, KeyError, TypeError, ValueError, AttributeError) as exc:
+        reason = f"生效规划的来源版本不一致：{exc}。原规划和正文均未改。"
+        observed: dict[str, str | None] = {}
+        for name in ("planning/active-v2.json", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md"):
+            try:
+                observed[name] = content_hash(_read(project.root / name))
+            except (OSError, UnicodeError):
+                observed[name] = None
+        try:
+            project.record_pending_work(kind="planning_source", reason=reason,
+                next_action="核对具体来源文件，恢复版本一致后从受影响层继续；采用手改内容须重新审核。",
+                source={"manifest_hash": observed.pop("planning/active-v2.json"), "files": observed})
+        except (OSError, sqlite3.Error):
+            pass  # The original source failure must remain visible when diagnostics cannot be saved.
         raise PlanningNeedsAttention(
-            "生效规划的来源版本不一致；原规划和正文均未改。",
+            reason,
             "在规划工作区核对修改或缺失的来源文件，恢复版本一致后只从受影响层继续。",
         ) from exc
+
+
+def v2_chapter_card(item: Any, brief: Any) -> ChapterCard:
+    return ChapterCard(
+        chapter_no=item.chapter_no, title_working=item.title, pov=brief.protagonist,
+        time_location=item.time_location or item.body, function=item.body,
+        goal=item.goal or item.body, obstacle=item.obstacle or item.body,
+        decision=item.decision or item.body, consequence=item.consequence or item.body,
+        irreversible_delta=item.consequence or "不得撤销前章已发生事实；本章变化以近期规划原文为准",
+        scenes=item.scenes or [item.body], information_release="只使用角色有途径获得的信息",
+        hook_type="问题", hook_question=item.hook_question or item.body,
+        target_words=brief.target_chapter_words,
+        dependencies=[f"v2近期规划第{item.chapter_no}章", "已接受正史"],
+    )
 
 
 def v2_execution_bundle(project: InkFlowProject, manifest: dict[str, Any], outline: BookOutlineV2,
@@ -273,16 +461,7 @@ def v2_execution_bundle(project: InkFlowProject, manifest: dict[str, Any], outli
     direction = next(item for item in outline.volumes if item.volume_no == detail.volume_no)
     first, last = window.chapters[0].chapter_no, window.chapters[-1].chapter_no
     key = f"v2:{manifest['trace_id']}:{first}-{last}"
-    cards = [ChapterCard(
-        chapter_no=item.chapter_no, title_working=item.title, pov=brief.protagonist,
-        time_location="承接正史及生效近期规划", function=item.body,
-        goal="按本章近期规划推进", obstacle="以已发生事实和本章阻力为准",
-        decision="由人物行动决定", consequence="呈现选择带来的实际后果",
-        irreversible_delta="不得撤销前章已发生事实", scenes=[item.title],
-        information_release="只使用角色有途径获得的信息", hook_type="问题",
-        hook_question="本章选择会带来什么后果？", target_words=brief.target_chapter_words,
-        dependencies=[f"v2近期规划第{item.chapter_no}章", "已接受正史"],
-    ) for item in window.chapters]
+    cards = [v2_chapter_card(item, brief) for item in window.chapters]
     arc = ArcPlan(
         arc_id=key, volume_no=detail.volume_no, title=f"第{first}—{last}章执行视图",
         chapter_start=first, chapter_end=last, promise=direction.central_conflict,
@@ -326,7 +505,12 @@ def synchronize_v2_projection(project: InkFlowProject) -> bool:
         return False
     manifest, outline, detail, window = active
     current = project.db.get_current_plan_bundle()
-    if current is not None and current.current_arc.arc_id.startswith(f"v2:{manifest['trace_id']}:"):
+    expected = v2_execution_bundle(project, manifest, outline, detail, window)
+    accepted_numbers = {int(row["chapter_no"]) for row in project.db.accepted_chapters()}
+    if (current is not None and current.model_dump(mode="json") == expected.model_dump(mode="json")
+            and all((existing := project.db.get_chapter_card(card.chapter_no)) == card.model_dump(mode="json")
+                    or (card.chapter_no in accepted_numbers and existing is not None)
+                    for card in expected.current_arc.chapter_cards)):
         return False
     archive_id = f"{manifest['trace_id']}-db-sync"
     archive = project.root / "planning" / "history" / f"database-{archive_id}.json"
@@ -334,7 +518,7 @@ def synchronize_v2_projection(project: InkFlowProject) -> bool:
         rows = [dict(row) for row in connection.execute("SELECT * FROM plans")]
         metadata = [dict(row) for row in connection.execute("SELECT * FROM metadata")]
     atomic_write_text(archive, json.dumps({"plans": rows, "metadata": metadata}, ensure_ascii=False, indent=2))
-    project.db.save_plan_bundle(v2_execution_bundle(project, manifest, outline, detail, window),
+    project.db.save_plan_bundle(expected,
                                 supersede_after_chapter=window.anchor_chapter)
     if not manifest.get("revision_no"):
         atomic_write_text(project.root / "planning" / "active-v2.json",
@@ -569,14 +753,59 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
     if end <= anchor or not instruction.strip():
         raise ValidationGateError("请说清以哪一章正史为锚点、要规划到第几章，以及后续剧情方向。")
     project = InkFlowProject(root)
+    recovery_path = project.root / "planning/publication-recovery.json"
+    continuing = bool(re.search(r"继续|恢复|重试|断点|续修", instruction))
+    if (continuing or getattr(project, "planning_recovery_result", None)) and recovery_path.is_file():
+        try:
+            recovery = json.loads(_read(recovery_path))
+            if not isinstance(recovery, dict):
+                raise ValueError("恢复记录不是有效对象")
+            if recovery.get("status") == "completed":
+                audit = json.loads(_read(project.resolve_user_path(recovery["audit_record"], allow_internal=True)))
+                if (audit.get("status") != "completed" or audit["payload_hash"] != recovery["payload_hash"]
+                        or content_hash(json.dumps(audit["payload"], ensure_ascii=False, sort_keys=True)) != recovery["payload_hash"]
+                        or audit["payload"]["manifest"] != recovery["manifest"]
+                        or audit["payload"]["snapshot"]["task_id"] != recovery["task_id"]):
+                    raise ValueError("完成回执与原发布审计不一致")
+                recovery = audit
+            recovered_payload = recovery["payload"]
+            if (not isinstance(recovered_payload, dict) or not isinstance(recovered_payload.get("snapshot"), dict)
+                    or not isinstance(recovered_payload.get("manifest"), dict)
+                    or content_hash(json.dumps(recovered_payload, ensure_ascii=False, sort_keys=True)) != recovery["payload_hash"]):
+                raise ValueError("恢复记录哈希或来源身份不符")
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, InkFlowError) as exc:
+            raise PlanningNeedsAttention(f"规划恢复记录无法核验：{exc}",
+                                         "先恢复原任务的发布审计与回执，再继续；不会重新发布或递增修订号。") from exc
+        task_scope = active_task_settings.get()
+        same_task = bool(task_scope and recovered_payload.get("snapshot", {}).get("task_id") == task_scope.task_id)
+        if same_task and recovered_payload["snapshot"].get("snapshot_hash") != task_scope.snapshot_hash:
+            raise PlanningNeedsAttention("原发布任务的配置快照哈希不一致。",
+                                         "先恢复原任务配置；不会用当前设置重放已完成发布。")
+        if same_task and recovery.get("status") != "completed":
+            warning = recover_planning_publication(project, user_retry=True)
+            if warning:
+                raise PlanningNeedsAttention(warning, "请先修复列出的来源或环境，再继续原任务并核验。")
+        if (same_task and (getattr(project, "planning_recovery_result", None) or recovery.get("status") == "completed")
+                and recovered_payload.get("manifest", {}).get("chapter_window") == [anchor, end]):
+            manifest = recovered_payload["manifest"]
+            active = load_active_planning(project)
+            if active is None or active[0] != manifest:
+                raise PlanningNeedsAttention("原任务的发布结果已经被新版本替代。", "核对当前正式版，不能将旧结果当作本次任务完成。")
+            return {"status": "planned", "trace_id": manifest["trace_id"],
+                    "revision_no": manifest["revision_no"], "recovered": True,
+                    "chapter_range": manifest["chapter_window"],
+                    "pending_history_choice": recovered_payload["history_choice"]}
     # A formal revision may only advance from a valid active publication.
     load_active_planning(project, allow_document_edits=focus != "chapter-window")
+    active_start_hashes = {name: content_hash(_read(project.root / name))
+                           for name in ("BOOK.md", "PLAN.md", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md",
+                                        "planning/active-v2.json")}
     accepted = project.db.accepted_chapters()
     if not accepted or int(accepted[-1]["chapter_no"]) != anchor:
         raise ValidationGateError("规划起点必须是当前最后一章已接受正文；不会改写或跳过正史。")
     trace = TraceRecorder(project.root, "planning-v2", engine.settings.trace_level)
     scope = active_task_settings.get()
-    review_role = "reviewer" if scope and scope.collaboration_mode in {"review_boost", "deep", "full_specialist"} else "editor"
+    review_role = "reviewer" if scope and scope.collaboration_mode in {"review_boost", "full_specialist"} else "editor"
     book = _read(project.root / "BOOK.md")
     state = _read(project.root / "STATE.md")
     from .story_settings import StorySettingsService
@@ -592,15 +821,33 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             raise ValidationGateError(f"第 {item['chapter_no']} 章正史文件缺失或版本不符，暂不重设计剧情。")
         canon.append(content)
     cited_canon = []
-    cited_numbers = {int(number) for number in re.findall(r"第\s*(\d+)\s*章", instruction)}
-    for item in accepted[:-3]:
-        if int(item["chapter_no"]) not in cited_numbers:
+    from .context import named_prior_chapters
+    cited_order = named_prior_chapters(instruction, anchor + 1, set())
+    cited_numbers = set(cited_order)
+    accepted_by_number = {int(item["chapter_no"]): item for item in accepted}
+    recent_numbers = {int(item["chapter_no"]) for item in accepted[-3:]}
+    for number in cited_order:
+        item = accepted_by_number.get(number)
+        if item is None:
+            reason = f"本次规划点名的第 {number} 章没有已接受正文，缺少必要过去依据。"
+            project.record_pending_work(kind="context_source", reason=reason,
+                source={"chapter_no": number, "boundary_chapter": anchor}, run_id=trace.run_id,
+                next_action="确认点名章与已接受来源后从规划资料节点续接；不让 Writer 为缺资料改稿。",
+                status="waiting_condition")
+            raise ValidationGateError(reason)
+        if number in recent_numbers:
             continue
         content = _accepted_text(project, item)
         if not content:
-            raise ValidationGateError(f"第 {item['chapter_no']} 章正史文件缺失或版本不符，暂不重设计剧情。")
+            reason = f"规划点名的第 {number} 章正史文件缺失或版本不符。"
+            project.record_pending_work(kind="context_source", reason=reason,
+                source={"chapter_no": number, "version": item["version"],
+                        "source_hash": item["content_hash"], "boundary_chapter": anchor}, run_id=trace.run_id,
+                next_action="恢复点名来源后从规划资料节点续接；不重写正文或默默跳过该章。",
+                status="waiting_condition")
+            raise ValidationGateError(reason)
         cited_canon.append(f"【第 {item['chapter_no']} 章已接受正文】\n{content}")
-    summaries = "\n".join(f"第 {item['chapter_no']} 章：{item.get('summary') or item.get('title') or ''}" for item in accepted)
+    summaries = "\n".join(f"第 {item['chapter_no']} 章：{item.get('summary') or (project.db.rebuilt_chapter_summary(item['chapter_no']) or {}).get('chapter_summary') or item.get('title') or ''}" for item in accepted)
     stable_sources = f"【书籍设定】\n{book}\n【已接受章节摘要】\n{summaries}\n【时序化事实与伏笔】\n{state_context}\n【最近三章全文】\n" + "\n\n".join(canon)
     from .manual_edits import ManualEditsService
     manual_edits = ManualEditsService(project)
@@ -616,13 +863,23 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
     from .preferences import preference_prompt
     frozen_preferences = preference_prompt(project.db)
     stable_sources += frozen_preferences
-    protocol = scope.role_protocol_version if scope else 1
-    hard_limit = min(engine.settings.context_budget_for(role, protocol)[1] for role in ("writer", review_role))
+    hard_limit = min(engine.settings.context_budget_for(role)[1] for role in ("writer", review_role))
     base_tokens = estimate_tokens(stable_sources) + max(0, estimate_tokens(review_settings_context) - estimate_tokens(settings_context))
+    source_input_limit = max(0, hard_limit - engine.settings.max_output_tokens - 4096)
+    if base_tokens > source_input_limit:
+        named = [{"chapter_no": number, "version": accepted_by_number[number]["version"],
+                  "source_hash": accepted_by_number[number]["content_hash"]} for number in cited_order]
+        reason = (f"规划必要来源约 {base_tokens} token，超过当前角色输入余量 {source_input_limit}；"
+                  + ("点名旧章：" + "、".join(f"第{number}章" for number in cited_order) if cited_order else "必要正史与设定均保留。"))
+        project.record_pending_work(kind="context_source", reason=reason,
+            source={"required_chapters": named, "boundary_chapter": anchor}, run_id=trace.run_id,
+            next_action="缩小必要点名范围或提高当前角色上下文容量后，从规划资料节点续接；不静默删去指定来源。",
+            status="waiting_condition")
+        raise ValidationGateError(reason)
     thread_context, thread_evidence = await asyncio.to_thread(_planning_thread_evidence,
         project, accepted, anchor=anchor, end=end,
         included={int(item["chapter_no"]) for item in accepted[-3:]} | cited_numbers,
-        token_limit=max(0, min(8000, hard_limit - base_tokens
+        token_limit=max(0, min(SOURCE_RECOVERY_TOKEN_LIMIT, hard_limit - base_tokens
                                - engine.settings.max_output_tokens - 4096)))
     stable_sources += thread_context
     atomic_write_text(trace.run_dir / "thread-evidence.json", json.dumps(thread_evidence, ensure_ascii=False, indent=2))
@@ -631,9 +888,6 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                            "missing_sources": thread_evidence["missing_sources"],
                            "unselected_count": len(thread_evidence["unselected_thread_ids"])})
     frozen = content_hash(stable_sources)
-    active_start_hashes = {name: content_hash(_read(project.root / name))
-                           for name in ("BOOK.md", "PLAN.md", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md",
-                                        "planning/active-v2.json")}
     min_review_confidence = max(0.80, engine.settings.review_min_confidence)
     prior_runs = sorted(
         (path for path in (project.root / ".inkflow" / "runs").glob("*-planning-v2-*")
@@ -647,10 +901,25 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         instruction,
     ) or re.search(r"断点.{0,8}续修", instruction))
     previous_run: Path | None = None
+    previous_review_identity_matches = False
+    recheck_saved_dependencies = False
     active_outline: BookOutlineV2 | None = None
     active_detail: VolumeDetailV2 | None = None
     active_source_run: Path | None = None
+    preserved_candidates: dict[str, Any] = {}
+    preserved_outline: BookOutlineV2 | None = None
     new_window = False
+    if focus in {"volume-detail", "outline"}:
+        active = load_active_planning(project)
+        if active is None or end != active[3].chapters[-1].chapter_no or anchor != active[3].anchor_chapter:
+            raise PlanningNeedsAttention("单层规划修改的正式锚点或窗口已变化。",
+                                         "先核对现行规划与正史，再明确受影响范围；不会自动重生三层。")
+        preserved_outline = active[1]
+        preserved_candidates["chapter-window"] = active[3]
+        if focus == "volume-detail":
+            active_outline = active[1]
+        else:
+            preserved_candidates["volume-detail"] = active[2]
     if focus == "chapter-window":
         active = load_active_planning(project)
         new_window = bool(active and anchor == project.db.latest_accepted_chapter_no()
@@ -680,6 +949,9 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         raise ValidationGateError("请指出要修订的未来章节范围；已接受正文和其他规划不会被猜测改动。")
     requested_instruction = instruction
     resume_basis = {
+        "snapshot_hash": scope.snapshot_hash if scope else "",
+        "collaboration_mode": scope.collaboration_mode if scope else "",
+        "review_role": review_role,
         "canon_hash": frozen,
         "settings_source_hash": settings_fingerprint,
         "accepted_versions": [[item["chapter_no"], item["version"], item["content_hash"]]
@@ -688,8 +960,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         "end": end,
         "focus": focus or "",
         "focus_chapters": sorted(focus_chapters),
-        "active_manifest_hash": content_hash(_read(project.root / "planning" / "active-v2.json"))
-        if focus == "chapter-window" else "",
+        "active_manifest_hash": active_start_hashes["planning/active-v2.json"],
     }
     if approved_run_id:
         if Path(approved_run_id).name != approved_run_id:
@@ -701,7 +972,8 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 or json.loads(_read(approved_dir / "resume-base.json")) != resume_basis):
             raise ValidationGateError("待确认规划的来源、范围或生效版本已变化，不能直接采用旧候选。")
         for stage in ("outline", "volume-detail", "chapter-window"):
-            required = ("candidate.json",) if focus == "chapter-window" and stage != "chapter-window" else ("candidate.json", "review.json")
+            required = ("candidate.json",) if ((focus == "chapter-window" and stage != "chapter-window")
+                                              or (focus == "volume-detail" and stage == "outline")) else ("candidate.json", "review.json")
             for suffix in required:
                 name = f"{stage}-{suffix}"
                 content = _read(approved_dir / name)
@@ -716,16 +988,55 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         trace.record("planning.reviewed_candidate", "completed", "用户明确采用同来源已审核候选；不重复调用模型",
                      metadata={"source_run_id": approved_run_id})
     if resume_requested:
+        candidate_only_run: Path | None = None
+        source_changed_run: Path | None = None
+        nearby_saved_runs: list[str] = []
+        identity_fields = {"snapshot_hash", "collaboration_mode", "review_role"}
         for prior in prior_runs:
             try:
                 prior_basis = json.loads(_read(prior / "resume-base.json"))
             except (ValueError, TypeError):
                 continue
-            if (prior_basis == resume_basis
-                    and any((prior / f"{name}-candidate.json").is_file()
-                            for name in ("outline", "volume-detail", "chapter-window"))):
+            has_candidate = any((prior / f"{name}-candidate.json").is_file()
+                                for name in ("outline", "volume-detail", "chapter-window"))
+            same_range = isinstance(prior_basis, dict) and all(prior_basis.get(key) == resume_basis[key]
+                for key in ("anchor", "end", "focus", "focus_chapters"))
+            same_snapshot = bool(scope and isinstance(prior_basis, dict)
+                                 and prior_basis.get("snapshot_hash") == scope.snapshot_hash)
+            if has_candidate and same_range:
+                nearby_saved_runs.append(prior.name)
+            if prior_basis == resume_basis and has_candidate:
                 previous_run = prior
+                previous_review_identity_matches = True
                 break
+            if (candidate_only_run is None and has_candidate and same_snapshot and isinstance(prior_basis, dict)
+                    and {key: value for key, value in prior_basis.items() if key not in identity_fields}
+                    == {key: value for key, value in resume_basis.items() if key not in identity_fields}):
+                candidate_only_run = prior
+            if source_changed_run is None and has_candidate and same_snapshot and same_range:
+                source_changed_run = prior
+        if previous_run is None and candidate_only_run is not None:
+            previous_run = candidate_only_run
+            trace.record("planning.candidate-recheck", "completed",
+                "来源与范围相同，保留已生成候选；旧配置或审核责任缺失/变化，按本次角色定点补审，不重生成上游",
+                metadata={"source_run_id": previous_run.name, "review_role": review_role,
+                          "prior_review_reusable": False})
+        if previous_run is None and source_changed_run is not None:
+            previous_run = source_changed_run
+            recheck_saved_dependencies = True
+            trace.record("planning.source-recheck", "completed",
+                "同原任务与授权范围的候选保留；来源已变化，旧通过状态失效，先逐层定点核对，不重生成上游",
+                metadata={"source_run_id": previous_run.name, "snapshot_hash": scope.snapshot_hash,
+                          "prior_review_reusable": False})
+        if previous_run is None and nearby_saved_runs:
+            reason = "找到同范围保存候选，但无法核验它属于本任务原配置；未读取另次旧规划来替代，也未重做Writer上游。"
+            action = "先恢复原任务配置与候选来源身份，再从该规划层继续审核。"
+            atomic_write_text(trace.run_dir / "planning-checkpoint.json", json.dumps({
+                "status": "waiting_condition", "stage": "sources", "phase": "candidate_identity",
+                "reason": reason, "next_action": action, "candidate_run_ids": nearby_saved_runs,
+                "snapshot": scope.public_summary() if scope else None}, ensure_ascii=False, indent=2))
+            trace.finish(status="waiting_condition", summary=reason)
+            raise PlanningNeedsAttention(reason, action)
     atomic_write_text(trace.run_dir / "resume-base.json", json.dumps(resume_basis, ensure_ascii=False))
     # A short follow-up such as "continue the saved candidate" does not erase
     # the creative goal that started the task. Keep one immutable root intent
@@ -748,7 +1059,13 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                        f"【本次最新补充；如与原目标冲突，以本次为准】\n{instruction}")
         trace.record("planning.intent-resume", "completed", "续接时保留原创作目标，并让本次补充优先")
 
+    current_node = {"stage": "sources", "phase": "source_check"}
     def verify_canon() -> None:
+        for filename, original_hash in active_start_hashes.items():
+            if content_hash(_read(project.root / filename)) != original_hash:
+                raise PlanningNeedsAttention(
+                    f"{filename} 的来源版本在规划期间已变化；候选与返回结果保留，未发布旧候选。",
+                    f"先对照当前 {filename}，从 {current_node['stage']} 的受影响来源核对继续，不重放已完成写稿。")
         if story_settings.source_fingerprint() != settings_fingerprint:
             raise PlanningNeedsAttention("规划期间设定合集已变化，候选保留，未覆盖现行规划。",
                                          "对照当前设定及其证据，从受影响的规划层继续。")
@@ -780,6 +1097,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             )
 
     async def generate_and_review(stage: str, model_type: Any, source: str, task: str) -> Any:
+        current_node.update(stage=stage, phase="source_check")
         verify_canon()
         candidate_path = trace.run_dir / f"{stage}-candidate.json"
         review_path = trace.run_dir / f"{stage}-review.json"
@@ -790,7 +1108,10 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         feedback = ""
         previous_candidate = ""
         resumed_candidate = None
-        if previous_run is not None and not (focus == "chapter-window" and previous_run == active_source_run):
+        if stage in preserved_candidates:
+            resumed_candidate = preserved_candidates[stage]
+            previous_candidate = _stage_text(resumed_candidate)
+        if stage not in preserved_candidates and previous_run is not None and not (focus == "chapter-window" and previous_run == active_source_run):
             dependencies = ("outline",) if stage == "volume-detail" else (("outline", "volume-detail") if stage == "chapter-window" else ())
             matching_dependencies = all(
                 content_hash(_read(previous_run / f"{name}-candidate.json"))
@@ -798,7 +1119,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 for name in dependencies
             )
             prior_candidate = previous_run / f"{stage}-candidate.json"
-            if matching_dependencies and prior_candidate.is_file():
+            if (matching_dependencies or recheck_saved_dependencies) and prior_candidate.is_file():
                 try:
                     resumed_candidate = model_type.model_validate_json(_read(prior_candidate))
                     previous_candidate = _stage_text(resumed_candidate)
@@ -828,7 +1149,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             })
             previous_candidate = _stage_text(resumed_candidate)
             prior_review_path = previous_run / "chapter-window-review.json" if previous_run else None
-            if (not creative_revision and len(focus_chapters) == 1
+            if (previous_review_identity_matches and not creative_revision and len(focus_chapters) == 1
                     and prior_review_path is not None and prior_review_path.is_file()):
                 prior_review = PlanningReviewV2.model_validate_json(_read(prior_review_path))
                 focus_body = revised[next(iter(focus_chapters))].body
@@ -850,7 +1171,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                                  metadata={"exact_evidence": len(exact),
                                            "discarded_paraphrases": len(prior_review.evidence) - len(exact)})
                     return resumed_candidate
-        if stage == "chapter-window" and resumed_candidate is not None and creative_revision:
+        if stage == "chapter-window" and resumed_candidate is not None and creative_revision and stage not in preserved_candidates:
             # A new creative requirement invalidates review of the old text.
             # Preserve the saved candidate as context, then let Writer revise
             # before Editor judges the changed objective.
@@ -874,12 +1195,14 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                                if replan_window else "")
                 chapter_body_note = ("\n【逐章交稿长度】每章 body 至少200个汉字，后面的章节也要写全；"
                                      "交代具体场景、人物目标、阻力、选择、可见后果及承接下一章的钩子。"
-                                     "不要把后半窗口缩成提纲，也不要用重复记纸凑字数。"
+                                     "同时填写 time_location、goal、obstacle、decision、consequence、scenes、hook_question，"
+                                     "这些结构字段与 body 一致，写具体动作因果，不填通用口号。不要用重复记纸凑字数。"
                                      if stage == "chapter-window" else "")
                 focused_note = ("\n【定点返回】只返回第 " + "、".join(str(number) for number in sorted(focus_chapters))
                                 + " 章的章节卡；其他章节由程序从生效版保留，不要复写。"
                                 if stage == "chapter-window" and active_source_run is not None
                                 and len(focus_chapters) < end - anchor else "")
+                current_node.update(phase="writer")
                 writer = await engine.provider.generate_json(
                     system_prompt=_WRITER_SYSTEM,
                     user_prompt=f"{source}\n\n【用户最新授权】\n{instruction}\n\n【本层任务】\n{task}{replan_note}{chapter_body_note}{focused_note}{revision_context}",
@@ -888,6 +1211,9 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                     timeout_seconds=engine.settings.planning_timeout_seconds, agent_role="writer",
                 )
                 candidate = writer.data
+                atomic_write_text(trace.run_dir / f"{stage}-writer-return-{attempt + 1}.json", candidate.model_dump_json(indent=2))
+                trace.record_model(f"{stage}.writer.{attempt + 1}", writer, "Writer 返回隔离规划候选；尚未发布")
+                verify_canon()
                 if focus == "chapter-window" and stage == "chapter-window" and active_source_run is not None:
                     original = RollingPlanV2.model_validate_json(_read(active_source_run / "chapter-window-candidate.json"))
                     changed = {item.chapter_no: item for item in candidate.chapters}
@@ -900,20 +1226,20 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                                      for item in original.chapters],
                     })
                 previous_candidate = _stage_text(candidate)
-                trace.record_model(f"{stage}.writer.{attempt + 1}", writer, "Writer 生成隔离规划候选")
             atomic_write_text(candidate_path, candidate.model_dump_json(indent=2))
+            if stage == "chapter-window" and stage not in preserved_candidates and resumed_candidate is None:
+                if any(not all((item.goal, item.obstacle, item.decision, item.consequence, item.scenes))
+                       for item in candidate.chapters):
+                    feedback = "本次近期规划缺少具体目标、阻力、选择、后果或场景；请同次补齐结构字段，并与 body 一致。"
+                    if attempt == 2:
+                        raise PlanningNeedsAttention(feedback, "从当前近期规划候选补齐缺失细节，再审核；不重做上游。")
+                    continue
+            pattern_hint = _repeated_user_rejected_pattern(latest_instruction, candidate) if stage == "chapter-window" else ""
             if stage == "chapter-window" and replan_window:
                 pattern_issue = _repeated_user_rejected_pattern(latest_instruction, candidate)
                 if pattern_issue:
-                    trace.record(f"{stage}.user-constraint.{attempt + 1}", "requires_revision",
+                    trace.record(f"{stage}.user-constraint.{attempt + 1}", "needs_review",
                                  pattern_issue, metadata={"source": "explicit_user_request"})
-                    if attempt == 2:
-                        raise PlanningNeedsAttention(
-                            f"近期规划仍重复用户明确拒绝的行动结构；候选已保留，未覆盖生效规划。{pattern_issue}",
-                            "从近期规划这一层调整 Writer 的章节行动与后果；大纲、细纲和已接受正文不重做。",
-                        )
-                    feedback = f"【用户明确要求的结构未兑现】\n{pattern_issue}"
-                    continue
             source_for_review = (f"【用户当前要求】\n{instruction}\n【已接受锚点正文】\n{canon[-1]}\n"
                                  + ("【本次点名的已接受前章】\n" + "\n\n".join(cited_canon) + "\n" if cited_canon else "")
                                  + f"【时序化事实与伏笔】\n{state_context}\n"
@@ -938,7 +1264,13 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             quotes = "\n".join(f"- {item}" for item in quote_bank)
             review_prompt = (f"【来源】\n{source_for_review}\n\n【可逐字复制的来源短句，引用时不要带项目符号】\n{quotes}"
                              f"\n\n【用户要求】\n{instruction}\n\n【当前层任务】\n{task}\n\n【候选】\n{previous_candidate}")
+            if stage == "chapter-window":
+                review_prompt += ("\n【用户拒绝的重复与本窗口推进】按原话识别行动组合，包括不同措辞的同类行动；"
+                                  "比较起点与终点的目标、选择、关系、风险和实际后果。词频只能提供线索，"
+                                  "若有真实变化允许慢热和再次行动；若未覆盖明确要求，用问题章原句与用户原话定位，"
+                                  "说明最小重组范围。结构字段与 body 必须相容。\n窄规则线索：" + (pattern_hint or "无，仍按语义审核"))
             verify_canon()
+            current_node.update(phase="review")
             reviewer = await engine.provider.generate_json(
                 system_prompt=_EDITOR_SYSTEM,
                 user_prompt=review_prompt,
@@ -946,10 +1278,10 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 max_tokens=min(engine.settings.max_output_tokens, 8192),
                 timeout_seconds=engine.settings.planning_timeout_seconds, agent_role=review_role,
             )
-            verify_canon()
             review = reviewer.data
             atomic_write_text(review_path, review.model_dump_json(indent=2))
             trace.record_model(f"{stage}.editor.{attempt + 1}", reviewer, f"规划审核：{review.verdict}")
+            verify_canon()
             if review.verdict == "insufficient_context":
                 raise PlanningNeedsAttention(
                     f"{stage} 缺少审核所必需的来源；候选已保留。审核说明：{review.summary}",
@@ -1004,6 +1336,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                         for span in difflib.get_close_matches(item.source_excerpt, source_spans, n=2, cutoff=0.25)
                     ))
                     verify_canon()
+                    current_node.update(phase="review_evidence")
                     audit = await engine.provider.generate_json(
                         system_prompt=_EDITOR_SYSTEM,
                         user_prompt=(f"【来源】\n{source_for_review}\n\n【可逐字复制的来源短句，引用时不要带项目符号】\n{quotes}\n\n【用户要求】\n{instruction}\n\n【当前层任务】\n{task}"
@@ -1021,11 +1354,11 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                         max_tokens=min(engine.settings.max_output_tokens, 8192),
                         timeout_seconds=engine.settings.planning_timeout_seconds, agent_role=review_role,
                     )
-                    verify_canon()
                     review = audit.data
                     atomic_write_text(review_path, review.model_dump_json(indent=2))
                     trace.record_model(f"{stage}.editor-citation-repair.{attempt + 1}.{citation_attempt + 1}", audit,
                                        f"仅重核引用：{review.verdict}")
+                    verify_canon()
                     exact_evidence = [
                         item for item in review.evidence
                         if grounded_item(item)
@@ -1049,6 +1382,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                     and any(re.search(r"未(?:说明|交代|写明|明确)|可能|容易|建议|风险|模糊|已明确|已写|倒灌|缺少", item.finding)
                             for item in review.evidence)):
                 verify_canon()
+                current_node.update(phase="review_coexistence")
                 challenge = await engine.provider.generate_json(
                     system_prompt=_EDITOR_SYSTEM,
                     user_prompt=(review_prompt + "\n\n【同一审核的共存复核】\n" + review.model_dump_json()
@@ -1063,10 +1397,11 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                     max_tokens=min(engine.settings.max_output_tokens, 8192),
                     timeout_seconds=engine.settings.planning_timeout_seconds, agent_role=review_role,
                 )
-                verify_canon()
                 challenged = challenge.data
+                atomic_write_text(trace.run_dir / f"{stage}-coexistence-return-{attempt + 1}.json", challenged.model_dump_json(indent=2))
                 trace.record_model(f"{stage}.editor-coexistence.{attempt + 1}", challenge,
                                    f"复核同真性：{challenged.verdict}")
+                verify_canon()
                 challenged_evidence = [item for item in challenged.evidence
                                        if item.candidate_excerpt in candidate_text
                                        and item.source_excerpt in review_source]
@@ -1094,6 +1429,9 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 f"候选原句：{item.candidate_excerpt}\n对照原句：{item.source_excerpt}\n问题：{item.finding}"
                 for item in review.evidence
             )
+            if stage in preserved_candidates:
+                raise PlanningNeedsAttention(f"单层修改影响了下游 {stage}：{review.summary}\n{findings}",
+                    "已保留单层候选和当前正式版；请确认是否同时修订受影响下游，原请求不会自动扩大。")
             feedback = (f"【审核对整体推进的观察，仅下列逐字证据作为阻断依据】\n{review.summary}\n"
                         f"【已定位的需修问题】\n{findings}\n"
                         "只处理上面有原句依据的问题，并顺读前后章节确认因果；"
@@ -1108,27 +1446,25 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         )
 
     superseded_files: list[dict[str, str]] = []
-    async def publish(stage: str, filename: str, rendered: str, source_hash: str, stamp: str) -> None:
-        active = project.root / filename
-        previous = _read(active)
-        if previous and content_hash(previous) != content_hash(rendered):
-            history = project.root / "planning" / "history" / f"{stage}-{stamp}-{content_hash(previous)[:10]}.md"
-            atomic_write_text(history, previous)
-            superseded_files.append({"source": filename, "path": str(history.relative_to(project.root)),
-                                     "content_hash": content_hash(previous)})
-        atomic_write_text(active, rendered)
-        trace.record(f"{stage}.publish", "prepared", f"{stage} 已写入，等待整组三层提交", metadata={"path": filename, "source_hash": source_hash})
 
     try:
         outline_task = (f"重设计全书大纲约5000～25000字，必须有主线、背景设定、重要场景、人物变化、主要高潮、大致结局和连续的卷级方向。"
                         f"前 {anchor} 章已经发生，不得更改；后续卷数与总章数可随剧情合理调整。第一卷包含第1～{anchor}章，后续每卷至少10章。body 不写逐章计划。")
+        if focus == "outline" and preserved_outline is not None:
+            outline_task = ("只修改生效全书大纲，保留既有卷号与各卷起止章，不改正史；"
+                            "下游细纲和近期规划本轮只做必要相容性审核，不自动重写。\n生效大纲："
+                            + _stage_text(preserved_outline))
         if active_outline is not None:
             outline = active_outline
             atomic_write_text(trace.run_dir / "outline-candidate.json", outline.model_dump_json(indent=2))
             trace.record("outline.reuse", "completed", "沿用已生效大纲；本轮不重新生成")
         else:
             outline = await generate_and_review("outline", BookOutlineV2, stable_sources, outline_task)
-        if (active_outline is None and outline.volumes[0].chapter_end != anchor) or len(outline.volumes) < 2:
+        if (focus == "outline" and preserved_outline is not None
+                and [(v.volume_no, v.chapter_start, v.chapter_end) for v in outline.volumes]
+                != [(v.volume_no, v.chapter_start, v.chapter_end) for v in preserved_outline.volumes]):
+            raise PlanningNeedsAttention("单独大纲修改改变了卷边界，候选保留但未发布。", "请确认是否扩大为完整三层重设计。")
+        if (active_outline is None and focus != "outline" and outline.volumes[0].chapter_end != anchor) or len(outline.volumes) < 2:
             raise ValidationGateError("大纲没有保留已接受第一卷边界并规划后续卷；候选未发布。")
         outline_text = _render_outline(outline)
         volume = next((item for item in outline.volumes if item.chapter_start <= anchor + 1 <= item.chapter_end), None)
@@ -1164,6 +1500,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             return {"status": "unchanged", "revision_no": current_publication[0].get("revision_no", 1),
                     "next_action": "候选与当前正式版相同；修订号保持不变。"}
         publication_mode = scope.settings.planning_publication_mode if scope else engine.settings.planning_publication_mode
+        current_node.update(stage="publication", phase="confirmation" if publication_mode == "confirm_after_review" else "publish")
         if publication_mode == "confirm_after_review" and not approved_run_id:
             async with project_write_lock(project.root):
                 verify_canon()
@@ -1178,7 +1515,8 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                     "artifact_hashes": {f"{stage}-{suffix}": content_hash(_read(
                         trace.run_dir / f"{stage}-{suffix}"))
                         for stage in ("outline", "volume-detail", "chapter-window")
-                        for suffix in (("candidate.json",) if focus == "chapter-window" and stage != "chapter-window"
+                        for suffix in (("candidate.json",) if ((focus == "chapter-window" and stage != "chapter-window")
+                                                               or (focus == "volume-detail" and stage == "outline"))
                                        else ("candidate.json", "review.json"))},
                 })
             trace.finish(status="waiting_user", summary="三层候选审核通过，等待用户确认正式采用")
@@ -1227,87 +1565,80 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 "legacy_plan_status": "replaced_in_database",
             }
             stamp = manifest["published_at"].replace(":", "-")
-            targets = ["OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md", "BOOK.md",
-                       "planning/cleanup-suggestions.json", "planning/active-v2.json",
-                       f"planning/history/revision-{trace.run_id}.json"]
-            before = {name: ((project.root / name).is_file(), _read(project.root / name)) for name in targets}
+            # Stage the complete authorized write before the first mutation.
+            contents = {"OUTLINE.md": outline_text, "STORY_DETAIL.md": detail_text,
+                        "RECENT_PLAN.md": plan_text, "BOOK.md": revised_book if scale_matches == 1 else book}
+            for stage_name, name in (("outline", "OUTLINE.md"), ("volume-detail", "STORY_DETAIL.md"),
+                                     ("chapter-window", "RECENT_PLAN.md"), ("book-scale", "BOOK.md")):
+                previous = _read(project.root / name)
+                if previous and previous != contents[name]:
+                    history_name = f"planning/history/{stage_name}-{stamp}-{content_hash(previous)[:10]}.md"
+                    contents[history_name] = previous
+                    if name != "BOOK.md":
+                        superseded_files.append({"source": name, "path": history_name,
+                                                 "content_hash": content_hash(previous)})
             with project.db.connect() as connection:
-                old_plan_rows = [dict(row) for row in connection.execute("SELECT * FROM plans")]
+                old_plan_rows = [dict(row) for row in connection.execute("SELECT * FROM plans ORDER BY kind,plan_key")]
                 old_plan_metadata = [dict(row) for row in connection.execute("SELECT * FROM metadata")]
-            database_changed = False
-            try:
-                await publish("outline", "OUTLINE.md", outline_text, frozen, stamp)
-                await publish("volume-detail", "STORY_DETAIL.md", detail_text, content_hash(outline_text), stamp)
-                await publish("chapter-window", "RECENT_PLAN.md", plan_text, content_hash(outline_text + detail_text), stamp)
-                if scale_matches == 1:
-                    if revised_book != book:
-                        history_book = project.root / "planning" / "history" / f"book-scale-{stamp}-{content_hash(book)[:10]}.md"
-                        atomic_write_text(history_book, book)
-                        # BOOK.md is a setting/source document, not a disposable plan.
-                    atomic_write_text(project.root / "BOOK.md", revised_book)
-                if superseded_files or old_plan_rows:
-                    archive_path = project.root / "planning" / "history" / f"database-{trace.run_id}.json"
-                    atomic_write_text(archive_path, json.dumps({
-                        "plans": old_plan_rows, "metadata": old_plan_metadata,
-                    }, ensure_ascii=False, indent=2))
-                    superseded_files.append({"source": "旧版数据库规划", "path": str(archive_path.relative_to(project.root)),
-                                             "content_hash": content_hash(_read(archive_path))})
-                cleanup = _cleanup_suggestions(project)
-                atomic_write_text(project.root / "planning" / "cleanup-suggestions.json",
-                                  json.dumps({"generated_at": utc_now(), "candidates": cleanup}, ensure_ascii=False, indent=2))
-                project.db.set_brief(revised_brief)
-                project.db.save_plan_bundle(v2_execution_bundle(project, manifest, outline, detail, plan),
-                                            supersede_after_chapter=anchor)
-                database_changed = True
-                if superseded_files:
-                    atomic_write_text(project.root / f"planning/history/revision-{trace.run_id}.json",
-                                      json.dumps({"run_id": trace.run_id, "revision_no": manifest["revision_no"] - 1,
-                                                  "superseded_by_revision": manifest["revision_no"],
-                                                  "previous_run_id": previous_manifest.get("trace_id"),
-                                                  "previous_manifest": previous_manifest,
-                                                  "created_at": manifest["published_at"], "status": "pending",
-                                                  "files": superseded_files}, ensure_ascii=False, indent=2))
-                # The manifest is written last: absent or mismatched hashes mean
-                # that a crashed publication must not be treated as active.
-                atomic_write_text(project.root / "planning" / "active-v2.json",
-                                  json.dumps(manifest, ensure_ascii=False, indent=2))
-                project.db.set_metadata("pending_planning_publication", {})
-                from .manual_edits import ManualEditsService
-                manual_edits = ManualEditsService(project)
-                if focus != "chapter-window":
-                    manual_edits.reconcile_planning(active_start_hashes, trace.run_id)
-                for name, text in (("OUTLINE.md", outline_text), ("STORY_DETAIL.md", detail_text),
-                                   ("RECENT_PLAN.md", plan_text)):
-                    manual_edits.note_engine_write(name, text)
-                if scale_matches == 1:
-                    manual_edits.note_engine_write("BOOK.md", revised_book)
-                trace.record("planning-v2.publish", "completed", "三层规划与规模设置已整组生效",
-                             metadata={"manifest": "planning/active-v2.json", "outline_hash": manifest["outline_hash"]})
-            except Exception:
-                if database_changed:
-                    with project.db.connect() as connection:
-                        connection.execute("BEGIN IMMEDIATE")
-                        connection.execute("DELETE FROM plans")
-                        connection.executemany(
-                            "INSERT INTO plans(kind,plan_key,parent_key,version,status,data_json,updated_at) "
-                            "VALUES (:kind,:plan_key,:parent_key,:version,:status,:data_json,:updated_at)",
-                            old_plan_rows,
-                        )
-                        connection.execute("DELETE FROM metadata")
-                        connection.executemany(
-                            "INSERT INTO metadata(key,value_json,updated_at) VALUES (:key,:value_json,:updated_at)",
-                            old_plan_metadata,
-                        )
-                        connection.commit()
-                for name, (existed, old_content) in before.items():
-                    path = project.root / name
-                    if existed:
-                        atomic_write_text(path, old_content)
-                    elif path.is_file():
-                        path.unlink()
-                project.db.set_brief(prior_brief)
-                trace.record("planning-v2.publish", "rolled_back", "整组发布遇错，已恢复原生效文件与规模设置")
-                raise
+            if superseded_files or old_plan_rows:
+                archive_name = f"planning/history/database-{trace.run_id}.json"
+                contents[archive_name] = json.dumps({"plans": old_plan_rows, "metadata": old_plan_metadata},
+                                                   ensure_ascii=False, indent=2)
+                superseded_files.append({"source": "旧版数据库规划", "path": archive_name,
+                                         "content_hash": content_hash(contents[archive_name])})
+            cleanup = _cleanup_suggestions(project)
+            contents["planning/cleanup-suggestions.json"] = json.dumps(
+                {"generated_at": utc_now(), "candidates": cleanup}, ensure_ascii=False, indent=2)
+            if superseded_files:
+                contents[f"planning/history/revision-{trace.run_id}.json"] = json.dumps({
+                    "run_id": trace.run_id, "revision_no": manifest["revision_no"] - 1,
+                    "superseded_by_revision": manifest["revision_no"],
+                    "previous_run_id": previous_manifest.get("trace_id"), "previous_manifest": previous_manifest,
+                    "created_at": manifest["published_at"], "status": "pending", "files": superseded_files,
+                }, ensure_ascii=False, indent=2)
+            contents["planning/active-v2.json"] = json.dumps(manifest, ensure_ascii=False, indent=2)
+            if scope:
+                from .studio import StudioService
+                with StudioService(project).db.connect() as connection:
+                    row = connection.execute("SELECT snapshot_json FROM task_settings_snapshots WHERE task_id=?",
+                                             (scope.task_id,)).fetchone()
+                if row is None:
+                    raise ValidationGateError("发布所关联的原任务配置快照缺失，未开始写入。")
+                snapshot = json.loads(row["snapshot_json"])
+                if snapshot["snapshot_hash"] != scope.snapshot_hash:
+                    raise ValidationGateError("发布的原任务配置哈希不一致，未开始写入。")
+            else:
+                snapshot = capture_task_settings(engine.settings, novel_id=project.project_id, task_id=trace.run_id)
+            payload = {
+                "snapshot": snapshot, "snapshot_linked": scope is not None, "manifest": manifest,
+                "files": {name: {"before": _read(project.root / name) if (project.root / name).is_file() else None,
+                                 "after": text} for name, text in contents.items()},
+                "sources": {**{name: active_start_hashes[name] for name in ("PLAN.md", "STATE.md")
+                               if name in active_start_hashes}, "STATE.md": content_hash(state),
+                            **{row["path"]: row["content_hash"] for row in accepted},
+                            **{str(path.relative_to(project.root)): content_hash(_read(path))
+                               for path in trace.run_dir.glob("*-candidate.json")},
+                            **{str(path.relative_to(project.root)): content_hash(_read(path))
+                               for path in trace.run_dir.glob("*-review.json")}},
+                "accepted": [[row["chapter_no"], row["version"], row["content_hash"]] for row in accepted],
+                "settings_source_hash": settings_fingerprint, "preferences_hash": content_hash(frozen_preferences),
+                "bundle": v2_execution_bundle(project, manifest, outline, detail, plan).model_dump(mode="json"),
+                "old_plans": old_plan_rows, "prior_brief": prior_brief.model_dump(mode="json"),
+                "brief": revised_brief.model_dump(mode="json"), "source_hashes": active_start_hashes,
+                "focus": focus, "approved_run_id": approved_run_id, "history_choice": bool(superseded_files),
+            }
+            recovery_record = {"status": "prepared", "attempts": 0, "stage": "prepared", "payload": payload,
+                               "payload_hash": content_hash(json.dumps(payload, ensure_ascii=False, sort_keys=True))}
+            atomic_write_text(project.root / "planning/publication-recovery.json",
+                              json.dumps(recovery_record, ensure_ascii=False, indent=2))
+            warning = recover_planning_publication(project)
+            if warning:
+                trace.record("planning-v2.publish", "recovering", "首次发布失败，定位后在原节点重试", warning)
+                warning = recover_planning_publication(project)
+            if warning:
+                raise PlanningNeedsAttention(warning, "修复报告中的具体位置后继续原规划任务；原候选与审核保留。")
+            trace.record("planning-v2.publish", "completed", "三层文件与执行投影核验一致，整组生效",
+                         metadata={"manifest": "planning/active-v2.json", "outline_hash": manifest["outline_hash"]})
         trace.finish(summary=f"大纲、卷细纲和第 {anchor}～{end} 章规划完成")
         return {"status": "planned", "chapter_range": [anchor, end], "future_range": [anchor + 1, end],
                 "revision_no": manifest["revision_no"],
@@ -1321,7 +1652,16 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         trace.finish(status="cancelled", summary="规划已停止，现有正史不变")
         raise
     except PlanningNeedsAttention as exc:
-        trace.record("planning-v2", "waiting_condition", "候选和上游成果已保留，等待定点处理", str(exc))
+        exc.next_action += (f" 当前断点：{current_node['stage']} / {current_node['phase']}；"
+                            f"来源与保留成果见 {trace.run_dir / 'planning-checkpoint.json'}。")
+        checkpoint = {"status": "waiting_condition", **current_node,
+            "reason": str(exc), "next_action": exc.next_action, "candidate_run_id": trace.run_id,
+            "snapshot": scope.public_summary() if scope else None,
+            "source_basis_path": str(trace.run_dir / "resume-base.json"),
+            "preserved_outputs": [str(path) for path in trace.run_dir.glob("*.json")
+                if "candidate" in path.name or "review" in path.name or "return" in path.name]}
+        atomic_write_text(trace.run_dir / "planning-checkpoint.json", json.dumps(checkpoint, ensure_ascii=False, indent=2))
+        trace.record("planning-v2", "waiting_condition", "候选和上游成果已保留，等待定点处理", str(exc), metadata=checkpoint)
         trace.finish(status="waiting_condition", summary=str(exc))
         raise
     except Exception as exc:
