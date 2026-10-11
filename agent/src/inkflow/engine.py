@@ -45,7 +45,7 @@ from .prompts import (
     WRITER_NOTE_CLARIFICATION_SYSTEM,
     VOICE_CLONE_SCRIPT_WRITER_SYSTEM,
 )
-from .provider import JsonModelProvider, create_provider
+from .provider import JsonModelProvider, create_provider, _json_system_prompt
 from .render import render_memory_conflict, render_plan, render_review
 from .retrieval import HybridRetriever
 from .review_rubric import EVIDENCE_POLICY_VERSION, GRADE_CREDIT, SCORING_VERSION, UNRESOLVED_RELATIONS, WEIGHTS, anchored_comparisons, score_review
@@ -214,6 +214,25 @@ class InkFlowEngine:
             actor=normalize_role(role),
             output_reserve_tokens=self.settings.effective_output_tokens(output_reserve, role),
         )
+
+    def _fit_review_prompt(self, project: InkFlowProject, packet: ContextPacket, *,
+                           system_prompt: str, tail: str, output_model: type, role: str) -> tuple[str, list[str]]:
+        system = _json_system_prompt(system_prompt, output_model)
+        reserve = self.settings.effective_output_tokens(8_000, role)
+        _, hard_limit = self.settings.context_budget_for(role)
+        def input_tokens(prompt: str) -> int:
+            return estimate_tokens(json.dumps([{"role": "system", "content": system},
+                {"role": "user", "content": prompt}], ensure_ascii=False))
+        prompt = packet.to_model_prompt() + tail
+        compressed = []
+        if input_tokens(prompt) + reserve > hard_limit:
+            compressed = self._context_builder(project, role)._shrink_soft_sections(
+                packet, protected_input=system + tail)
+            prompt = packet.to_model_prompt() + tail
+        if input_tokens(prompt) + reserve > hard_limit:
+            raise ValidationGateError(f"{role}完整JSON请求与报告预留超过当前{hard_limit:,} tokens上下文；"
+                "正文与必要来源保留，请缩小资料范围后从本节点继续。")
+        return prompt, compressed
 
     @staticmethod
     def _writer_skills(packet: ContextPacket, *built_in: str) -> list[str]:
@@ -3445,6 +3464,12 @@ class InkFlowEngine:
                     "新人物、新事件不必已在正史出现；同姓或职业差异不是身份同一的证明。"
                     "被语义核验判为 not_blocking 的指控，若无新的双方证据，不再当作必需项失败。"
                 )
+                user_prompt, compressed = self._fit_review_prompt(project, packet,
+                    system_prompt=systems[role], tail=user_prompt[len(packet.to_model_prompt()):],
+                    output_model=ModeCheckOutput, role=role)
+                if compressed:
+                    trace.record("review.context.compress", "completed", "为完整报告预留额度，仅压缩软资料",
+                        metadata={"role": role, "sections": compressed})
                 call_key = content_hash(json_dumps({
                     "role": role, "mode": mode, "checks": checks, "source": source_fingerprint,
                     "snapshot": scope.snapshot_hash, "system": systems[role], "prompt": user_prompt,
@@ -3980,7 +4005,8 @@ class InkFlowEngine:
             recovery["writer_note_clarification"] = clarification
         # Only the assigned role is rerun. This is a repair call, not a second
         # complete multi-agent debate, and uses the ordinary runtime budget.
-        repair_prompt = packet.to_model_prompt()
+        repair_prefix = packet.to_model_prompt()
+        repair_prompt = repair_prefix
         if not any(section.key == "E" and section.content == content for section in packet.sections):
             repair_prompt += "\n\n# 当前完整正文\n" + content
         repair_prompt += "\n\n# 本次职责和权限（继续保持）\n" + role_instruction
@@ -4045,14 +4071,20 @@ class InkFlowEngine:
             + "\n优先在source_evidence、chapter_evidence、goal_evidence、change_evidence及事实evidence中填写对应@quote:编号，"
               "只选语义支持且source_id一致的片段；也可逐字摘录其他已读原文，不能填概述。"
             + ("当前角色负责记忆，memory_patch必须完整返回并修正候选引文，不能遗漏原有效交接。" if memory_required else ""))
-        if estimate_tokens(system_prompt + repair_prompt) + min(8_000, self.settings.max_output_tokens) > hard_limit:
-            recovery["status"] = "context_budget_exhausted"
+        output_reserve = self.settings.effective_output_tokens(8_000, agent_role)
+        try:
+            repair_prompt, compressed = self._fit_review_prompt(project, packet,
+                system_prompt=system_prompt, tail=repair_prompt[len(repair_prefix):],
+                output_model=type(output), role=agent_role)
+            recovery["compressed_sections"] = compressed
+        except ValidationGateError as exc:
+            recovery.update(status="context_budget_exhausted", error=str(exc))
             atomic_write_text(trace_path, json_dumps(recovery))
             return output.model_copy(update={"verdict": "unknown"}), packet, recovery
         try:
             result = await self.provider.generate_json(
                 system_prompt=system_prompt, user_prompt=repair_prompt,
-                output_model=type(output), effort="low", max_tokens=min(8_000, self.settings.max_output_tokens),
+                output_model=type(output), effort="low", max_tokens=output_reserve,
                 timeout_seconds=120, thinking=False, agent_role=agent_role,
             )
         except (RunBudgetExceeded, ValidationGateError):

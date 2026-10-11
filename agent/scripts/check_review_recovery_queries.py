@@ -40,6 +40,23 @@ def check():
             requested=output.model_copy(update={"source_queries":["灯火 来源"]})
             asyncio.run(run(requested))
             search.assert_called_once()
+            original_packet=packet.model_copy(deep=True)
+            packet.sections.append(ContextSection(key="F",title="低优先级参考",content="无关参考。"*9000,hard=False))
+            engine.settings.context_hard_tokens=30_000
+            engine.settings.context_soft_tokens=25_000
+            provider.generate_json.reset_mock()
+            _, compressed, record=asyncio.run(run(output))
+            assert "低优先级参考" in record["compressed_sections"]
+            assert compressed.sections[0].content==original_packet.sections[0].content
+            assert len(next(section.content for section in compressed.sections if section.key=="F"))<=10_000
+            assert provider.generate_json.call_args.kwargs["max_tokens"]==8_000
+            engine.settings.context_hard_tokens=1_000
+            provider.generate_json.reset_mock()
+            _,_,record=asyncio.run(run(output))
+            assert record["status"]=="context_budget_exhausted"
+            provider.generate_json.assert_not_called()
+            engine.settings=Settings()
+            packet=original_packet
         print("Review recovery query checks passed: loaded-packet attribution skips unrelated canon search; explicit source gaps search once; unknown gates remain.")
         notes={"chapter_version":1,"hook_note":{"annotations":[]}}
         failed={"artifact_id":"original","status":"current","data":{"status":"failed","source_hash":"body",

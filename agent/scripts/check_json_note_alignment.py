@@ -4,7 +4,7 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 from pydantic import ValidationError
-from inkflow.provider import _model_from_json_content
+from inkflow.provider import _model_from_json_content, _json_system_prompt, _generation_schema
 from inkflow.schemas import DraftOutput, WriterNoteClarification
 from inkflow.writer_notes import align_annotation_quotes, annotation_gaps, version_notes
 from inkflow.errors import ProviderError
@@ -51,7 +51,7 @@ def check():
         and ast.unparse(node.test)=="choice.get('finish_reason') == 'length'")
     wrapper=ast.parse("def cap(choice,requested_max_tokens):\n pass").body[0]
     wrapper.body=[branch]
-    namespace={"ProviderError":ProviderError}
+    namespace={"ProviderError":ProviderError,"payload":{"thinking":{"type":"disabled"}}}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper],type_ignores=[])),str(source),"exec"),namespace)
     namespace["cap"]({"finish_reason":"stop"},8192)
     try:
@@ -60,6 +60,8 @@ def check():
         assert "8192" in str(error) and "截断" in str(error)
     else:
         raise AssertionError("Length response must not enter JSON approval")
+    expected="核对来源\n\n你必须只输出一个合法 JSON 对象，不能使用 Markdown 代码围栏。输出必须满足以下 JSON Schema：\n"+json.dumps(_generation_schema(WriterNoteClarification),ensure_ascii=False,sort_keys=True,separators=(",",":"))
+    assert _json_system_prompt("核对来源  ",WriterNoteClarification)==expected
     print("JSON and note alignment checks passed: complete root, escaped quotes/braces, truncated root rejected, punctuation alignment and false fact retained.")
 
 

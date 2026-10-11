@@ -104,6 +104,12 @@ def _generation_schema(output_model: type[T]) -> dict[str, Any]:
     return schema
 
 
+def _json_system_prompt(system_prompt: str, output_model: type[T]) -> str:
+    schema_prompt = json.dumps(_generation_schema(output_model), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return (system_prompt.rstrip() + "\n\n你必须只输出一个合法 JSON 对象，不能使用 Markdown 代码围栏。"
+        + "输出必须满足以下 JSON Schema：\n" + schema_prompt)
+
+
 @dataclass(slots=True)
 class ProviderResult(Generic[T]):
     data: T
@@ -223,16 +229,9 @@ class DeepSeekProvider:
         agent_role = _model_role(agent_role)
         model_override = _selected_model(self.settings, agent_role, model_override)
         api_key = self.settings.require_api_key()
-        schema = _generation_schema(output_model)
         # A canonical schema string keeps the long system-prefix byte-identical
         # across repeated calls of the same Agent/output contract.
-        schema_prompt = json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        system = (
-            system_prompt.rstrip()
-            + "\n\n你必须只输出一个合法 JSON 对象，不能使用 Markdown 代码围栏。"
-            + "输出必须满足以下 JSON Schema：\n"
-            + schema_prompt
-        )
+        system = _json_system_prompt(system_prompt, output_model)
         # Hash only: diagnose exact-contract or early-prefix drift without
         # writing novel text or credentials to usage logs. A matching hash is
         # necessary, not sufficient, for a provider-side cache hit.
@@ -363,6 +362,8 @@ class DeepSeekProvider:
                 message = choice["message"]
                 content = message.get("content") or ""
                 if choice.get("finish_reason") == "length":
+                    if payload.get("thinking", {}).get("type") != "enabled":
+                        retry_kind = "permanent"
                     raise ProviderError(f"模型输出达到本次 {requested_max_tokens} tokens 上限，响应被截断；保留已有成果，需要缩短报告或按任务设置调整输出预算。")
                 if not content:
                     usage = dict(body.get("usage") or {})
