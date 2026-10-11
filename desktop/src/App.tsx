@@ -2389,7 +2389,7 @@ function completionReference(events: EngineEvent[], runId?: string): TraceRefere
 }
 
 function pendingWorkLabel(item: PendingWorkItem, action = false): string {
-  if (item.kind === "plan_revision") return item.status === "needs_writer" ? action ? "修订并复审这章" : "执行卡修订交接" : action ? "复审这章" : "规划交接核对";
+  if (item.kind === "plan_revision") return item.status === "needs_writer" ? action ? "核对并按需修订" : "章节规划核对" : action ? "复核这章" : "规划交接核对";
   const labels: Record<string, [string, string]> = {
     accepted_projection: ["正史文件同步", "同步章节文件"], planning_publication: ["规划发布收尾", "恢复规划发布"],
     manual_edit: ["手动修改核对", "继续核对修改"], review_gate: ["本章审查缺口", "补齐本章审查"],
