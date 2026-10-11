@@ -1,9 +1,9 @@
 import { parse, type ParseError } from "jsonc-parser";
 
 export type ApiImport = { provider_kind: string; base_url: string; model: string; api_key?: string };
-export const PROVIDERS = ["deepseek", "openai", "anthropic", "gemini", "openrouter", "ollama", "custom"] as const;
+export const PROVIDERS = ["deepseek", "mimo", "openai", "anthropic", "gemini", "openrouter", "ollama", "custom"] as const;
 export const PROVIDER_BASES: Record<string, string> = {
-  deepseek: "https://api.deepseek.com", openai: "https://api.openai.com/v1",
+  deepseek: "https://api.deepseek.com", mimo: "https://api.xiaomimimo.com/v1", openai: "https://api.openai.com/v1",
   anthropic: "https://api.anthropic.com", gemini: "https://generativelanguage.googleapis.com/v1beta/openai",
   openrouter: "https://openrouter.ai/api/v1", ollama: "http://localhost:11434/v1",
 };
@@ -17,6 +17,8 @@ export function validateApiConfig(value: ApiImport): ApiImport {
   if (url.username || url.password || url.search || url.hash) throw new Error("接口地址不能包含用户名、密码、查询密钥或片段；请将 API key 单独填写。");
   if (/\/(chat\/completions|messages|generateContent)\/?$/i.test(url.pathname)) throw new Error("请填写 API 基础地址，去掉 chat/completions、messages 或 generateContent 请求路径。");
   if (value.provider_kind === "gemini" && !url.pathname.includes("/openai")) throw new Error("当前 Gemini 接口使用 OpenAI 兼容协议，请填写 /v1beta/openai 基础地址；原生 Gemini 协议不适用。");
+  if (url.hostname === "api.xiaomimimo.com" && /^(?:tp|ttp)-/.test(value.api_key?.trim() || "")) throw new Error("MiMo Token Plan 密钥需要订阅专用地址 https://token-plan-cn.xiaomimimo.com/v1。");
+  if (url.hostname === "token-plan-cn.xiaomimimo.com" && value.api_key?.trim().startsWith("sk-")) throw new Error("MiMo Token Plan 地址需要订阅密钥；普通按量密钥请配合 https://api.xiaomimimo.com/v1。");
   return { ...value, model: value.model.trim(), base_url: value.base_url.trim().replace(/\/+$/, "") };
 }
 
@@ -54,7 +56,7 @@ export function redactDiagnostic(value: unknown, knownSecrets: Iterable<string> 
       try { const parsed = new URL(url); parsed.username = ""; parsed.password = ""; parsed.search = ""; parsed.hash = ""; return parsed.toString(); } catch { return "[接口地址已隐藏]"; }
     })
     .replace(/\bBearer\s+[^\s,"'}]+/gi, "Bearer [密钥已隐藏]")
-    .replace(/\bsk-[A-Za-z0-9_-]+/g, "[密钥已隐藏]")
+    .replace(/\b(?:sk|tp|ttp)-[A-Za-z0-9_-]+/g, "[密钥已隐藏]")
     .replace(/((?:api[_-]?key|api[_-]?token|authorization|password|secret)["']?\s*[=:]\s*["']?)[^\s,"'}]+/gi, "$1[密钥已隐藏]");
 }
 

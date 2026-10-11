@@ -18,6 +18,13 @@ const config = helpers.apiImportCandidates('{/*source*/"provider":"custom","apiB
 assert.equal(config.base_url, 'https://example.test/v1');
 assert.equal(config.api_key, 'secret-value');
 assert.equal(helpers.apiImportCandidates('{"models":[{"provider":"openai","model":"model-a"},{"provider":"custom","model":"model-b","base_url":"https://example.test/v1"}]}').length, 2);
+const mimo = helpers.apiImportCandidates('{"provider":"mimo","model":"mimo-v2.6-flash"}')[0];
+assert.equal(mimo.base_url, 'https://api.xiaomimimo.com/v1');
+assert.equal(helpers.apiImportCandidates('{"provider":"mimo","model":"mimo-v2.6-pro","base_url":"https://token-plan-cn.xiaomimimo.com/v1","api_key":"tp-offline-placeholder"}')[0].provider_kind, 'mimo');
+assert.throws(() => helpers.validateApiConfig({ ...mimo, api_key: 'tp-offline-placeholder' }));
+assert.throws(() => helpers.validateApiConfig({ ...mimo, api_key: 'ttp-offline-placeholder' }));
+assert.throws(() => helpers.validateApiConfig({ ...mimo, base_url: 'https://token-plan-cn.xiaomimimo.com/v1', api_key: 'sk-offline-placeholder' }));
+assert.ok(!helpers.redactDiagnostic('tp-offline-placeholder ttp-team-placeholder').includes('placeholder'));
 for (const source of ['{"model":"x"}garbage', '{"provider":"custom","model":"x","base_url":"https://u:password@example.test/v1"}', '{"provider":"custom","model":"x","base_url":"https://example.test/v1?api_key=secret"}', '{"provider":"gemini","model":"x","base_url":"https://generativelanguage.googleapis.com/v1beta"}', '{"provider":"openai","model":"x","apiKey":"${ENV_KEY}"}']) assert.throws(() => helpers.apiImportCandidates(source));
 const redacted = helpers.redactDiagnostic('Bearer secret-value https://user:pass@example.test/v1?token=abc sk-private ApiKey=another', ['secret-value']);
 for (const source of ['{"models":[]}', '{"models":42}', '{"provider":{}}', '{"provider":0}', '{"provider":"openai","model":{}}', '{"provider":"openai","model":42}', '{"provider":"openai","model":"x","base_url":0}', '{"provider":"openai","model":"x","api_key":false}', '{"provider":"openai","model":"x","api_key":null}']) assert.throws(() => helpers.apiImportCandidates(source));
@@ -55,4 +62,5 @@ assert.ok(extension.includes('CONTROL_COMMANDS.has(record.command)') && extensio
 assert.ok(extension.includes('"provider.test" ? 240_000') && extension.includes('明确继续使用现有系统凭据'));
 assert.ok(!extension.includes('function controlHtml(webview:'));
 assert.ok(extension.includes('type: conversationAction ? "result" : "notice"'), 'An unrelated API/diagnostic error cannot clear the running conversation');
+assert.ok(extension.includes('"mimo-v2.6-flash"') && extension.includes('Token Plan'));
 console.log('墨流扩展工作台：API 导入/脱敏/状态/恢复资格/生成脚本/命令静态断言通过（全离线）。');

@@ -1,0 +1,82 @@
+{
+  "resources": [
+    {
+      "target": "mobao-idle.webm",
+      "source": "mobao-clean-idle.webm",
+      "bytes": 144236,
+      "sha256": "c8178c670a368927e564df42db0f70f1593ced7c546f539d4d01bb8f87680bf5"
+    },
+    {
+      "target": "mobao-idle.poster.png",
+      "source": "mobao-clean-idle.poster.png",
+      "bytes": 68734,
+      "sha256": "ef186b30bfbab16b24470cfe76eeb4878deb5091179e213b623b9d42664fffe1"
+    },
+    {
+      "target": "mobao-thinking.webm",
+      "source": "mobao-clean-thinking.webm",
+      "bytes": 137538,
+      "sha256": "466da929b84a6df521972d6492aa819ad7d1f6407d7e6ea396ed2e0cda306ce1"
+    },
+    {
+      "target": "mobao-thinking.poster.png",
+      "source": "mobao-clean-thinking.poster.png",
+      "bytes": 70594,
+      "sha256": "5b624240eca0a6ebace7d18e70aba506dc587c7b3e9a42da0eba9e163e22db22"
+    },
+    {
+      "target": "mobao-waiting.webm",
+      "source": "mobao-clean-waiting-user.webm",
+      "bytes": 145531,
+      "sha256": "6f94f07f87dc1c7d990fa4512cb440fbdd8aea663d6a9aee0d811b99ac8aa11c"
+    },
+    {
+      "target": "mobao-waiting.poster.png",
+      "source": "mobao-clean-waiting-user.poster.png",
+      "bytes": 128370,
+      "sha256": "f4cca1044729c11bd3fdf2ba826a2db6bf1d230bd805b9d630a403155550d591"
+    },
+    {
+      "target": "mobao-success.webm",
+      "source": "mobao-clean-show-summary.webm",
+      "bytes": 158464,
+      "sha256": "2128165cd89f50090850eba2fa304a3eb12652fad55e90978f083bb678611fcc"
+    },
+    {
+      "target": "mobao-success.poster.png",
+      "source": "mobao-clean-show-summary.poster.png",
+      "bytes": 114587,
+      "sha256": "6522f9bb844184fd29a67c08db0156598abcda7d1fabe5f9d024e0346fb6dd83"
+    },
+    {
+      "target": "mobao-rest.webm",
+      "source": "mobao-clean-pause-exhausted.webm",
+      "bytes": 121663,
+      "sha256": "7bb3562fd7cc9c689714365b83cc601718dc91339e8585eeaa55d956703c9bb1"
+    },
+    {
+      "target": "mobao-rest.poster.png",
+      "source": "mobao-clean-pause-exhausted.poster.png",
+      "bytes": 104711,
+      "sha256": "1a201cc9f4948e13fb517da755e8cabc4929ff1b9860a07e89ace8bebf0c2033"
+    },
+    {
+      "target": "mobao-welcome.webm",
+      "source": "mobao-clean-welcome.webm",
+      "bytes": 173872,
+      "sha256": "e1bad330954ea448ea9c181fd1811f1fff0f2ad02c432237c49f7972af0bd600"
+    },
+    {
+      "target": "mobao-welcome.poster.png",
+      "source": "mobao-clean-welcome.poster.png",
+      "bytes": 66928,
+      "sha256": "c8fe572bfc3c9c3d08401399cd1fc9a4eb87219255cb9e297f407a79eb562b9f"
+    },
+    {
+      "target": "mobao-reading.png",
+      "source": "mobao-clean-reviewing.poster.png",
+      "bytes": 75912,
+      "sha256": "54dcd3f011d5fb0ad187fd35a10318274472bd2326a68752ef88fbfd0f6a506a"
+    }
+  ]
+}

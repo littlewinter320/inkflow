@@ -6,7 +6,9 @@
 
 没有打开小说也可以打开侧栏的「模型接口 · 配置与诊断」。点击「导入 API 配置」读取 JSON / JSONC；有多个模型时选择一个，预览服务商、基础地址与模型 ID 后再保存。也可以使用「手动配置 API」在密码框填写密钥。
 
-支持 `deepseek`、`openai`、`anthropic`、`gemini`、`openrouter`、`ollama` 和 `custom`。`custom` 与 Gemini 使用 OpenAI 兼容协议；Gemini 基础地址须使用 `/v1beta/openai`，原生 Gemini 请求配置不会被当成兼容配置导入。基础地址不能包含账号、密码、查询密钥或最终请求路径。
+支持 `deepseek`、`mimo`、`openai`、`anthropic`、`gemini`、`openrouter`、`ollama` 和 `custom`。`custom` 与 Gemini 使用 OpenAI 兼容协议；Gemini 基础地址须使用 `/v1beta/openai`，原生 Gemini 请求配置不会被当成兼容配置导入。基础地址不能包含账号、密码、查询密钥或最终请求路径。
+
+小米 MiMo 默认使用 `https://api.xiaomimimo.com/v1` 和 `mimo-v2.6-flash`。Token Plan 需填写 `https://token-plan-cn.xiaomimimo.com/v1` 及对应 `tp-` / `ttp-` 密钥，不能与普通按量的 `sk-` 密钥混用。可通过 `MIMO_API_KEY` 或现有系统凭据保存密钥；`INKFLOW_API_KEY` 仍优先。连接检查明确关闭思考，按 `max_completion_tokens` 请求短 JSON；角色模型不会在导入时自动替换。[适配契约与验证范围](../docs/MIMO_API_2026-10-11.md)。
 
 最小导入格式如下；密钥可省略后通过密码框填写：
 

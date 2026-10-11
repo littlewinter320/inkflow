@@ -893,6 +893,7 @@ class InkFlowAppService:
                     "tasks": _task_rows_with_history(project, int(params.get("task_limit", 30)), self.instance_id),
                     "batches": _list_batch_summaries(project),
                     "pending_work": project.pending_work(),
+                    "rejected_work": [work for work in project.pending_work(include_rejected=True) if work["status"] == "rejected"],
                     "learning_events": project.db.list_learning_events(int(params.get("learning_limit", 12))),
                     "artifacts": project.db.list_agent_artifacts(limit=30),
                     "trace_runs": recent_trace_runs(root, int(params.get("trace_limit", 12))),
@@ -1006,6 +1007,19 @@ class InkFlowAppService:
             )
         if method == "project.status":
             return studio.dashboard()
+        if method == "project.pending_decide":
+            identity = params.get("work_id")
+            decision = params.get("decision")
+            reason = params.get("reason", "")
+            expected = params.get("expected_updated_at")
+            if (not isinstance(identity, str) or not isinstance(decision, str) or not isinstance(reason, str)
+                    or (expected is not None and not isinstance(expected, str))):
+                raise ProjectError("待办决定字段格式不正确，未修改安排。")
+            await asyncio.to_thread(project.decide_pending_work, identity, decision=decision,
+                                    reason=reason, expected_updated_at=expected)
+            return {"status": "completed", "pending_work": project.pending_work(),
+                    "rejected_work": [work for work in project.pending_work(include_rejected=True) if work["status"] == "rejected"],
+                    "reply": "决定已保存。已有成果和必要门禁保持原状。"}
         if method == "context.status":
             settings = Settings.from_env(project.root)
             status_path = project.internal / "context-status.json"
