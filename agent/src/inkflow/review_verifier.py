@@ -30,10 +30,10 @@ def resolve_review_quote_refs(output: Any, quotes: dict[str, dict[str, str]]) ->
     if focus:
         for field in ("goal_evidence", "change_evidence"):
             focus[field] = resolve(focus[field], "当前正文")
-    for item in data.get("source_comparisons", []):
-        item["source_evidence"] = resolve(item["source_evidence"], item["source_id"])
-        item["chapter_evidence"] = resolve(item["chapter_evidence"], "当前正文")
-    for item in data.get("assessments", []):
+    for item in [*data.get("source_comparisons", []), *data.get("assessments", [])]:
+        entry = quotes.get(item["source_evidence"])
+        if entry and entry["source_id"] != "当前正文":
+            item["source_id"] = entry["source_id"]
         item["chapter_evidence"] = resolve(item["chapter_evidence"], "当前正文")
         item["source_evidence"] = resolve(item["source_evidence"], item["source_id"])
     patch = data.get("memory_patch")
@@ -46,6 +46,18 @@ def resolve_review_quote_refs(output: Any, quotes: dict[str, dict[str, str]]) ->
 def packet_sources(packet: ContextPacket) -> dict[str, str]:
     sources: dict[str, str] = {}
     for section in packet.sections:
+        if section.key == "B2":
+            try:
+                payload = json.loads(section.content)
+            except ValueError:
+                continue
+            indexed = {item["chapter_no"]: item for item in payload
+                       if isinstance(item, dict) and isinstance(item.get("chapter_no"), int)} if isinstance(payload, list) else {}
+            for ref in section.source_ids:
+                match = re.fullmatch(r"batch-memory:.+:chapter:(\d+)", ref)
+                if match and int(match.group(1)) in indexed:
+                    sources[ref] = json.dumps(indexed[int(match.group(1))], ensure_ascii=False, indent=2)
+            continue
         if section.key == "F0" or (section.key == "F" and section.title == "分层混合检索结果"):
             try:
                 payload = json.loads(section.content)

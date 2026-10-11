@@ -11,7 +11,7 @@ from inkflow.engine import InkFlowEngine
 from inkflow.project import InkFlowProject
 from inkflow.schemas import BookBrief, ContextPacket, ContextSection, ModeCheckOutput, ReviewAssessment, ReviewSourceComparison, WriterNoteClarification
 from inkflow.writer_notes import notes_hash
-from inkflow.review_verifier import resolve_review_quote_refs
+from inkflow.review_verifier import resolve_review_quote_refs, packet_sources
 from inkflow.project_lock import project_write_lock
 
 
@@ -135,6 +135,22 @@ def check():
         assert located.memory_patch.facts[0].evidence=="他在灯下核对来信。" and located.verdict=="unknown"
         assert selections.memory_patch.facts[0].evidence=="@quote:0"
         assert resolve_review_quote_refs(selections,{}).model_dump()==selections.model_dump()
+        mismatched=selections.model_copy(deep=True)
+        mismatched.assessments[0].source_id="plan:chapter:00001"
+        located=resolve_review_quote_refs(mismatched,choices)
+        assert located.assessments[0].source_id=="RECENT_PLAN.md" and located.assessments[0].source_evidence=="在灯下核对来信。"
+        assert mismatched.assessments[0].source_id=="plan:chapter:00001" and located.verdict=="unknown"
+        mismatched.source_comparisons[0].source_id="OUTLINE.md"
+        located=resolve_review_quote_refs(mismatched,choices)
+        assert located.source_comparisons[0].source_id=="RECENT_PLAN.md", "A selected planning excerpt cannot claim another document was read"
+        assert located.focus_observation.change_evidence=="@quote:1", "Planning selections cannot become prose evidence"
+        memory_packet=ContextPacket(project_id="local",chapter_no=3,task="核对临时身份",estimated_tokens=0,sections=[
+            ContextSection(key="B2",title="临时记忆",content=json.dumps([
+                {"chapter_no":1,"summary":"第一章来信"},{"chapter_no":2,"summary":"第二章回信"}],ensure_ascii=False),
+                source_ids=["batch-memory:b:chapter:00001","batch-memory:b:chapter:00002"])])
+        sources=packet_sources(memory_packet)
+        assert "第一章来信" in sources["batch-memory:b:chapter:00001"] and "第二章回信" not in sources["batch-memory:b:chapter:00001"]
+        assert "第二章回信" in sources["batch-memory:b:chapter:00002"] and "第一章来信" not in sources["batch-memory:b:chapter:00002"]
 
 
 if __name__=="__main__":
