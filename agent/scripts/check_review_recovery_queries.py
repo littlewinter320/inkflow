@@ -112,10 +112,11 @@ def check():
             with patch("inkflow.engine._review_evidence_gaps",return_value=["尚未对照当前 RECENT_PLAN.md"]):
                 repaired,_,_=asyncio.run(run(candidate))
                 assert not repaired.source_comparisons, "The affected source must be rechecked"
+            previous_source=packet.sections[0].content
             packet.sections[0].content="规划已改变，当前先收回原件。"
             repaired,_,_=asyncio.run(run(candidate))
             assert not repaired.source_comparisons, "Changed source text cannot reuse a previous quote"
-            packet.sections[0].content=original_packet.sections[0].content
+            packet.sections[0].content=previous_source
             async def concurrent_result():
                 acquired=asyncio.Event()
                 async def holder():
