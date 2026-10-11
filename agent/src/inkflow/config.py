@@ -19,9 +19,10 @@ from .role_protocol import (
 
 KEYRING_SERVICE = "InkFlow"
 KEYRING_ACCOUNT = "deepseek_api_key"
-PROVIDER_KINDS = {"deepseek", "openai", "anthropic", "gemini", "openrouter", "ollama", "custom"}
+PROVIDER_KINDS = {"deepseek", "mimo", "openai", "anthropic", "gemini", "openrouter", "ollama", "custom"}
 PROVIDER_ENV_KEYS = {
     "deepseek": "DEEPSEEK_API_KEY",
+    "mimo": "MIMO_API_KEY",
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "gemini": "GEMINI_API_KEY",
@@ -113,6 +114,13 @@ DEFAULT_ROLE_CONTEXT_BUDGETS = DEFAULT_AGENT_CONTEXT_BUDGETS
 
 
 def _official_model_limits(base_url: str, model: str) -> dict[str, Any]:
+    if urlparse(base_url).hostname in {"api.xiaomimimo.com", "token-plan-cn.xiaomimimo.com"} and model in {
+        "mimo-v2.6-flash", "mimo-v2.6-pro", "mimo-v2.6-pro-ultraspeed", "mimo-v2.5", "mimo-v2.5-pro",
+    }:
+        # MiMo documents 1M without an exact integer; retain a conservative context ceiling.
+        return {"model": model, "context_tokens": 1_000_000, "max_output_tokens": 131_072,
+                "source": "https://mimo.mi.com/docs/zh-CN/quick-start/summary/model",
+                "checked_at": "2026-10-11"}
     # Official API limits checked 2026-10-09; proxies do not inherit these limits.
     if urlparse(base_url).hostname != "api.deepseek.com" or model not in {
         "deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro",
@@ -368,11 +376,11 @@ class Settings:
         trace_level = str(value.get("trace_level", defaults.trace_level)).lower()
         if trace_level not in {"compact", "standard", "full"}:
             raise ConfigurationError("过程记录级别只能是 compact、standard 或 full。")
-        base_url = str(value.get("base_url", defaults.base_url)).strip().rstrip("/")
+        base_url = str(value.get("base_url", "https://api.xiaomimimo.com/v1" if provider_kind == "mimo" else defaults.base_url)).strip().rstrip("/")
         parsed = urlparse(base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ConfigurationError("模型接口地址必须是完整的 http 或 https 地址。")
-        model = str(value.get("model", defaults.model)).strip()
+        model = str(value.get("model", "mimo-v2.6-flash" if provider_kind == "mimo" else defaults.model)).strip()
         if not model:
             raise ConfigurationError("模型名称不能为空。")
         soft = _positive_int(value.get("context_soft_tokens", defaults.context_soft_tokens), "软上下文预算")
@@ -623,6 +631,12 @@ class Settings:
     def is_deepseek(self) -> bool:
         return self.provider_kind == "deepseek" or "deepseek" in urlparse(self.base_url).netloc.casefold()
 
+    @property
+    def is_mimo(self) -> bool:
+        return self.provider_kind == "mimo" or urlparse(self.base_url).hostname in {
+            "api.xiaomimimo.com", "token-plan-cn.xiaomimimo.com",
+        }
+
     def get_api_key(self) -> str | None:
         provider_env = PROVIDER_ENV_KEYS.get(self.provider_kind)
         for name in tuple(name for name in ("INKFLOW_API_KEY", provider_env) if name):
@@ -644,10 +658,16 @@ class Settings:
             return self.get_api_key() or ""
         key = self.get_api_key()
         if not key:
+            environment_name = PROVIDER_ENV_KEYS.get(self.provider_kind, "INKFLOW_API_KEY")
             raise ConfigurationError(
                 "未找到模型 API Key。请在墨流设置中保存到 Windows 凭据库，"
-                "或设置 INKFLOW_API_KEY / DEEPSEEK_API_KEY 环境变量。"
+                f"或设置 INKFLOW_API_KEY / {environment_name} 环境变量。"
             )
+        host = urlparse(self.base_url).hostname
+        if host == "api.xiaomimimo.com" and key.startswith(("tp-", "ttp-")):
+            raise ConfigurationError("MiMo Token Plan 密钥需要订阅专用地址 https://token-plan-cn.xiaomimimo.com/v1；尚未发送请求。")
+        if host == "token-plan-cn.xiaomimimo.com" and key.startswith("sk-"):
+            raise ConfigurationError("MiMo Token Plan 地址需要专用订阅密钥；普通按量密钥请配合 https://api.xiaomimimo.com/v1，尚未发送请求。")
         return key
 
 

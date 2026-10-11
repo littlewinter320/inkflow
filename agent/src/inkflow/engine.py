@@ -3901,22 +3901,23 @@ class InkFlowEngine:
         findings = getattr(output, "findings", getattr(output, "deviations", []))
         queries.extend(item.claim or item.explanation for item in findings
                        if item.severity in {"major", "blocking"})
-        queries.extend(item.reason for item in output.assessments if item.status == "data_missing"
-                       or item.evidence_relation in UNRESOLVED_RELATIONS)
+        queries.extend(item.reason for item in output.assessments if item.status == "data_missing")
         patch = getattr(output, "memory_patch", None)
         if patch:
             queries.extend(patch.unresolved_conflicts)
-        if not queries:
-            queries = [output.summary]
+        # A missing attribution or current-plan comparison is repaired from the
+        # already loaded packet, not by searching unrelated historical prose.
+        needs_search = bool(queries or getattr(output, "missing_source_ids", []))
         card = project.db.get_chapter_card(boundary) or {}
         hook_leads = [str(card.get("hook_question") or ""),
                       *[str(value) for value in card.get("foreshadow_advance", [])],
                       *[str(value) for value in card.get("payoff", [])]]
-        queries.extend(value for value in hook_leads if value.strip())
+        if needs_search:
+            queries.extend(value for value in hook_leads if value.strip())
         queries = list(dict.fromkeys(value.strip()[:160] for value in queries if value.strip()))[:4]
         hits, recovery = (await asyncio.to_thread(
             HybridRetriever(project).recover_review_sources, queries, chapter_no=boundary, role=agent_role,
-        )) if gaps else ([], {"queries": [], "searched_chapters": []})
+        )) if gaps and needs_search else ([], {"queries": [], "searched_chapters": []})
         recovery.update({"attempted": True, "role": agent_role, "gaps": gaps,
                          "loaded_sources": [], **note_snapshot})
         requested = list(output.missing_source_ids)
@@ -3966,7 +3967,8 @@ class InkFlowEngine:
         if clarification:
             repair_prompt += "\n\n# Writer限次短答（仍需对照原文，不能当正史证据）\n" + json_dumps(clarification)
         repair_prompt += "\n\n# 自动补读后的定向复核\n" + json_dumps({
-            "缺口": gaps, "检索记录": recovery, "待核判断": {
+            "缺口": gaps, "检索记录": {key: recovery.get(key) for key in (
+                "queries", "loaded_sources", "source_loading", "reference_hits", "load_warnings")}, "待核判断": {
                 "summary": output.summary,
                 "assessments": [item.model_dump(mode="json") for item in output.assessments],
                 "findings": [item.model_dump(mode="json") for item in findings],

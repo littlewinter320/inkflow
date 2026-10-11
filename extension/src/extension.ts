@@ -817,13 +817,13 @@ async function applyApi(context: vscode.ExtensionContext, raw: ApiImport): Promi
 async function configureApi(context: vscode.ExtensionContext): Promise<void> {
   assertWorkspaceTrust();
   const current = asRecord(await requestEngine(context, "provider.status", connectionParams()));
-  const picked = await vscode.window.showQuickPick(PROVIDERS.map((provider) => ({ label: provider, description: provider === current.provider_kind ? "当前接口" : provider === "custom" ? "OpenAI 兼容第三方接口" : "" })), { title: "配置墨流模型 API", placeHolder: "选择 API 协议；不会更改角色权限" });
+  const picked = await vscode.window.showQuickPick(PROVIDERS.map((provider) => ({ label: provider, description: provider === current.provider_kind ? "当前接口" : provider === "mimo" ? "小米 MiMo · 按量或 Token Plan" : provider === "custom" ? "OpenAI 兼容第三方接口" : "" })), { title: "配置墨流模型 API", placeHolder: "选择 API 协议；不会更改角色权限" });
   if (!picked) return;
-  const base = await vscode.window.showInputBox({ title: "API 基础地址", value: picked.label === current.provider_kind ? String(current.base_url || "") : PROVIDER_BASES[picked.label] || "", prompt: "填写基础地址，不要带密钥或 chat/completions 请求路径。", ignoreFocusOut: true });
+  const base = await vscode.window.showInputBox({ title: "API 基础地址", value: picked.label === current.provider_kind ? String(current.base_url || "") : PROVIDER_BASES[picked.label] || "", prompt: picked.label === "mimo" ? "普通按量使用 api.xiaomimimo.com/v1；Token Plan 使用 token-plan-cn.xiaomimimo.com/v1，请配合各自密钥。" : "填写基础地址，不要带密钥或 chat/completions 请求路径。", ignoreFocusOut: true });
   if (base === undefined) return;
-  const model = await vscode.window.showInputBox({ title: "模型 ID", value: picked.label === current.provider_kind ? String(current.model || "") : "", prompt: "填写服务商实际支持的完整模型 ID。", ignoreFocusOut: true });
+  const model = await vscode.window.showInputBox({ title: "模型 ID", value: picked.label === current.provider_kind ? String(current.model || "") : picked.label === "mimo" ? "mimo-v2.6-flash" : "", prompt: "填写服务商实际支持的完整模型 ID。", ignoreFocusOut: true });
   if (model === undefined) return;
-  const api_key = await vscode.window.showInputBox({ title: "模型密钥", password: true, prompt: "留空沿用现有系统凭据；新密钥只保存到墨流共享系统凭据。", ignoreFocusOut: true });
+  const api_key = await vscode.window.showInputBox({ title: "模型密钥", password: true, prompt: picked.label === "mimo" ? "普通按量密钥为 sk-；订阅密钥为 tp-/ttp-，需对应接口。留空沿用本服务商凭据，环境变量优先。" : "留空沿用现有系统凭据；新密钥只保存到墨流共享系统凭据。", ignoreFocusOut: true });
   if (api_key === undefined) return;
   await applyApi(context, { provider_kind: picked.label, base_url: base, model, ...(api_key.trim() ? { api_key: api_key.trim() } : {}) });
 }

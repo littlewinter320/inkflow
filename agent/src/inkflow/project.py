@@ -52,7 +52,7 @@ class InkFlowProject:
         self.db.reconcile_collaboration_queue()
         self.reconcile_pending_work()
 
-    def pending_work(self, *, chapter_no: int | None = None) -> list[dict[str, Any]]:
+    def pending_work(self, *, chapter_no: int | None = None, include_rejected: bool = False) -> list[dict[str, Any]]:
         with self.db.connect() as connection:
             rows = connection.execute(
                 "SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%' ORDER BY updated_at DESC"
@@ -90,7 +90,7 @@ class InkFlowProject:
         items = [item for item in items if item["id"] not in native_ids]
         for item in native:
             decision = saved.get(item["id"], {})
-            items.append({**decision, **item, **({"status": "deferred"} if decision.get("status") == "deferred" else {})})
+            items.append({**decision, **item, **({"status": decision["status"]} if decision.get("status") in {"deferred", "rejected"} else {})})
         workflows = {item["source"]["task_id"]: item for item in items if item["kind"] == "workflow" and item.get("source", {}).get("task_id")}
         for item in items:
             parent = workflows.get(item.get("source", {}).get("task_id"))
@@ -102,8 +102,19 @@ class InkFlowProject:
             elif item["kind"] == "manual_edit":
                 handling = "manual" if item["status"] in {"pending", "failed", "deferred"} and int(item["source"].get("attempts") or 0) < 2 else "decision"
             elif item["kind"] in {"review_gate", "review_evidence", "chapter_gate"} and item.get("chapter_no"):
-                chapter = self.db.get_chapter(int(item["chapter_no"]))
+                number = int(item["chapter_no"])
+                chapter = self.db.get_chapter(number)
                 handling = "review" if chapter and chapter["status"] == "draft" else "blocked"
+                revision = self.db.get_metadata(f"pending_plan_revision:{number}", {})
+                if revision.get("status") in {"needs_writer", "awaiting_review"}:
+                    handling = "blocked"
+                    item["next_action"] = "此诊断由同章的规划复审事项接管；从该事项续接，不另发整章审查。"
+                elif chapter and (review := self.db.latest_review_record(number)):
+                    report = review["report"]
+                    if (review["chapter_version"] == chapter["version"] and report.source_hash == chapter["content_hash"]
+                            and report.verdict == "unknown" and report.evidence_recovery.get("attempted")):
+                        handling = "blocked"
+                        item["next_action"] = "同版已做有界补读；先修复报告列出的具体来源或输出条件，不从诊断卡重复整章审查。"
             if item["status"] == "running" or (item["kind"] == "manual_edit" and item["status"] == "reviewing"):
                 handling = "running"
             if int(item.get("processing_attempts", 0)) >= 2:
@@ -118,9 +129,57 @@ class InkFlowProject:
                        for row in records if isinstance(record := json.loads(row["value_json"]), dict)):
                     handling = "blocked"
             item["handling"] = "deferred" if item["status"] == "deferred" else handling
-            item["can_process"] = handling in {"resume", "local", "manual", "review"}
+            item["can_process"] = item["status"] != "rejected" and handling in {"resume", "local", "manual", "review"}
+            optional = item["kind"] in {"optimization", "memory_summary", "workflow"}
+            item["can_reject"] = optional and handling != "running" and item["status"] != "rejected"
+            item["reject_label"] = "不重建这份摘要" if item["kind"] == "memory_summary" else "不执行这项额外工作" if item["kind"] == "optimization" else "放弃这次任务"
+            item["reject_impact"] = ("旧摘要继续隔离；需要资料时核对当前已接受原文，正史不变。" if item["kind"] == "memory_summary" else
+                "停止安排这项工作并保留拒绝记录；已有成果保留，关联审查与依赖仍独立核验。")
+            item["reject_blocked_reason"] = "必要审查、规划依赖或提交收尾不能由拒绝标为解决；可留待下次或在相应候选入口决定。" if not optional else "任务运行期间不能拒绝；请先停止。" if handling == "running" else ""
         return [item for item in items if item["status"] not in {"completed", "superseded"}
+                and (include_rejected or item["status"] != "rejected")
                 and (chapter_no is None or item.get("chapter_no") in {None, chapter_no})]
+
+    def decide_pending_work(self, identity: str, *, decision: str, reason: str = "",
+                            expected_updated_at: str | None = None) -> dict[str, Any]:
+        """Record scheduling decisions without changing novel content or passing a gate."""
+        with project_write_lock_sync(self.root):
+            item = next((work for work in self.pending_work(include_rejected=True) if work["id"] == identity), None)
+            if item is None:
+                raise ProjectError("待办来源已变化或已收尾，请刷新后查看。")
+            if expected_updated_at is not None and item.get("updated_at") != expected_updated_at:
+                raise ProjectError("待办状态已改变，本次决定未保存；请刷新后重新核对。")
+            if decision == "reject":
+                if not item["can_reject"]:
+                    raise ProjectError(item["reject_blocked_reason"] or "这项待办当前不能拒绝。")
+                task_id = item.get("source", {}).get("task_id")
+                if task_id and (self.internal / "studio.db").is_file():
+                    from .studio import StudioDatabase
+                    task = StudioDatabase(self.internal / "studio.db").latest_task_run_for_settings(task_id)
+                    if task and task["status"] == "running":
+                        raise ProjectError("原任务仍在运行，请先停止，再决定是否拒绝。")
+                reason = reason.strip()
+                if not reason or len(reason) > 1000:
+                    raise ProjectError("请填写1～1000字的拒绝原因，便于之后查看或恢复安排。")
+                changes = {"status": "rejected", "rejection": {"reason": reason, "at": utc_now(), "previous_status": item["status"]}}
+            elif decision == "reopen" and item["status"] == "rejected":
+                changes = {"status": item.get("rejection", {}).get("previous_status", "pending"),
+                           "reopened_at": utc_now()}
+            else:
+                raise ProjectError("决定无效；只能拒绝可选工作或恢复已拒绝的安排。")
+            saved = self.update_pending_work(identity, **changes)
+            if item["kind"] == "workflow":
+                for child in self.pending_work(include_rejected=True):
+                    if child.get("parent_id") == identity and child["kind"] == "coordinator_recovery":
+                        child_changes = {"status": "rejected", "rejection": {**changes["rejection"], "previous_status": child["status"]}} if decision == "reject" else {
+                            "status": child.get("rejection", {}).get("previous_status", "pending"), "reopened_at": utc_now()}
+                        self.update_pending_work(child["id"], **child_changes, decision_parent=identity)
+            source = item.get("source", {})
+            key = source.get("conversation")
+            pending = self.db.get_metadata(key) if isinstance(key, str) and key else None
+            if isinstance(pending, dict) and pending.get("task_id") == source.get("task_id"):
+                self.db.set_metadata(key, {**pending, "status": changes["status"]})
+            return saved
 
     def record_pending_work(self, *, kind: str, reason: str, next_action: str,
                             source: dict[str, Any], intent: dict[str, Any] | None = None,
@@ -164,6 +223,30 @@ class InkFlowProject:
         finished_tasks = {item["source"].get("task_id"): item for row in rows
                           if (item := json.loads(row["value_json"])).get("kind") == "workflow" and item.get("status") == "completed" and item.get("source", {}).get("task_id")}
         for item in self.pending_work():
+            if item["kind"] == "workflow" and item.get("intent", {}).get("pending_work_id"):
+                target_id = item["intent"]["pending_work_id"]
+                target = self.db.get_metadata(f"pending_work:{target_id}", {})
+                if target.get("status") in {"completed", "superseded"}:
+                    self.update_pending_work(item["id"], status=target["status"],
+                        resolution={"work_id": target_id, "reason": "原待办已收尾或由当前来源接管；保留原任务与快照，不重放旧请求。"})
+                    key = item.get("source", {}).get("conversation")
+                    pending = self.db.get_metadata(key) if isinstance(key, str) and key else None
+                    if isinstance(pending, dict) and pending.get("task_id") == item["source"].get("task_id"):
+                        self.db.set_metadata(key, {**pending, "status": target["status"]})
+                    continue
+            if item["kind"] == "coordinator_recovery" and item.get("parent_id"):
+                parent = self.db.get_metadata(f"pending_work:{item['parent_id']}", {})
+                if parent.get("status") in {"completed", "superseded", "rejected"}:
+                    self.update_pending_work(item["id"], status=parent["status"],
+                        resolution={"workflow_id": parent["id"], "reason": "跟随原任务安排，独立正文门禁不受影响。"})
+                    continue
+            if item["kind"] == "memory_summary":
+                number = item.get("source", {}).get("chapter_no")
+                cache = self.db.rebuilt_chapter_summary(int(number)) if number else None
+                if cache:
+                    self.update_pending_work(item["id"], status="completed",
+                        resolution={key: cache[key] for key in ("chapter_no", "source_version", "source_hash", "actor", "task_id", "run_id")})
+                    continue
             if item["kind"] == "plan_revision":
                 number = int(item["chapter_no"])
                 chapter = self.db.get_chapter(number)

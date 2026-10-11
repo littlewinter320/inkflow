@@ -14,7 +14,7 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from .config import Settings
-from .errors import ProviderError
+from .errors import ConfigurationError, ProviderError
 from .utils import content_hash, strip_json_fence, estimate_tokens
 from .runtime import active_runtime, ensure_run_runtime
 from .model_usage import ModelAttempt, normalized_usage
@@ -90,6 +90,20 @@ def _generation_settings(settings: Settings, role: str | None) -> dict[str, floa
     return settings.generation_for(role)
 
 
+def _generation_schema(output_model: type[T]) -> dict[str, Any]:
+    schema = output_model.model_json_schema()
+    # Historical reports may omit attribution; new model outputs must explicitly classify it.
+    for name in ("ReviewAssessment", "ReviewSourceComparison"):
+        definition = schema.get("$defs", {}).get(name, {})
+        relation = definition.get("properties", {}).get("evidence_relation")
+        if relation is not None:
+            relation.pop("default", None)
+            required = definition.setdefault("required", [])
+            if "evidence_relation" not in required:
+                required.append("evidence_relation")
+    return schema
+
+
 @dataclass(slots=True)
 class ProviderResult(Generic[T]):
     data: T
@@ -134,9 +148,12 @@ class DeepSeekProvider:
             "provider": kind,
             "protocol": "openai_compatible",
             "json_mode": kind != "ollama",
-            "reasoning_effort": kind in {"deepseek", "openai"},
+            "reasoning_effort": not self.settings.is_mimo and kind in {"deepseek", "openai"},
+            "thinking": self.settings.is_mimo or self.settings.is_deepseek,
+            "sampling_constraints": ({"temperature": [0, 1.5], "top_p": [0.01, 1],
+                "thinking_temperature": 1.0, "thinking_top_p": 0.95} if self.settings.is_mimo else {}),
             "top_k": False,
-            "balance": self.settings.is_deepseek,
+            "balance": self.settings.is_deepseek and not self.settings.is_mimo,
             "api_key_required": kind != "ollama",
             "context_hard_tokens": self.settings.context_hard_tokens,
             "max_output_tokens": self.settings.max_output_tokens,
@@ -160,7 +177,7 @@ class DeepSeekProvider:
             raise ProviderError(f"无法读取模型列表：{exc}") from exc
 
     async def get_balance(self) -> dict[str, Any]:
-        if not self.settings.is_deepseek:
+        if not self.settings.is_deepseek or self.settings.is_mimo:
             raise ProviderError("当前是自定义 OpenAI 兼容接口，未声明 DeepSeek 余额能力。")
         api_key = self.settings.require_api_key()
         headers = {"Authorization": f"Bearer {api_key}"}
@@ -206,7 +223,7 @@ class DeepSeekProvider:
         agent_role = _model_role(agent_role)
         model_override = _selected_model(self.settings, agent_role, model_override)
         api_key = self.settings.require_api_key()
-        schema = output_model.model_json_schema()
+        schema = _generation_schema(output_model)
         # A canonical schema string keeps the long system-prefix byte-identical
         # across repeated calls of the same Agent/output contract.
         schema_prompt = json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -228,6 +245,7 @@ class DeepSeekProvider:
         requested_max_tokens = self.settings.effective_output_tokens(max_tokens, agent_role, model_override,
             estimate_tokens(json.dumps([{"role": "system", "content": system},
                                        {"role": "user", "content": user_prompt}], ensure_ascii=False)))
+        token_parameter = "max_completion_tokens" if self.settings.is_mimo else "max_tokens"
         payload: dict[str, Any] = {
             "model": model_override or self.settings.model,
             "messages": [
@@ -235,23 +253,31 @@ class DeepSeekProvider:
                 {"role": "user", "content": user_prompt},
             ],
             "response_format": {"type": "json_object"},
-            "max_tokens": requested_max_tokens,
+            token_parameter: requested_max_tokens,
             "stream": False,
         }
-        if self.settings.provider_kind == "openai":
+        if self.settings.provider_kind == "openai" and not self.settings.is_mimo:
             payload["prompt_cache_key"] = (
                 f"inkflow:{agent_role or 'unknown'}:{model_override or self.settings.model}:"
                 f"{output_model.__name__}:v1"
             )
         generation = _generation_settings(self.settings, agent_role)
+        if self.settings.is_mimo and generation and (
+            not 0 <= generation["temperature"] <= 1.5 or not 0.01 <= generation["top_p"] <= 1
+        ):
+            raise ConfigurationError("MiMo 温度必须在 0～1.5、Top P 在 0.01～1 之间；请调整当前角色设置，尚未发送请求。")
         if generation:
             payload["temperature"] = generation["temperature"]
             payload["top_p"] = generation["top_p"]
-            if generation["top_k"] is not None:
+            if generation["top_k"] is not None and not self.settings.is_mimo:
                 payload["top_k"] = generation["top_k"]
-        if self.settings.is_deepseek:
+        if self.settings.is_mimo:
             payload["thinking"] = {"type": "enabled" if thinking else "disabled"}
-        if thinking and self.settings.is_deepseek:
+            if thinking:
+                payload.update(temperature=1.0, top_p=0.95)
+        elif self.settings.is_deepseek:
+            payload["thinking"] = {"type": "enabled" if thinking else "disabled"}
+        if thinking and self.settings.is_deepseek and not self.settings.is_mimo:
             payload["reasoning_effort"] = effort or self.settings.reasoning_effort
         url = f"{self.settings.base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -268,7 +294,7 @@ class DeepSeekProvider:
             serialized_input = json.dumps(payload["messages"], ensure_ascii=False)
             requested_max_tokens = self.settings.effective_output_tokens(
                 min(max_tokens, requested_max_tokens), agent_role, model_override, estimate_tokens(serialized_input))
-            payload["max_tokens"] = requested_max_tokens
+            payload[token_parameter] = requested_max_tokens
             reservation_output = requested_max_tokens
             reserved = runtime.reserve(
                 estimate_tokens(serialized_input) + reservation_output
@@ -309,6 +335,7 @@ class DeepSeekProvider:
                     if (
                         attempt == 0
                         and not self.settings.is_deepseek
+                        and not self.settings.is_mimo
                         and response.status_code in {400, 404, 422}
                         and "response_format" in payload
                     ):
@@ -317,7 +344,7 @@ class DeepSeekProvider:
                     retry_kind = "transport" if response.status_code in {408, 429, 500, 502, 503, 504} else "permanent"
                     if retry_kind == "transport":
                         retry_delay = _retry_after_seconds(response, attempt)
-                    provider_name = "DeepSeek" if self.settings.is_deepseek else "模型服务"
+                    provider_name = "小米 MiMo" if self.settings.is_mimo else "DeepSeek" if self.settings.is_deepseek else "模型服务"
                     raise ProviderError(f"{provider_name} API 返回 HTTP {response.status_code}：{message}")
                 body = response.json()
                 usage = dict(body.get("usage") or {})
@@ -401,10 +428,13 @@ class DeepSeekProvider:
                     # 对 DeepSeek 而言，空内容且 finish_reason=length 通常表示推理
                     # 已经耗尽预算，却没有留下最终 JSON。第二次机会应优先交付
                     # 可解析的答案：关闭推理，且绝不因为重试而突破本次任务预算。
-                    if self.settings.is_deepseek:
+                    if self.settings.is_deepseek or self.settings.is_mimo:
                         payload["thinking"] = {"type": "disabled"}
                         payload.pop("reasoning_effort", None)
-                    payload["max_tokens"] = requested_max_tokens
+                    if self.settings.is_mimo:
+                        payload.update(temperature=generation.get("temperature", 1.0),
+                                       top_p=generation.get("top_p", 0.95))
+                    payload[token_parameter] = requested_max_tokens
                     payload["messages"][1]["content"] = (
                         user_prompt
                         + "\n\n上一次输出为空、截断或不符合 Schema。此轮不展开推理，"
@@ -489,7 +519,7 @@ class AnthropicProvider:
         model_override = _selected_model(self.settings, agent_role, model_override)
         del effort, thinking
         schema_prompt = json.dumps(
-            output_model.model_json_schema(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            _generation_schema(output_model), ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         generation = _generation_settings(self.settings, agent_role)
         payload: dict[str, Any] = {

@@ -10,8 +10,8 @@ input, textarea, select { background: var(--bg); border-radius: 10px; }
 .wordmark strong { letter-spacing: .18em; }
 .wordmark small { letter-spacing: .25em; }
 .top-actions button { border-color: transparent; background: transparent; color: var(--muted); padding: 8px; }
-.context-topbar-badge { min-width: 105px; border: 0; padding: 5px 8px; background: transparent; }
-.context-topbar-badge em { display: none; }
+
+
 .left-rail { background: var(--panel); padding: 18px 10px; }
 .rail-heading { padding: 0 8px 16px; color: var(--muted); }
 .tree-label { font-size: 11px; letter-spacing: .06em; padding-top: 15px; padding-bottom: 9px; }
@@ -103,7 +103,7 @@ input, textarea, select { background: var(--bg); border-radius: 10px; }
 .mobao[data-mood="reviewing"] .mobao-video { animation: mobao-inspect 3s ease-in-out infinite; }
 @keyframes mobao-inspect { 0%,100% { transform: translateY(0); } 40% { transform: translateY(-4px) rotate(-2deg); } 70% { transform: translateY(-2px) rotate(1deg); } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
-@media (max-width: 1100px) { .top-actions button { font-size: 10px; padding: 6px; } .context-topbar-badge { display: none; } .scroll-panel { padding: 20px; } .tabbar { padding-left: 8px; gap: 0; } .tabbar button { padding: 10px 9px; } }
+@media (max-width: 1100px) { .top-actions button { font-size: 10px; padding: 6px; }  .scroll-panel { padding: 20px; } .tabbar { padding-left: 8px; gap: 0; } .tabbar button { padding: 10px 9px; } }
 .computer-action-modal { width: min(760px, 96vw); }
 .computer-action-modal section { min-width: 0; }
 .computer-action-modal section > small { color: var(--muted); font-size: 11px; }
@@ -157,3 +157,17 @@ input, textarea, select { background: var(--bg); border-radius: 10px; }
 .editor-toolbar { flex-wrap: wrap; gap: 9px; }
 .editor-toolbar > div { flex-wrap: wrap; }
 @media (max-width: 1100px) { .pending-board { padding: 16px; } }
+.project-heading { flex-wrap: wrap; row-gap: 3px; align-content: center; }
+.project-heading > .chapter-milestones { display: flex; flex: 1 1 auto; min-width: 0; max-width: 100%; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; color: var(--muted); font-size: 11px; }
+.chapter-milestones > span { white-space: nowrap; }
+.chapter-milestones strong { color: var(--text); font-size: 12px; font-variant-numeric: tabular-nums; }
+.project-body-total { justify-content: flex-end; background: var(--panel); color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.batch-progress-heading { flex-wrap: wrap; gap: 6px; }
+.batch-progress-phase { margin: 7px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.pending-work-card > .pending-decision-note { margin: 8px 0 0; font-size: 11px; line-height: 1.55; }
+.pending-reject-action { color: var(--muted); border-color: var(--line); background: transparent; }
+.pending-rejection-dialog { max-width: 560px; }
+.pending-rejection-dialog > p, .pending-rejection-dialog label { font-size: 13px; line-height: 1.65; }
+.pending-rejection-dialog textarea { min-height: 88px; margin-top: 7px; font-size: 13px; line-height: 1.6; }
+.pending-rejection-impact { padding: 10px 0; border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
+.mimo-connection-options { margin: 12px 0; }

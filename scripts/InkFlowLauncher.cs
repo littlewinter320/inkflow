@@ -8,7 +8,7 @@ using System.Windows.Forms;
 [assembly: AssemblyProduct("墨流 InkFlow")]
 [assembly: AssemblyCompany("InkFlow")]
 [assembly: AssemblyDescription("墨流本地开发版启动程序")]
-[assembly: AssemblyVersion("0.7.4.0")]
+[assembly: AssemblyVersion("0.7.5.0")]
 
 internal static class InkFlowLauncher
 {

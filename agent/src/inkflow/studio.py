@@ -1149,18 +1149,31 @@ class StudioService:
     def dashboard(self) -> dict[str, Any]:
         brief = self.project.db.get_brief()
         plan = self.project.db.get_current_plan_bundle()
-        accepted = self.project.db.accepted_chapters()
+        with self.project.db.connect() as connection:
+            chapters = [dict(row) for row in connection.execute("SELECT * FROM chapters ORDER BY chapter_no")]
         total_characters = 0
-        for chapter in accepted:
-            canonical = self.project.db.canonical_chapter_content(int(chapter["chapter_no"]))
+        written_characters = 0
+        counted_chapters = []
+        for chapter in chapters:
+            canonical = chapter.get("content_text")
+            characters = 0
             if canonical is not None and content_hash(canonical) == chapter["content_hash"]:
-                total_characters += text_statistics(canonical)["characters"]
+                characters = text_statistics(canonical)["characters"]
             else:
                 path = self.project.root / chapter["path"]
                 if path.is_file():
                     projected = path.read_text(encoding="utf-8")
                     if content_hash(projected) == chapter["content_hash"]:
-                        total_characters += text_statistics(projected)["characters"]
+                        characters = text_statistics(projected)["characters"]
+            written_characters += characters
+            if characters:
+                counted_chapters.append(chapter)
+            if chapter["status"] == "accepted":
+                total_characters += characters
+        accepted_numbers = {int(chapter["chapter_no"]) for chapter in counted_chapters if chapter["status"] == "accepted"}
+        accepted_through = 0
+        while accepted_through + 1 in accepted_numbers:
+            accepted_through += 1
         return {
             "project_id": self.project.project_id,
             "root": str(self.project.root),
@@ -1179,6 +1192,14 @@ class StudioService:
             "threads": self.project.db.open_threads(),
             "bible_entries": self.db.list_bible_entries(),
             "accepted_characters": total_characters,
+            "written_characters": written_characters,
+            "chapter_progress": {
+                "written": len(counted_chapters),
+                "awaiting_review": sum(chapter["status"] != "accepted" for chapter in counted_chapters),
+                "accepted": len(accepted_numbers),
+                "written_through": max((int(chapter["chapter_no"]) for chapter in counted_chapters), default=0),
+                "accepted_through": accepted_through,
+            },
             "quality_hold": self.project.latest_accepted_quality_hold(),
             "planning_impact": self.project.db.planning_source_impact(),
             "pending_planning_publication": {
