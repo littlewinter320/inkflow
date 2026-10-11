@@ -4075,21 +4075,29 @@ class InkFlowEngine:
                     quote = line[start:start + 400]
                     if len(quote) >= 4:
                         quote_choices[f"@quote:{len(quote_choices)}"] = {"source_id": source_id, "quote": quote}
-        repair_prompt += ("\n\n# 本次可选择的逐字原文，代码按编号回填，语义仍由你核对\n" + json_dumps(quote_choices)
-            + "\n已提供可支持判断的片段时，source_evidence、chapter_evidence、goal_evidence、change_evidence及事实evidence必须填写对应@quote:编号，"
+        repair_tail = repair_prompt[len(repair_prefix):]
+        choice_note = ("\n已提供可支持判断的片段时，source_evidence、chapter_evidence、goal_evidence、change_evidence及事实evidence必须填写对应@quote:编号，"
               "只选语义支持且source_id一致的片段；也可逐字摘录其他已读原文，不能填概述。"
               "填写source_evidence编号时，source_id必须逐字等于该编号记录的source_id；不要把RECENT_PLAN.md选项标成plan:chapter等另一个来源。"
             + ("当前角色负责记忆，memory_patch必须完整返回并修正候选引文，不能遗漏原有效交接。" if memory_required else ""))
         output_reserve = self.settings.effective_output_tokens(8_000, agent_role)
-        try:
-            repair_prompt, compressed = self._fit_review_prompt(project, packet,
-                system_prompt=system_prompt, tail=repair_prompt[len(repair_prefix):],
-                output_model=type(output), role=agent_role)
-            recovery["compressed_sections"] = compressed
-        except ValidationGateError as exc:
-            recovery.update(status="context_budget_exhausted", error=str(exc))
-            atomic_write_text(trace_path, json_dumps(recovery))
-            return output.model_copy(update={"verdict": "unknown"}), packet, recovery
+        choice_count = len(quote_choices)
+        before_sections = {section.key: section.content for section in packet.sections}
+        while True:
+            tail = repair_tail + "\n\n# 本次可选择的逐字原文，代码按编号回填，语义仍由你核对\n" + json_dumps(quote_choices) + choice_note
+            try:
+                repair_prompt, _ = self._fit_review_prompt(project, packet,
+                    system_prompt=system_prompt, tail=tail, output_model=type(output), role=agent_role)
+                break
+            except ValidationGateError as exc:
+                if quote_choices:
+                    quote_choices = dict(list(quote_choices.items())[::2]) if len(quote_choices) > 1 else {}
+                    continue
+                recovery.update(status="context_budget_exhausted", error=str(exc))
+                atomic_write_text(trace_path, json_dumps(recovery))
+                return output.model_copy(update={"verdict": "unknown"}), packet, recovery
+        recovery["compressed_sections"] = [section.title for section in packet.sections if before_sections[section.key] != section.content]
+        recovery["omitted_quote_choices"] = choice_count - len(quote_choices)
         try:
             result = await self.provider.generate_json(
                 system_prompt=system_prompt, user_prompt=repair_prompt,

@@ -60,6 +60,16 @@ def check():
             assert any(item["source_id"]=="plan:chapter:00001" for item in json.loads(choice_block).values())
             assert "必须填写对应@quote:编号" in repair_prompt
             del packet.sections[-2:]
+            large_source="\n".join(f"本章卡第{number}项要求核对来信后归还原件。" for number in range(500))
+            packet.sections.append(ContextSection(key="C",title="必要章节卡",content=large_source,source_ids=["plan:chapter:00001"],hard=True))
+            engine.settings.context_hard_tokens=24_000
+            engine.settings.context_soft_tokens=21_000
+            provider.generate_json.reset_mock()
+            _,_,record=asyncio.run(run(compared))
+            assert record.get("omitted_quote_choices",0)>0 and packet.sections[-1].content==large_source, record
+            provider.generate_json.assert_awaited_once()
+            packet.sections.pop()
+            engine.settings=Settings()
             original_packet=packet.model_copy(deep=True)
             packet.sections.append(ContextSection(key="F",title="低优先级参考",content="无关参考。"*9000,hard=False))
             engine.settings.context_hard_tokens=30_000
