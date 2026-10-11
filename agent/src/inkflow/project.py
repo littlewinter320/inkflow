@@ -109,6 +109,9 @@ class InkFlowProject:
                 if revision.get("status") in {"needs_writer", "awaiting_review"}:
                     handling = "blocked"
                     item["next_action"] = "此诊断由同章的规划复审事项接管；从该事项续接，不另发整章审查。"
+                    owner = next((work for work in native if work["kind"] == "plan_revision" and work["chapter_no"] == number), None)
+                    if owner:
+                        item["parent_id"] = owner["id"]
                 elif chapter and (review := self.db.latest_review_record(number)):
                     report = review["report"]
                     if (review["chapter_version"] == chapter["version"] and report.source_hash == chapter["content_hash"]

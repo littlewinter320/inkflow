@@ -3173,6 +3173,16 @@ def _list_batch_summaries(project: InkFlowProject) -> list[dict[str, Any]]:
     if not folder.is_dir():
         return []
     db = StudioService(project).db
+    with project.db.connect() as connection:
+        current_chapters = [dict(row) for row in connection.execute("SELECT * FROM chapters")]
+    for chapter in current_chapters:
+        body = chapter.get("content_text")
+        if not isinstance(body, str) or content_hash(body) != chapter["content_hash"]:
+            try:
+                body = project.resolve_user_path(chapter["path"]).read_text(encoding="utf-8")
+            except (OSError, ValueError, ProjectError):
+                body = None
+        chapter["source_valid"] = isinstance(body, str) and content_hash(body) == chapter["content_hash"]
     result: list[dict[str, Any]] = []
     for path in sorted(folder.glob("batch-*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:30]:
         try:
@@ -3198,9 +3208,21 @@ def _list_batch_summaries(project: InkFlowProject) -> list[dict[str, Any]]:
                     _batch_resume_params(project, value, source_run)
                 except (InkFlowError, ValueError, TypeError):
                     resumable = False
+            first, last = int(value["start_chapter_no"]), int(value["end_chapter_no"])
+            targets = [chapter for chapter in current_chapters if first <= chapter["chapter_no"] <= last]
+            current_complete = (last >= first and len(targets) == last - first + 1
+                and all(chapter["source_valid"] for chapter in targets))
+            history_reason = ""
+            if current_complete and not (source_run and source_run.get("status") == "running"):
+                if all(chapter["status"] == "accepted" for chapter in targets):
+                    history_reason = "当前范围已全部进入正史；这次原始批次的失败和来源只保留历史，不再安排补写。"
+                elif not projected["chapters"] and not resumable and status in {"failed", "interrupted", "needs_revision"}:
+                    history_reason = "这次批次没有保存正文，当前范围已有其他来源的正文；原错误留历史，必要审核从当前章节待办处理。"
             result.append({
                 **projected,
                 "status": status,
+                "historical": bool(history_reason),
+                "history_reason": history_reason,
                 "run_id": value.get("last_run_id"),
                 "resume_available": resumable,
                 "start_chapter_no": value.get("start_chapter_no"),

@@ -62,6 +62,7 @@ def check():
         project.db.set_metadata("pending_plan_revision:1",{"status":"awaiting_review","instruction":"只核对当前章节卡"})
         pending=next(x for x in project.pending_work() if x["id"]==diagnostic["id"])
         assert not pending["can_process"] and "规划复审" in pending["next_action"]
+        assert pending["parent_id"] == next(x["id"] for x in project.pending_work() if x["kind"] == "plan_revision")
         print("Pending decisions/progress checks passed: rejection history, restore without resetting attempts, required gates, obsolete target handoff, written versus accepted.")
 
 

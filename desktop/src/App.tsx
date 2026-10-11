@@ -215,6 +215,7 @@ type BatchChapterSummary = {
 };
 type BatchSummary = {
   batch_id: string; status: string; run_id?: string; resume_available?: boolean;
+  historical?: boolean; history_reason?: string;
   stop_reason?: string; stopped_at_chapter?: number; start_chapter_no?: number; end_chapter_no?: number;
   phase?: string; current_phase?: string; error?: string; next_action?: string; pending_work_id?: string;
   checkpoint?: { chapter_no?: number; phase?: string; error?: string };
@@ -2340,8 +2341,11 @@ function BatchProgressStatus({ batches, events, activeRunId }: { batches: BatchS
 
 function collaborationPending(value: CollaborationOverview | null) {
   const items = [...new Map((value?.pending_work || []).filter(item => !["completed", "superseded", "rejected", "cancelled"].includes(item.status)).map(item => [item.id, item])).values()];
-  const work = items.filter(item => !item.parent_id || !items.some(parent => parent.id === item.parent_id));
-  const batches = (value?.batches || []).filter(batch => !(batch.chapters.length && batch.chapters.every(batchChapterAccepted))
+  const suggestions = items.filter(item => item.can_reject === true && item.can_process === false
+    && ["memory_summary", "optimization"].includes(item.kind) && item.status !== "deferred");
+  const work = items.filter(item => !suggestions.includes(item) && (!item.parent_id || !items.some(parent => parent.id === item.parent_id)));
+  const historicalBatches = (value?.batches || []).filter(batch => batch.historical);
+  const batches = (value?.batches || []).filter(batch => !batch.historical && !(batch.chapters.length && batch.chapters.every(batchChapterAccepted))
     && !work.some(item => item.id === batch.pending_work_id || item.intent?.batch_id === batch.batch_id || item.source?.batch_id === batch.batch_id));
   const readyBatches = batches.filter((item) => ["ready_for_acceptance", "accepting"].includes(item.status)
     && !item.remaining_review_range?.length && !item.chapters.some((chapter) => chapter.dependency_reason || ["invalidated", "stale", "memory_pending"].includes(chapter.memory_status || "")));
@@ -2352,7 +2356,7 @@ function collaborationPending(value: CollaborationOverview | null) {
   const messages = (value?.messages || []).filter(item => ["pending", "responded", "escalated"].includes(item.status));
   const rejected = [...new Map([...(value?.rejected_work || []), ...(value?.pending_work || []).filter(item => item.status === "rejected")].map(item => [item.id, item])).values()];
   return { items, work, readyBatches, resumableBatches, pendingBatches, messages,
-    rejected, count: Array.isArray(value?.pending_work) ? work.filter(item => item.status !== "deferred").length : readyBatches.length + resumableBatches.length + pendingBatches.length };
+    rejected, suggestions, historicalBatches, count: Array.isArray(value?.pending_work) ? work.filter(item => item.status !== "deferred").length : readyBatches.length + resumableBatches.length + pendingBatches.length };
 }
 
 function canPollWorkspace(visibility: string, focused: boolean): boolean {
@@ -2436,7 +2440,9 @@ function CollaborationBoard({ value, busy, onProcessAll, onWork, onReject, onReo
     {chapterNumbers.map(number => <section className="pending-chapter-group" key={number}><h4>{number ? `第 ${number} 章` : "项目收尾"}<span>{active.filter(item => (item.chapter_no || 0) === number).length} 项</span></h4>{active.filter(item => (item.chapter_no || 0) === number).sort((a, b) => rank(a) - rank(b)).map(renderWork)}</section>)}
     {pending.resumableBatches.length + pending.readyBatches.length + pending.pendingBatches.length > 0 && <details className="pending-board-disclosure"><summary>批次来源与保存断点 <span>{pending.resumableBatches.length + pending.readyBatches.length + pending.pendingBatches.length}</span></summary><p>每个批次保留自己的产物与审核来源；不会叠加成当前工作数量，也不代表全书正史进度。</p>{pending.resumableBatches.map(batch => renderBatch(batch, "resume"))}{pending.readyBatches.map(batch => renderBatch(batch, "accept"))}{pending.pendingBatches.map(batch => renderBatch(batch, "inspect"))}</details>}
     {deferred.length > 0 && <details className="pending-board-disclosure"><summary>留到下次的事项 <span>{deferred.length}</span></summary>{deferred.map(renderWork)}</details>}
+    {pending.suggestions.length > 0 && <details className="pending-board-disclosure"><summary>摘要与优化建议 <span>{pending.suggestions.length}</span></summary><p>这些建议不单独阻断写作，也不计入待审核数量。相关审核读到完整来源时可同次整理；你也可以选择不采用并留档。</p>{pending.suggestions.map(renderWork)}</details>}
     {pending.messages.length > 0 && <details className="pending-board-disclosure"><summary>Agent 协作讨论 <span>{pending.messages.length}</span></summary><p>这里保留角色交接和待回应问题，具体处理与运行记录见下方「Agent」。</p>{pending.messages.map(item => <article className="pending-discussion" key={item.message_id}><header><strong>{item.chapter_no ? `第 ${item.chapter_no} 章 · ` : ""}{messageTypeLabel(item.message_type)}</strong><span>{roleLabel(item.sender_role)} → {roleLabel(item.recipient_role)}</span></header><p>{item.claim}</p></article>)}</details>}
+    {pending.historicalBatches.length > 0 && <details className="pending-board-disclosure"><summary>已被当前成果接管的批次历史 <span>{pending.historicalBatches.length}</span></summary>{pending.historicalBatches.map(batch => <article className="pending-discussion" key={batch.batch_id}><header><strong>第 {batch.start_chapter_no}—{batch.end_chapter_no} 章</strong><span>仅历史记录</span></header><p>{batch.history_reason}</p><BatchStateDetails batch={batch} /></article>)}</details>}
     {pending.rejected.length > 0 && <details className="pending-board-disclosure"><summary>已拒绝的建议与工作 <span>{pending.rejected.length}</span></summary><p>拒绝记录保留；恢复安排保留原任务处理次数，不立即执行，也不表示问题已经解决。</p>{pending.rejected.map(item => <article className="pending-discussion" key={item.id}><header><strong>{item.chapter_no ? `第 ${item.chapter_no} 章 · ` : ""}{pendingWorkLabel(item)}</strong><span>已拒绝，保留记录</span></header><p>{item.rejection?.reason || item.reason}</p>{item.reject_impact && <p>{item.reject_impact}</p>}<div className="pending-work-actions"><button type="button" disabled={busy} onClick={() => onReopen(item)}>恢复安排</button></div><small>{item.id}</small></article>)}</details>}
   </section>;
 }

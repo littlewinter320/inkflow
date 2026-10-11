@@ -26,6 +26,19 @@ assert.equal(overview.count, 1); // Count current source work; batch handoffs an
 assert.equal(overview.work.length, 2); // The deferred task remains visible in its disclosure.
 assert.equal(overview.messages.length, 1);
 assert.equal(overview.resumableBatches.length, 0);
+const historical = context.collaborationPending({ batches: [
+  { batch_id: "old-empty", status: "failed", historical: true, chapters: [] },
+  { batch_id: "live-missing", status: "failed", chapters: [] },
+], messages: [] });
+assert.equal(historical.historicalBatches.length, 1);
+assert.equal(historical.pendingBatches.length, 1);
+assert.equal(historical.count, 1);
+const suggestions = context.collaborationPending({ pending_work: [work,
+  { id: "summary", kind: "memory_summary", status: "waiting_condition", can_reject: true, can_process: false },
+  { id: "required", kind: "review_gate", status: "waiting_condition", can_reject: false, can_process: false },
+], batches: [], messages: [] });
+assert.equal(suggestions.suggestions.length, 1);
+assert.equal(suggestions.count, 2, "Non-executable optional suggestions must not inflate required review counts");
 assert.equal(context.pendingWorkLabel(work, true), "复审这章");
 assert.equal(context.pendingWorkLabel({ ...work, status: "needs_writer" }, true), "修订并复审这章");
 assert.equal(context.batchChapterAccepted({ status: "draft", memory_status: "canon" }), false);

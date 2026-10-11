@@ -103,6 +103,7 @@ TERMINAL_ROUTER_SYSTEM = """
 多方案与第二意见规则：用户要求多个 Writer 或多个 Reviewer 时，不能增加正式 Agent、不能让多个角色自由改同一篇正文。将“多个 Writer”理解为同一 Writer 在同一 Context Packet 和硬约束下产出互不重叠的候选方向、章节卡或局部替换提案，等待用户选择后再进入单一正式草稿；将“多个 Reviewer”理解为对同一正文哈希的独立证据意见，任何分歧必须以结构化异议交给 Coordinator 汇总。若当前工作流没有相应的候选/复审入口，action=discuss，说明需要先确定范围与选择标准，不得假装已并行执行。
 
 章节工作流 action 必须给出 chapter_no。若用户未明确章节号且不能从其文字可靠确定，仍返回最接近的 action，chapter_no 设为 null；宿主会安全地要求补充，不可猜测。
+pending_work_id 只关联用户本次明确指定或要求续接的当前待办、或唯一关联待答卡；不能从旧对话或相同章号自动附加。独立的新核对请求保留本次范围与禁止项，该字段为 null；查看诊断不等于恢复旧任务或重置次数。
 operation_instruction 用简洁中文保留用户对正文的硬约束，但不写正文；visible_reason 用普通人能看懂的一句话说明“这次会做什么、不会做什么”，不要重复 action 名或要求用户理解内部工作流，不泄露逐步思考。
 用户已要求“自动完成/不用逐章确认/完成到第N章”时，这是该目标内的工作流授权，不再逐步询问；执行 continue_run 或明确的批次流程，保留审核、记忆和停止门禁。自动补救最多两次，max_revision_rounds 只在0～2选择；用户指定更少时遵从，两次失败后交用户，不因续做重置。
 requested_outcome 用一句中文保留用户最终想看到的完整结果，即使本轮只能执行第一步。
@@ -955,6 +956,17 @@ class TerminalSession:
             intent = self._apply_acceptance_policy(text, intent)
             if intent.pending_work_id and intent.action != "pending_work":
                 selected_work = next((item for item in project.pending_work() if item["id"] == intent.pending_work_id), None)
+                trace.record("controller.pending_work.selection", "completed", "核对 Coordinator 提出的待办关联",
+                    metadata={"work_id": intent.pending_work_id, "current_source": selected_work is not None,
+                              "response_kind": intent.response_kind, "action": intent.action})
+                if (pending is None and local_work is None
+                        and intent.response_kind == "new_task" and not intent.related_task_id
+                        and intent.pending_work_id not in text
+                        and not re.search(r"待办|待处理|续接|恢复原任务|继续原任务|处理这项", text)):
+                    # Model-suggested IDs cannot turn an independent request into an old-task recovery.
+                    intent = intent.model_copy(update={"pending_work_id": None})
+                    trace.record("controller.pending_work.selection", "superseded", "旧待办关联不属于当前请求，按本次原话核验范围与权限")
+            if intent.pending_work_id and intent.action != "pending_work":
                 if not isinstance(selected_work, dict) or not selected_work.get("intent"):
                     raise ValidationGateError("待处理任务没有可执行的原任务，请先核对具体问题。")
                 if not selected_work.get("can_process"):
