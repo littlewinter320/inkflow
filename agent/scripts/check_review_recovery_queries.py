@@ -96,6 +96,26 @@ def check():
             provider.generate_json.assert_not_called()
             engine.settings=Settings()
             packet=original_packet
+            valid_comparison=ReviewSourceComparison(source_id="RECENT_PLAN.md",source_evidence="在灯下核对来信。",
+                chapter_evidence="测试正文",relation="aligned",evidence_relation="direct",reason="同轮有效核对")
+            candidate=output.model_copy(update={"source_comparisons":[valid_comparison]})
+            provider.generate_json.return_value=SimpleNamespace(data=output)
+            provider.generate_json.reset_mock()
+            repaired,_,record=asyncio.run(run(candidate))
+            assert repaired.source_comparisons==[valid_comparison] and record["retained_source_comparisons"]==["RECENT_PLAN.md"]
+            provider.generate_json.assert_awaited_once()
+            replacement=valid_comparison.model_copy(update={"relation":"conflict","evidence_relation":"exclusive_conflict"})
+            provider.generate_json.return_value=SimpleNamespace(data=output.model_copy(update={"source_comparisons":[replacement]}))
+            repaired,_,record=asyncio.run(run(candidate))
+            assert repaired.source_comparisons==[replacement], "A new explicit source decision must not be overwritten"
+            provider.generate_json.return_value=SimpleNamespace(data=output)
+            with patch("inkflow.engine._review_evidence_gaps",return_value=["尚未对照当前 RECENT_PLAN.md"]):
+                repaired,_,_=asyncio.run(run(candidate))
+                assert not repaired.source_comparisons, "The affected source must be rechecked"
+            packet.sections[0].content="规划已改变，当前先收回原件。"
+            repaired,_,_=asyncio.run(run(candidate))
+            assert not repaired.source_comparisons, "Changed source text cannot reuse a previous quote"
+            packet.sections[0].content=original_packet.sections[0].content
             async def concurrent_result():
                 acquired=asyncio.Event()
                 async def holder():

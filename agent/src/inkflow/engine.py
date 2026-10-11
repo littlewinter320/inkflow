@@ -4147,6 +4147,16 @@ class InkFlowEngine:
         if carried:
             key = "deviations" if isinstance(repaired, ArcAuditReport) else "findings"
             repaired = repaired.model_copy(update={key: [*carried, *getattr(repaired, key)]})
+        compared_ids = {item.source_id for item in repaired.source_comparisons}
+        retained = [item for item in anchored_comparisons(output.source_comparisons, content, packet)
+                    if item.source_id in {"OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md"}
+                    and item.source_id not in compared_ids and not any(item.source_id in gap for gap in gaps)
+                    and item.relation == "aligned" and item.evidence_relation not in UNRESOLVED_RELATIONS
+                    and item.evidence_relation != "exclusive_conflict"]
+        if retained:
+            # Repair one missing check without discarding unrelated same-round, source-bound checks.
+            repaired = repaired.model_copy(update={"source_comparisons": [*repaired.source_comparisons, *retained]})
+            recovery["retained_source_comparisons"] = [item.source_id for item in retained]
         remaining = _review_evidence_gaps(repaired, content, packet, primary=primary, memory_required=memory_required, source_boundary=boundary)
         if note_questions:
             corrected = clarification.get("reply", {}).get("corrected_hook_note")
