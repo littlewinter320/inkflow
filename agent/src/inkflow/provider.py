@@ -362,6 +362,8 @@ class DeepSeekProvider:
                 choice = body["choices"][0]
                 message = choice["message"]
                 content = message.get("content") or ""
+                if choice.get("finish_reason") == "length":
+                    raise ProviderError(f"模型输出达到本次 {requested_max_tokens} tokens 上限，响应被截断；保留已有成果，需要缩短报告或按任务设置调整输出预算。")
                 if not content:
                     usage = dict(body.get("usage") or {})
                     detail = usage.get("completion_tokens_details") or {}
@@ -698,15 +700,33 @@ def _model_from_json_content(content: str, output_model: type[T]) -> T:
         candidates.append(json.loads(cleaned, strict=False))
     except json.JSONDecodeError as direct_error:
         decoder = json.JSONDecoder(strict=False)
+        depth, start, quoted, escaped = 0, 0, False, False
         for index, char in enumerate(cleaned):
-            if char != "{":
+            if not depth and char != "{":
                 continue
-            try:
-                value, _ = decoder.raw_decode(cleaned[index:])
-            except json.JSONDecodeError:
+            if not depth:
+                start = index
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = False
                 continue
-            if isinstance(value, dict):
-                candidates.append(value)
+            if char == '"':
+                quoted = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if not depth:
+                    try:
+                        value, _ = decoder.raw_decode(cleaned[start:index + 1])
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(value, dict):
+                        candidates.append(value)
         if not candidates:
             raise direct_error
 
@@ -724,6 +744,9 @@ def _model_from_json_content(content: str, output_model: type[T]) -> T:
         ):
             candidate = dict(candidate)
             candidate["content"] = candidate["content"].replace("、", "，")
+            if isinstance(candidate.get("hook_note"), dict):
+                from .writer_notes import align_annotation_quotes
+                candidate["hook_note"], _ = align_annotation_quotes(candidate["hook_note"], candidate["content"])
         # 兼容 Reviewer 偶尔把一条 finding 直接放在顶层的情况。它仍然
         # 必须具备 finding 的完整字段；包装后继续走 ReviewReport 的严格
         # 校验与后续证据门禁，不能因此自动放行。

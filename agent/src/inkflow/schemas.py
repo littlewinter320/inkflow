@@ -1441,6 +1441,7 @@ class TerminalIntent(StrictModel):
     confirmation_token: str | None = Field(default=None, max_length=120)
     batch_id: str | None = Field(default=None, max_length=180)
     batch_review_only: bool = False
+    review_before_revision: bool = False
     plan_change_confirmed: bool = False
     planning_revision_no: int | None = Field(default=None, ge=0)
     planning_part: Literal["none", "outline", "detail", "recent"] = "none"

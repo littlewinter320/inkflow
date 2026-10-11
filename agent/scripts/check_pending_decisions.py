@@ -63,6 +63,9 @@ def check():
         pending=next(x for x in project.pending_work() if x["id"]==diagnostic["id"])
         assert not pending["can_process"] and "规划复审" in pending["next_action"]
         assert pending["parent_id"] == next(x["id"] for x in project.pending_work() if x["kind"] == "plan_revision")
+        assert next(x for x in project.pending_work() if x["kind"] == "plan_revision")["intent"]["review_before_revision"]
+        linked=next(x for x in project.pending_work() if x["id"]==task["id"])
+        assert linked["parent_id"] == pending["parent_id"] and linked["processing_attempts"]==2
         print("Pending decisions/progress checks passed: rejection history, restore without resetting attempts, required gates, obsolete target handoff, written versus accepted.")
 
 

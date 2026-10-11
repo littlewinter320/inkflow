@@ -8,14 +8,17 @@ from unittest.mock import AsyncMock, patch
 from inkflow.config import Settings
 from inkflow.engine import InkFlowEngine
 from inkflow.project import InkFlowProject
-from inkflow.schemas import BookBrief, ContextPacket, ModeCheckOutput, ReviewAssessment
+from inkflow.schemas import BookBrief, ContextPacket, ContextSection, ModeCheckOutput, ReviewAssessment, WriterNoteClarification
+from inkflow.writer_notes import notes_hash
+from inkflow.review_verifier import resolve_review_quote_refs
 
 
 def check():
     with TemporaryDirectory(prefix="review-recovery-",dir="D:/墨流/cache") as folder:
         project=InkFlowProject.create(Path(folder)/"book",BookBrief(title="离线归因",genre="现实",protagonist="林安",premise="仅核对补读选择和来源预算，不生成小说。"))
-        trace=SimpleNamespace(run_dir=Path(folder),record=lambda *a,**k:None,record_model=lambda *a,**k:None)
-        packet=ContextPacket(project_id=project.project_id,chapter_no=1,task="归因核验",sections=[],estimated_tokens=0)
+        trace=SimpleNamespace(run_id="fixture",run_dir=Path(folder),record=lambda *a,**k:None,record_model=lambda *a,**k:None)
+        packet=ContextPacket(project_id=project.project_id,chapter_no=1,task="归因核验",sections=[
+            ContextSection(key="O2",title="当前近期规划",content="## 第1章\n在灯下核对来信。",source_ids=["RECENT_PLAN.md"])],estimated_tokens=0)
         output=ModeCheckOutput(verdict="unknown",confidence=0,summary="仅当前规划对照归因未填",
             assessments=[ReviewAssessment(criterion="readability",status="met",grade=4,reason="当前正文行文可读",alternative="保留待核",chapter_evidence="测试正文")])
         provider=SimpleNamespace(generate_json=AsyncMock(return_value=SimpleNamespace(data=output)))
@@ -28,10 +31,57 @@ def check():
             result,_,record=asyncio.run(run(output))
             search.assert_not_called()
             assert result.verdict=="unknown" and record["status"]=="remaining_gaps"
+            repair_prompt = provider.generate_json.call_args.kwargs["user_prompt"]
+            assert '"source_comparisons"' in repair_prompt and '"focus_observation"' in repair_prompt
+            assert '"RECENT_PLAN.md": "\\n## 第1章\\n在灯下核对来信。"' in repair_prompt
+            assert '"field": "focus_observation.goal_evidence"' in repair_prompt
+            assert "引文不添加‘第N章：’" in repair_prompt and "测试正文" in repair_prompt
+            assert "@quote:0" in repair_prompt and "memory_patch必须完整返回" in repair_prompt
             requested=output.model_copy(update={"source_queries":["灯火 来源"]})
             asyncio.run(run(requested))
             search.assert_called_once()
         print("Review recovery query checks passed: loaded-packet attribution skips unrelated canon search; explicit source gaps search once; unknown gates remain.")
+        notes={"chapter_version":1,"hook_note":{"annotations":[]}}
+        failed={"artifact_id":"original","status":"current","data":{"status":"failed","source_hash":"body",
+            "writer_notes_hash":notes_hash(notes),"story_fingerprint":"story"}}
+        artifacts=[failed]
+        def save(**kwargs):
+            item={"artifact_id":str(len(artifacts)),"status":"current","data":dict(kwargs["data"])}
+            artifacts.insert(0,item)
+            return item
+        fake=SimpleNamespace(root=project.root,db=SimpleNamespace(
+            list_agent_artifacts=lambda **kwargs:artifacts,
+            save_agent_artifact=save,
+            set_agent_artifact_status=lambda identity,status: next(item for item in artifacts if item["artifact_id"]==identity).update(status=status)))
+        provider.generate_json.reset_mock()
+        provider.generate_json.return_value=SimpleNamespace(data=WriterNoteClarification(answers=["仅更正说明，不改正文"]))
+        async def clarify(authorization=""):
+            return await engine._clarify_writer_notes(fake,notes,["核对说明"],"测试正文",packet,trace,retry_authorization=authorization)
+        with patch.object(engine,"_review_source_fingerprint",return_value="source"),patch.object(
+                engine,"_writer_source_fingerprint",return_value="story"),patch("inkflow.engine.content_hash",return_value="body"):
+            assert asyncio.run(clarify())["status"]=="failed"
+            provider.generate_json.assert_not_called()
+            answer=asyncio.run(clarify("本次明确额外授权一次"))
+            assert answer["status"]=="answered" and answer["previous_artifact_id"]=="original"
+            assert failed["data"]["status"]=="failed"
+            assert asyncio.run(clarify("再次要求"))["reused"]
+            provider.generate_json.assert_awaited_once()
+        print("Writer note authorization checks passed: no automatic extra attempt; one recorded manual extra; original failure retained; no repeat.")
+        selections=ModeCheckOutput.model_validate({"verdict":"unknown","confidence":0,"summary":"语义仍由责任角色核对",
+            "focus_observation":{"goal_evidence":"@quote:0","change_evidence":"@quote:1"},
+            "assessments":[{"criterion":"requirements","status":"met","grade":4,"reason":"目标完成","alternative":"保留其他合理解读","chapter_evidence":"@quote:0","source_id":"RECENT_PLAN.md","source_evidence":"@quote:1"}],
+            "source_comparisons":[{"source_id":"RECENT_PLAN.md","source_evidence":"@quote:1","chapter_evidence":"@quote:0","relation":"aligned","reason":"本次目标一致"}],
+            "memory_patch":{"chapter_no":1,"chapter_summary":"核对来信","facts":[{"fact_id":"f1","subject":"林安","predicate":"行动","value":"核对来信","valid_from_chapter":1,"evidence":"@quote:0"}]}})
+        choices={"@quote:0":{"source_id":"当前正文","quote":"他在灯下核对来信。"},
+                 "@quote:1":{"source_id":"RECENT_PLAN.md","quote":"在灯下核对来信。"}}
+        located=resolve_review_quote_refs(selections,choices)
+        assert located.focus_observation.goal_evidence=="他在灯下核对来信。"
+        assert located.focus_observation.change_evidence=="@quote:1", "Planning excerpt cannot impersonate body evidence"
+        assert located.source_comparisons[0].source_evidence=="在灯下核对来信。"
+        assert located.assessments[0].chapter_evidence=="他在灯下核对来信。" and located.assessments[0].source_evidence=="在灯下核对来信。"
+        assert located.memory_patch.facts[0].evidence=="他在灯下核对来信。" and located.verdict=="unknown"
+        assert selections.memory_patch.facts[0].evidence=="@quote:0"
+        assert resolve_review_quote_refs(selections,{}).model_dump()==selections.model_dump()
 
 
 if __name__=="__main__":

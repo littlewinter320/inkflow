@@ -80,6 +80,7 @@ class InkFlowProject:
                     "next_action": "按当前新卡核对草稿，再按已授权范围定向修订和复审。",
                     "intent": TerminalIntent(action="revise_review" if revision["status"] == "needs_writer" else "review",
                         chapter_no=number, authorization="proposed", visible_reason="仅处理这章执行卡修订交接",
+                        review_before_revision=True,
                         operation_instruction=revision.get("instruction") or "按当前章节卡修订并复审；保留其他章节和已接受正文。",
                         forbidden_actions=["accept"]).model_dump(mode="json"),
                     "source": revision})
@@ -96,6 +97,14 @@ class InkFlowProject:
             parent = workflows.get(item.get("source", {}).get("task_id"))
             if parent and parent["id"] != item["id"]:
                 item["parent_id"] = parent["id"]
+            if item["kind"] == "workflow":
+                intent = item.get("intent", {})
+                owner = next((work for work in native if work["kind"] == "plan_revision"
+                    and (intent.get("pending_work_id") == work["id"] or (
+                        intent.get("action") == "review" and not intent.get("end_chapter_no")
+                        and intent.get("chapter_no") == work["chapter_no"]))), None)
+                if owner:
+                    item["parent_id"] = owner["id"]
             handling = "resume" if item.get("intent") else "blocked"
             if item["kind"] in {"accepted_projection", "planning_publication"}:
                 handling = "local"

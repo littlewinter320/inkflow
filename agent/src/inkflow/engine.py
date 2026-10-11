@@ -60,6 +60,7 @@ from .review_verifier import (
     local_nli_decisions,
     packet_sources,
     resolve_packet_source_id,
+    resolve_review_quote_refs,
     same_chapter_disputes,
     verify_review,
 )
@@ -3347,6 +3348,7 @@ class InkFlowEngine:
         self, root: str | Path, chapter_no: int, *, mode: str,
         instruction: str = "", provisional_chapters: list[dict[str, Any]] | None = None,
         recheck_report: ReviewReport | None = None,
+        writer_note_retry_authorization: str = "",
     ) -> dict[str, Any]:
         """One review pipeline; modes only assign checks to their owners."""
         from .prompts import EDITOR_SYSTEM, MEMORY_KEEPER_SYSTEM, SPECIALIST_REVIEWER_SYSTEM
@@ -3358,6 +3360,7 @@ class InkFlowEngine:
                 return await self.review_chapter_mode(
                     root, chapter_no, mode=mode, instruction=instruction,
                     provisional_chapters=provisional_chapters, recheck_report=recheck_report,
+                    writer_note_retry_authorization=writer_note_retry_authorization,
                 )
         if scope.collaboration_mode != mode:
             raise ValidationGateError("审查模式必须与已冻结的任务配置一致。")
@@ -3370,8 +3373,9 @@ class InkFlowEngine:
             card = project.db.get_chapter_card(chapter_no)
             if not chapter or chapter["status"] != "draft" or not card:
                 raise ValidationGateError(f"第 {chapter_no} 章缺少待审草稿或章节卡。")
-            if project.db.pending_plan_revision(chapter_no):
-                raise ValidationGateError("章节计划已变更，必须先按新计划修订草稿。")
+            plan_revision = project.db.pending_plan_revision(chapter_no)
+            if plan_revision and plan_revision.get("card_hash") != content_hash(json_dumps(card)):
+                raise ValidationGateError("计划待核来源与当前章节卡不一致；先核对生效规划，不能沿用旧待办。")
             content = (project.root / chapter["path"]).read_text(encoding="utf-8")
             source_hash = content_hash(content)
             if source_hash != chapter["content_hash"]:
@@ -3517,6 +3521,7 @@ class InkFlowEngine:
                         system_prompt=systems[role], primary=(role == (owners.get("general") or owners.get("logic_continuity"))),
                         role_instruction=json_dumps({"checks": checks, "memory_owner": owners["memory"],
                             "user_instruction": instruction, "mode": mode, "writer_clarification": inherited_reply}),
+                        writer_note_retry_authorization=writer_note_retry_authorization,
                     )
                     if candidate.preference_conflicts:
                         preference_decisions[role] = resolve_preference_conflicts(candidate.preference_conflicts,
@@ -3732,6 +3737,13 @@ class InkFlowEngine:
                     run_id=trace.run_id, primary_role="editor" if "editor" in assigned else "reviewer",
                     bundle=bundle,
                 )
+                if verdict == "pass" and plan_revision:
+                    if project.db.pending_plan_revision(chapter_no) != plan_revision:
+                        raise ValidationGateError("规划待核来源在审核期间已变化；保留报告，不关闭新事项。")
+                    # Fresh source-bound approval can confirm an unchanged draft already fits the new plan.
+                    project.db.set_metadata(f"pending_plan_revision:{chapter_no}", {**plan_revision,
+                        "status": "awaiting_review", "revised_version": int(chapter["version"]),
+                        "write_skipped_after_review": True, "review_id": review_id})
                 self._record_review_collaboration(
                     project, chapter_no, int(chapter["version"]), report, trace.run_id, "",
                     actor=focus_owner or "editor",
@@ -3817,6 +3829,7 @@ class InkFlowEngine:
     async def _clarify_writer_notes(
         self, project: InkFlowProject, notes: dict[str, Any], questions: list[str],
         content: str, packet: ContextPacket, trace: TraceRecorder,
+        *, retry_authorization: str = "",
     ) -> dict[str, Any]:
         """At most one Writer answer per body hash, including failed/interrupted attempts."""
         chapter_no = packet.chapter_no
@@ -3830,7 +3843,11 @@ class InkFlowEngine:
             previous = next((item for item in project.db.list_agent_artifacts(
                 chapter_no=chapter_no, artifact_type="writer_note_clarification", limit=200)
                 if item["status"] != "superseded" and item["data"].get("source_hash") == body_hash), None)
-            if previous:
+            manual_retry = bool(previous and retry_authorization and not previous["data"].get("retry_authorization")
+                and previous["data"].get("status") != "answered"
+                and previous["data"].get("writer_notes_hash") == notes_hash(notes)
+                and previous["data"].get("story_fingerprint") == story_fingerprint)
+            if previous and not manual_retry:
                 if (previous["data"].get("writer_notes_hash") != notes_hash(notes)
                         or previous["data"].get("story_fingerprint") != story_fingerprint):
                     return {"status": "attempt_limit", "artifact_id": previous["artifact_id"],
@@ -3838,12 +3855,15 @@ class InkFlowEngine:
                 return {**previous["data"], "artifact_id": previous["artifact_id"], "reused": True}
             data = {"status": "attempted", "source_hash": body_hash,
                     "writer_notes_hash": notes_hash(notes), "story_fingerprint": story_fingerprint, "questions": questions}
+            if manual_retry:
+                data.update(retry_authorization=retry_authorization, previous_artifact_id=previous["artifact_id"])
             attempt = project.db.save_agent_artifact(
                 artifact_type="writer_note_clarification", run_id=trace.run_id, role="writer",
                 chapter_no=chapter_no, chapter_version=notes["chapter_version"], data=data,
             )
         prompt = packet.to_model_prompt() + "\n\n# 当前正文\n" + content + notes_prompt(notes)
-        prompt += "\n\n# 仅回答以下问题，保留有效说明，不改正文\n" + json_dumps(questions)
+        prompt += ("\n\n# 仅回答以下问题，保留有效说明，不改正文\n" + json_dumps(questions)
+            + f"\n本次共{len(questions)}题，answers必须恰好{len(questions)}项并按原顺序逐题对应；说明中的条目不是额外问题。")
         _, hard_limit = self.settings.context_budget_for("writer")
         if estimate_tokens(WRITER_NOTE_CLARIFICATION_SYSTEM + prompt) + min(2_000, self.settings.max_output_tokens) > hard_limit:
             return {**data, "status": "context_budget_exhausted", "artifact_id": attempt["artifact_id"]}
@@ -3854,10 +3874,10 @@ class InkFlowEngine:
                 max_tokens=min(2_000, self.settings.max_output_tokens), timeout_seconds=90, thinking=False,
             )
             reply = WriterNoteClarification.model_validate(result.data)
+            trace.record_model("writer.note_clarification", result, "Writer说明短答已返回，核验题数和来源后采用")
             if len(reply.answers) != len(questions):
                 raise ValueError("Writer未逐题回答，短答不能作为已解决问题")
             data.update(status="answered", reply=reply.model_dump(mode="json"))
-            trace.record_model("writer.note_clarification", result, "Writer仅答创作意图，正文没有重生成")
         except (RunBudgetExceeded, ValidationGateError):
             raise
         except Exception as exc:
@@ -3878,6 +3898,7 @@ class InkFlowEngine:
         packet: ContextPacket, trace: TraceRecorder, *, agent_role: str,
         system_prompt: str, role_instruction: str, primary: bool,
         source_boundary: int | None = None,
+        writer_note_retry_authorization: str = "",
     ) -> tuple[Any, ContextPacket, dict[str, Any]]:
         """One role-scoped search/reread/review, before publishing a missing-data report."""
         scope = active_task_settings.get()
@@ -3931,7 +3952,7 @@ class InkFlowEngine:
         _, hard_limit = self.settings.context_budget_for(agent_role)
         packet = _review_evidence_packet(project, packet, boundary, requested,
             reference_hits=recovery.get("reference_hits", []),
-            added_token_limit=SOURCE_RECOVERY_TOKEN_LIMIT, hard_token_limit=hard_limit - min(6_000, self.settings.max_output_tokens) - 2_000)
+            added_token_limit=SOURCE_RECOVERY_TOKEN_LIMIT, hard_token_limit=hard_limit - min(8_000, self.settings.max_output_tokens) - 2_000)
         recovery["reference_sources"] = [json.loads(section.content) for section in packet.sections
                                          if section.key.startswith("reference-recovery-")]
         # Recovery diagnostics carry identities, never a second unbudgeted copy of source text.
@@ -3954,7 +3975,8 @@ class InkFlowEngine:
             raise ValidationGateError("补读来源版本已变化，未请求模型复核。")
         clarification = {}
         if note_questions:
-            clarification = await self._clarify_writer_notes(project, notes, note_questions, content, packet, trace)
+            clarification = await self._clarify_writer_notes(project, notes, note_questions, content, packet, trace,
+                retry_authorization=writer_note_retry_authorization)
             recovery["writer_note_clarification"] = clarification
         # Only the assigned role is rerun. This is a repair call, not a second
         # complete multi-agent debate, and uses the ordinary runtime budget.
@@ -3971,8 +3993,12 @@ class InkFlowEngine:
                 "queries", "loaded_sources", "source_loading", "reference_hits", "load_warnings")}, "待核判断": {
                 "summary": output.summary,
                 "assessments": [item.model_dump(mode="json") for item in output.assessments],
+                "source_comparisons": [item.model_dump(mode="json") for item in getattr(output, "source_comparisons", [])],
+                "focus_observation": getattr(output, "focus_observation", None).model_dump(mode="json")
+                    if getattr(output, "focus_observation", None) is not None else None,
                 "findings": [item.model_dump(mode="json") for item in findings],
                 "memory_conflicts": patch.unresolved_conflicts if patch else [],
+                "memory_patch": patch.model_dump(mode="json") if patch else None,
             },
             "要求": "重新依据正文和来源判断，不以旧报告为真。先区分新增信息、状态变化、人物信念/谎言、规划调整和排他矛盾。"
             "已找到的引文也要核对对象、事件时间和说话人；未命中不等于不存在。合理新增或悬念不因旧章没提过而失败。"
@@ -3983,14 +4009,50 @@ class InkFlowEngine:
             "缺关键前提仍用unknown/data_missing，说明确切缺什么；只有双侧原文证实硬问题才交Writer。"
             "记忆归类或候选错误由记忆责任角色修正，不要求Writer改正文。保留仍有效的判断，填写可定位引文与证据关系。",
         })
-        if estimate_tokens(system_prompt + repair_prompt) + min(6_000, self.settings.max_output_tokens) > hard_limit:
+        sources = packet_sources(packet)
+        windows = {}
+        for source_id in ("OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md"):
+            body = sources.get(source_id, "")
+            heading = re.search(rf"第\s*{boundary}\s*章", body)
+            start = max(0, heading.start() - 80) if heading else 0
+            windows[source_id] = body[start:start + 2000]
+        repair_prompt += ("\n\n# 当前来源的原文定位窗口（节选，完整资料仍在前文；不能把概述改写成引文）\n"
+            + json_dumps(windows)
+            + "\n保留已核实的各来源对照，完整返回三份当前规划及紧邻前章的source_comparisons。"
+              "focus_observation的两句都只能逐字取当前正文，不能取规划；不得用一份文件的句子冒充另一份文件。")
+        rejected_quotes = []
+        focus = getattr(output, "focus_observation", None)
+        if focus:
+            for field in ("goal_evidence", "change_evidence"):
+                quote = getattr(focus, field)
+                if not quote or not evidence_matches(quote, content):
+                    rejected_quotes.append({"field": "focus_observation." + field, "quote": quote, "source_id": "当前正文"})
+        for index, comparison in enumerate(getattr(output, "source_comparisons", [])):
+            source_id = resolve_packet_source_id(comparison.source_id, sources)
+            if not source_id or not evidence_matches(comparison.source_evidence, sources[source_id]):
+                rejected_quotes.append({"field": f"source_comparisons[{index}].source_evidence",
+                    "quote": comparison.source_evidence, "source_id": comparison.source_id})
+        if rejected_quotes:
+            repair_prompt += ("\n\n# 以下具体引文未定位，必须更正，不能复制旧值\n" + json_dumps(rejected_quotes)
+                + "\n引文不添加‘第N章：’等说明标签，不改写、合并或补出原文。正文开头原文定位窗口：\n" + content[:1600])
+        quote_choices = {}
+        for source_id, body in {"当前正文": content, **windows}.items():
+            for line in body.splitlines():
+                quote = line.strip()[:240]
+                if len(quote) >= 4:
+                    quote_choices[f"@quote:{len(quote_choices)}"] = {"source_id": source_id, "quote": quote}
+        repair_prompt += ("\n\n# 本次可选择的逐字原文，代码按编号回填，语义仍由你核对\n" + json_dumps(quote_choices)
+            + "\n优先在source_evidence、chapter_evidence、goal_evidence、change_evidence及事实evidence中填写对应@quote:编号，"
+              "只选语义支持且source_id一致的片段；也可逐字摘录其他已读原文，不能填概述。"
+            + ("当前角色负责记忆，memory_patch必须完整返回并修正候选引文，不能遗漏原有效交接。" if memory_required else ""))
+        if estimate_tokens(system_prompt + repair_prompt) + min(8_000, self.settings.max_output_tokens) > hard_limit:
             recovery["status"] = "context_budget_exhausted"
             atomic_write_text(trace_path, json_dumps(recovery))
             return output.model_copy(update={"verdict": "unknown"}), packet, recovery
         try:
             result = await self.provider.generate_json(
                 system_prompt=system_prompt, user_prompt=repair_prompt,
-                output_model=type(output), effort="low", max_tokens=min(6_000, self.settings.max_output_tokens),
+                output_model=type(output), effort="low", max_tokens=min(8_000, self.settings.max_output_tokens),
                 timeout_seconds=120, thinking=False, agent_role=agent_role,
             )
         except (RunBudgetExceeded, ValidationGateError):
@@ -4000,7 +4062,9 @@ class InkFlowEngine:
             trace.record("review.source_recovery", "warning", "补读复核未完成，保留未定结论", str(exc))
             atomic_write_text(trace_path, json_dumps(recovery))
             return output.model_copy(update={"verdict": "unknown"}), packet, recovery
-        repaired = result.data
+        repaired = resolve_review_quote_refs(result.data, quote_choices)
+        recovery["quote_choices"] = {key: {"source_id": value["source_id"], "quote_hash": content_hash(value["quote"])}
+            for key, value in quote_choices.items()}
         # An omitted or merely relabelled concrete two-quote conflict still
         # needs the existing, evidence-bound same-chapter decision.
         before, _ = verify_review(ReviewReport(verdict="unknown", confidence=output.confidence,
@@ -5167,7 +5231,7 @@ class InkFlowEngine:
             if not chapter or chapter["status"] != "draft":
                 raise ProjectError(f"第 {chapter_no} 章没有待接受草稿。")
             if project.db.pending_plan_revision(chapter_no):
-                raise ValidationGateError("章节计划已更新，必须先由 Writer 按新卡修订再重审；不能沿用旧通过结论接受正文。")
+                raise ValidationGateError("章节计划已更新，须先核对当前草稿是否符合新卡；不能沿用旧通过结论接受正文。")
             if not review_record:
                 raise ValidationGateError("没有审查报告，不能提交正史。")
             if review_record["chapter_version"] != int(chapter["version"]):
@@ -6348,14 +6412,12 @@ class InkFlowEngine:
         project = InkFlowProject(root)
         manifest = self._load_batch_manifest(project, batch_id)
         repairable_status = manifest.get("status") in {"ready_for_acceptance", "needs_revision", "interrupted"}
-        if manifest.get("status") == "failed" and manifest.get("current_phase") == "memory_handoff":
+        if manifest.get("status") == "failed" and (review_only or manifest.get("current_phase") == "memory_handoff"):
             repairable_status = True
         if not repairable_status:
             raise ValidationGateError("只有未验收的待修订、已完成或已中断临时批次可以继续修复。")
         entries = [item for item in manifest.get("chapters") or []
                    if all(key in item for key in ("title", "draft_path", "review_path", "version"))]
-        if not entries:
-            raise ValidationGateError("批次没有可修复的章节。")
         entries.sort(key=lambda item: int(item["chapter_no"]))
         batch_start = int(manifest["start_chapter_no"])
         batch_end = int(manifest["end_chapter_no"])

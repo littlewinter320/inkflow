@@ -93,6 +93,7 @@ TERMINAL_ROUTER_SYSTEM = """
 - write_review：让 Writer 写指定章节，然后让 Editor 审查；绝不接受。
 - write_review_accept：用户明确要求写完检查并验收，或由已保存的自动验收策略升级时使用；包含必要的限次修订，只有当前版本 `pass` 才调用 记忆服务。用户要求先看草稿或不要验收时绝不能使用。
 - revise_review：让 Writer 依同版本审查修订指定章节，然后让 Editor 重审；绝不接受。
+- “先检查，有正文问题才修好并复审”使用 revise_review 且 review_before_revision=true；先由当前审查角色核对，只有有证据的正文问题才交 Writer。资料不足、记忆归类错误或普通建议不先改稿，不能降为只修草稿的 revise_draft。用户明确给出要替换的内容则沿用普通修订流程。
 - repair_accepted：用户明确要求自己核对并修复已接受正史章的疑点时使用。仅处理最新正史章已有的双引文疑点或用户明确指出的局部连续性问题；先由审读者对照紧邻前章及完整当前章判断，必要时 Writer 局部修订，再独立复核并由引擎保留旧版提交。不撤回整章，不自动写下一章。只讨论或要求先看候选时不要执行。
 - review_accept：先让 Editor 审查；仅当 verdict=pass 时才让记忆服务接受，且 force 永远为 false。
 - revise_review_accept：修订→重审→必要时自动定点修复→仅 pass 时接受；常见可恢复问题不要求用户逐个确认。
@@ -1113,14 +1114,20 @@ class TerminalSession:
                     project.db.resolve_collaboration_thread(ticket.ticket_id)
                     failure = workflow_failure_reason(response)
                     if failure or response.get("needs_clarification"):
+                        failed_node = next((item for item in self._recovery_nodes(response)
+                            if item["status"] != "completed" and (item["result"].get("stopped_at_chapter") or item["result"].get("chapter_no"))), {})
+                        failure_chapter = (failed_node.get("result", {}).get("stopped_at_chapter")
+                            or failed_node.get("result", {}).get("chapter_no")
+                            or (ticket.chapter_no if not intent.end_chapter_no else None))
+                        failed_source = project.db.get_chapter(failure_chapter) if failure_chapter else None
                         project.db.append_collaboration_message(
                             thread_id=ticket.ticket_id,
                             run_id=trace.run_id,
                             sender_role="coordinator",
                             recipient_role="user",
                             message_type="risk",
-                            chapter_no=ticket.chapter_no,
-                            chapter_version=ticket.chapter_version,
+                            chapter_no=failure_chapter,
+                            chapter_version=failed_source["version"] if failed_source else None,
                             context_packet_id=content_hash(packet.to_model_prompt()),
                             claim=failure or "任务仍需要用户补充信息。",
                             evidence_refs=ticket.input_sources,
@@ -1322,7 +1329,7 @@ class TerminalSession:
                     ("step", "status", "error_type", "recovery_node", "recovery_attempts", "recovery_exhausted", "next_action")}
                     | {"status": workflow_result_status(value), "reason": workflow_failure_reason(value),
                        "result": {key: value.get("result", {}).get(key) for key in
-                           ("chapter_no", "version", "source_hash", "content_hash", "path", "trace_id", "verdict")}
+                           ("chapter_no", "stopped_at_chapter", "version", "source_hash", "content_hash", "path", "trace_id", "verdict")}
                            if isinstance(value.get("result"), dict) else {}})
             stack.extend(value.get("steps", []) if isinstance(value.get("steps"), list) else [])
             if isinstance(value.get("result"), dict):
@@ -1399,13 +1406,14 @@ class TerminalSession:
             "original_intent": intent.model_dump(mode="json"), "ticket": ticket.model_dump(mode="json"),
             "mode": dispatch.collaboration_mode, "steps": nodes, "failure": reason,
             "source": source, "previous_attempts": history, "runtime": runtime.snapshot()}
-        latest_review = project.db.latest_review_record(intent.chapter_no) if intent.chapter_no else None
-        current_chapter = project.db.get_chapter(intent.chapter_no) if intent.chapter_no else None
+        failure_chapter = failed.get("result", {}).get("stopped_at_chapter") or failed.get("result", {}).get("chapter_no") or intent.chapter_no
+        latest_review = project.db.latest_review_record(failure_chapter) if failure_chapter else None
+        current_chapter = project.db.get_chapter(failure_chapter) if failure_chapter else None
         same_round_recovery = bool(latest_review and current_chapter
             and latest_review["chapter_version"] == current_chapter["version"]
             and latest_review["report"].source_hash == current_chapter["content_hash"]
             and latest_review["report"].evidence_recovery.get("attempted"))
-        if same_round_recovery and node == "engine.review_mode":
+        if same_round_recovery and (node == "engine.review_mode" or node == "batch_repair" and intent.batch_review_only):
             evidence = latest_review["report"].evidence_recovery
             reason = "同版审查已完成有界补读，仍有必要依据缺口，已停止外围重审。"
             detail = evidence.get("error") or "；".join(evidence.get("remaining_gaps", []))
@@ -1625,6 +1633,18 @@ class TerminalSession:
         if start_chapter < 1 or end_chapter <= start_chapter:
             return None
 
+        if re.search(r"^(?:墨宝[，,\s]*)?(?:现在|请|本次|这次)?[，,\s]*(?:只|仅)(?:补审|复审|核对|审查|审核)", text) and re.search(r"现有|已有|当前", text) and re.search(r"批次|这批", text):
+            if not _NO_ACCEPTANCE_PATTERN.search(text) and re.search(r"验收|接受|接收|入正史|收进", text):
+                return None
+            batch = re.search(r"\bbatch-[a-zA-Z0-9+_-]+\b", text)
+            return TerminalIntent(action="batch_repair",batch_review_only=True,
+                batch_id=batch.group(0) if batch else None,
+                requested_outcome=text[:1_000],confidence="high",authorization="approved",
+                authorization_source="current_request",chapter_no=start_chapter,end_chapter_no=end_chapter,
+                max_revision_rounds=0,operation_instruction=text[-4_000:],
+                forbidden_actions=["write","revise","accept"],
+                visible_reason=f"只补核现有第 {start_chapter}～{end_chapter} 章与临时记忆；正文不变，不验收。")
+
         # A chapter range can delimit a planning document.  Treat an explicit
         # outline request as such before looking for incidental words like
         # "已写好的正文"; otherwise a harmless revision can start a full batch.
@@ -1664,7 +1684,7 @@ class TerminalSession:
         # A range can describe a planning/editing window, not a request to
         # write chapters.  Never let incidental words such as "已写正文" or
         # "完成卷末收束" override an explicit no-prose instruction.
-        if re.search(r"(?:不写|不要写|先别写|暂不写|只(?:调整|修改|重排|规划|讨论))[^。！？\n]{0,28}(?:正文|章节|草稿|计划|安排)", text):
+        if re.search(r"(?:不写|不要写|先别写|暂不写|不重写|不新增|不修改正文|不调用\s*Writer|只(?:补审|复审|核对|调整|修改|重排|规划|讨论))[^。！？\n]{0,28}(?:正文|章节|草稿|计划|安排)", text):
             return None
 
         if (re.search(r"(?:只|仅)修(?:订|正)?[^。！？\n]{0,24}草稿", text)
@@ -1983,6 +2003,10 @@ class TerminalSession:
         missing = {item for item in intent.missing_fields if item in relevant_fields}
         action = intent.action
 
+        if intent.review_before_revision and action == "revise_draft":
+            action = "revise_review"
+            updates["action"] = action
+
         # A user who says “fix this chapter, then finish the batch and accept
         # it” is asking for the complete resumable workflow, not the narrower
         # repair-only tool.  Keep this deterministic so ordinary conversation
@@ -2126,7 +2150,7 @@ class TerminalSession:
             requested_start = updates.get("chapter_no", intent.chapter_no)
             requested_end = updates.get("end_chapter_no", intent.end_chapter_no)
             if not intent.batch_id:
-                repairable_batches = self._repairable_batch_ids(project)
+                repairable_batches = self._repairable_batch_ids(project, review_only=intent.batch_review_only)
                 pending_task = project.db.get_metadata(conversation_key("pending_creation_task"))
                 pending_batch = (pending_task.get("intent", {}).get("batch_id")
                                  if isinstance(pending_task, dict) else None)
@@ -2521,7 +2545,7 @@ class TerminalSession:
         return sorted(result)
 
     @staticmethod
-    def _repairable_batch_ids(project: InkFlowProject) -> list[str]:
+    def _repairable_batch_ids(project: InkFlowProject, *, review_only: bool = False) -> list[str]:
         folder = project.internal / "batches"
         result: list[str] = []
         for path in folder.glob("batch-*.json"):
@@ -2530,6 +2554,8 @@ class TerminalSession:
             except (OSError, json.JSONDecodeError):
                 continue
             repairable_status = value.get("status") in {"ready_for_acceptance", "needs_revision", "interrupted"}
+            if value.get("status") == "failed" and (review_only or value.get("current_phase") == "memory_handoff"):
+                repairable_status = True
             if repairable_status and value.get("batch_id") == path.stem:
                 result.append(path.stem)
         return sorted(result)
@@ -3143,8 +3169,11 @@ class TerminalSession:
         forbidden = set(intent.forbidden_actions)
         if (("write" in forbidden and intent.action in {
                 "scene_draft", "write_draft", "write_review", "write_review_accept",
-                "batch_draft", "batch_draft_accept", "batch_repair", "continue_run",
-            }) or ("review" in forbidden and intent.action in {
+                "batch_draft", "batch_draft_accept", "continue_run",
+            }) or ("write" in forbidden and intent.action == "batch_repair" and not intent.batch_review_only)
+            or ("revise" in forbidden and (intent.action in {"revise_draft", "revise_review", "revise_review_accept"}
+                or intent.action == "batch_repair" and not intent.batch_review_only))
+            or ("review" in forbidden and intent.action in {
                 "review", "review_accept", "write_review", "write_review_accept",
                 "revise_review", "revise_review_accept", "batch_draft", "batch_draft_accept",
                 "batch_repair", "continue_run",
@@ -3684,7 +3713,7 @@ class TerminalSession:
             current_review = bool(record and chapter
                 and record["chapter_version"] == chapter["version"]
                 and record["report"].source_hash == chapter["content_hash"])
-            if current_review:
+            if current_review and not intent.review_before_revision:
                 revised = self._reuse_workflow_writer(project, chapter_no, "revise", instruction)
                 revised = revised or await self._run_step(
                     "writer.revise", self.engine.revise_chapter(root, chapter_no, instruction)
@@ -3705,6 +3734,8 @@ class TerminalSession:
             review = self.engine.review_chapter_mode(
                 root, chapter_no, mode=dispatch_plan.collaboration_mode,
                 instruction=instruction,
+                writer_note_retry_authorization=(ticket.user_message if ticket
+                    and re.search(r"本次授权额外一次\s*Writer\s*说明短答", ticket.user_message) else ""),
             )
             steps.append(await self._run_step(
                 "engine.review_mode",

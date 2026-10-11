@@ -20,6 +20,29 @@ HARD_RULES = {
 _SAME_CHAPTER_CONFLICT_NOTE = "本章双处逐字引文待核"
 
 
+def resolve_review_quote_refs(output: Any, quotes: dict[str, dict[str, str]]) -> Any:
+    """Resolve explicit choices from this call's source-bound excerpts, never fuzzy-match claims."""
+    data = output.model_dump(mode="json")
+    def resolve(value: str, source_id: str) -> str:
+        entry = quotes.get(value)
+        return entry["quote"] if entry and entry["source_id"] == source_id else value
+    focus = data.get("focus_observation")
+    if focus:
+        for field in ("goal_evidence", "change_evidence"):
+            focus[field] = resolve(focus[field], "当前正文")
+    for item in data.get("source_comparisons", []):
+        item["source_evidence"] = resolve(item["source_evidence"], item["source_id"])
+        item["chapter_evidence"] = resolve(item["chapter_evidence"], "当前正文")
+    for item in data.get("assessments", []):
+        item["chapter_evidence"] = resolve(item["chapter_evidence"], "当前正文")
+        item["source_evidence"] = resolve(item["source_evidence"], item["source_id"])
+    patch = data.get("memory_patch")
+    if patch:
+        for item in patch.get("facts", []):
+            item["evidence"] = resolve(item["evidence"], "当前正文")
+    return type(output).model_validate(data)
+
+
 def packet_sources(packet: ContextPacket) -> dict[str, str]:
     sources: dict[str, str] = {}
     for section in packet.sections:

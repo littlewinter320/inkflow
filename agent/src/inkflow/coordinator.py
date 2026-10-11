@@ -157,10 +157,11 @@ class Coordinator:
         updates: dict[str, object] = {"user_message": text[:4_000]}
         action = intent.action
         # Conditional repair is review-first, not evidence-free rewriting.
-        if action in {"revise_review", "revise_review_accept"} and re.search(
-            r"(?:有|发现|如果|若).{0,10}(?:问题|错误|不通过|没过).{0,8}(?:改|修)", text
+        if action in {"revise_draft", "revise_review", "revise_review_accept"} and re.search(
+            r"(?:有|发现|如果|若).{0,10}(?:问题|错误|不通过|没过).{0,12}(?:改|修)", text
         ) and re.search(r"审|检查|核对", text):
-            action = "review_accept" if action.endswith("_accept") else "revise_review"
+            action = "revise_review_accept" if action.endswith("_accept") else "revise_review"
+            updates["review_before_revision"] = True
         no_accept = NO_ACCEPTANCE_PATTERN.search(text)
         no_review = re.search(r"(?:别|不要|先不|暂不|暂时不|暂时别|不必|无需).{0,8}(?:审查|审核|复审)", text)
         # Negation must govern the writing task itself. "别把丢失的原件写回来"

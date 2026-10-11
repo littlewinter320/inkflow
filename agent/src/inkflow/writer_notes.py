@@ -6,6 +6,19 @@ from .schemas import HookNote
 from .utils import content_hash, json_dumps
 
 
+def align_annotation_quotes(note: dict[str, Any], content: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    annotations = [dict(item) for item in note.get("annotations", [])]
+    changes = []
+    for index, item in enumerate(annotations):
+        quote = str(item.get("quote") or "")
+        aligned = quote.replace("、", "，")
+        if quote and quote not in content and aligned != quote and aligned in content:
+            item["quote"] = aligned
+            changes.append({"annotation_index": index, "original_quote": quote, "quote": aligned,
+                "reason": "正文格式处理已替换顿号；同一连续原句同步定位，不改说明含义"})
+    return ({**note, "annotations": annotations}, changes) if changes else (note, [])
+
+
 def version_notes(project: Any, chapter_no: int) -> dict[str, Any]:
     chapter = project.db.get_chapter(chapter_no)
     if not chapter:
@@ -21,6 +34,14 @@ def version_notes(project: Any, chapter_no: int) -> dict[str, Any]:
             notes.setdefault("artifact_ids", []).append(item["artifact_id"])
     if notes:
         notes.update(chapter_no=chapter_no, chapter_version=chapter["version"], content_hash=chapter["content_hash"])
+        content = chapter.get("content_text")
+        if not isinstance(content, str) or content_hash(content) != chapter["content_hash"]:
+            path = project.resolve_user_path(chapter["path"])
+            content = path.read_text(encoding="utf-8") if path.is_file() else ""
+        if content_hash(content) == chapter["content_hash"] and "hook_note" in notes:
+            notes["hook_note"], alignments = align_annotation_quotes(notes["hook_note"], content)
+            if alignments:
+                notes["quote_alignments"] = alignments
     return notes
 
 
