@@ -4063,7 +4063,7 @@ class InkFlowEngine:
                 + "\n引文不添加‘第N章：’等说明标签，不改写、合并或补出原文。正文开头原文定位窗口：\n" + content[:1600])
         quote_choices = {}
         quote_sources = {"当前正文": content, **windows}
-        for comparison in getattr(output, "source_comparisons", []):
+        for comparison in [*getattr(output, "source_comparisons", []), *output.assessments]:
             source_id = resolve_packet_source_id(comparison.source_id, sources)
             if source_id:
                 quote_sources.setdefault(source_id, sources[source_id])
@@ -4078,6 +4078,7 @@ class InkFlowEngine:
         repair_prompt += ("\n\n# 本次可选择的逐字原文，代码按编号回填，语义仍由你核对\n" + json_dumps(quote_choices)
             + "\n已提供可支持判断的片段时，source_evidence、chapter_evidence、goal_evidence、change_evidence及事实evidence必须填写对应@quote:编号，"
               "只选语义支持且source_id一致的片段；也可逐字摘录其他已读原文，不能填概述。"
+              "填写source_evidence编号时，source_id必须逐字等于该编号记录的source_id；不要把RECENT_PLAN.md选项标成plan:chapter等另一个来源。"
             + ("当前角色负责记忆，memory_patch必须完整返回并修正候选引文，不能遗漏原有效交接。" if memory_required else ""))
         output_reserve = self.settings.effective_output_tokens(8_000, agent_role)
         try:

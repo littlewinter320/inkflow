@@ -44,17 +44,21 @@ def check():
             search.assert_called_once()
             prior_quote="原件取出。"+"核对"*250+"原件放回。"
             packet.sections.append(ContextSection(key="D1",title="前章原文",content=prior_quote,source_ids=["chapter:00000"]))
+            packet.sections.append(ContextSection(key="C",title="当前章节卡",content="当前卡只核对来信。",source_ids=["plan:chapter:00001"]))
             compared=output.model_copy(update={"source_comparisons":[ReviewSourceComparison(
                 source_id="chapter:00000",source_evidence="旧报告摘错",chapter_evidence="测试正文",
-                relation="aligned",reason="核对前章物件状态")]})
+                relation="aligned",reason="核对前章物件状态")],"assessments":[ReviewAssessment(
+                criterion="requirements",status="met",grade=4,reason="核对当前章节卡",alternative="保留待核",
+                chapter_evidence="测试正文",source_id="plan:chapter:00001",source_evidence="旧报告摘错")]})
             asyncio.run(run(compared))
             repair_prompt=provider.generate_json.call_args.kwargs["user_prompt"]
             choice_block=repair_prompt.split("# 本次可选择的逐字原文，代码按编号回填，语义仍由你核对\n")[1].split("\n已提供")[0]
             prior_choices=[item["quote"] for item in json.loads(choice_block).values() if item["source_id"]=="chapter:00000"]
             assert prior_quote[:400] in prior_choices and prior_quote[400:] in prior_choices
             assert all(len(quote)<=400 and quote in prior_quote for quote in prior_choices)
+            assert any(item["source_id"]=="plan:chapter:00001" for item in json.loads(choice_block).values())
             assert "必须填写对应@quote:编号" in repair_prompt
-            packet.sections.pop()
+            del packet.sections[-2:]
             original_packet=packet.model_copy(deep=True)
             packet.sections.append(ContextSection(key="F",title="低优先级参考",content="无关参考。"*9000,hard=False))
             engine.settings.context_hard_tokens=30_000
