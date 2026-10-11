@@ -12,7 +12,8 @@ from inkflow.coordinator import Coordinator
 from inkflow.terminal_session import TerminalSession
 from inkflow.config import Settings
 from inkflow.errors import ValidationGateError
-from inkflow.utils import content_hash, json_dumps, workflow_result_status, workflow_failure_reason
+from inkflow.utils import content_hash, json_dumps, workflow_result_status, workflow_failure_reason, estimate_tokens
+from inkflow.context import named_prior_chapters
 
 
 def check():
@@ -23,6 +24,26 @@ def check():
         ({"status": {"accepted": 30}, "steps": [{"status": "failed", "stop_reason": "原节点失败"}]}, "failed", "原节点失败"),
     ):
         assert workflow_result_status(result) == status and workflow_failure_reason(result) == failure
+    context_source = Path(__file__).parents[1]/"src/inkflow/context.py"
+    context_tree = ast.parse(context_source.read_text("utf-8"))
+    build = next(node for node in ast.walk(context_tree) if isinstance(node, ast.FunctionDef) and node.name == "build")
+    first = next(index for index, node in enumerate(build.body) if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "cited_chapters")
+    last = next(index for index, node in enumerate(build.body) if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "ending_pattern_inputs")
+    wrapper = ast.parse("def named_context(self,task,chapter_no,mode,recent,provisional_chapters):\n pass").body[0]
+    wrapper.body = [*build.body[first:last], ast.parse("return recent_provisional, loaded_numbers, named_source_tokens").body[0]]
+    namespace = {"named_prior_chapters":named_prior_chapters,"estimate_tokens":estimate_tokens,"ContextSection":object,"ValidationGateError":ValidationGateError}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper],type_ignores=[])),str(context_source),"exec"),namespace)
+    def missing(*args,**kwargs): raise ValueError("不是已接受正史")
+    fixture = SimpleNamespace(retriever=SimpleNamespace(_accepted_source=missing),project=SimpleNamespace(record_pending_work=lambda **kwargs:None))
+    provisional = [{"chapter_no":number,"content":f"本批第{number}章原文"} for number in range(31,39)]
+    selected, loaded, tokens = namespace["named_context"](fixture,"复用第31章已核验草稿",38,"review",[],provisional)
+    assert [item["chapter_no"] for item in selected] == [31,34,35,36,37] and 38 not in loaded and tokens[31]>0
+    try:
+        namespace["named_context"](fixture,"复用第30章",38,"review",[],provisional)
+    except ValidationGateError:
+        pass
+    else:
+        raise AssertionError("Unprovided provisional chapters must still satisfy canonical-source gates")
     source = Path(__file__).parents[1]/"src/inkflow/terminal_session.py"
     tree = ast.parse(source.read_text("utf-8"))
     handle = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "handle")

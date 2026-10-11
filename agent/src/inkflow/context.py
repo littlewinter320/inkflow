@@ -315,9 +315,14 @@ class ContextBuilder:
             recent_ids.append(f"chapter:{item['chapter_no']:05d}")
         cited_chapters = []
         named_numbers = named_prior_chapters(task, chapter_no, set())
+        prior_provisional = [item for item in provisional_chapters or [] if int(item["chapter_no"]) < chapter_no]
+        recent_provisional = [item for index, item in enumerate(prior_provisional)
+                              if index >= len(prior_provisional) - (4 if mode == "review" else 2)
+                              or int(item["chapter_no"]) in named_numbers]
+        loaded_numbers = {int(item["chapter_no"]) for item in [*recent, *recent_provisional]}
         named_source_tokens = {int(item["chapter_no"]): estimate_tokens(item["content"])
-                               for item in recent if int(item["chapter_no"]) in named_numbers}
-        for number in named_prior_chapters(task, chapter_no, {int(item["chapter_no"]) for item in recent}):
+                               for item in [*recent, *recent_provisional] if int(item["chapter_no"]) in named_numbers}
+        for number in named_prior_chapters(task, chapter_no, loaded_numbers):
             try:
                 source = self.retriever._accepted_source(number, before_chapter=chapter_no)
             except (ValueError, OSError) as exc:
@@ -347,7 +352,7 @@ class ContextBuilder:
                 f"batch:{item.get('batch_id', 'current')}:chapter:{provisional_no:05d}"
             )
         ending_patterns = _recent_ending_patterns(self.project.root, ending_pattern_inputs)
-        for item in (provisional_chapters or [])[-4 if mode == "review" else -2:]:
+        for item in recent_provisional:
             provisional_no = int(item["chapter_no"])
             provisional_content = str(item["content"])
             recent_parts.append(
@@ -564,7 +569,7 @@ class ContextBuilder:
                 title="最近已接受章节与批次临时草稿",
                 content="\n\n".join(recent_parts) or "尚无前章。",
                 source_ids=recent_ids,
-                hard=bool(set(named_numbers) & {int(item["chapter_no"]) for item in recent}),
+                hard=bool(set(named_numbers) & loaded_numbers),
                 cache_scope="chapter",
             ),
             *cited_chapters,
