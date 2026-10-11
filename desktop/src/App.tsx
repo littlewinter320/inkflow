@@ -2385,7 +2385,8 @@ function completionReference(events: EngineEvent[], runId?: string): TraceRefere
   return [...events].reverse().filter(event => event.run_id === runId && runId
     && ["completed", "accepted", "resolved"].includes(event.status || "")
     && !/context|retriev|input/.test(`${event.stage || ""} ${event.type || ""}`))
-    .flatMap(event => event.references || []).find(reference => reference.exists);
+    .flatMap(event => event.references || []).find(reference => reference.exists
+      && !/^\.inkflow[\\/]/i.test(reference.relative_path) && /\.(md|txt)$/i.test(reference.relative_path));
 }
 
 function pendingWorkLabel(item: PendingWorkItem, action = false): string {

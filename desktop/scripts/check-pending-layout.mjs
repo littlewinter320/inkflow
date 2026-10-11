@@ -39,8 +39,8 @@ const suggestions = context.collaborationPending({ pending_work: [work,
 ], batches: [], messages: [] });
 assert.equal(suggestions.suggestions.length, 1);
 assert.equal(suggestions.count, 2, "Non-executable optional suggestions must not inflate required review counts");
-assert.equal(context.pendingWorkLabel(work, true), "复审这章");
-assert.equal(context.pendingWorkLabel({ ...work, status: "needs_writer" }, true), "修订并复审这章");
+assert.equal(context.pendingWorkLabel(work, true), "复核这章");
+assert.equal(context.pendingWorkLabel({ ...work, status: "needs_writer" }, true), "核对并按需修订");
 assert.equal(context.batchChapterAccepted({ status: "draft", memory_status: "canon" }), false);
 assert.equal(context.batchChapterAccepted({ status: "accepted", chapter_status: "draft" }), false);
 assert.equal(context.batchChapterReviewed({ status: "accepted", review_status: "needs_review" }), false);
@@ -89,6 +89,14 @@ const references = [{ run_id: "now", status: "completed", stage: "context.compil
   { run_id: "other", status: "completed", stage: "draft.saved", references: [{ exists: true, relative_path: "chapters/other.md" }] },
   { run_id: "now", status: "failed", stage: "review.failed", references: [{ exists: true, relative_path: "reviews/failed.md" }] }];
 assert.equal(context.completionReference(references, "now")?.relative_path, "chapters/31.draft.md");
+const diagnostics=[{run_id:"now",status:"completed",stage:"mode.editor",references:[
+  {exists:true,relative_path:".inkflow/runs/review/output.json"},
+  {exists:true,relative_path:".inkflow\\runs\\review\\trace.md"},
+  {exists:true,relative_path:"reviews/output.json"}]}];
+assert.equal(context.completionReference(diagnostics,"now"),undefined);
+assert.equal(context.completionReference([...references,...diagnostics],"now")?.relative_path,"chapters/31.draft.md");
+assert.equal(context.completionReference([...diagnostics,{run_id:"now",status:"completed",stage:"review.saved",references:[
+  {exists:true,relative_path:"reviews/current.review.md"}]}],"now")?.relative_path,"reviews/current.review.md");
 assert.ok(source.includes("autoPreview={Boolean(completionReference(events, mobaoCompletion?.runId))}"));
 assert.ok(source.includes('"document.read_reference"') && source.includes("text !== savedText"));
 assert.equal(context.canPollWorkspace("visible", true), true);
