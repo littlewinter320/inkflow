@@ -9,10 +9,11 @@ from unittest.mock import AsyncMock, patch
 from inkflow.config import Settings
 from inkflow.engine import InkFlowEngine
 from inkflow.project import InkFlowProject
-from inkflow.schemas import BookBrief, ContextPacket, ContextSection, ModeCheckOutput, ReviewAssessment, ReviewSourceComparison, WriterNoteClarification
+from inkflow.schemas import BookBrief, ContextPacket, ContextSection, ModeCheckOutput, ReviewAssessment, ReviewSourceComparison, WriterNoteClarification, MemoryPatch
 from inkflow.writer_notes import notes_hash
 from inkflow.review_verifier import resolve_review_quote_refs, packet_sources
 from inkflow.project_lock import project_write_lock
+from inkflow.utils import content_hash
 
 
 def check():
@@ -151,6 +152,21 @@ def check():
         sources=packet_sources(memory_packet)
         assert "第一章来信" in sources["batch-memory:b:chapter:00001"] and "第二章回信" not in sources["batch-memory:b:chapter:00001"]
         assert "第二章回信" in sources["batch-memory:b:chapter:00002"] and "第一章来信" not in sources["batch-memory:b:chapter:00002"]
+        body="本批当前草稿。"
+        (Path(folder)/"fixture.md").write_text(body,encoding="utf-8")
+        memory=MemoryPatch(chapter_no=2,chapter_summary="已核验的临时交接")
+        staged={"status":"active","chapter_version":1,"content_hash":content_hash(body),"patch":memory}
+        closed=[]
+        db=SimpleNamespace(get_chapter=lambda number:{"status":"draft","version":1,"content_hash":content_hash(body),"path":"fixture.md"},
+            latest_review_record=lambda number:{"chapter_version":1,"report":SimpleNamespace(verdict="pass",source_hash=content_hash(body))},
+            get_provisional_memory_patch=lambda *args:staged,append_collaboration_message=lambda **kwargs:None)
+        pending_project=SimpleNamespace(root=Path(folder),db=db,reconcile_pending_work=lambda current_pass:closed.extend([current_pass(2),current_pass(1)]))
+        prefix=[{"chapter_no":1,"content":"本批前章原文。"}]
+        with patch.object(engine,"current_pass_review",return_value={"id":37}) as verify:
+            asyncio.run(engine._stage_batch_memory(pending_project,batch_id="b",chapter_no=2,chapter_version=1,
+                content=body,memory_patch=memory,trace=trace,claim="保存临时交接",requested_response="继续原范围",provisional_chapters=prefix))
+            verify.assert_called_once_with(pending_project,2,provisional_chapters=prefix)
+            assert closed==[{"id":37},None], "Only the checked chapter closes; other pending gates remain independent"
 
 
 if __name__=="__main__":

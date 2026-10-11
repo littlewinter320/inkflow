@@ -142,10 +142,11 @@ class InkFlowProject:
                     handling = "blocked"
             item["handling"] = "deferred" if item["status"] == "deferred" else handling
             item["can_process"] = item["status"] != "rejected" and handling in {"resume", "local", "manual", "review"}
-            optional = item["kind"] in {"optimization", "memory_summary", "workflow"}
+            optional = item["kind"] in {"optimization", "memory_summary", "workflow", "context_source"}
             item["can_reject"] = optional and handling != "running" and item["status"] != "rejected"
-            item["reject_label"] = "不重建这份摘要" if item["kind"] == "memory_summary" else "不执行这项额外工作" if item["kind"] == "optimization" else "放弃这次任务"
+            item["reject_label"] = "不重建这份摘要" if item["kind"] == "memory_summary" else "不执行这项额外工作" if item["kind"] == "optimization" else "暂不补充这份依据" if item["kind"] == "context_source" else "放弃这次任务"
             item["reject_impact"] = ("旧摘要继续隔离；需要资料时核对当前已接受原文，正史不变。" if item["kind"] == "memory_summary" else
+                "停止安排本项资料补充并留档；后续任务仍核实际来源，缺必要依据时仍会暂停，不代表问题已通过审核。" if item["kind"] == "context_source" else
                 "停止安排这项工作并保留拒绝记录；已有成果保留，关联审查与依赖仍独立核验。")
             item["reject_blocked_reason"] = "必要审查、规划依赖或提交收尾不能由拒绝标为解决；可留待下次或在相应候选入口决定。" if not optional else "任务运行期间不能拒绝；请先停止。" if handling == "running" else ""
         return [item for item in items if item["status"] not in {"completed", "superseded"}

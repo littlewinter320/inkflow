@@ -6007,6 +6007,7 @@ class InkFlowEngine:
         self, project: InkFlowProject, *, batch_id: str, chapter_no: int,
         chapter_version: int, content: str, memory_patch: MemoryPatch,
         trace: TraceRecorder, claim: str, requested_response: str,
+        provisional_chapters: list[dict[str, Any]] | None = None,
     ) -> None:
         """Promote one checked candidate to provisional memory only if its source still matches."""
         async with project_write_lock(project.root):
@@ -6033,6 +6034,9 @@ class InkFlowEngine:
                     if attempt or not any(word in str(exc).lower() for word in ("locked", "busy")):
                         raise
                     trace.record("batch.memory.retry", "recovering", "临时记忆数据库忙，原节点重试一次", str(exc))
+            project.reconcile_pending_work(current_pass=lambda number: self.current_pass_review(
+                project, number, provisional_chapters=provisional_chapters,
+            ) if number == chapter_no else None)
             try:
                 project.db.append_collaboration_message(
                 thread_id=f"batch-{batch_id}-chapter-{chapter_no:05d}-v{chapter_version}",
@@ -6329,6 +6333,7 @@ class InkFlowEngine:
                         )
                         await self._stage_batch_memory(
                             project, batch_id=batch_id, chapter_no=chapter_no,
+                            provisional_chapters=provisional,
                             chapter_version=int(current["version"]), content=content,
                             memory_patch=memory_patch, trace=trace,
                             claim=f"第 {chapter_no} 章审查已通过；临时事实与伏笔已写入批次记忆，但尚非正史。",
@@ -6568,6 +6573,7 @@ class InkFlowEngine:
                     )
                     await self._stage_batch_memory(
                         project, batch_id=batch_id, chapter_no=chapter_no,
+                        provisional_chapters=provisional,
                         chapter_version=int(current["version"]), content=content,
                         memory_patch=memory_patch, trace=trace,
                         claim=f"第 {chapter_no} 章现有版本已补审；临时记忆重新同步，未进入正史。",
@@ -6700,6 +6706,7 @@ class InkFlowEngine:
                         )
                         await self._stage_batch_memory(
                             project, batch_id=batch_id, chapter_no=chapter_no,
+                            provisional_chapters=provisional,
                             chapter_version=int(current["version"]), content=content,
                             memory_patch=memory_patch, trace=trace,
                             claim=f"第 {chapter_no} 章修订版已通过；临时事实与伏笔已重新同步，仍未进入正史。",
