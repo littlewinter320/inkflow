@@ -46,7 +46,7 @@ def resolve_review_quote_refs(output: Any, quotes: dict[str, dict[str, str]]) ->
 def packet_sources(packet: ContextPacket) -> dict[str, str]:
     sources: dict[str, str] = {}
     for section in packet.sections:
-        if section.key == "B2":
+        if section.key in {"B2", "E0"}:
             try:
                 payload = json.loads(section.content)
             except ValueError:
@@ -57,6 +57,20 @@ def packet_sources(packet: ContextPacket) -> dict[str, str]:
                 match = re.fullmatch(r"batch-memory:.+:chapter:(\d+)", ref)
                 if match and int(match.group(1)) in indexed:
                     sources[ref] = json.dumps(indexed[int(match.group(1))], ensure_ascii=False, indent=2)
+            continue
+        if section.title in {"不可违反的硬正史", "当前人物状态与知识边界", "相关历史索引"}:
+            try:
+                payload = json.loads(section.content)
+            except ValueError:
+                continue
+            indexed = {str(item["事实编号"]): item for item in payload
+                       if isinstance(item, dict) and item.get("事实编号")} if isinstance(payload, list) else {}
+            for ref in section.source_ids:
+                if ref in indexed:
+                    sources[ref] = sources.get(ref, "") + "\n" + json.dumps(indexed[ref], ensure_ascii=False, indent=2)
+            continue
+        if section.key == "E1":
+            # Derived ending summaries cannot supply a chapter's literal prose evidence.
             continue
         if section.key == "F0" or (section.key == "F" and section.title == "分层混合检索结果"):
             try:

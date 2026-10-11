@@ -4063,6 +4063,10 @@ class InkFlowEngine:
                 + "\n引文不添加‘第N章：’等说明标签，不改写、合并或补出原文。正文开头原文定位窗口：\n" + content[:1600])
         quote_choices = {}
         quote_sources = {"当前正文": content, **windows}
+        prior_sources = {source_id: body for source_id, body in sources.items()
+                         if source_id.startswith(("chapter:", "batch:"))
+                         and source_id.endswith(f"chapter:{boundary - 1:05d}")}
+        quote_sources.update(prior_sources)
         for comparison in [*getattr(output, "source_comparisons", []), *output.assessments]:
             source_id = resolve_packet_source_id(comparison.source_id, sources)
             if source_id:
@@ -4080,6 +4084,9 @@ class InkFlowEngine:
               "只选语义支持且source_id一致的片段；也可逐字摘录其他已读原文，不能填概述。"
               "填写source_evidence编号时，source_id必须逐字等于该编号记录的source_id；不要把RECENT_PLAN.md选项标成plan:chapter等另一个来源。"
             + ("当前角色负责记忆，memory_patch必须完整返回并修正候选引文，不能遗漏原有效交接。" if memory_required else ""))
+        if prior_sources:
+            choice_note += ("\n必须对照紧邻前章正文来源：" + "、".join(prior_sources)
+                + "；batch-memory是临时记忆，不是前章正文，不能替代这项对照。")
         output_reserve = self.settings.effective_output_tokens(8_000, agent_role)
         choice_count = len(quote_choices)
         before_sections = {section.key: section.content for section in packet.sections}
@@ -4091,7 +4098,11 @@ class InkFlowEngine:
                 break
             except ValidationGateError as exc:
                 if quote_choices:
-                    quote_choices = dict(list(quote_choices.items())[::2]) if len(quote_choices) > 1 else {}
+                    groups = {}
+                    for key, entry in quote_choices.items():
+                        groups.setdefault(entry["source_id"], []).append((key, entry))
+                    reduced = dict(item for entries in groups.values() for item in entries[::2])
+                    quote_choices = reduced if len(reduced) < len(quote_choices) else {}
                     continue
                 recovery.update(status="context_budget_exhausted", error=str(exc))
                 atomic_write_text(trace_path, json_dumps(recovery))

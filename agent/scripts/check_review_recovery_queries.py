@@ -60,6 +60,15 @@ def check():
             assert any(item["source_id"]=="plan:chapter:00001" for item in json.loads(choice_block).values())
             assert "必须填写对应@quote:编号" in repair_prompt
             del packet.sections[-2:]
+            packet.chapter_no=2
+            packet.sections.append(ContextSection(key="E",title="前章正文",content="### 批次临时草稿 · 第 1 章\n前章收到原件。",source_ids=["batch:b:chapter:00001"]))
+            asyncio.run(run(output))
+            repair_prompt=provider.generate_json.call_args.kwargs["user_prompt"]
+            choice_block=repair_prompt.split("# 本次可选择的逐字原文，代码按编号回填，语义仍由你核对\n")[1].split("\n已提供")[0]
+            assert any(item["source_id"]=="batch:b:chapter:00001" for item in json.loads(choice_block).values()), "A missing prose comparison must still receive the actual previous chapter"
+            assert "batch-memory是临时记忆，不是前章正文" in repair_prompt
+            packet.sections.pop()
+            packet.chapter_no=1
             large_source="\n".join(f"本章卡第{number}项要求核对来信后归还原件。" for number in range(500))
             packet.sections.append(ContextSection(key="C",title="必要章节卡",content=large_source,source_ids=["plan:chapter:00001"],hard=True))
             engine.settings.context_hard_tokens=24_000
@@ -162,6 +171,14 @@ def check():
         sources=packet_sources(memory_packet)
         assert "第一章来信" in sources["batch-memory:b:chapter:00001"] and "第二章回信" not in sources["batch-memory:b:chapter:00001"]
         assert "第二章回信" in sources["batch-memory:b:chapter:00002"] and "第一章来信" not in sources["batch-memory:b:chapter:00002"]
+        facts_packet=ContextPacket(project_id="fixture",chapter_no=2,task="来源隔离",estimated_tokens=0,sections=[
+            ContextSection(key="B",title="不可违反的硬正史",content=json.dumps([
+                {"事实编号":"f1","正文证据":"原件收到。"},{"事实编号":"f2","正文证据":"副本寄出。"}],ensure_ascii=False),source_ids=["f1","f2"]),
+            ContextSection(key="E1",title="近期章节结尾模式摘要",content="派生概述不能充当原文。",source_ids=["chapter:00001"])])
+        sources=packet_sources(facts_packet)
+        assert "原件收到。" in sources["f1"] and "副本寄出。" not in sources["f1"]
+        assert "副本寄出。" in sources["f2"] and "原件收到。" not in sources["f2"]
+        assert "chapter:00001" not in sources
         body="本批当前草稿。"
         (Path(folder)/"fixture.md").write_text(body,encoding="utf-8")
         memory=MemoryPatch(chapter_no=2,chapter_summary="已核验的临时交接")
