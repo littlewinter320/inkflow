@@ -1,5 +1,6 @@
 """Only missing source evidence searches canon; attribution repair reuses the loaded packet."""
 import asyncio
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -41,14 +42,17 @@ def check():
             requested=output.model_copy(update={"source_queries":["灯火 来源"]})
             asyncio.run(run(requested))
             search.assert_called_once()
-            prior_quote="原件取出。"+"核对"*150+"原件放回。"
+            prior_quote="原件取出。"+"核对"*250+"原件放回。"
             packet.sections.append(ContextSection(key="D1",title="前章原文",content=prior_quote,source_ids=["chapter:00000"]))
             compared=output.model_copy(update={"source_comparisons":[ReviewSourceComparison(
                 source_id="chapter:00000",source_evidence="旧报告摘错",chapter_evidence="测试正文",
                 relation="aligned",reason="核对前章物件状态")]})
             asyncio.run(run(compared))
             repair_prompt=provider.generate_json.call_args.kwargs["user_prompt"]
-            assert prior_quote in repair_prompt and '"source_id": "chapter:00000"' in repair_prompt
+            choice_block=repair_prompt.split("# 本次可选择的逐字原文，代码按编号回填，语义仍由你核对\n")[1].split("\n已提供")[0]
+            prior_choices=[item["quote"] for item in json.loads(choice_block).values() if item["source_id"]=="chapter:00000"]
+            assert prior_quote[:400] in prior_choices and prior_quote[400:] in prior_choices
+            assert all(len(quote)<=400 and quote in prior_quote for quote in prior_choices)
             assert "必须填写对应@quote:编号" in repair_prompt
             packet.sections.pop()
             original_packet=packet.model_copy(deep=True)
