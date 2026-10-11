@@ -1,6 +1,6 @@
 # 墨流 0.7.5 发布记录
 
-当前状态：源码、媒体、桌面安装包和扩展已完成相关检查，等待 GitHub 上传及发布回执。0.7.4 的标签、附件与验证记录保留；本版上传与正式发布不以本地封包成功代替。
+当前状态：0.7.5 已于北京时间 **2026-10-11 16:33:45** 正式公开发布，GitHub latest 指向本版；五个附件上传完整且服务端 digest 与本地一致。0.7.4 的标签、附件与验证记录保留。
 
 本版用户可见变化见 [CHANGELOG](../CHANGELOG.md)，逐项改动和已执行的相关检查见 [后续修复记录](FIXES_2026-10-11.md)、[MiMo契约](MIMO_API_2026-10-11.md)、[界面与音频](UI_PROGRESS_PENDING_AUDIO_2026-10-11.md)及[墨宝媒体](MOBAO_MEDIA_2026-10-11.md)。
 
@@ -13,7 +13,7 @@
 - 引导实际 effect 的离线计时器检查通过：正常顺序、完整两秒指向及一点五秒轻点、自动预览至多一次、输入中断清理和减少动态效果收尾；不代替应用实播。
 - updater 的版本、安装包名称、大小与 SHA512 一致。安装包和应用的 ProductName 为“墨流 InkFlow”，版本分别为 0.7.5 / 0.7.5.0；`Get-AuthenticodeSignature` 均返回 NotSigned，未宣称有签名发布者。
 
-本地待上传附件：
+已上传并核对服务端 digest 的附件：
 
 | 附件 | 字节 | SHA256 |
 |---|---:|---|
@@ -21,8 +21,17 @@
 | InkFlow-Setup-0.7.5.exe.blockmap | 151,441 | `0c1287d3715d67ef374b959f89bb76aaa969a74d2ace908dda78b2b0aa875fb6` |
 | latest.yml | 343 | `ac687f24d8089dc3691cdfa6a12906ceefd358b6c5ccc714e07781bab999206b` |
 | inkflow-vscode-0.7.5.vsix | 23,463,699 | `b19e00e2456a2aa53950ee71b1ab2b129cf361f4687a463c260132b5bf63918a` |
+| SHA256SUMS.txt | 362 | `261f30800894e62ca179f4dad2f025441a08b88847df1b802ffa9707fb72866d` |
 
-`SHA256SUMS.txt` 随上述四个附件上传。待补齐：源码提交/PR、标签、上传附件的服务端 digest 及发布工作流回执。
+`SHA256SUMS.txt` 包含其余四个附件的校验值。五个附件状态均为 uploaded，发布后下载地址均使用 v0.7.5；私人小说、项目数据库、凭据和开发模型缓存没有上传。
+
+## GitHub 发布回执
+
+- 修复提交：`5542dc6e08ab7eb5afa375adbd992cf0832f4878`；[PR #3](https://github.com/littlewinter320/inkflow/pull/3) 于北京时间 2026-10-11 16:31:45 合并。
+- 标签对应源码：`add623cfe0bba86c8186c55f4828f0919b362a87`；annotated tag 对象为 `76d93d3001701429dba14b09ecd63cd4bc73ef6e`，远端标签与本地一致。后补的发布回执提交只更新文档，不挪动标签。
+- [正式 Release](https://github.com/littlewinter320/inkflow/releases/tag/v0.7.5)：ID `409538895`，draft=false、prerelease=false，当前 latest=v0.7.5。
+- 附件 ID：安装包 `630223536`、blockmap `630223493`、VSIX `630223496`、latest.yml `630223498`、校验清单 `630223492`。逐项实际 size 和 digest 见上表。
+- [发布工作流](https://github.com/littlewinter320/inkflow/actions/runs/38125237460)：北京时间 16:34:00 完成，conclusion=success。源码检出、已上传附件检测及标签/三个包版本检查成功；因为附件齐全，Python/Node 初始化、引擎构建、依赖安装及桌面发布步骤均 skipped。本次云端未重复构建，不能把这些 skipped 写为又一次编译通过。
 
 ## 实际小说来源核验
 
