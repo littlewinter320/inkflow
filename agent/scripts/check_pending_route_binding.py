@@ -12,10 +12,17 @@ from inkflow.coordinator import Coordinator
 from inkflow.terminal_session import TerminalSession
 from inkflow.config import Settings
 from inkflow.errors import ValidationGateError
-from inkflow.utils import content_hash, json_dumps
+from inkflow.utils import content_hash, json_dumps, workflow_result_status, workflow_failure_reason
 
 
 def check():
+    for result, status, failure in (
+        ({"status": {"accepted": 30, "draft": 10}}, "completed", ""),
+        ({"verdict": {"detail": "辅助统计"}}, "completed", ""),
+        ({"status": {"accepted": 30}, "result": {"status": "waiting_condition"}}, "waiting_condition", ""),
+        ({"status": {"accepted": 30}, "steps": [{"status": "failed", "stop_reason": "原节点失败"}]}, "failed", "原节点失败"),
+    ):
+        assert workflow_result_status(result) == status and workflow_failure_reason(result) == failure
     source = Path(__file__).parents[1]/"src/inkflow/terminal_session.py"
     tree = ast.parse(source.read_text("utf-8"))
     handle = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "handle")

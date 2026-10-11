@@ -8,9 +8,10 @@ from unittest.mock import AsyncMock, patch
 from inkflow.config import Settings
 from inkflow.engine import InkFlowEngine
 from inkflow.project import InkFlowProject
-from inkflow.schemas import BookBrief, ContextPacket, ContextSection, ModeCheckOutput, ReviewAssessment, WriterNoteClarification
+from inkflow.schemas import BookBrief, ContextPacket, ContextSection, ModeCheckOutput, ReviewAssessment, ReviewSourceComparison, WriterNoteClarification
 from inkflow.writer_notes import notes_hash
 from inkflow.review_verifier import resolve_review_quote_refs
+from inkflow.project_lock import project_write_lock
 
 
 def check():
@@ -40,6 +41,16 @@ def check():
             requested=output.model_copy(update={"source_queries":["灯火 来源"]})
             asyncio.run(run(requested))
             search.assert_called_once()
+            prior_quote="原件取出。"+"核对"*150+"原件放回。"
+            packet.sections.append(ContextSection(key="D1",title="前章原文",content=prior_quote,source_ids=["chapter:00000"]))
+            compared=output.model_copy(update={"source_comparisons":[ReviewSourceComparison(
+                source_id="chapter:00000",source_evidence="旧报告摘错",chapter_evidence="测试正文",
+                relation="aligned",reason="核对前章物件状态")]})
+            asyncio.run(run(compared))
+            repair_prompt=provider.generate_json.call_args.kwargs["user_prompt"]
+            assert prior_quote in repair_prompt and '"source_id": "chapter:00000"' in repair_prompt
+            assert "必须填写对应@quote:编号" in repair_prompt
+            packet.sections.pop()
             original_packet=packet.model_copy(deep=True)
             packet.sections.append(ContextSection(key="F",title="低优先级参考",content="无关参考。"*9000,hard=False))
             engine.settings.context_hard_tokens=30_000
@@ -57,6 +68,23 @@ def check():
             provider.generate_json.assert_not_called()
             engine.settings=Settings()
             packet=original_packet
+            async def concurrent_result():
+                acquired=asyncio.Event()
+                async def holder():
+                    async with project_write_lock(project.root):
+                        acquired.set()
+                        await asyncio.sleep(0.1)
+                owner=asyncio.create_task(holder())
+                await acquired.wait()
+                return SimpleNamespace(data=output),owner
+            async def locked_run():
+                result,owner=await concurrent_result()
+                provider.generate_json.return_value=result
+                restored=await run(output)
+                await owner
+                return restored
+            _,_,record=asyncio.run(locked_run())
+            assert record["status"]=="remaining_gaps", "Short concurrent writes must not discard model results"
         print("Review recovery query checks passed: loaded-packet attribution skips unrelated canon search; explicit source gaps search once; unknown gates remain.")
         notes={"chapter_version":1,"hook_note":{"annotations":[]}}
         failed={"artifact_id":"original","status":"current","data":{"status":"failed","source_hash":"body",

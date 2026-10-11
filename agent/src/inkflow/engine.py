@@ -4062,13 +4062,21 @@ class InkFlowEngine:
             repair_prompt += ("\n\n# 以下具体引文未定位，必须更正，不能复制旧值\n" + json_dumps(rejected_quotes)
                 + "\n引文不添加‘第N章：’等说明标签，不改写、合并或补出原文。正文开头原文定位窗口：\n" + content[:1600])
         quote_choices = {}
-        for source_id, body in {"当前正文": content, **windows}.items():
+        quote_sources = {"当前正文": content, **windows}
+        for comparison in getattr(output, "source_comparisons", []):
+            source_id = resolve_packet_source_id(comparison.source_id, sources)
+            if source_id:
+                quote_sources.setdefault(source_id, sources[source_id])
+        for source_id, body in quote_sources.items():
             for line in body.splitlines():
-                quote = line.strip()[:240]
-                if len(quote) >= 4:
-                    quote_choices[f"@quote:{len(quote_choices)}"] = {"source_id": source_id, "quote": quote}
+                line = line.strip()
+                # Keep paragraph tails while respecting the report's 400-character evidence fields.
+                for start in range(0, len(line) if len(line) > 400 else 1, 200):
+                    quote = line[start:start + 400]
+                    if len(quote) >= 4:
+                        quote_choices[f"@quote:{len(quote_choices)}"] = {"source_id": source_id, "quote": quote}
         repair_prompt += ("\n\n# 本次可选择的逐字原文，代码按编号回填，语义仍由你核对\n" + json_dumps(quote_choices)
-            + "\n优先在source_evidence、chapter_evidence、goal_evidence、change_evidence及事实evidence中填写对应@quote:编号，"
+            + "\n已提供可支持判断的片段时，source_evidence、chapter_evidence、goal_evidence、change_evidence及事实evidence必须填写对应@quote:编号，"
               "只选语义支持且source_id一致的片段；也可逐字摘录其他已读原文，不能填概述。"
             + ("当前角色负责记忆，memory_patch必须完整返回并修正候选引文，不能遗漏原有效交接。" if memory_required else ""))
         output_reserve = self.settings.effective_output_tokens(8_000, agent_role)
@@ -4094,6 +4102,7 @@ class InkFlowEngine:
             trace.record("review.source_recovery", "warning", "补读复核未完成，保留未定结论", str(exc))
             atomic_write_text(trace_path, json_dumps(recovery))
             return output.model_copy(update={"verdict": "unknown"}), packet, recovery
+        trace.record_model("review.source_recovery", result, "同责任角色补核已返回，核验来源与交接后采用")
         repaired = resolve_review_quote_refs(result.data, quote_choices)
         recovery["quote_choices"] = {key: {"source_id": value["source_id"], "quote_hash": content_hash(value["quote"])}
             for key, value in quote_choices.items()}
@@ -4127,16 +4136,16 @@ class InkFlowEngine:
             remaining.extend(f"创作意图仍待核：{value}" for value in getattr(repaired, "writer_note_questions", []))
         recovery.update(status="remaining_gaps" if remaining else "rechecked", remaining_gaps=remaining)
         if remaining:
-            current_chapter = project.db.get_chapter(packet.chapter_no)
-            project.record_pending_work(kind="review_evidence", reason="；".join(remaining),
-                next_action="根据 source_loading 核对具体未读来源和原因；修复后由原责任角色定点复核，不为资料问题改正文。",
-                source={"chapter_no": packet.chapter_no, "content_hash": current_chapter.get("content_hash") if current_chapter else content_hash(content),
-                        "role": agent_role, "gaps": remaining, "source_loading": recovery.get("source_loading", {})},
-                chapter_no=packet.chapter_no, status="waiting_condition")
+            async with project_write_lock(project.root):
+                current_chapter = project.db.get_chapter(packet.chapter_no)
+                project.record_pending_work(kind="review_evidence", reason="；".join(remaining),
+                    next_action="根据 source_loading 核对具体未读来源和原因；修复后由原责任角色定点复核，不为资料问题改正文。",
+                    source={"chapter_no": packet.chapter_no, "content_hash": current_chapter.get("content_hash") if current_chapter else content_hash(content),
+                            "role": agent_role, "gaps": remaining, "source_loading": recovery.get("source_loading", {})},
+                    chapter_no=packet.chapter_no, status="waiting_condition")
         if remaining and repaired.verdict in {"pass", "aligned"}:
             repaired = repaired.model_copy(update={"verdict": "unknown"})
         atomic_write_text(trace_path, json_dumps(recovery))
-        trace.record_model("review.source_recovery", result, "同责任角色已补读原文并重新核对；最终门禁仍由引擎执行")
         return repaired, packet, recovery
 
     async def _verify_review_output(

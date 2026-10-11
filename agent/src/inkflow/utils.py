@@ -24,7 +24,7 @@ def workflow_failure_reason(result: Any) -> str:
         return str(result["gate"])
     resumable_boundary = result.get("resumable") is True and result.get("status") == "interrupted"
     if not resumable_boundary and (
-        result.get("status") in {"failed", "gate_stop", "needs_revision", "interrupted"}
+        result.get("status") in ("failed", "gate_stop", "needs_revision", "interrupted")
         or result.get("stop_reason")
     ):
         return str(result.get("stop_reason") or result.get("detail") or result.get("summary") or "任务未完成")
@@ -44,11 +44,11 @@ def workflow_result_status(result: Any) -> str:
     status = result.get("status")
     if result.get("post_commit_status") == "waiting_condition":
         return "waiting_condition"
-    if result.get("verdict") in {"unknown", "patch", "replan", "revise", "insufficient_context"}:
+    if result.get("verdict") in ("unknown", "patch", "replan", "revise", "insufficient_context"):
         return "waiting_condition"
     if status == "needs_input":
         return "waiting_user"
-    if status in {"waiting_user", "waiting_condition"}:
+    if status in ("waiting_user", "waiting_condition"):
         return str(status)
     if result.get("resumable") is True and status == "interrupted":
         return "waiting_condition"
