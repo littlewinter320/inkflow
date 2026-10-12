@@ -3,7 +3,8 @@ from pydantic import ValidationError
 import asyncio
 
 from inkflow.app_server import _error_payload
-from inkflow.errors import ProviderError
+from inkflow.errors import ProviderError, ValidationGateError
+from inkflow.engine import _apply_unique_replacements
 from inkflow.review_verifier import resolve_review_quote_refs, restore_review_quote_choices
 from inkflow.schemas import ModeCheckOutput, TerminalIntent
 from inkflow.terminal_session import TerminalSession
@@ -11,6 +12,16 @@ from inkflow.utils import content_hash
 
 
 def check():
+    prose = "第一段照旧。\n\n错误日期。\n\n最后一段照旧。"
+    assert _apply_unique_replacements(prose, [("错误日期。", "正确日期。")]) == "第一段照旧。\n\n正确日期。\n\n最后一段照旧。"
+    assert _apply_unique_replacements(prose, [("错误日期。", "")]) == "第一段照旧。\n\n\n\n最后一段照旧。"
+    for source, edits in ((prose, [(prose, "整篇新稿")]), (prose, [("错误日期", "新日期"), ("日期", "时刻")]), ("日期。日期。", [("日期", "时刻")])):
+        try:
+            _apply_unique_replacements(source, edits)
+        except ValidationGateError:
+            pass
+        else:
+            raise AssertionError("Whole, overlapping or nonunique replacements must not change prose")
     output = ModeCheckOutput.model_validate({"verdict": "unknown", "confidence": 0, "summary": "仍需语义核验",
         "findings": [{"category": "style", "severity": "info", "explanation": "句子可以再简洁", "repair_instruction": "不强制改稿", "evidence": "@quote:0"}],
         "memory_patch": {"chapter_no": 2, "chapter_summary": "核对原件", "facts": [

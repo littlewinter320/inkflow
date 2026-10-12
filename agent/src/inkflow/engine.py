@@ -3361,6 +3361,7 @@ class InkFlowEngine:
                 revised = await self.revise_chapter(
                     root, chapter_no, (instruction + "\n\n" + strategy).strip(),
                     provisional_chapters=provisional_chapters,
+                    local_only=True,
                 )
                 if revised.get("unchanged"):
                     trace.record("recovery.no_change", "warning", "正文没有变化，保留原审核结论并切换修订策略")
@@ -4612,12 +4613,8 @@ class InkFlowEngine:
                         edits[index][0] < edits[index - 1][1] for index in range(1, len(edits))
                     ):
                         raise ValidationGateError("Writer 候选触及过多或重叠段落，正史未改。")
-                    parts: list[str] = []
-                    cursor = 0
-                    for start_at, end_at, replacement in edits:
-                        parts.extend((source[cursor:start_at], replacement))
-                        cursor = end_at
-                    candidate = "".join([*parts, source[cursor:]])
+                    candidate = _apply_unique_replacements(source,
+                        [(source[start_at:end_at], replacement) for start_at, end_at, replacement in edits])
                     if abs(len(candidate) - len(current)) > 600:
                         raise ValidationGateError("Writer 候选改动超出局部范围，正史未改。")
                     atomic_write_text(trace.run_dir / f"accepted-candidate-{round_no + 1}.md", candidate)
@@ -4860,10 +4857,12 @@ class InkFlowEngine:
         instruction: str = "",
         *,
         provisional_chapters: list[dict[str, Any]] | None = None,
+        local_only: bool = False,
     ) -> dict[str, Any]:
         project = InkFlowProject(root)
         trace = TraceRecorder(project.root, f"revise-{chapter_no:05d}", self.settings.trace_level)
         try:
+            local_only = local_only or bool(re.search(r"局部|只改|只替换|定点|定向", instruction))
             chapter = project.db.get_chapter(chapter_no)
             card = project.db.get_chapter_card(chapter_no)
             review_record = project.db.latest_review_record(chapter_no)
@@ -4940,6 +4939,13 @@ class InkFlowEngine:
                 + "不得用重复解释、空泛总结、提纲或标题凑数。"
             )
             user_prompt += self._continuity_anchor(project, chapter_no, current_draft + "\n" + instruction)
+            revision_system = REVISER_SYSTEM
+            revision_limit = self.settings.max_output_tokens
+            if local_only:
+                revision_system += ("\n本次只输出AcceptedContinuityPatch：edits中逐项给正文唯一的target_excerpt和replacement，"
+                    "最多四处原句替换，reason说明各处修改依据。不返回完整改写稿，不改标题；范围外正文由代码原样保留。"
+                    "只处理当前有据问题与必要转场，选取能唯一定位的完整原文，不因篇幅或格式要求扩大范围。")
+                revision_limit = min(revision_limit, 6_000)
             if self._revision_source_fingerprint(project, chapter_no) != source_fingerprint:
                 raise ValidationGateError("构建 Writer 修订输入期间依据已变化；模型请求未发送，请核对当前版本。")
             # DeepSeek Flash can consume the structured-output budget in
@@ -4954,20 +4960,29 @@ class InkFlowEngine:
                 # Revisions should be shorter than creative drafting: the
                 # existing prose is supplied in the prompt and only a
                 # complete replacement plus its decision summary is needed.
-                max_tokens=self.settings.max_output_tokens,
+                max_tokens=revision_limit,
                 timeout_seconds=self.settings.request_timeout_seconds,
                 thinking=revision_thinking,
             )
             result = await self.provider.generate_json(
-                system_prompt=REVISER_SYSTEM,
+                system_prompt=revision_system,
                 user_prompt=user_prompt,
-                output_model=DraftOutput,
+                output_model=AcceptedContinuityPatch if local_only else DraftOutput,
                 effort=self.settings.reasoning_effort,
-                max_tokens=self.settings.max_output_tokens,
+                max_tokens=revision_limit,
                 thinking=revision_thinking,
                 agent_role="writer",
             )
-            draft = result.data
+            if local_only:
+                patch = result.data
+                header_end = current_draft.find("\n") if current_draft.startswith("#") else 0
+                if any(0 <= current_draft.find(edit.target_excerpt) < header_end for edit in patch.edits):
+                    raise ValidationGateError("局部修订不能修改章节标题，原稿未改。")
+                patched = _apply_unique_replacements(current_draft,
+                    [(edit.target_excerpt, edit.replacement) for edit in patch.edits])
+                draft = DraftOutput(title=str(chapter["title"]), content=patched, decision_summary=[patch.reason])
+            else:
+                draft = result.data
             trace.record_model("writer.revise", result, "Writer 读取旧稿与审查证据后完成定点修订")
             if self._revision_source_fingerprint(project, chapter_no) != source_fingerprint:
                 candidate_path = trace.run_dir / "stale-revision-candidate.md"
@@ -4976,21 +4991,21 @@ class InkFlowEngine:
                     f"Writer 修订期间依据已变化，未覆盖当前草稿；候选稿在 {candidate_path}，请按当前版本继续。"
                 )
             chapter_title = _normalise_chapter_title(chapter_no, draft.title)
-            clean_content = _deduplicate_exact_paragraphs(
-                _strip_model_chapter_heading(draft.content, chapter_no)
-            )
-            draft, clean_content = await self._repair_short_draft(
-                draft,
-                clean_content,
-                chapter_no=chapter_no,
-                card=card,
-                base_prompt=user_prompt,
-                system_prompt=REVISER_SYSTEM,
-                trace=trace,
-                stage="writer.revise.length_repair",
-            )
+            clean_content = draft.content if local_only else _deduplicate_exact_paragraphs(
+                _strip_model_chapter_heading(draft.content, chapter_no))
+            if not local_only:
+                draft, clean_content = await self._repair_short_draft(
+                    draft,
+                    clean_content,
+                    chapter_no=chapter_no,
+                    card=card,
+                    base_prompt=user_prompt,
+                    system_prompt=REVISER_SYSTEM,
+                    trace=trace,
+                    stage="writer.revise.length_repair",
+                )
             chapter_title = _normalise_chapter_title(chapter_no, draft.title)
-            chapter_text = f"# 第 {chapter_no} 章 {chapter_title}\n\n{clean_content}\n"
+            chapter_text = clean_content if local_only else f"# 第 {chapter_no} 章 {chapter_title}\n\n{clean_content}\n"
             async with project_write_lock(project.root):
                 if self._revision_source_fingerprint(project, chapter_no) != source_fingerprint:
                     candidate_path = trace.run_dir / "stale-revision-candidate.md"
@@ -5074,7 +5089,8 @@ class InkFlowEngine:
             trace.record(
                 "draft.revise",
                 "completed",
-                f"草稿由 v{previous_version} 修订为 v{version}；旧审查自动失效",
+                f"草稿由 v{previous_version} 修订为 v{version}；旧审查自动失效"
+                + (f"，按原句替换 {sum(edit.target_excerpt != edit.replacement for edit in patch.edits)} 处，其余原文保持原样" if local_only else ""),
                 details="\n".join(f"- {item}" for item in draft.decision_summary),
                 metadata={"path": chapter["path"], "characters": _content_char_count(clean_content)},
             )
@@ -8738,6 +8754,26 @@ def _assert_new_plan_cards(project: InkFlowProject, arc: ArcPlan) -> None:
 
 def _content_char_count(content: str) -> int:
     return effective_character_count(content)
+
+
+def _apply_unique_replacements(source: str, replacements: list[tuple[str, str]]) -> str:
+    """Apply located edits together; every unselected character stays unchanged."""
+    edits = []
+    for target, replacement in replacements:
+        if target == replacement:
+            continue
+        if not target or source.count(target) != 1:
+            raise ValidationGateError("修改原句无法唯一定位，原稿未改；请核对本次问题的实际原文。")
+        start = source.index(target)
+        edits.append((start, start + len(target), replacement))
+    edits.sort()
+    if any(edits[index][0] < edits[index - 1][1] for index in range(1, len(edits))):
+        raise ValidationGateError("修改范围互相重叠，原稿未改。")
+    if sum(end - start for start, end, _ in edits) >= len(source.strip()):
+        raise ValidationGateError("局部修订不能替换整章，原稿未改。")
+    for start, end, replacement in reversed(edits):
+        source = source[:start] + replacement + source[end:]
+    return source
 
 
 def _strip_model_chapter_heading(content: str, chapter_no: int) -> str:

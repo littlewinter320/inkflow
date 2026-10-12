@@ -633,7 +633,7 @@ class AcceptedContinuityDiagnosis(StrictModel):
 
 class AcceptedContinuityLocalEdit(StrictModel):
     target_excerpt: str = Field(min_length=1, max_length=500)
-    replacement: str = Field(min_length=1, max_length=800)
+    replacement: str = Field(max_length=800)
 
 
 class AcceptedContinuityPatch(StrictModel):
