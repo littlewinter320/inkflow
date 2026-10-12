@@ -123,7 +123,7 @@ type EngineEvent = {
     stop_conditions?: string[];
   };
 };
-type Message = { id: string; role: "user" | "assistant" | "system"; text: string; details?: string; reasoning?: string[]; animate?: boolean; createdAt?: string };
+type Message = { id: string; role: "user" | "assistant" | "system"; text: string; details?: string; reasoning?: string[]; animate?: boolean; createdAt?: string; process?: { startedAt: string; finishedAt: string; status: string; steps: EngineEvent[] } };
 type ConversationHistoryEntry = { id: string; user: string; assistant: string; action_note: string; recorded_at: string };
 type SuggestedPromptItem = { label: string; prompt: string };
 
@@ -236,6 +236,18 @@ type CollaborationOverview = { messages: CollaborationMessage[]; pending_work?: 
 type PrefillResult = { insertion: string; document_hash: string; cursor_offset: number; confidence: string };
 type WorkspacePreset = "balanced" | "writing" | "planning" | "review";
 type WorkspaceResizeTarget = "navigation" | "assistant" | "inspector";
+function conversationDockTarget(x: number, y: number, bounds: { left: number; right: number; top: number; bottom: number }) {
+  if (x < bounds.left || x > bounds.right || y < bounds.top || y > bounds.bottom) return null;
+  const edge = Math.min(72, (bounds.right - bounds.left) / 4);
+  return x <= bounds.left + edge ? "left" : x >= bounds.right - edge ? "right" : null;
+}
+
+function busyMascotMood(events: EngineEvent[], runId: string | null): MascotMood {
+  const current = [...events].reverse().find(event => event.run_id === runId && event.role);
+  if (current?.role === "writer") return /outline|planning|plan|detail|window|candidate/.test(current.stage || "") ? "thinking" : "writing";
+  return current && ["editor", "reviewer", "memory_keeper"].includes(current.role || "") ? "reviewing" : "thinking";
+}
+
 type WorkspaceLayout = {
   navigationVisible: boolean;
   assistantVisible: boolean;
@@ -411,6 +423,8 @@ function App() {
   const [openingDocumentPath, setOpeningDocumentPath] = useState<string | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
+  const runEventsRef = useRef<EngineEvent[]>([]);
+  const runStartedAtRef = useRef("");
   const projectRootRef = useRef("");
   const projectOpenRequestRef = useRef(0);
   const editorNavigationRef = useRef(0);
@@ -435,7 +449,9 @@ function App() {
   const [manualJobs, setManualJobs] = useState<ManualEditJob[]>([]);
   const [manualMonitorError, setManualMonitorError] = useState("");
   const conversationPanelRef = useRef<HTMLElement | null>(null);
-  const floatingMoveRef = useRef<{ x: number; y: number; startX: number; startY: number } | null>(null);
+  const floatingMoveRef = useRef<{ x: number; y: number; startX: number; startY: number; width: number; height: number; pointerId: number; moved: boolean; dock: "left" | "right" | null } | null>(null);
+  const [conversationDragging, setConversationDragging] = useState(false);
+  const [conversationDock, setConversationDock] = useState<"left" | "right" | null>(null);
   const [showUpdate, setShowUpdate] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
@@ -482,6 +498,7 @@ function App() {
   const voiceRecorderRef = useRef<LocalWavRecorder | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioPlaybackSequenceRef = useRef(0);
+  const autoReadPausedRef = useRef(false);
   const speakingMessageIdRef = useRef<string | null>(null);
 
   const replaceEditorDocument = useCallback((loaded: DocumentData | null, root: string) => {
@@ -582,8 +599,13 @@ function App() {
     const resize = (event: PointerEvent) => {
       const moving = floatingMoveRef.current;
       if (moving) {
-        const width = conversationPanelRef.current?.clientWidth || 320;
-        setWorkspaceLayout(current => ({ ...current, assistantX: Math.max(0, Math.min(window.innerWidth - width, moving.x + event.clientX - moving.startX)), assistantY: Math.max(0, Math.min(window.innerHeight - 80, moving.y + event.clientY - moving.startY)) }));
+        if (moving.pointerId !== event.pointerId || (!moving.moved && Math.hypot(event.clientX - moving.startX, event.clientY - moving.startY) < 6)) return;
+        moving.moved = true;
+        const bounds = mobaoWorkAreaRef.current?.getBoundingClientRect();
+        moving.dock = bounds ? conversationDockTarget(event.clientX, event.clientY, bounds) : null;
+        setConversationDragging(true);
+        setConversationDock(moving.dock);
+        setWorkspaceLayout(current => ({ ...current, assistantPosition: "floating", assistantWidth: moving.width, assistantX: Math.max(0, Math.min(window.innerWidth - moving.width, moving.x + event.clientX - moving.startX)), assistantY: Math.max(0, Math.min(window.innerHeight - Math.min(moving.height, window.innerHeight - 80), moving.y + event.clientY - moving.startY)) }));
         return;
       }
       const activeResize = resizeRef.current;
@@ -592,16 +614,24 @@ function App() {
       const widthKey = activeResize.target === "navigation" ? "navigationWidth" : activeResize.target === "assistant" ? "assistantWidth" : "inspectorWidth";
       setWorkspaceLayout((current) => ({ ...current, [widthKey]: width }));
     };
-    const stop = () => {
+    const stop = (event: Event) => {
+      const moving = floatingMoveRef.current;
+      if (moving?.moved && moving.dock && event.type === "pointerup") setWorkspaceLayout(current => ({ ...current, assistantPosition: moving.dock! }));
       resizeRef.current = null;
       floatingMoveRef.current = null;
+      setConversationDragging(false);
+      setConversationDock(null);
       window.document.body.classList.remove("layout-resizing");
     };
     window.addEventListener("pointermove", resize);
     window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+    window.addEventListener("blur", stop);
     return () => {
       window.removeEventListener("pointermove", resize);
       window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+      window.removeEventListener("blur", stop);
       window.document.body.classList.remove("layout-resizing");
     };
   }, []);
@@ -1009,6 +1039,7 @@ function App() {
   useEffect(() => {
     const removeEvent = window.inkflow.onEvent((value) => {
       const event = value as EngineEvent;
+      if (event.run_id === activeRunIdRef.current) runEventsRef.current.push({ ...event, timestamp: event.timestamp || new Date().toISOString() });
       setEvents((items) => [...items.slice(-199), { ...event, timestamp: new Date().toISOString() }]);
       if (event.type?.startsWith("voice.job.")) setVoiceRevision((current) => current + 1);
       if (/^voice\.(edge|moss|asr)\.(ready|models_failed|install\.(queued|failed))$/.test(event.type || "")) {
@@ -1295,7 +1326,8 @@ function App() {
     } catch (cause) { if (current()) fail(cause); }
   };
 
-  const speakText = async (messageId: string, content: string) => {
+  const speakText = async (messageId: string, content: string, automatic = false) => {
+    if (automatic && autoReadPausedRef.current) return;
     if (speakingMessageIdRef.current === messageId) { stopAudioPlayback(); return; }
     stopAudioPlayback();
     const sequence = audioPlaybackSequenceRef.current;
@@ -1304,11 +1336,15 @@ function App() {
     try {
       const result = await request<{ audio_path: string }>("voice.speak", { text: content });
       if (sequence !== audioPlaybackSequenceRef.current) return;
+      autoReadPausedRef.current = false;
       await playAudioPath(result.audio_path, messageId, sequence);
     } catch (cause) {
       if (sequence !== audioPlaybackSequenceRef.current) return;
       stopAudioPlayback();
-      setError(audioPlaybackFailure(cause));
+      if (automatic) {
+        autoReadPausedRef.current = true;
+        setNotice(`${audioPlaybackFailure(cause)} 自动朗读已暂停；文字任务继续，服务恢复后可点击朗读重试。`);
+      } else setError(audioPlaybackFailure(cause));
     }
   };
   useEffect(() => { stopAudioPlayback(); }, [projectRoot]);
@@ -1477,6 +1513,8 @@ function App() {
     const runId = `desktop-${crypto.randomUUID()}`;
     const runRoot = projectRootRef.current || projectRoot;
     activeRunIdRef.current = runId;
+    runEventsRef.current = [];
+    runStartedAtRef.current = new Date().toISOString();
     cancelRequestedRef.current = false;
     setActiveRunId(runId);
     let refreshSuggestions = false;
@@ -1489,7 +1527,7 @@ function App() {
       const questionSource = result && typeof result === "object" ? (result as Record<string, unknown>).questions : null;
       if (Array.isArray(questionSource)) setPendingQuestions(questionSource as QuestionCard[]);
       const assistantMessageId = crypto.randomUUID();
-      setMessages((items) => [...items, { id: assistantMessageId, role: "assistant", text: visible.summary, details: visible.details, reasoning: visible.reasoning, animate: true, createdAt: new Date().toISOString() }]);
+      setMessages((items) => [...items, { id: assistantMessageId, role: "assistant", text: visible.summary, details: visible.details, reasoning: visible.reasoning, animate: true, createdAt: new Date().toISOString(), process: { startedAt: runStartedAtRef.current, finishedAt: new Date().toISOString(), status: String((result as Record<string, unknown>)?.status || "completed"), steps: [...runEventsRef.current] } }]);
       if (result && typeof result === "object" && (result as Record<string, unknown>).settings_updated) {
         // Coordinator settings changes are persisted by the engine. Refresh
         // the two settings snapshots so reopening Settings immediately shows
@@ -1497,7 +1535,7 @@ function App() {
         void window.inkflow.request<Record<string, unknown>>("provider.status", { workspace_root: projectRootRef.current }).then(setProvider).catch(() => undefined);
         void window.inkflow.request<VoiceSettings>("voice.settings.get", { workspace_root: projectRootRef.current }).then(setVoiceSettings).catch(() => undefined);
       }
-      if (voiceSettings?.voice_enabled && voiceSettings.voice_output_enabled && voiceSettings.voice_auto_read) void speakText(assistantMessageId, visible.summary);
+      if (voiceSettings?.voice_enabled && voiceSettings.voice_output_enabled && voiceSettings.voice_auto_read) void speakText(assistantMessageId, visible.summary, true);
       try {
         const history = await request<{ entries: ConversationHistoryEntry[] }>("conversation.history", { project_root: runRoot, limit: 100 });
         if (runRoot === projectRootRef.current) {
@@ -1538,7 +1576,8 @@ function App() {
       setMessages((items) => [...items, {
         id: crypto.randomUUID(),
         role: "assistant",
-        text: cancelled ? messageText : `\u8fd9\u6b21\u6ca1\u6709\u5b8c\u6210\uff1a${messageText}`,
+        text: messageText,
+        process: { startedAt: runStartedAtRef.current, finishedAt: new Date().toISOString(), status: cancelled ? "cancelled" : "failed", steps: [...runEventsRef.current] },
       }]);
       if (!cancelled) setError(messageText);
       setMascotMood(cancelled ? "waiting" : "rest");
@@ -1714,6 +1753,8 @@ function App() {
     const runId = `desktop-${crypto.randomUUID()}`;
     const runRoot = projectRootRef.current || projectRoot;
     activeRunIdRef.current = runId;
+    runEventsRef.current = [];
+    runStartedAtRef.current = new Date().toISOString();
     cancelRequestedRef.current = false;
     setActiveRunId(runId);
     try {
@@ -1728,7 +1769,7 @@ function App() {
       const assistantMessageId = crypto.randomUUID();
       setMessages((items) => [
         ...items,
-        { id: assistantMessageId, role: "assistant", text: visible.summary, details: visible.details, reasoning: visible.reasoning, animate: true },
+        { id: assistantMessageId, role: "assistant", text: visible.summary, details: visible.details, reasoning: visible.reasoning, animate: true, process: { startedAt: runStartedAtRef.current, finishedAt: new Date().toISOString(), status: String((result as Record<string, unknown>)?.status || "completed"), steps: [...runEventsRef.current] } },
       ]);
       if (runRoot === projectRootRef.current) await refresh(runRoot);
       const resultRecord = result && typeof result === "object" ? result as Record<string, unknown> : {};
@@ -1862,7 +1903,7 @@ function App() {
             <button onClick={openFolder}>打开项目</button>
           </div>
           <div className="welcome-meta">
-            <span>版本 {String(appInfo?.version || "0.7.0")}</span>
+            <span>版本 {String(updateInfo.currentVersion || appInfo?.version || "读取中")}</span>
             <span>{!provider ? "正在读取模型配置…" : provider.api_key_configured ? "模型已配置" : "尚未配置模型 Key"}</span>
             <button className="text-button" onClick={() => setShowSettings(true)}>模型设置</button>
             <button className="text-button" onClick={() => setShowUpdate(true)}>检查更新</button>
@@ -1929,13 +1970,14 @@ function App() {
           <button onClick={() => setShowSearch(true)}>⌕ 搜索</button>
           <button onClick={() => void window.inkflow.openPath(projectRoot)}>打开文件夹</button>
           <button onClick={() => setShowSettings(true)}>设置</button>
-          <button onClick={() => void openConversationWindow()}>＋ 对话窗口</button>
+          <button aria-pressed={workspaceLayout.assistantVisible} onClick={() => updateWorkspaceLayout({ assistantVisible: !workspaceLayout.assistantVisible })}>{workspaceLayout.assistantVisible ? "隐藏对话" : "打开对话"}</button>
           <button onClick={() => setShowManualMonitor(true)}>修改核对</button>
           <button onClick={() => setShowUpdate(true)}>{updateInfo.status === "downloaded" ? "安装更新" : "检查更新"}</button>
         </nav>
       </header>
 
       <main className={workspaceGridClass} style={workspaceGridStyle} ref={mobaoWorkAreaRef}>
+        {conversationDragging && <div className={`conversation-drop-target ${conversationDock || "floating"}`} aria-live="polite">{conversationDock ? `松开后停靠${conversationDock === "left" ? "左侧" : "右侧"}` : "松开后保持浮动"}</div>}
         {workspaceLayout.navigationVisible && <>
         <aside className="left-rail">
           <div className="rail-heading"><span>小说结构</span><button title="新建小说" onClick={() => setShowCreate(true)}>＋</button></div>
@@ -1961,10 +2003,23 @@ function App() {
         {workspaceLayout.assistantVisible && <>
         <section className="conversation-panel" ref={conversationPanelRef}>
           <div className="floating-chat-controls">
-            {workspaceLayout.assistantPosition === "floating" && <button type="button" className="chat-drag-handle" aria-label="移动对话面板，方向键微调位置" onPointerDown={event => { event.preventDefault(); floatingMoveRef.current = { x: workspaceLayout.assistantX, y: workspaceLayout.assistantY, startX: event.clientX, startY: event.clientY }; }} onKeyDown={event => { const delta = ({ ArrowLeft: [-20, 0], ArrowRight: [20, 0], ArrowUp: [0, -20], ArrowDown: [0, 20] } as Record<string, number[]>)[event.key]; if (!delta) return; event.preventDefault(); updateWorkspaceLayout({ assistantX: Math.max(0, Math.min(window.innerWidth - 320, workspaceLayout.assistantX + delta[0])), assistantY: Math.max(0, Math.min(window.innerHeight - 80, workspaceLayout.assistantY + delta[1])) }); }}>⠿ 移动</button>}
-            <select className="conversation-layout-select" aria-label="对话面板位置" value={workspaceLayout.assistantPosition} onChange={event => updateWorkspaceLayout({ assistantPosition: event.target.value as WorkspaceLayout["assistantPosition"] })}><option value="left">正文左侧</option><option value="right">正文右侧</option><option value="bottom">正文下方</option><option value="floating">自由浮动</option></select>
+            <button type="button" className="chat-drag-handle" title="拖到左边或右边停靠，拖到中间浮动；Alt+左右方向键停靠" aria-label="移动对话面板，Alt加左右方向键停靠" onPointerDown={event => {
+              if (event.button !== 0) return;
+              const bounds = conversationPanelRef.current?.getBoundingClientRect();
+              if (!bounds) return;
+              event.preventDefault();
+              event.currentTarget.setPointerCapture(event.pointerId);
+              floatingMoveRef.current = { x: bounds.left, y: bounds.top, width: Math.max(320, bounds.width), height: bounds.height, startX: event.clientX, startY: event.clientY, pointerId: event.pointerId, moved: false, dock: null };
+            }} onKeyDown={event => {
+              if (event.altKey && ["ArrowLeft", "ArrowRight"].includes(event.key)) { event.preventDefault(); updateWorkspaceLayout({ assistantPosition: event.key === "ArrowLeft" ? "left" : "right" }); return; }
+              const delta = ({ ArrowLeft: [-20, 0], ArrowRight: [20, 0], ArrowUp: [0, -20], ArrowDown: [0, 20] } as Record<string, number[]>)[event.key];
+              const bounds = conversationPanelRef.current?.getBoundingClientRect();
+              if (!delta || !bounds) return;
+              event.preventDefault();
+              updateWorkspaceLayout({ assistantPosition: "floating", assistantX: Math.max(0, Math.min(window.innerWidth - bounds.width, bounds.left + delta[0])), assistantY: Math.max(0, Math.min(window.innerHeight - Math.min(bounds.height, window.innerHeight - 80), bounds.top + delta[1])) });
+            }}>⠿ 对话</button>
             <button type="button" onClick={() => void openConversationWindow()}>＋ 独立对话</button>
-            <button type="button" onClick={() => setShowManualMonitor(true)}>后台核对</button>
+            <button type="button" className="chat-close" aria-label="关闭对话面板" title="关闭面板，保留对话和运行中的任务" onClick={() => updateWorkspaceLayout({ assistantVisible: false })}>×</button>
           </div>
           {manualJobs.some(job => ["needs_confirmation", "awaiting_confirmation", "waiting_user", "needs_evidence", "revision_requested", "conflict", "blocked", "failed"].includes(job.status)) && <details className="manual-edit-issues"><summary>手动修改有待处理问题</summary><p>原稿已保留，待核对改动不会自动变成正史。</p><button type="button" onClick={() => setShowManualMonitor(true)}>查看证据并决定</button></details>}
           <div className="panel-title">
@@ -1973,7 +2028,7 @@ function App() {
               <button className="history-trigger" onClick={() => setShowHistory(true)}>对话历史 <span>{conversationHistory.length}</span></button>
               <div className="mascot-conversation" ref={mobaoDockRef}>
                 <Mascot
-                  mood={busy ? ([...events].reverse().find(item => item.run_id === activeRunId && item.role)?.role === "writer" ? "writing" : [...events].reverse().find(item => item.run_id === activeRunId && item.role)?.role === "reviewer" ? "reviewing" : "thinking") : mascotMood}
+                  mood={busy ? busyMascotMood(events, activeRunId) : mascotMood}
                   onSettled={() => setMascotMood("idle")}
                 />
               </div>
@@ -1992,7 +2047,8 @@ function App() {
               <article key={message.id} className={`message ${message.role}`} ref={message.id === mobaoCompletion?.messageId ? mobaoTargetRef : undefined}>
                 <span className="avatar">{message.role === "user" ? "你" : message.role === "system" ? "记" : "墨"}</span>
                 <div>
-                  <p>{message.text}</p>
+                  <p>{message.role === "assistant" && message.text.startsWith("这次没有完成：") ? errorMessage(message.text.replace(/^这次没有完成：\s*/, "")) : message.text}</p>
+                  {message.process && <ProcessDisclosure {...message.process} reasoning={message.reasoning} />}
                   {message.createdAt && <time className="message-time" dateTime={message.createdAt}>{formatTime(message.createdAt)}</time>}
                   <div className="message-actions">
                     {message.id !== "welcome" && (
@@ -2007,7 +2063,7 @@ function App() {
                 </div>
               </article>
             ))}
-            {busy && activeRunId && <LiveRunCard summary={[...events].reverse().find(item => item.run_id === activeRunId && item.summary)?.summary} steps={events.filter(item => item.run_id === activeRunId).slice(-6)} />}
+            {busy && activeRunId && <LiveRunCard summary={[...events].reverse().find(item => item.run_id === activeRunId && item.summary)?.summary} steps={runEventsRef.current} startedAt={runStartedAtRef.current} />}
           </div>
           <form className="composer" onSubmit={sendChat}>
             <textarea
@@ -2366,6 +2422,7 @@ function canPollWorkspace(visibility: string, focused: boolean): boolean {
 function audioPlaybackFailure(cause?: unknown, mediaCode?: number): string {
   const message = cause instanceof Error ? cause.message : String(cause || "");
   const name = cause && typeof cause === "object" && "name" in cause ? String(cause.name) : "";
+  if (/403|在线朗读服务拒绝/.test(message)) return "在线朗读服务拒绝连接（403），这次没有生成音频。正文和对话文字已保留，请稍后手动重试，或在语音设置中选择已就绪的本地朗读组件。";
   if (mediaCode === 4 || name === "NotSupportedError" || /no supported source|unsupported source|not supported|播放器无法打开/i.test(message)) return "音频已经生成，但本地文件格式或播放地址当前不可用。已有文件保留，请在听读页查看或导出音频，核对格式后再播放。";
   if (mediaCode === 3) return "音频文件无法解码。已有文件保留，请在听读页导出并核对格式，不必重新生成正文。";
   if (mediaCode === 2) return "本地音频暂时无法读取。请确认文件仍存在，并从听读页重新打开。";
@@ -3907,7 +3964,7 @@ function UpdateDialog({ info, onClose }: { info: UpdateInfo; onClose: () => void
     } finally { setWorking(false); }
   };
   const sourceLabel = local.source === "embedded" ? "发布包内置更新源" : local.source === "github" ? "GitHub Releases" : local.source === "environment" ? "自定义公开更新源" : "尚未配置";
-  return <Modal title="软件更新" subtitle="新版会自动下载，并在关闭或重启墨流时安装；小说正文、正史数据库和本地项目不会被删除。" onClose={onClose}><section className={`update-card ${local.status || "ready"}`}><div><small>当前版本</small><strong>{local.currentVersion || "0.7.0"}</strong></div><div><small>可用版本</small><strong>{local.availableVersion || "—"}</strong></div><div><small>更新来源</small><strong>{sourceLabel}</strong></div>{typeof local.progress === "number" && <div className="update-progress"><span style={{ width: `${Math.max(0, Math.min(local.progress, 100))}%` }} /></div>}<p>{local.message || "墨流会自动检查新版本，也可以在这里立即检查。"}</p></section>{local.status === "not_configured" && <p className="form-hint">私密仓库的下载需要账号令牌，不适合写进大众软件。仓库或独立发布仓库公开后，只需在构建时配置发布源即可启用在线更新。</p>}<div className="dialog-actions"><button onClick={onClose}>关闭</button>{!new Set(["available", "downloading", "downloaded"]).has(String(local.status)) && <button className="primary" disabled={working || local.status === "not_configured" || local.status === "checking"} onClick={() => void action("check")}>{local.status === "checking" ? "正在检查…" : "检查新版本"}</button>}{local.status === "available" && <button className="primary" disabled>正在准备自动下载…</button>}{local.status === "downloading" && <button className="primary" disabled>正在下载 {Math.round(Number(local.progress || 0))}%</button>}{local.status === "downloaded" && <button className="primary" disabled={working} onClick={() => void action("install")}>重启并安装</button>}</div></Modal>;
+  return <Modal title="软件更新" subtitle="新版会自动下载，并在关闭或重启墨流时安装；小说正文、正史数据库和本地项目不会被删除。" onClose={onClose}><section className={`update-card ${local.status || "ready"}`}><div><small>当前版本</small><strong>{local.currentVersion || "读取中"}</strong></div><div><small>可用版本</small><strong>{local.availableVersion || "—"}</strong></div><div><small>更新来源</small><strong>{sourceLabel}</strong></div>{typeof local.progress === "number" && <div className="update-progress"><span style={{ width: `${Math.max(0, Math.min(local.progress, 100))}%` }} /></div>}<p>{local.message || "墨流会自动检查新版本，也可以在这里立即检查。"}</p></section>{local.status === "not_configured" && <p className="form-hint">私密仓库的下载需要账号令牌，不适合写进大众软件。仓库或独立发布仓库公开后，只需在构建时配置发布源即可启用在线更新。</p>}<div className="dialog-actions"><button onClick={onClose}>关闭</button>{!new Set(["available", "downloading", "downloaded"]).has(String(local.status)) && <button className="primary" disabled={working || local.status === "not_configured" || local.status === "checking"} onClick={() => void action("check")}>{local.status === "checking" ? "正在检查…" : "检查新版本"}</button>}{local.status === "available" && <button className="primary" disabled>正在准备自动下载…</button>}{local.status === "downloading" && <button className="primary" disabled>正在下载 {Math.round(Number(local.progress || 0))}%</button>}{local.status === "downloaded" && <button className="primary" disabled={working} onClick={() => void action("install")}>重启并安装</button>}</div></Modal>;
 }
 
 function SelectionDialog({ selection, busy, onClose, onSubmit }: { selection: SelectionDraft; busy: boolean; onClose: () => void; onSubmit: (mode: "comment" | "revise", comment: string) => void }) {
@@ -3970,7 +4027,41 @@ function ConversationHistoryDialog({ projectRoot, onOpenConversation, entries, m
   </Modal>;
 }
 
-function LiveRunCard({ summary, steps = [] }: { summary?: string; steps?: EngineEvent[] }) {
+function processElapsed(startedAt: string, end: number): string {
+  const seconds = Math.max(0, Math.floor((end - Date.parse(startedAt)) / 1000) || 0);
+  return seconds < 60 ? `${seconds}秒` : `${Math.floor(seconds / 60)}分${seconds % 60}秒`;
+}
+
+function publicProcessSteps(steps: EngineEvent[]): EngineEvent[] {
+  return steps.filter(step => step.summary && !/provider[_ .-]?reasoning|reasoning_content|thinking_content|raw_thought|usage\.updated/i.test(`${step.type || ""} ${step.stage || ""}`));
+}
+
+function ProcessDisclosure({ startedAt, finishedAt, status = "running", steps, reasoning = [] }: { startedAt: string; finishedAt?: string; status?: string; steps: EngineEvent[]; reasoning?: string[] }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (finishedAt) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [finishedAt]);
+  const label = !finishedAt ? "正在思考与处理" : /waiting|interrupted/.test(status) ? "等待下一步" : status === "failed" ? "本次未完成" : status === "cancelled" ? "已停止" : "处理完成";
+  const visible = publicProcessSteps(steps);
+  return <details className="process-disclosure">
+    <summary><span className="process-triangle" aria-hidden="true">▶</span><span>{label} · 用时 {processElapsed(startedAt, finishedAt ? Date.parse(finishedAt) : now)}</span></summary>
+    <div className="process-body">
+      <p className="process-hint">这里会更新本次做了什么、参考了哪些依据，以及目前进度。</p>
+      {reasoning.length > 0 && <ul className="reasoning-list">{reasoning.map((line, index) => <li key={index}>{line}</li>)}</ul>}
+      <ol>{visible.map((step, index) => <li key={index}>
+        <small>{step.timestamp ? formatTime(step.timestamp) : ""}{step.role ? ` · ${agentRoleLabel(step.role)}` : ""} · {step.status === "completed" ? "本步完成" : step.status === "failed" ? "本步未完成" : step.status === "started" ? "处理中" : "公开记录"}</small>
+        <p>{step.summary}</p>
+        {collectPublicSummaries(step.metadata).map((line, number) => <p className="process-reason" key={number}>{line}</p>)}
+      </li>)}</ol>
+      {!visible.length && <p>正在理解请求，尚未返回新的公开判断。</p>}
+      <p className="process-hint">本次会话保留这些步骤；重开项目后可在协作台查看保存的运行记录。</p>
+    </div>
+  </details>;
+}
+
+function LiveRunCard({ summary, steps = [], startedAt }: { summary?: string; steps?: EngineEvent[]; startedAt: string }) {
   const current = [...steps].reverse().find(step => step.type !== "usage.updated");
   const stage = current?.stage || current?.type || "";
   const role = current?.role || String(current?.metadata?.agent_role || "");
@@ -3993,6 +4084,7 @@ function LiveRunCard({ summary, steps = [] }: { summary?: string; steps?: Engine
     <span className="avatar" aria-hidden="true">墨</span>
     <div>
       <p>{current?.status === "failed" ? summary || "遇到问题，正在检查能否继续。" : focus}</p>
+      <ProcessDisclosure startedAt={startedAt} steps={steps} />
     </div>
   </article>;
 }
@@ -4023,7 +4115,7 @@ function visibleResult(result: unknown): { summary: string; details?: string; re
   }
   if (["waiting_user", "waiting_condition", "failed", "interrupted"].includes(String(value.status || ""))) {
     const nested = value.result && typeof value.result === "object" ? visibleResult(value.result).summary : "";
-    const state = value.status === "waiting_user" ? "等待你的选择" : value.status === "failed" ? "本次未完成" : "已保留断点";
+    const state = value.status === "waiting_user" ? "等待你的选择" : value.status === "failed" ? "本次未完成" : "等待条件满足后继续";
     const summary = String(value.reply || value.reason || value.summary || nested || state);
     const nextStep = value.next_step && typeof value.next_step === "object" ? (value.next_step as Record<string, unknown>).reason : "";
     const impact = value.impact && typeof value.impact === "object" ? value.impact as Record<string, unknown> : null;
@@ -4039,7 +4131,7 @@ function visibleResult(result: unknown): { summary: string; details?: string; re
     if (value.changed && value.version) {
       return { summary: `第 ${String(value.chapter_no)} 章已生成修订 v${String(value.version)}，但还没得到你的认可。${String(value.next_action || "请查看正文后选择通过或写下拒绝原因。")}`, reasoning, details: safeDetails };
     }
-    return { summary: `第 ${String(value.chapter_no)} 章还需处理：${String(value.reason || "局部修订尚未通过复核")} 已保留当前正史与修订记录。`, reasoning, details: safeDetails };
+    return { summary: `第 ${String(value.chapter_no)} 章还需处理：${String(value.reason || "局部修订尚未通过复核")}`, reasoning, details: safeDetails };
   }
   if (value.status === "resolved" && value.chapter_no) {
     return { summary: `第 ${String(value.chapter_no)} 章已核对${value.changed ? `，局部修订为 v${String(value.version)}` : "，原文无需改动"}。${String(value.reason || "")}`, reasoning, details: safeDetails };
@@ -4090,15 +4182,10 @@ function errorMessage(cause: unknown): string {
     .replace(/^Error invoking remote method ['"]engine:request['"]:\s*Error:\s*/i, "")
     .replace(/^Error:\s*/i, "")
     .trim();
-  if (/墨流本地引擎已退出/.test(message)) return "本地写作引擎意外中断。已经落盘的规划和正文仍然保留；下一次操作会自动重启引擎，请在协作台确认最后完成的阶段后重试未完成部分。";
-  if (/影响：/.test(message) && /下一步：/.test(message)) return message;
+  if (/墨流本地引擎已退出/.test(message)) return "本地写作引擎意外中断。下一次操作会自动重启引擎；请先在任务记录确认最后完成的步骤，再续接未完成部分。";
+  if (/^(?:本次操作未完成\s*)?['"]stop_reason['"](?:\s|$)/.test(message)) return "审查结果已经返回，但墨流读取暂停原因时出错了。这是任务衔接的程序问题，需要修复结果读取后从本章审查继续。";
   if (/pip-unpack|No such file or directory.*\.whl|临时目录中的下载文件/.test(message)) return "语音组件安装时，Windows 临时下载文件失效。墨流已清理本次暂存目录；请回到语音设置点击重新安装，稳定缓存会复用已下载文件。";
-  if (/MOSS|Edge|语音组件|依赖安装|模型下载/.test(message)) return `${message}\n已有录音、声音档案和生成音频不会被删除。请在语音设置查看进度或重试。`;
-  if (/API Key|密钥|模型接口|服务商/.test(message)) return `${message}\n影响：当前模型任务未完成，小说文件和正史未改变。下一步：打开设置检查服务商、模型名称和密钥。`;
-  if (/版本|哈希|正文已变化|重新审查/.test(message)) return `${message}\n影响：系统已停止使用旧审查或旧正文继续提交。已保存：当前草稿版本仍在。下一步：打开当前章重新审查，再决定是否验收。`;
-  if (/章节卡|尚未生成.*规划|缺少.*规划/.test(message)) return `${message}\n影响：Writer 没有可靠的章节约束，因此没有继续写作。下一步：先生成或补齐当前篇章规划。`;
-  if (/超时|网络|连接/.test(message)) return `${message}\n影响：本次远程调用没有正常返回；已经落盘的本地版本不会被删除。下一步：在协作台查看任务状态，再选择重试。`;
-  return `${message}\n影响：本次操作已停止；已有正文和正史保持当前状态。下一步：在协作台查看最后阶段，并按提示重试或调整输入。`;
+  return message.replace(/\n(?:已保留|已保存)：[^\n]*/g, "").replace(/\n影响：(?:本次操作已停止[；。]?|当前模型任务未完成[，。]?)[^\n]*/g, "");
 }
 async function withDeadline<T>(request: Promise<T>, ms: number, message: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;

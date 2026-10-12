@@ -2547,6 +2547,7 @@ class JsonLineServer:
         selected_conversation = conversation_id(params.get("conversation_id"))
         conversation_token = active_conversation.set(selected_conversation)
         last_public_event: dict[str, Any] = {}
+        last_operation: dict[str, Any] = {"method": method}
 
         async def emit(event: dict[str, Any]) -> None:
             event = {**event, "conversation_id": selected_conversation}
@@ -2557,6 +2558,16 @@ class JsonLineServer:
                 await self._bind_applied_steering_revision(run_id, event["task_ticket"])
             last_public_event.clear()
             last_public_event.update(event)
+            stage = str(event.get("stage") or "")
+            event_type = str(event.get("type") or "")
+            if (event_type == "workflow.stage" and stage not in {"run", "long_run"}) or event_type.startswith(("writer.", "editor.", "reviewer.", "outline.", "planning.", "provider.", "voice.")):
+                if not event_type.endswith((".delta", ".token")):
+                    last_operation["stage"] = stage or event_type
+                    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+                    chapter = event.get("chapter_no") or metadata.get("chapter_no")
+                    match = re.search(r"第\s*(\d+)\s*章", str(event.get("summary") or ""))
+                    if chapter or match:
+                        last_operation["chapter_no"] = chapter or int(match.group(1))
             await self.write(
                 {
                     "jsonrpc": "2.0",
@@ -2765,12 +2776,14 @@ class JsonLineServer:
             failure = workflow_failure_reason(result)
             failure_guidance = None
             if outcome == "failed" and failure and isinstance(result, dict):
-                result = {**result, "workflow_failure": failure}
-                failure_guidance = _error_payload(InkFlowError(failure))
+                failure_guidance = _error_payload(InkFlowError(failure), last_operation)
+                result = {**result, "workflow_failure": failure_guidance["message"],
+                    "next_action": "；".join(action["label"] for action in failure_guidance["actions"]),
+                    "failure_guidance": failure_guidance}
             record_warning = persist_outcome(
                 outcome,
                 summary=_visible_result_summary(result),
-                error_message=failure if failure_guidance is not None else "",
+                error_message=failure_guidance["message"] if failure_guidance is not None else "",
                 error_code="workflow_result" if failure_guidance is not None else None,
                 retry_allowed=False if failure_guidance is not None else None,
             )
@@ -2859,14 +2872,14 @@ class JsonLineServer:
                 "waiting_condition", summary=str(exc), error_message=str(exc),
                 error_code=type(exc).__name__, retry_allowed=False,
             )
-            error = _error_payload(exc)
+            error = _error_payload(exc, last_operation)
             if record_warning:
                 error["record_warning"] = record_warning
                 error["impact"] = f"{error.get('impact', '')} {record_warning}".strip()
             await self.write({"jsonrpc": "2.0", "id": request_id, "error": error})
             public_events.put_nowait({"type": "run.waiting_condition", "method": method, "summary": str(exc)})
         except Exception as exc:
-            error = _error_payload(exc)
+            error = _error_payload(exc, last_operation)
             action_labels = [
                 str(action.get("label") or "").strip()
                 for action in error.get("actions", [])
@@ -2875,8 +2888,6 @@ class JsonLineServer:
             durable_error = "\n".join(
                 line for line in (
                     str(error.get("message") or str(exc)),
-                    f"影响：{error.get('impact')}" if error.get("impact") else "",
-                    f"已保留：{error.get('preserved')}" if error.get("preserved") else "",
                     f"下一步：{'；'.join(action_labels)}" if action_labels else "",
                 ) if line
             )
@@ -3396,7 +3407,7 @@ def _should_track_task(method: str, params: dict[str, Any]) -> bool:
     }
 
 
-def _error_payload(exc: Exception) -> dict[str, Any]:
+def _error_payload(exc: Exception, operation: dict[str, Any] | None = None) -> dict[str, Any]:
     message = str(exc) or "墨流遇到未知错误。"
     normalized = message.casefold()
     http_match = re.search(r"\bHTTP\s+(\d{3})\b", message, re.IGNORECASE)
@@ -3405,79 +3416,77 @@ def _error_payload(exc: Exception) -> dict[str, Any]:
         "code": exc.__class__.__name__,
         "title": "本次操作未完成",
         "message": message,
-        "impact": "本次操作已停止。",
-        "preserved": "已经保存的正文、版本和正史保持当前状态。",
-        "actions": [{"id": "open_process", "label": "查看协作台最后阶段"}],
+        "actions": [{"id": "open_process", "label": "在任务记录查看出错步骤和诊断详情"}],
         "retryable": False,
     }
     if isinstance(exc, ProjectBusyError):
         payload.update(
             title="项目写入暂时繁忙",
-            impact="当前写入步骤未获得项目写锁；已保存的正文和审查不会被撤回或自动重做。",
-            actions=[{"id": "open_process", "label": "查看正在执行的任务与已保存成果"}],
+            message="另一个操作正在写入本项目，这一步还不能同时写入。请等待该操作结束，再从当前步骤继续；无需重新生成前面的章节。",
+            actions=[{"id": "open_process", "label": "查看哪个任务正在写入"}],
             retryable=False,
         )
-        return payload
-    if isinstance(exc, ValidationError):
+    elif isinstance(exc, KeyError):
+        payload.update(title="任务衔接出现程序错误",
+            message="审查结果已经返回，但墨流读取暂停原因时出错了。这是任务衔接的程序问题，需要修复结果读取后从本章审查继续。" if exc.args == ("stop_reason",) else "墨流读取任务结果时缺少必要的状态字段，无法确定下一步。这是程序衔接问题，需要先修复结果读取，再续接出错步骤。")
+    elif isinstance(exc, ValidationError):
         issues = exc.errors(include_input=False)
-        brief = "；".join(
-            f"{'.'.join(map(str, item.get('loc') or ())) or '结果'}：{item.get('msg') or item.get('type')}"
-            for item in issues[:3]
-        )
+        names = {"memory_patch": "记忆更新", "evidence_refs": "附加证据", "evidence": "证据原文", "quote": "引用原文", "source_comparisons": "规划对照", "assessments": "审查依据", "chapter_no": "章号", "hook_note": "创作说明", "content": "正文", "max_output_tokens": "单次输出上限", "context_window": "上下文容量"}
+        parts = list(dict.fromkeys(next((names[key] for key in reversed(item.get("loc") or ()) if key in names), "必要的结果内容") for item in issues))
         payload.update(
             code="validation_error",
             title="输入或模型输出不完整",
-            message=f"输入或模型输出格式不完整：{brief}" if brief else "输入或模型输出格式不完整。",
-            impact="当前步骤没有通过格式门禁，因此没有继续写入后续结果。",
-            actions=[{"id": "retry", "label": "补齐输入或重试当前步骤"}],
+            message=f"这一步收到的{'、'.join(parts[:3])}不完整或格式不正确，共有 {len(issues)} 处需要核对，因此还不能用于后续处理。",
+            actions=[{"id": "open_process", "label": "展开格式问题，核对输入和本步返回结果"}],
             retryable=False,
             details=[
                 {key: item.get(key) for key in ("type", "loc", "msg")}
                 for item in issues
             ],
         )
-        return payload
-    if http_status in {401, 403}:
+    elif "@quote:" in message:
+        count = len(set(re.findall(r"@quote:\d+", message)))
+        payload.update(title="审查引用还没有核对完成",
+            message=f"审查结果中有 {count} 条引用还没有还原成可核对的原文，所以相关记忆暂时不能入正史。需要核对引用解析与来源，再继续本章审查；这不代表正文已经被判定有矛盾。",
+            actions=[{"id": "open_chapter_review", "label": "查看本章尚未定位的引用和补读记录"}])
+    elif http_status in {401, 403}:
         payload.update(
-            title="模型认证失败", impact="当前模型步骤没有完成；已保存成果不受影响。",
+            title="模型认证失败", message="服务商没有接受当前密钥（401）。请核对所选服务商和密钥是否对应，以及密钥是否仍有效。" if http_status == 401 else "服务商拒绝了当前请求（403）。请核对账号是否有该模型的使用权限，以及服务商是否限制了当前访问。",
             actions=[{"id": "open_settings", "label": "检查模型密钥与服务权限"}], retryable=False,
         )
     elif http_status in {408, 429, 500, 502, 503, 504}:
         payload.update(
             title="模型服务暂时不可用" if http_status != 429 else "模型服务暂时限流",
-            impact="已在当前模型步骤内限次重试；没有重做已保存的正文或提交。",
+            message="请求过于频繁，服务商暂时拒绝继续处理（429）。请等限流解除后续接本步，并检查并发上限是否符合该服务商的限制。" if http_status == 429 else f"服务商没有及时或正常返回结果（{http_status}）。请先核对原任务状态，服务恢复后只续接未完成的步骤。",
             actions=[{"id": "open_process", "label": "查看最后阶段"},
                      {"id": "retry", "label": "恢复后续接未完成步骤"}],
             retryable=True,
         )
     elif http_status == 402:
         payload.update(
-            title="模型服务余额或计费状态需要处理", impact="服务商拒绝了当前模型请求；本地成果保留。",
+            title="模型服务余额或计费状态需要处理", message="服务商因账户计费问题拒绝请求（402）。请核对余额、额度和付款状态，处理后续接本步。",
             actions=[{"id": "open_settings", "label": "检查服务商账户与模型配置"}], retryable=False,
         )
     elif http_status == 413:
         payload.update(
-            title="模型输入超过接口限制", impact="当前请求未完成；正文和硬约束不会被自动删除。",
+            title="模型输入超过接口限制", message="这次发送的内容超过接口允许的大小（413）。请核对该模型的上下文容量与请求大小限制，调整资料预算后再继续本步。",
             actions=[{"id": "open_context", "label": "查看上下文占用"}], retryable=False,
         )
     elif http_status in {400, 404, 422}:
         payload.update(
-            title="模型请求参数或格式不兼容", impact="当前模型步骤没有完成；不建议原样反复发送。",
+            title="模型请求参数或格式不兼容", message="服务商找不到请求的模型或接口（404）。请核对模型名称与接口地址是否属于同一服务商。" if http_status == 404 else f"服务商无法接受这次请求的参数或内容格式（{http_status}）。请对照接口错误详情调整配置，原样重发通常不能解决。",
             actions=[{"id": "open_settings", "label": "检查模型与接口配置"},
                      {"id": "open_process", "label": "查看接口错误详情"}], retryable=False,
         )
     elif any(word in normalized for word in ("api key", "密钥", "模型接口", "服务商")):
         payload.update(
             title="模型配置需要处理",
-            impact="当前模型任务没有完成。",
             actions=[{"id": "open_settings", "label": "打开模型设置"}],
             retryable=False,
         )
     elif any(word in normalized for word in ("版本", "哈希", "正文已变化", "重新审查")):
         payload.update(
             title="版本门禁已阻止继续",
-            impact="旧审查或旧正文不能用于提交当前版本。",
-            preserved="当前草稿版本仍然保留。",
             actions=[{"id": "open_chapter_review", "label": "打开当前章重新审查"}],
             retryable=False,
         )
@@ -3486,21 +3495,19 @@ def _error_payload(exc: Exception) -> dict[str, Any]:
     ):
         payload.update(
             title="当前章节缺少规划约束",
-            impact="Writer 没有可靠章节卡，写作步骤没有启动。",
             actions=[{"id": "open_planning", "label": "生成或补齐篇章规划"}],
             retryable=False,
         )
     elif any(word in normalized for word in ("上下文容量", "最大上下文", "soft token", "hard token")):
         payload.update(
             title="上下文容量不足",
-            impact="墨流保留了硬正史和用户要求，并停止本次模型调用。",
             actions=[{"id": "open_context", "label": "查看上下文占用"}],
             retryable=False,
         )
     elif "finish_reason=length" in normalized or "空 json 内容" in normalized:
         payload.update(
             title="模型输出被截断或没有正文",
-            impact="当前模型步骤未形成完整结果；已保存的正文与正史保持不变。",
+            message="模型在结果写完之前就达到单次输出上限，返回内容无法完整解析。请检查该模型实际支持的输出上限和本步预算，再从这个步骤继续。" if "finish_reason=length" in normalized else "模型没有返回可解析的结果内容。请查看本步返回记录，核对接口格式及服务状态后再继续。",
             actions=[{"id": "open_process", "label": "查看本次输出与重试记录"},
                      {"id": "open_settings", "label": "检查单次输出上限"}],
             retryable=False,
@@ -3513,7 +3520,7 @@ def _error_payload(exc: Exception) -> dict[str, Any]:
     ):
         payload.update(
             title="模型调用没有正常返回",
-            impact="当前远程步骤未完成。",
+            message="连接在完整结果返回前中断或超时，墨流无法确认本步结果。请先核对任务状态和网络，再续接未完成步骤，避免重复生成。",
             actions=[
                 {"id": "open_process", "label": "先查看任务状态"},
                 {"id": "retry", "label": "确认后重试"},
@@ -3523,19 +3530,27 @@ def _error_payload(exc: Exception) -> dict[str, Any]:
     elif isinstance(exc, sqlite3.Error):
         payload.update(
             title="本地任务记录暂时不可用",
-            impact="当前步骤未能可靠记录状态；已保存文件不自动撤回，也不重发模型请求。",
+            message="本地数据库未能完成这次状态读写，所以墨流无法可靠判断该步骤是否完成。请先核对任务记录与对应文件，再恢复处理，避免重复提交。",
             actions=[{"id": "open_process", "label": "核对原任务和当前文件"}],
             retryable=False,
         )
     elif isinstance(exc, OSError):
         payload.update(
             title="本地文件或进程访问失败",
-            impact="当前步骤未完成；请检查文件是否仍存在、被其他程序占用或无写入权限。",
-            actions=[{"id": "open_process", "label": "查看失败位置与已保存成果"}],
+            message="系统不允许访问这一步需要的文件或进程。请检查目录权限、文件占用及安全软件的拦截记录。" if isinstance(exc, PermissionError) else "这一步需要的本地文件或程序不存在。请检查应用资源是否完整，以及项目文件是否被移动。" if isinstance(exc, FileNotFoundError) else "系统无法完成这一步的文件或进程操作。请在诊断中核对失败位置，检查文件占用、目录权限及磁盘状态。",
+            actions=[{"id": "open_process", "label": "查看失败位置和系统错误详情"}],
             retryable=False,
         )
     elif isinstance(exc, InkFlowError):
         payload["retryable"] = False
+    else:
+        payload["message"] = "墨流处理任务时遇到了程序异常，当前记录还不足以确定具体原因。请展开本次诊断定位出错步骤，修复后从该步骤继续。"
+    operation = operation or {}
+    stage = str(operation.get("stage") or operation.get("method") or "")
+    step = "审查与记忆核对" if any(key in stage for key in ("review", "mode.", "editor", "memory")) else "规划" if any(key in stage for key in ("plan", "outline")) else "写作" if any(key in stage for key in ("writer", "draft")) else ""
+    chapter = operation.get("chapter_no")
+    if step:
+        payload["message"] = f"{f'第 {chapter} 章的' if chapter else ''}{step}在这一步暂停。\n{payload['message']}"
     if os.getenv("INKFLOW_DEBUG") == "1" and not isinstance(exc, ValidationError):
         payload["details"] = traceback.format_exc(limit=5)
     return payload

@@ -1755,6 +1755,11 @@ class VoiceRuntime:
             if not temporary.is_file() or temporary.stat().st_size == 0:
                 raise RuntimeError("在线语音没有返回音频。")
             temporary.replace(output)
+        except Exception as exc:
+            if getattr(exc, "status", None) == 403:
+                raise RuntimeError("在线朗读服务拒绝连接（403），本次未生成音频。文字成果保留；"
+                                   "可稍后重试，或选择已就绪的本地朗读组件。") from exc
+            raise
         finally:
             temporary.unlink(missing_ok=True)
 

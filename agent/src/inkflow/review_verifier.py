@@ -36,11 +36,51 @@ def resolve_review_quote_refs(output: Any, quotes: dict[str, dict[str, str]]) ->
             item["source_id"] = entry["source_id"]
         item["chapter_evidence"] = resolve(item["chapter_evidence"], "当前正文")
         item["source_evidence"] = resolve(item["source_evidence"], item["source_id"])
+    for item in [*data.get("findings", []), *data.get("deviations", [])]:
+        item["evidence"] = resolve(item["evidence"], "当前正文")
+        entry = quotes.get(item.get("reference_evidence", ""))
+        allowed = item.get("canon_refs") or ["当前正文"]
+        if entry and entry["source_id"] in allowed:
+            item["reference_evidence"] = entry["quote"]
     patch = data.get("memory_patch")
     if patch:
+        def resolve_reference(item: dict[str, Any]) -> None:
+            entry = quotes.get(item.get("quote", ""))
+            chapter = item.get("source_chapter")
+            if not entry or not isinstance(chapter, int) or chapter > patch["chapter_no"]:
+                return
+            source = entry["source_id"]
+            if ((chapter == patch["chapter_no"] and source == "当前正文")
+                    or source == f"chapter:{chapter:05d}"
+                    or (source.startswith("batch:") and source.endswith(f":chapter:{chapter:05d}"))):
+                item["quote"] = entry["quote"]
         for item in patch.get("facts", []):
             item["evidence"] = resolve(item["evidence"], "当前正文")
+            for reference in item.get("evidence_refs", []):
+                resolve_reference(reference)
+        for operation in patch.get("operations", []):
+            for reference in operation.get("evidence", []):
+                resolve_reference(reference)
     return type(output).model_validate(data)
+
+
+def restore_review_quote_choices(registry: dict[str, dict[str, str]], sources: dict[str, str]) -> dict[str, dict[str, str]]:
+    """Rebuild only hash-identical excerpts; caller must verify the saved task and source identity."""
+    wanted = {(entry["source_id"], entry["quote_hash"]) for entry in registry.values()}
+    found: dict[tuple[str, str], str] = {}
+    for source_id, body in sources.items():
+        if not any(source == source_id for source, _ in wanted):
+            continue
+        for line in body.splitlines():
+            line = line.strip()
+            for start in range(0, len(line) if len(line) > 400 else 1, 200):
+                quote = line[start:start + 400]
+                identity = (source_id, content_hash(quote))
+                if identity in wanted:
+                    found[identity] = quote
+    return {key: {"source_id": entry["source_id"], "quote": found[identity]}
+            for key, entry in registry.items()
+            if (identity := (entry["source_id"], entry["quote_hash"])) in found}
 
 
 def packet_sources(packet: ContextPacket) -> dict[str, str]:

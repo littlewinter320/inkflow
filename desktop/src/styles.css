@@ -154,7 +154,7 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .panel-mascot { display: flex; flex: 0 0 auto; align-items: center; gap: 7px; }
 .history-trigger { display: inline-flex; align-items: center; gap: 7px; padding: 6px 9px; border-color: #3b3a32; background: transparent; color: var(--muted); font-size: 10px; }
 .history-trigger span { display: grid; place-items: center; min-width: 20px; height: 20px; padding: 0 5px; border-radius: 999px; background: #24231e; color: var(--accent); font-variant-numeric: tabular-nums; }
-.panel-mascot .mobao { width: 70px; height: 62px; }
+.panel-mascot .mobao { width: 70px; height: 70px; }
 .panel-mascot .mobao-video { min-height: 48px; }
 .mascot-conversation { position: relative; }
 .pet-row { display: flex; gap: 6px; overflow-x: auto; padding: 0 18px 8px; scrollbar-width: none; }
@@ -192,6 +192,16 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .message.pending { opacity: .75; }
 .message.pending small { display: block; margin-top: 8px; color: var(--faint); font-size: 10px; }
 .live-run-card { padding-bottom: 8px; }
+.process-disclosure { margin-top: 8px; min-width: 0; }
+.process-disclosure > summary { display: flex; align-items: center; gap: 8px; cursor: pointer; color: var(--accent-dim); list-style: none; font-size: 12px; font-variant-numeric: tabular-nums; }
+.process-disclosure > summary::-webkit-details-marker { display: none; }
+.process-disclosure > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+.process-triangle { font-size: 10px; }
+.process-disclosure[open] .process-triangle { transform: rotate(90deg); }
+.process-body { margin-top: 10px; padding-left: 10px; border-left: 1px solid var(--line-soft); max-height: 340px; overflow-y: auto; overflow-wrap: anywhere; }
+.process-body ol { padding-left: 20px; margin: 10px 0; }
+.process-body li { margin-bottom: 12px; }
+.process-body .process-reason { color: var(--muted); font-size: 12px; line-height: 1.65; }
 .live-run-meta { display: flex; flex-wrap: wrap; gap: 5px 10px; margin-top: 7px; color: var(--faint); font-size: 9px; }
 .live-run-meta span:first-child { color: var(--accent-dim); }
 .live-guidance { margin-top: 8px; color: var(--muted); font-size: 10px; }
@@ -937,7 +947,7 @@ pre { white-space: pre-wrap; word-break: break-word; }
 }
 @media (max-height: 760px) {
   .panel-title { padding-top: 13px; padding-bottom: 8px; }
-  .panel-mascot .mobao { width: 58px; height: 52px; }
+  .panel-mascot .mobao { width: 58px; height: 58px; }
   .quick-row { padding-bottom: 8px; }
   .composer textarea { min-height: 64px; }
 }
@@ -1142,7 +1152,7 @@ body.layout-resizing, body.layout-resizing * { cursor: col-resize !important; us
 :root[data-density="compact"] .topbar { min-height: 52px; }
 :root[data-density="compact"] .app-shell { grid-template-rows: 52px minmax(0, 1fr) 29px; }
 :root[data-density="compact"] .panel-title { padding-block: 10px 7px; }
-:root[data-density="compact"] .panel-mascot .mobao { width: 54px; height: 48px; }
+:root[data-density="compact"] .panel-mascot .mobao { width: 54px; height: 54px; }
 :root[data-density="compact"] .message { margin-bottom: 12px; }
 :root[data-density="compact"] .messages { padding-block: 12px 18px; }
 :root[data-density="compact"] .scroll-panel { padding: 18px; }

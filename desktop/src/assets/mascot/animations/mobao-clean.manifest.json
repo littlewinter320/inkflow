@@ -8,72 +8,6 @@
   },
   "clips": [
     {
-      "source": "exec-3c0def88-dbd0-4685-87ba-775d60b45a4f.png",
-      "source_sha256": "fb4ea506ada578c280db90f591276b3dd6a895fa512d7aa996bde9a677de5a27",
-      "action": "waiting-user",
-      "drawn_frames": 12,
-      "sheet_grid": [
-        4,
-        3
-      ],
-      "duration": 3.0,
-      "size": [
-        384,
-        384
-      ],
-      "fps": 20,
-      "drawn_fps": 4,
-      "alpha": true,
-      "loop": true,
-      "decoded_frames": 60,
-      "bytes": 145531,
-      "method": "image_gen reference edit; common crop, scale and RGBA cells"
-    },
-    {
-      "source": "exec-7477f192-3ad1-4604-86a8-40ae6cd2908e.png",
-      "source_sha256": "dc9079a47f6fc168f76f004a1502c8832e1d626660696c7ac53ebe8454dbece1",
-      "action": "pause-exhausted",
-      "drawn_frames": 12,
-      "sheet_grid": [
-        4,
-        3
-      ],
-      "duration": 3.0,
-      "size": [
-        384,
-        384
-      ],
-      "fps": 20,
-      "drawn_fps": 4,
-      "alpha": true,
-      "loop": false,
-      "decoded_frames": 60,
-      "bytes": 121663,
-      "method": "image_gen reference edit; common crop, scale and RGBA cells"
-    },
-    {
-      "source": "exec-8a3f392a-24f9-49b0-9d29-299483076ac7.png",
-      "source_sha256": "425261062669caa576622f260f27cce2872736cc083115b8bed8462ef19a69bf",
-      "action": "show-summary",
-      "drawn_frames": 12,
-      "sheet_grid": [
-        4,
-        3
-      ],
-      "duration": 3.0,
-      "size": [
-        384,
-        384
-      ],
-      "fps": 20,
-      "drawn_fps": 4,
-      "alpha": true,
-      "loop": false,
-      "decoded_frames": 60,
-      "bytes": 158464,
-      "method": "image_gen reference edit; common crop, scale and RGBA cells"
-    },
-    {
       "source": "墨宝视频生成.mp4",
       "source_sha256": "1e0eeed09ebb1f70e5a7bc7d1f5b20712ff7e86d383bc04134c9a88e0e81f55b",
       "source_duration": 4.041992,
@@ -208,6 +142,72 @@
       "loop": false,
       "bytes": 146251,
       "method": "ISNet anime semantic seeds + OpenCV GrabCut, per-frame"
+    },
+    {
+      "source": "exec-7caa71ce-82d8-4cb4-8230-7a7edfc25317.png",
+      "source_sha256": "6225b9a392d877569fe930dc5f16096fc07f755b9ed2755bed6a3bf9170ad3e1",
+      "action": "waiting-user",
+      "drawn_frames": 36,
+      "sheet_grid": [
+        6,
+        6
+      ],
+      "duration": 1.8,
+      "size": [
+        384,
+        384
+      ],
+      "fps": 20,
+      "drawn_fps": 20,
+      "alpha": true,
+      "loop": true,
+      "decoded_frames": 36,
+      "bytes": 250627,
+      "method": "image_gen reference edit; common crop, scale and RGBA cells"
+    },
+    {
+      "source": "exec-c75dd4db-f944-4acf-a874-d61384fb4f74.png",
+      "source_sha256": "81cfed9fafe9b91555bd7d4c7e6d4208fb625aa98888547feacd7b0a187e407c",
+      "action": "pause-exhausted",
+      "drawn_frames": 30,
+      "sheet_grid": [
+        6,
+        5
+      ],
+      "duration": 1.5,
+      "size": [
+        384,
+        384
+      ],
+      "fps": 20,
+      "drawn_fps": 20,
+      "alpha": true,
+      "loop": false,
+      "decoded_frames": 30,
+      "bytes": 186873,
+      "method": "image_gen reference edit; common crop, scale and RGBA cells"
+    },
+    {
+      "source": "exec-386d2b29-171c-4b44-b216-78a3db206e12.png",
+      "source_sha256": "8db35fbe7b901af025d151aeb07fb8707d8c82d914d57c783600909405f7e183",
+      "action": "show-summary",
+      "drawn_frames": 36,
+      "sheet_grid": [
+        6,
+        6
+      ],
+      "duration": 1.8,
+      "size": [
+        384,
+        384
+      ],
+      "fps": 20,
+      "drawn_fps": 20,
+      "alpha": true,
+      "loop": false,
+      "decoded_frames": 36,
+      "bytes": 258256,
+      "method": "image_gen reference edit; common crop, scale and RGBA cells"
     }
   ]
 }

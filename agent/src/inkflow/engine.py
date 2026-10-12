@@ -61,6 +61,7 @@ from .review_verifier import (
     packet_sources,
     resolve_packet_source_id,
     resolve_review_quote_refs,
+    restore_review_quote_choices,
     same_chapter_disputes,
     verify_review,
 )
@@ -1500,6 +1501,8 @@ class InkFlowEngine:
         instruction: str = "",
         chapter_range: tuple[int, int] | None = None,
         preserve_brief: bool = False,
+        total_chapters: int | None = None,
+        volume_count: int | None = None,
     ) -> dict[str, Any]:
         project = InkFlowProject(root)
         if project.db.latest_accepted_chapter_no():
@@ -1507,15 +1510,21 @@ class InkFlowEngine:
                 raise ValidationGateError("已有正史，请明确要调整的未接受章节范围；不会重新生成整书规划。")
             active_v2 = load_active_planning(project)
             if active_v2 is not None:
+                if ((total_chapters is not None and active_v2[1].volumes[-1].chapter_end != total_chapters)
+                        or (volume_count is not None and len(active_v2[1].volumes) != volume_count)):
+                    raise ValidationGateError("生效大纲规模与本次明确要求不同；先修订全书方向，不会在旧规模下继续规划。")
                 window = active_v2[3]
                 accepted = project.db.latest_accepted_chapter_no()
-                if (chapter_range[0] > accepted and chapter_range[1] > window.chapters[-1].chapter_no
-                        and chapter_range[1] <= active_v2[2].chapter_end):
+                next_volume = next((volume for volume in active_v2[1].volumes
+                                    if volume.chapter_start <= accepted + 1 <= volume.chapter_end), None)
+                if (chapter_range[0] == accepted + 1 and chapter_range[1] > window.chapters[-1].chapter_no
+                        and next_volume is not None and chapter_range[1] <= next_volume.chapter_end):
                     return await self.redesign_story(
                         root, anchor=accepted, end=chapter_range[1],
                         instruction=(f"{instruction.strip()}\n以第 {accepted} 章正史为锚续开第 {accepted + 1}～{chapter_range[1]} 章近期窗口；"
-                                     f"其中第 {accepted + 1}～{window.chapters[-1].chapter_no} 章沿用仍有效的既定因果。"),
+                                     "沿用生效大纲，进入下一卷时仅补齐该卷细纲并审核，不重写正史或全书方向。"),
                         focus="chapter-window",
+                        total_chapters=total_chapters, volume_count=volume_count,
                     )
                 if chapter_range != (window.anchor_chapter + 1, window.chapters[-1].chapter_no):
                     raise ValidationGateError("当前使用正式三层规划；请明确重排整个生效近期窗口或发起新的三层规划，不会用旧版章节卡局部覆盖。")
@@ -1523,6 +1532,7 @@ class InkFlowEngine:
                     root, anchor=window.anchor_chapter, end=window.chapters[-1].chapter_no,
                     instruction=f"{instruction.strip()}\n重排第 {chapter_range[0]} 到 {chapter_range[1]} 章的生效近期规划。",
                     focus="chapter-window",
+                    total_chapters=total_chapters, volume_count=volume_count,
                 )
             return await self.replan_pending(root, *chapter_range, instruction=instruction)
         trace = TraceRecorder(project.root, "plan", self.settings.trace_level)
@@ -1712,10 +1722,12 @@ class InkFlowEngine:
             raise
 
     async def redesign_story(self, root: str | Path, *, anchor: int, end: int,
-                             instruction: str, focus: str = "", approved_run_id: str = "") -> dict[str, Any]:
+                             instruction: str, focus: str = "", approved_run_id: str = "",
+                             total_chapters: int | None = None, volume_count: int | None = None) -> dict[str, Any]:
         return await redesign_existing_story(self, root, anchor=anchor, end=end,
                                              instruction=instruction, focus=focus,
-                                             approved_run_id=approved_run_id)
+                                             approved_run_id=approved_run_id,
+                                             total_chapters=total_chapters, volume_count=volume_count)
 
     async def generate_outline(
         self,
@@ -3300,7 +3312,8 @@ class InkFlowEngine:
                 if reviewed.get("preference_conflicts"):
                     trace.finish(status="waiting", summary="偏好互斥需本次取舍，保留正文与审查断点")
                     return {**reviewed, "status": "waiting_user", "revision_rounds": revisions,
-                            "reason": "需核对或选择本次适用偏好；没有因此重写正文。"}
+                            "reason": "需核对或选择本次适用偏好；没有因此重写正文。",
+                            "stop_reason": "需核对或选择本次适用偏好；没有因此重写正文。"}
                 clarity_strategy = ""
                 chapter = project.db.get_chapter(chapter_no)
                 chapter_version = int(chapter["version"]) if chapter else -1
@@ -3319,6 +3332,7 @@ class InkFlowEngine:
                     )
                     trace.finish(status="waiting", summary=reason)
                     return {**reviewed, "status": "needs_input", "reason": reason,
+                            "stop_reason": reason,
                             "revision_rounds": revisions, "recovery_trace_id": trace.run_id}
                 if (reviewed["verdict"] != "patch" and not clarity_strategy) or revisions >= recovery["limit"]:
                     record = project.db.latest_review_record(chapter_no)
@@ -3482,6 +3496,38 @@ class InkFlowEngine:
                             and item["status"] == "verified" and data.get("call_key") == call_key):
                         candidate = ModeCheckOutput.model_validate(data["output"])
                         recovery = data.get("evidence_recovery", {})
+                        gaps = recovery.get("remaining_gaps") or []
+                        if (candidate.verdict == "unknown" and recovery.get("status") == "remaining_gaps"
+                                and gaps and all("@quote:" in gap for gap in gaps)
+                                and not _recovered_sources_changed(project, recovery)):
+                            packet = _review_evidence_packet(project, packet, chapter_no,
+                                [f"chapter:{loaded['chapter_no']:05d}" for loaded in recovery.get("loaded_sources", [])])
+                            choices = restore_review_quote_choices(recovery.get("quote_choices", {}),
+                                {"当前正文": content, **packet_sources(packet)})
+                            decoded = resolve_review_quote_refs(candidate, choices)
+                            saved_run = (project.internal / "runs" / item["run_id"]).resolve()
+                            outputs = list(saved_run.glob("review.source_recovery.*.output.json")) if saved_run.is_relative_to(project.internal.resolve()) else []
+                            if len(outputs) == 1:
+                                try:
+                                    original = resolve_review_quote_refs(ModeCheckOutput.model_validate_json(outputs[0].read_text(encoding="utf-8")), choices)
+                                except (OSError, ValueError):
+                                    original = None
+                                if (original is not None and original.verdict == "pass"
+                                        and original.model_copy(update={"verdict": "unknown"}) == decoded
+                                        and not _review_evidence_gaps(original, content, packet,
+                                            primary=role == (owners.get("general") or owners.get("logic_continuity")),
+                                            memory_required=role == owners["memory"], source_boundary=chapter_no)):
+                                    candidate = original
+                                    recovery = {**recovery, "status": "rechecked", "remaining_gaps": [],
+                                        "local_quote_ref_repair": item["artifact_id"]}
+                                    async with project_write_lock(project.root):
+                                        if self._review_source_fingerprint(project, chapter_no) != source_fingerprint:
+                                            raise ValidationGateError("引文解码复核期间来源已变化，未采用旧结果。")
+                                        item = project.db.save_agent_artifact(artifact_type="mode_check_candidate",
+                                            run_id=trace.run_id, role=role, chapter_no=chapter_no,
+                                            chapter_version=int(chapter["version"]), dimension=mode, status="verified",
+                                            data={**data, "output": candidate.model_dump(mode="json"), "evidence_recovery": recovery})
+                                    trace.record("review.quote_decode", "completed", "已还原同来源的审查与记忆引用，复用原责任角色结果", metadata={"role": role})
                         if (recheck_report is None or candidate.verdict != "unknown") and not _recovered_sources_changed(project, recovery):
                             if recovery:
                                 packet = _review_evidence_packet(project, packet, chapter_no,
@@ -7663,9 +7709,10 @@ class InkFlowEngine:
                                "verdict": reviewed["verdict"], "revision_rounds": reviewed["revision_rounds"],
                                "trace_id": reviewed.get("recovery_trace_id")})
                 if reviewed["verdict"] != "pass":
-                    reason = reviewed["stop_reason"]
-                    result = snapshot("gate_stop", reason)
-                    trace.finish(status="failed", summary=reason)
+                    reason = reviewed.get("stop_reason") or reviewed.get("reason") or reviewed.get("summary") or f"第 {chapter_no} 章审查尚未完成，请核对本章依据。"
+                    waiting = reviewed.get("status") in {"needs_input", "waiting_user"} or reviewed["verdict"] == "unknown"
+                    result = snapshot("waiting_user" if reviewed.get("preference_conflicts") else "waiting_condition" if waiting else "gate_stop", reason)
+                    trace.finish(status="waiting" if waiting else "failed", summary=reason)
                     return result
                 accepted = await self.accept_chapter(project.root, chapter_no, force=False)
                 current_counts = self.accepted_character_count(project.root)

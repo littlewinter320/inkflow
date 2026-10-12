@@ -1274,7 +1274,8 @@ class ContextBuilder:
         updated_at = utc_now()
         ordered = sorted(enumerate(packet.sections), key=lambda pair: (
             {"global": 0, "book": 1, "canon": 2, "chapter": 3, "request": 4}[pair[1].cache_scope],
-            {"J": 0, "B": 1, "O0": 2, "O1": 3, "O2": 4, "C0": 5}.get(pair[1].key, 10 + pair[0]) if pair[1].cache_scope == "book" else pair[0],
+            {"J": 0, "B": 1, "O0": 2, "O1": 3, "O2": 4, "C0": 5}.get(pair[1].key, 10 + pair[0]) if pair[1].cache_scope == "book"
+            else -1 if pair[1].cache_scope == "chapter" and pair[1].key == "E0" else pair[0],
         ))
         prefix_sections = [item for _, item in ordered if item.cache_scope in {"global", "book"}]
         prefix_hashes = {

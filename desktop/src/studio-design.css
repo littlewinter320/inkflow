@@ -153,7 +153,7 @@ input, textarea, select { background: var(--bg); border-radius: 10px; }
 .message > div, .editor-toolbar > div { min-width: 0; }
 .message-text { overflow-wrap: anywhere; }
 .floating-chat-controls { flex-wrap: wrap; }
-.floating-chat-controls > button, .conversation-layout-select { flex-shrink: 0; white-space: nowrap; }
+.floating-chat-controls > button { flex-shrink: 0; white-space: nowrap; }
 .editor-toolbar { flex-wrap: wrap; gap: 9px; }
 .editor-toolbar > div { flex-wrap: wrap; }
 @media (max-width: 1100px) { .pending-board { padding: 16px; } }

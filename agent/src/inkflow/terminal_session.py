@@ -70,6 +70,7 @@ TERMINAL_ROUTER_SYSTEM = """
 - planning_history_restore：只有用户明确要求恢复某个保留的旧版规划时使用，planning_revision_no 必填；恢复会创建新的正式修订号，不倒退版本号。旧版来源和当前正史锚点必须兼容，否则提示重规划。
 - planning_publish_reviewed：当前设置要求人工确认且三层候选均已审核通过时，用户明确说采用刚才那版才使用；若原话含候选编号，逐字填入 checkpoint_id。引擎核对唯一待确认 run、原来源版本和审核记录后零模型调用发布，失败不增加修订号。不能把普通“继续看看”解释成确认发布。
 - redesign_story：用户要求以已有正史为基础重设计全书大纲、相关卷细纲，接着规划指定近期章节时使用。这是一个连续可恢复的规划任务，三层分别由 Writer 产出、当前模式审核者审读，通过后由引擎发布并自动进入下一层；不写正文、不改已接受章节。chapter_no 填最后一章已接受正文作锚点，end_chapter_no 填规划结束章；用户说“第15～24章”而第15章已接受，就把15当只读衔接章，实际规划第16～24章。
+- 用户明确全书总章数、卷数时，分别填写planning_total_chapters、planning_volume_count；它们约束最终全书规模，不是本次近期窗口的终点。用户要求沿用生效大纲，仅续开近期窗口时选择plan；进入下一卷由现有链补齐该卷细纲，不重做全书大纲，也不因历史错误提示要求用户改选完整重设计。
 - 用户明确要求把保留旧版的某部分融入新规划时，仍用 redesign_story，并填写 planning_revision_no、planning_part 和可选的旧版章节/卷号；这是非正史参考，必须经过新版审核与正式发布。没有用户明确要求时，这些字段留空，绝不自动拿旧版内容作依据。
 - outline：仅生成单层大纲或卷细纲时使用；全书大纲与逐卷细纲不同于逐章规划。旧版 outline 流程尚未迁移到新契约时应说明，不能把逐章摘要冒充全书大纲。
 - 项目已有正式三层规划时，改其大纲或卷细纲应选择 redesign_story，以上一章已接受正文为锚点，并审核受影响的三层后发布；独立旧入口不能直接覆盖生效的一层。只改近期窗口时仍通过正式链修订，不绕回旧数据库重排入口。
@@ -566,17 +567,6 @@ class TerminalSession:
                     {"id": "planning-publish-other", "label": "其他", "description": "说明想怎样处理这份候选。", "kind": "other"},
                 ],
             }]
-        elif result.get("pending_history_choice"):
-            response["questions"] = [{
-                "id": "planning-history", "revision_id": result.get("trace_id"),
-                "header": "旧版处置", "question": "新版已生效，被替换的旧版如何处理？",
-                "why_it_matters": "旧版不会再被自动引用；删除前还要逐项预览并再次明确确认。",
-                "selection": "single", "options": [
-                    {"id": "planning-history-keep", "label": "保留旧版到历史", "description": "以后仅按你的明确指令查看、参考或恢复。", "kind": "choice"},
-                    {"id": "planning-history-preview", "label": "查看旧版删除清单", "description": "先看准确文件、引用与影响，本次回答不会删除文件。", "kind": "choice"},
-                    {"id": "planning-history-other", "label": "其他", "description": "说明想怎样处理被替换的旧版。", "kind": "other"},
-                ],
-            }]
 
     @staticmethod
     async def _planning_question_answer(project: InkFlowProject, text: str) -> dict[str, Any] | None:
@@ -614,11 +604,8 @@ class TerminalSession:
                 return {"reply": result["next_action"], "result": result}
             paths = [item for item in preview["candidates"] if item.get("revision_id") == revision_id]
             project.db.set_metadata(conversation_key("pending_terminal_question"), None)
-            listing = "\n".join(
-                f"- {item['path']}：{item['blocked'] or '可选择删除'}（哈希 {item['content_hash'][:12]}）"
-                for item in paths
-            ) or "- 这份旧版没有可列出的历史文件。"
-            return {"reply": f"旧版删除清单：\n{listing}\n{preview['impact']}\n本次没有删除文件；请在项目中心逐项选择并再次确认。",
+            listing = "\n".join(f"- {item['display_name']}：{item['handling_note']}" for item in paths) or "- 这份旧版没有需要清理的资料。"
+            return {"reply": f"旧版资料的处理建议：\n{listing}\n\n当前正文与生效规划保持不变。本次只查看；如需清理，请指定要删除的资料，再核对具体影响。",
                     "result": {"candidates": paths, "impact": preview["impact"]}}
 
     async def handle(
@@ -3400,6 +3387,8 @@ class TerminalSession:
                         "result": await self.engine.generate_plan(
                             root,
                             instruction=intent.operation_instruction,
+                            total_chapters=intent.planning_total_chapters,
+                            volume_count=intent.planning_volume_count,
                             chapter_range=(intent.chapter_no, intent.end_chapter_no)
                             if intent.chapter_no is not None and intent.end_chapter_no is not None
                             else None,
@@ -3451,6 +3440,7 @@ class TerminalSession:
                 root, anchor=int(pending["anchor"]), end=int(pending["end"]),
                 instruction=str(pending["instruction"]), focus=str(pending.get("focus") or ""),
                 approved_run_id=str(pending["run_id"]),
+                total_chapters=pending.get("total_chapters"), volume_count=pending.get("volume_count"),
             )
             async with project_write_lock(root):
                 project = InkFlowProject(root)
@@ -3498,6 +3488,7 @@ class TerminalSession:
                 root, anchor=intent.chapter_no, end=intent.end_chapter_no,
                 instruction=planning_instruction,
                 focus="chapter-window" if _focused_recent_plan_request(intent.operation_instruction or intent.user_message) else "",
+                total_chapters=intent.planning_total_chapters, volume_count=intent.planning_volume_count,
             )}
         if intent.action == "outline":
             if intent.outline_level == "detail":

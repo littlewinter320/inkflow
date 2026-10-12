@@ -24,6 +24,7 @@ import pointPoster from "./assets/mascot/animations/mobao-clean-point-result.pos
 import pointVideo from "./assets/mascot/animations/mobao-clean-point-result.webm";
 import tapPoster from "./assets/mascot/animations/mobao-clean-tap-result.poster.png";
 import tapVideo from "./assets/mascot/animations/mobao-clean-tap-result.webm";
+import animationManifest from "./assets/mascot/animations/mobao-clean.manifest.json";
 import { useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { createPortal } from "react-dom";
@@ -39,25 +40,33 @@ type MascotClip = {
   loop: boolean;
   duration: number;
   flip?: boolean;
+  frames?: number;
+  columns?: number;
+  rows?: number;
+  fps?: number;
 };
+
+const sheetMotion = Object.fromEntries(animationManifest.clips.filter(clip => clip.drawn_frames).map(clip => [clip.action, {
+  duration: clip.duration, frames: clip.drawn_frames!, columns: clip.sheet_grid![0], rows: clip.sheet_grid![1], fps: clip.drawn_fps!,
+}]));
 
 const clips: Record<MascotMood, MascotClip> = {
   writing: { video: writingVideo, poster: writingImage, label: "墨宝正在写作", loop: true, duration: 4 },
   reviewing: { video: reviewingVideo, poster: reviewingImage, label: "墨宝正在校对", loop: true, duration: 4 },
   idle: { video: idleVideo, poster: idlePoster, label: "墨宝在这里", loop: true, duration: 4 },
   thinking: { video: thinkingVideo, poster: thinkingPoster, label: "正在理解和安排", loop: true, duration: 3 },
-  waiting: { video: waitingVideo, poster: waitingPoster, sheet: waitingSheet, label: "等你确认下一步", loop: true, duration: 3 },
-  success: { video: successVideo, poster: successPoster, sheet: successSheet, label: "这一步完成了", loop: false, duration: 3 },
-  rest: { video: restVideo, poster: restPoster, sheet: restSheet, label: "进度已保留，可补齐条件后继续", loop: false, duration: 3 },
+  waiting: { video: waitingVideo, poster: waitingPoster, sheet: waitingSheet, label: "等你确认下一步", loop: true, ...sheetMotion["waiting-user"] },
+  success: { video: successVideo, poster: successPoster, sheet: successSheet, label: "这一步完成了", loop: false, ...sheetMotion["show-summary"] },
+  rest: { video: restVideo, poster: restPoster, sheet: restSheet, label: "进度已保留，可补齐条件后继续", loop: false, ...sheetMotion["pause-exhausted"] },
   welcome: { video: welcomeVideo, poster: welcomePoster, label: "欢迎来到墨流", loop: false, duration: 3 },
   reading: { video: reviewingVideo, poster: reviewingImage, label: "墨宝正在阅读选中的正文", loop: true, duration: 4 },
   move_right: { video: moveVideo, poster: movePoster, label: "墨宝向右移动", loop: true, duration: 2 },
   move_left: { video: moveVideo, poster: movePoster, label: "墨宝向左移动", loop: true, duration: 2, flip: true },
   point_result: { video: pointVideo, poster: pointPoster, label: "墨宝指向已完成的结果", loop: false, duration: 2 },
   tap_result: { video: tapVideo, poster: tapPoster, label: "墨宝轻点只读结果入口", loop: false, duration: 1.5 },
-  show_summary: { video: successVideo, poster: successPoster, sheet: successSheet, label: "墨宝展示已完成的内容", loop: false, duration: 3 },
-  waiting_user: { video: waitingVideo, poster: waitingPoster, sheet: waitingSheet, label: "墨宝等待你的决定", loop: true, duration: 3 },
-  pause_exhausted: { video: restVideo, poster: restPoster, sheet: restSheet, label: "进度已保留，本轮尝试结束", loop: false, duration: 3 },
+  show_summary: { video: successVideo, poster: successPoster, sheet: successSheet, label: "墨宝展示已完成的内容", loop: false, ...sheetMotion["show-summary"] },
+  waiting_user: { video: waitingVideo, poster: waitingPoster, sheet: waitingSheet, label: "墨宝等待你的决定", loop: true, ...sheetMotion["waiting-user"] },
+  pause_exhausted: { video: restVideo, poster: restPoster, sheet: restSheet, label: "进度已保留，本轮尝试结束", loop: false, ...sheetMotion["pause-exhausted"] },
 };
 
 const moodLabels: Record<MascotMood, string> = {
@@ -80,9 +89,9 @@ export function isTransientMediaError(error: unknown) {
     && error.name === "AbortError";
 }
 
-export function spritePosition(frame: number) {
-  const index = Math.max(0, Math.min(11, Math.floor(frame)));
-  return `${(index % 4) / 3 * 100}% ${Math.floor(index / 4) / 2 * 100}%`;
+export function spritePosition(frame: number, columns = 4, rows = 3) {
+  const index = Math.max(0, Math.min(columns * rows - 1, Math.floor(frame)));
+  return `${(index % columns) / (columns - 1) * 100}% ${Math.floor(index / columns) / (rows - 1) * 100}%`;
 }
 
 export const mobaoIdlePoster = logo;
@@ -104,6 +113,7 @@ export function Mascot({
   onSettled?: () => void;
 }) {
   const clip = clips[mood];
+  const figureRef = useRef<HTMLElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const settledRef = useRef(onSettled);
   settledRef.current = onSettled;
@@ -112,7 +122,9 @@ export function Mascot({
   const [mediaState, setMediaState] = useState({ source: clip.video, ready: false, failed: false });
   const [sheetReady, setSheetReady] = useState<string | null>(null);
   const [frame, setFrame] = useState(0);
-  const [visible, setVisible] = useState(() => !document.hidden);
+  const [pageVisible, setPageVisible] = useState(() => !document.hidden);
+  const [inViewport, setInViewport] = useState(true);
+  const visible = pageVisible && inViewport;
   const videoFailed = mediaState.source === clip.video && mediaState.failed;
   const videoReady = mediaState.source === clip.video && mediaState.ready;
   const useSheet = !!clip.sheet && sheetReady === clip.sheet && !reducedMotion && !videoReady;
@@ -131,9 +143,16 @@ export function Mascot({
     return () => media.removeEventListener("change", update);
   }, []);
   useEffect(() => {
-    const update = () => setVisible(!document.hidden);
+    const update = () => setPageVisible(!document.hidden);
     document.addEventListener("visibilitychange", update);
     return () => document.removeEventListener("visibilitychange", update);
+  }, []);
+  useEffect(() => {
+    const figure = figureRef.current;
+    if (!figure) return;
+    const observer = new IntersectionObserver(([entry]) => setInViewport(entry.isIntersecting), { rootMargin: "32px" });
+    observer.observe(figure);
+    return () => observer.disconnect();
   }, []);
   useEffect(() => {
     settled.current = false;
@@ -143,6 +162,12 @@ export function Mascot({
     warmPoster(clips.idle.poster);
   }, [mood, clip.poster]);
   useEffect(() => setMediaState({ source: clip.video, ready: false, failed: false }), [clip.video, reducedMotion]);
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !visible || reducedMotion || videoFailed || !video.requestVideoFrameCallback) return;
+    const callback = video.requestVideoFrameCallback(() => updateMedia(video, true, false));
+    return () => video.cancelVideoFrameCallback(callback);
+  }, [clip.video, visible, reducedMotion, videoFailed]);
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -175,25 +200,33 @@ export function Mascot({
   }, [clip.sheet, reducedMotion, visible, videoReady, videoFailed, sheetReady]);
   useEffect(() => {
     if (!useSheet || !visible) return;
-    const timer = window.setInterval(() => setFrame(value => clip.loop ? (value+1)%12 : Math.min(value+1, 11)), 250);
-    return () => window.clearInterval(timer);
-  }, [mood, useSheet, visible, clip.loop]);
+    const started = performance.now();
+    const frameCount = clip.frames || 12;
+    let callback = 0;
+    const tick = (now: number) => {
+      const value = Math.floor((now - started) * (clip.fps || 4) / 1000);
+      setFrame(clip.loop ? value % frameCount : Math.min(value, frameCount - 1));
+      if (clip.loop || value < frameCount - 1) callback = window.requestAnimationFrame(tick);
+    };
+    callback = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(callback);
+  }, [mood, useSheet, visible, clip.loop, clip.frames, clip.fps]);
   useEffect(() => {
-    if (clip.loop || !(reducedMotion || videoFailed) || !visible) return;
-    const timer = window.setTimeout(finish, clip.duration * 1000);
+    if (clip.loop || !visible) return;
+    const timer = window.setTimeout(finish, (clip.duration + (reducedMotion || videoFailed ? 0 : 4)) * 1000);
     return () => window.clearTimeout(timer);
   }, [mood, reducedMotion, videoFailed, visible, clip.loop, clip.duration]);
   return (
-    <figure className={`mobao ${className}`.trim()} data-mood={mood} aria-label={clip.label}>
+    <figure ref={figureRef} className={`mobao ${className}`.trim()} data-mood={mood} aria-label={clip.label}>
       <span style={{ position: "relative", display: "block", width: "100%", height: "100%", minHeight: 0, aspectRatio: "1 / 1", transform: clip.flip ? "scaleX(-1)" : undefined }}>
-        {(reducedMotion || !videoReady || videoFailed) && (useSheet ?
-          <span role="img" aria-label={clip.label} style={{ display: "block", width: "100%", height: "100%", aspectRatio: "1 / 1", backgroundImage: `url(${clip.sheet})`, backgroundRepeat: "no-repeat", backgroundSize: "400% 300%", backgroundPosition: spritePosition(frame) }} />
-          : <img className="mobao-video" src={clip.poster} alt={clip.label} decoding="async" />)}
+        {useSheet ?
+          <span role="img" aria-label={clip.label} style={{ display: "block", width: "100%", height: "100%", aspectRatio: "1 / 1", backgroundImage: `url(${clip.sheet})`, backgroundRepeat: "no-repeat", backgroundSize: `${(clip.columns || 4) * 100}% ${(clip.rows || 3) * 100}%`, backgroundPosition: spritePosition(frame, clip.columns, clip.rows) }} />
+          : <img className="mobao-video" src={clip.poster} alt={clip.label} decoding="async" style={{ opacity: videoReady && !videoFailed && !reducedMotion ? 0 : 1, transition: "opacity 150ms ease" }} />}
         {!reducedMotion && !videoFailed && <video
           ref={videoRef}
           key={clip.video}
           className="mobao-video"
-          style={{ position: "absolute", inset: 0, opacity: videoReady ? 1 : 0 }}
+          style={{ position: "absolute", inset: 0, opacity: videoReady ? 1 : 0, transition: "opacity 150ms ease" }}
           src={clip.video}
           poster={clip.poster}
           autoPlay={visible}
@@ -203,8 +236,8 @@ export function Mascot({
           preload={visible ? "auto" : "none"}
           disablePictureInPicture
           aria-label={clip.label}
-          onLoadedData={event => updateMedia(event.currentTarget, true, false)}
-          onPlaying={event => updateMedia(event.currentTarget, true, false)}
+          onLoadedData={event => { if (!event.currentTarget.requestVideoFrameCallback) updateMedia(event.currentTarget, true, false); }}
+          onPlaying={event => { if (!event.currentTarget.requestVideoFrameCallback) updateMedia(event.currentTarget, true, false); }}
           onError={event => updateMedia(event.currentTarget, false, true)}
           onEnded={clip.loop ? undefined : event => { if (event.currentTarget === videoRef.current) finish(); }}
         />}
@@ -239,6 +272,7 @@ export function MobaoGuide({
   const previewRef = useRef(onPreview);
   previewRef.current = onPreview;
   const manualPreviewRef = useRef<(() => void) | null>(null);
+  const settledPhaseRef = useRef<((phase: string) => void) | null>(null);
   const [guide, setGuide] = useState<{
     phase: "move" | "point" | "tap" | "present" | "return";
     position: { x: number; y: number };
@@ -265,7 +299,7 @@ export function MobaoGuide({
     const card = { ...boundedGuidePoint(arrival.x - cardWidth + 72, arrival.y + 76, bounds, cardWidth, 100), width: cardWidth };
     let cancelled = false;
     const timers: number[] = [];
-    const stop = () => { cancelled = true; manualPreviewRef.current = null; setGuide(null); timers.forEach(window.clearTimeout); };
+    const stop = () => { cancelled = true; manualPreviewRef.current = null; settledPhaseRef.current = null; setGuide(null); timers.forEach(window.clearTimeout); };
     const later = (callback: () => void, delay: number) => timers.push(window.setTimeout(() => {
       if (!cancelled && target.isConnected && !document.hidden) callback();
       else stop();
@@ -276,21 +310,21 @@ export function MobaoGuide({
     };
     manualPreviewRef.current = () => {
       if (cancelled || !canPreview()) return;
-      setGuide(value => value && { ...value, phase: "tap" });
-      later(preview, reduced ? 0 : 650);
-      later(stop, reduced ? 100 : 1500);
+      if (reduced) { preview(); later(stop, 100); }
+      else setGuide(value => value && { ...value, phase: "tap" });
     };
     const automaticTap = autoPreview && canPreview();
-    setGuide({ phase: reduced ? "point" : "move", position: reduced ? arrival : origin, card, reduced, summary: cue.summary, rightward: arrival.x >= origin.x });
+    settledPhaseRef.current = phase => {
+      if (cancelled || reduced) return;
+      if (phase === "point") setGuide(value => value && { ...value, phase: automaticTap ? "tap" : "present" });
+      else if (phase === "tap") { preview(); setGuide(value => value && { ...value, phase: "present" }); }
+      else if (phase === "present") { setGuide(value => value && { ...value, phase: "return", position: origin }); later(stop, 1100); }
+    };
+    setGuide({ phase: reduced ? "present" : "move", position: reduced ? arrival : origin, card, reduced, summary: cue.summary, rightward: arrival.x >= origin.x });
     if (!reduced) later(() => setGuide(value => value && { ...value, position: arrival }), 30);
-    later(() => setGuide(value => value && { ...value, phase: "point" }), reduced ? 0 : 1100);
-    later(() => {
-      setGuide(value => value && { ...value, phase: automaticTap && !reduced ? "tap" : "present" });
-      if (automaticTap) later(preview, reduced ? 0 : 650);
-    }, reduced ? 100 : 3100);
-    if (automaticTap && !reduced) later(() => setGuide(value => value && { ...value, phase: "present" }), 4600);
-    if (!reduced) later(() => setGuide(value => value && { ...value, phase: "return", position: origin }), automaticTap ? 7600 : 6100);
-    later(stop, reduced ? 3500 : automaticTap ? 8800 : 7300);
+    if (!reduced) later(() => setGuide(value => value && { ...value, phase: "point" }), 1100);
+    if (reduced && automaticTap) later(preview, 100);
+    later(stop, reduced ? 3500 : 20000);
     const interrupt = (event: Event) => {
       if (event.target instanceof Node && overlayRef.current?.contains(event.target)) return;
       stop();
@@ -312,7 +346,7 @@ export function MobaoGuide({
   if (!guide) return null;
   return createPortal(<div ref={overlayRef} className="mobao-result-guide" aria-live="polite" style={{ pointerEvents: "none" }}>
     <div aria-hidden="true" style={{ position: "fixed", left: 0, top: 0, width: 80, height: 80, zIndex: 40, transform: `translate(${guide.position.x}px, ${guide.position.y}px)`, transition: guide.reduced ? "none" : "transform 1s ease-in-out" }}>
-      <Mascot mood={guide.phase === "present" ? "show_summary" : guide.phase === "point" ? "point_result" : guide.phase === "tap" ? "tap_result" : (guide.phase === "move" ? guide.rightward : !guide.rightward) ? "move_right" : "move_left"} />
+      <Mascot mood={guide.phase === "present" ? "show_summary" : guide.phase === "point" ? "point_result" : guide.phase === "tap" ? "tap_result" : (guide.phase === "move" ? guide.rightward : !guide.rightward) ? "move_right" : "move_left"} onSettled={() => settledPhaseRef.current?.(guide.phase)} />
       {guide.phase === "point" && <span style={{ position: "absolute", right: 4, bottom: 2, color: "#efb855", fontSize: 26 }}>↘</span>}
     </div>
     {guide.phase === "present" && <div style={{ position: "fixed", left: guide.card.x, top: guide.card.y, width: guide.card.width, boxSizing: "border-box", zIndex: 41, padding: "10px 12px", border: "1px solid var(--amber, #ad8244)", borderRadius: 14, background: "var(--panel-2, #20252d)", color: "var(--text, #f1eadf)", boxShadow: "0 8px 24px #0005", pointerEvents: "auto" }}>

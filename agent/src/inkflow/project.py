@@ -976,8 +976,12 @@ class InkFlowProject:
 
     def _finish_projection_pending_work(self, chapter: dict[str, Any]) -> None:
         source = {key: chapter[key] for key in ("chapter_no", "version", "content_hash", "path")}
-        pending = [item for item in self.pending_work(chapter_no=int(chapter["chapter_no"]))
-                   if item["kind"] == "accepted_projection" and item["source"] == source]
+        # Closing a projection must not recompute unrelated review/task UI state.
+        with self.db.connect() as connection:
+            rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
+        pending = [item for row in rows if (item := json.loads(row["value_json"]))["kind"] == "accepted_projection"
+                   and item["source"] == source and item["status"] not in {"completed", "superseded", "rejected"}
+                   and item.get("chapter_no") in {None, int(chapter["chapter_no"])}]
         if not pending:
             return
         current = self.db.get_chapter(int(chapter["chapter_no"]))

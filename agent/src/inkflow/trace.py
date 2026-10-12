@@ -201,6 +201,11 @@ class TraceRecorder:
             "response_id": result.response_id,
             "usage": result.usage,
         }
+        public_summary = getattr(result.data, "public_reasoning_summary", [])
+        if public_summary:
+            metadata["public_reasoning_summary"] = public_summary
+        if isinstance(getattr(result.data, "summary", None), str):
+            metadata["decision_summary"] = result.data.summary
         if self.trace_level == "full":
             ordinal = 1 + sum(event.stage == stage and event.status == "completed" for event in self.events)
             output_path = self.run_dir / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', stage)}.{ordinal}.output.json"

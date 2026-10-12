@@ -1059,7 +1059,9 @@ class ContextPacket(StrictModel):
             # outline boundary. Keep it ahead of O0 so a new outline draft
             # does not invalidate the book-level DeepSeek cache.
             book_order = {"J": 0, "B": 1, "O0": 2, "O1": 3, "O2": 4, "C0": 5}
-            order = book_order.get(section.key, 10 + index) if section.cache_scope == "book" else index
+            # Append-only batch memory remains reusable ahead of the changing chapter card.
+            order = (book_order.get(section.key, 10 + index) if section.cache_scope == "book"
+                     else -1 if section.cache_scope == "chapter" and section.key == "E0" else index)
             return (scopes[section.cache_scope], order, index)
 
         output = ["# 墨流编译上下文", ""]
@@ -1445,6 +1447,8 @@ class TerminalIntent(StrictModel):
     plan_change_confirmed: bool = False
     planning_revision_no: int | None = Field(default=None, ge=0)
     planning_part: Literal["none", "outline", "detail", "recent"] = "none"
+    planning_total_chapters: int | None = Field(default=None, ge=1)
+    planning_volume_count: int | None = Field(default=None, ge=1, le=20)
     planning_reference_chapter_no: int | None = Field(default=None, ge=1)
     planning_reference_volume_no: int | None = Field(default=None, ge=1)
     target_characters: int | None = Field(default=None, ge=1_000, le=5_000_000)
