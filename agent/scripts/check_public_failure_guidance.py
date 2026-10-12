@@ -1,10 +1,12 @@
 """Focused check for source-bound quote decoding and public failure guidance; no model calls."""
 from pydantic import ValidationError
+import asyncio
 
 from inkflow.app_server import _error_payload
 from inkflow.errors import ProviderError
 from inkflow.review_verifier import resolve_review_quote_refs, restore_review_quote_choices
-from inkflow.schemas import ModeCheckOutput
+from inkflow.schemas import ModeCheckOutput, TerminalIntent
+from inkflow.terminal_session import TerminalSession
 from inkflow.utils import content_hash
 
 
@@ -38,6 +40,13 @@ def check():
     error = _error_payload(ProviderError("HTTP 429"), operation)
     assert error["retryable"] and "过于频繁" in error["message"] and "限次重试" not in error["message"]
     assert not _error_payload(RuntimeError("unknown"))["retryable"]
+    session = object.__new__(TerminalSession)
+    failed_plan = {"status": "failed", "reason": "近期规划候选需要定点修改"}
+    planned = asyncio.run(session._recover_failed_workflow(None,
+        TerminalIntent(action="redesign_story", chapter_no=42, end_chapter_no=50),
+        None, None, failed_plan, None))
+    assert planned["status"] == "failed" and planned["coordinator_recovery"]["status"] == "not_run"
+    assert "正文复审不能修复规划" in planned["coordinator_recovery"]["reason"]
     try:
         ModeCheckOutput.model_validate({"verdict": "pass"})
     except ValidationError as exc:

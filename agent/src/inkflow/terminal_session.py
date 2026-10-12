@@ -1369,6 +1369,9 @@ class TerminalSession:
         outcome = workflow_result_status(response)
         if intent.action == "pending_work" or outcome not in {"failed", "waiting_condition"} or response.get("questions"):
             return response
+        if intent.action in {"plan", "plan_next_arc", "outline", "redesign_story", "planning_publish_reviewed"}:
+            return response | {"coordinator_recovery": {"status": "not_run",
+                "reason": "规划候选须在原规划节点定点修订；正文复审不能修复规划，未增加外围模型调用。"}}
         no_extra = bool(set(intent.forbidden_actions) & {"extra_calls", "extra_model_calls", "coordinator_recovery"})
         no_extra = no_extra or bool(re.search(r"(?:不要|禁止|不允许|无需).{0,8}额外.{0,8}(?:调用|模型|任务)",
                                                intent.user_message + "\n" + intent.operation_instruction))
