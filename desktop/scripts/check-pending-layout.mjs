@@ -34,11 +34,17 @@ const workProbe = new pendingProbe.PendingProbe([{method:"conversation.send",con
 assert.equal(workProbe.pendingWorkCount(), 3, "Generation, saving and installation still protect exit");
 assert.equal(workProbe.pendingWorkCount("a"), 1, "Closing one conversation must not count another conversation's work");
 const names = ["conversationDockTarget", "busyMascotMood", "batchChapterAccepted", "batchChapterReviewed", "batchChapterWritten", "batchMilestones", "chapterMilestones", "collaborationPending", "pendingWorkLabel", "pendingDecisionPayload", "BatchProgressStatus", "completionReference", "canPollWorkspace", "chatRefreshScope", "audioPlaybackFailure", "workflowStageState", "processElapsed", "publicProcessSteps", "collectPublicSummaries", "isSensitivePresentationKey"];
+names.push("readableWorkMessage", "readableWorkReason");
 const functions = parsed.statements.filter(node => ts.isFunctionDeclaration(node) && names.includes(node.name?.text));
 assert.equal(functions.length, names.length);
 const code = ts.transpileModule(functions.map(node => node.getText(parsed)).join("\n"), { compilerOptions: { jsx: ts.JsxEmit.React, target: ts.ScriptTarget.ES2022 } }).outputText;
 const context = {};
 runInNewContext(code, context);
+const selectedWork = {id:"ab3cc97ec6d768a97dc701e3",kind:"workflow",chapter_no:41,intent:{action:"continue_until",end_chapter_no:50}};
+assert.equal(context.readableWorkMessage("处理待办 ab3cc97ec6d768a97dc701e3", [selectedWork]), "继续处理第41—50章的未完成任务。");
+assert.equal(context.readableWorkMessage("钥匙编号731仍在原处。", [selectedWork]), "钥匙编号731仍在原处。");
+assert.ok(!context.readableWorkMessage("处理待办 ab3cc97ec6d768a97dc701e3", []).includes(selectedWork.id));
+assert.ok(context.readableWorkReason({chapter_no:42,reason:"引用待核 @quote:6；@quote:8"}).includes("2条记忆引用"));
 const messageFunction = parsed.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "errorMessage");
 runInNewContext(ts.transpileModule(messageFunction.getText(parsed), {}).outputText, context);
 assert.equal(context.errorMessage("原步骤暂时不能完成\n已保留：已经保存的正文保持当前状态。"), "原步骤暂时不能完成");

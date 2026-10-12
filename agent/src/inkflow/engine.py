@@ -2682,6 +2682,7 @@ class InkFlowEngine:
             writer_prompt = packet.to_model_prompt() + self._continuity_anchor(
                 project, chapter_no, json_dumps(card) + "\n" + instruction
             )
+            writer_prompt += "\n连续写作先核对前章已经完成的行动和时间，不把已发生的登记、见面、报信或取得证据再次写成首次发生，不复演前章整场对白。若章节卡的核心行动已由正史完成，应从该结果后的新选择、代价或后果推进，并在同次创作说明中解释衔接调整；未来规划不能覆盖已发生事实。\n"
             if self._writer_source_fingerprint(project, chapter_no) != source_fingerprint:
                 raise ValidationGateError("构建 Writer 输入期间章节依据发生变化，本次请求未发送；请按当前版本继续。")
             trace.record_model_started(

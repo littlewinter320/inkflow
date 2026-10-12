@@ -3297,7 +3297,7 @@ class TerminalSession:
                         "next_action": remaining["next_action"] if remaining else "查看已完成结果",
                         "pending_work": project.pending_work()}
             response = {"pending_work": items, "reply": "当前没有待处理工作。" if not items else
-                        "待处理工作：\n" + "\n".join(f"{item['id']} · {item['status']}：{item['reason']}\n下一步：{item['next_action']}" for item in items)}
+                        "待处理工作：\n" + "\n".join(f"{'第{}章：'.format(item['chapter_no']) if item.get('chapter_no') else ''}{item['reason']}\n下一步：{item['next_action']}" for item in items)}
             # A fixed answer is bound to this exact item and routed as its saved workflow.
             self._pending_work_question(project, response, include_deferred=True)
             return response

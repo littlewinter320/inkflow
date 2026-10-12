@@ -231,7 +231,7 @@ type QualifiedProduction = { accepted_products: number; unknown_cost_calls: numb
 type RecentCacheSummary = { calls: number; reported_calls: number; unknown_calls: number; input_tokens: number; hit_tokens: number; miss_tokens: number; hit_rate: number | null; last_at: string | null; by_role?: Record<string, { calls: number; reported_calls: number; unknown_calls: number; hit_rate: number | null }>; by_family?: Record<string, { calls: number; reported_calls: number; input_tokens: number; hit_tokens: number; miss_tokens: number; hit_rate: number | null }>; performance_diagnostic?: PerformanceDiagnostic; qualified_production?: QualifiedProduction };
 type VoiceInstallProgress = { status: string; stage: string; progress: number; summary: string; downloaded_mb: number; retryable: boolean; error?: string };
 type PersistentUsage = { calls: number; since: string | null; estimated_cost: number; pending_estimated_cost: number; unknown_usage_calls: number; unknown_cost_calls: number; price_note: string };
-type PendingWorkItem = { id: string; kind: string; status: string; reason: string; next_action: string; chapter_no?: number | null; handling?: string; can_process?: boolean; can_reject?: boolean; reject_label?: string; reject_impact?: string; reject_blocked_reason?: string; updated_at?: string; rejection?: { reason?: string; at?: string }; parent_id?: string; processing_attempts?: number; source?: Record<string, unknown>; intent?: { action?: string; batch_id?: string | null } };
+type PendingWorkItem = { id: string; kind: string; status: string; reason: string; next_action: string; chapter_no?: number | null; handling?: string; can_process?: boolean; can_reject?: boolean; reject_label?: string; reject_impact?: string; reject_blocked_reason?: string; updated_at?: string; rejection?: { reason?: string; at?: string }; parent_id?: string; processing_attempts?: number; source?: Record<string, unknown>; intent?: { action?: string; batch_id?: string | null; end_chapter_no?: number | null } };
 type CollaborationOverview = { messages: CollaborationMessage[]; pending_work?: PendingWorkItem[]; rejected_work?: PendingWorkItem[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; trace_runs?: TraceRun[]; usage?: UsageSummary & { by_agent_role?: Record<string, UsageSummary>; recent_deepseek_cache?: RecentCacheSummary | null; estimated_cost: number; currency: string; pricing_configured: boolean; accounting?: { available: boolean; warning?: string; project?: PersistentUsage; all_projects?: PersistentUsage } } };
 type PrefillResult = { insertion: string; document_hash: string; cursor_offset: number; confidence: string };
 type WorkspacePreset = "balanced" | "writing" | "planning" | "review";
@@ -1367,7 +1367,7 @@ function App() {
 
   const copyMessageText = async (message: Message) => {
     try {
-      await navigator.clipboard.writeText(message.text);
+      await navigator.clipboard.writeText(readableWorkMessage(message.text, collaborationPending(collaboration).work));
       setNotice("已复制这条消息。");
     } catch {
       setError("复制失败：剪贴板当前不可用。");
@@ -1507,7 +1507,7 @@ function App() {
     setPromptOptimization(null);
     setPromptUndo(null);
     setError("");
-    setMessages((items) => [...items, { id: crypto.randomUUID(), role: "user", text: message, createdAt: new Date().toISOString() }]);
+    setMessages((items) => [...items, { id: crypto.randomUUID(), role: "user", text: readableWorkMessage(message, collaborationPending(collaboration).work), createdAt: new Date().toISOString() }]);
     setBusy(true);
     setMascotMood("thinking");
     const runId = `desktop-${crypto.randomUUID()}`;
@@ -1536,7 +1536,7 @@ function App() {
         void window.inkflow.request<VoiceSettings>("voice.settings.get", { workspace_root: projectRootRef.current }).then(setVoiceSettings).catch(() => undefined);
       }
       if (voiceSettings?.voice_enabled && voiceSettings.voice_output_enabled && voiceSettings.voice_auto_read) void speakText(assistantMessageId, visible.summary, true);
-      try {
+      void (async () => { try {
         const history = await request<{ entries: ConversationHistoryEntry[] }>("conversation.history", { project_root: runRoot, limit: 100 });
         if (runRoot === projectRootRef.current) {
           setConversationHistory(history.entries);
@@ -1556,7 +1556,7 @@ function App() {
           .replace(/^Error:\s*/i, "")
           .trim();
         setNotice(`本次对话结果已返回；只是项目面板没有刷新，已提交的正文不会因此撤回。\n刷新失败原因：${reason}\n可稍后点“刷新”核对章节状态。`);
-      }
+      } })();
       const resultState = result && typeof result === "object" ? String((result as Record<string, unknown>).status || "") : "";
       if (["failed", "interrupted", "waiting_condition"].includes(resultState) && runRoot === projectRootRef.current) {
         setSuggestedPrompts([{ label: "查看待办与恢复条件", prompt: "查看待办" }]);
@@ -2047,7 +2047,7 @@ function App() {
               <article key={message.id} className={`message ${message.role}`} ref={message.id === mobaoCompletion?.messageId ? mobaoTargetRef : undefined}>
                 <span className="avatar">{message.role === "user" ? "你" : message.role === "system" ? "记" : "墨"}</span>
                 <div>
-                  <p>{message.role === "assistant" && message.text.startsWith("这次没有完成：") ? errorMessage(message.text.replace(/^这次没有完成：\s*/, "")) : message.text}</p>
+                  <p>{message.role === "assistant" && message.text.startsWith("这次没有完成：") ? errorMessage(message.text.replace(/^这次没有完成：\s*/, "")) : readableWorkMessage(message.text, collaborationPending(collaboration).work)}</p>
                   {message.process && <ProcessDisclosure {...message.process} reasoning={message.reasoning} />}
                   {message.createdAt && <time className="message-time" dateTime={message.createdAt}>{formatTime(message.createdAt)}</time>}
                   <div className="message-actions">
@@ -2058,7 +2058,7 @@ function App() {
                         {message.role === "user" && <button type="button" className="message-action" title="清掉这条之后的消息并原样重发" disabled={busy} onClick={() => rerunMessage(message.id)}>重新运行</button>}
                       </>
                     )}
-                    <button className={`message-speak ${speakingMessageId === message.id ? "playing" : ""}`} title="朗读这条对话" aria-label="朗读这条对话" onClick={() => void speakText(message.id, message.text)}>{speakingMessageId === message.id ? "■" : "◖))"}</button>
+                    <button className={`message-speak ${speakingMessageId === message.id ? "playing" : ""}`} title="朗读这条对话" aria-label="朗读这条对话" onClick={() => void speakText(message.id, readableWorkMessage(message.text, collaborationPending(collaboration).work))}>{speakingMessageId === message.id ? "■" : "◖))"}</button>
                   </div>
                 </div>
               </article>
@@ -2459,6 +2459,24 @@ function pendingWorkLabel(item: PendingWorkItem, action = false): string {
   return labels[item.kind]?.[action ? 1 : 0] || (action ? "按原任务处理" : "任务条件待核对");
 }
 
+function readableWorkMessage(text: string, items: PendingWorkItem[]): string {
+  const match = text.match(/^(处理待办|查看待办|下次再处理待办)\s+([a-zA-Z0-9-]{1,180})[。！!\s]*$/);
+  if (!match) return text;
+  const item = items.find(value => value.id === match[2]);
+  const start = item?.chapter_no;
+  const end = item?.intent?.end_chapter_no;
+  const scope = start ? `第${start}${end && end > start ? `—${end}` : ""}章的` : "";
+  const target = item?.kind === "workflow" ? `${scope}${item.intent?.action === "plan" ? "规划任务" : "未完成任务"}` : item ? `${scope}${pendingWorkLabel(item)}` : "刚才选中的待办";
+  const action = match[1] === "查看待办" ? "查看" : match[1] === "下次再处理待办" ? "下次继续处理" : "继续处理";
+  return `${action}${target}。`;
+}
+
+function readableWorkReason(item: PendingWorkItem): string {
+  const quotes = [...new Set(item.reason.match(/@quote:\d+/g) || [])];
+  if (quotes.length) return `${item.chapter_no ? `第${item.chapter_no}章有` : "有"}${quotes.length}条记忆引用还没有定位到原文，需要继续核对引用和来源；目前还不能把相关记忆纳入正史。`;
+  return item.reason.replace(/^editor:\s*/i, "编辑检查：");
+}
+
 function pendingDecisionPayload(projectRoot: string, item: PendingWorkItem, decision: "reject" | "reopen", reason = "") {
   return { project_root: projectRoot, work_id: item.id, decision,
     ...(decision === "reject" ? { reason: reason.trim() || "用户选择不执行此项工作，保留已有成果和必要依赖" } : {}),
@@ -2476,7 +2494,7 @@ function CollaborationBoard({ value, busy, onProcessAll, onWork, onReject, onReo
     const decision = item.handling === "decision" && item.kind === "manual_edit";
     return <article className={`pending-work-card ${item.handling || "blocked"}`} key={item.id}>
       <header><strong>{pendingWorkLabel(item)}</strong><span>{({ deferred: "留待下次", running: "进行中", blocked: "需补充条件", decision: "需要你决定", local: "可本地恢复", manual: "可续核", review: "可复审", resume: "可续接" } as Record<string, string>)[item.handling || ""] || "待核对"}</span></header>
-      <p className="pending-work-reason">{item.reason}</p>
+      <p className="pending-work-reason">{readableWorkReason(item)}</p>
       <div className="pending-work-actions">
         {item.can_process && item.handling !== "running" && <button type="button" className="primary" disabled={busy} onClick={() => onWork(item, "process")}>{pendingWorkLabel(item, true)}</button>}
         {!item.can_process && item.handling !== "running" && <button type="button" disabled={busy} onClick={() => onWork(item, "inspect")}>{decision ? "核对修改并决定" : "查看恢复条件"}</button>}
