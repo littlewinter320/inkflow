@@ -55,6 +55,8 @@ def recent_trace_runs(project_root: str | Path, limit: int = 12) -> list[dict[st
             except json.JSONDecodeError:
                 continue
             metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+            if metadata.get("internal"):
+                continue
             marker = event.pop("role_protocol_version", None)
             metadata = _canonical_role_metadata(metadata, legacy=type(marker) is int and marker == 1)
             if metadata.get("canonical_agent_role"):
@@ -155,6 +157,7 @@ class TraceRecorder:
         summary: str,
         details: str = "",
         metadata: dict[str, Any] | None = None,
+        *, public: bool = True,
     ) -> None:
         event = TraceEvent(
             timestamp=utc_now(),
@@ -162,14 +165,14 @@ class TraceRecorder:
             status=status,
             summary=summary,
             details=details,
-            metadata=_canonical_role_metadata(metadata or {}),
+            metadata=_canonical_role_metadata({**(metadata or {}), **({"internal": True} if not public else {})}),
         )
         self.events.append(event)
         with self.events_path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(asdict(event), ensure_ascii=False) + "\n")
         self._render()
         runtime = active_runtime.get()
-        if runtime and not stage.endswith("provider_reasoning"):
+        if runtime and public and not event.metadata.get("internal") and not stage.endswith("provider_reasoning"):
             runtime.publish({"type": "workflow.stage", "trace_id": self.run_id,
                              "stage": stage, "status": status, "summary": summary,
                              "details": details, "role": event.metadata.get("agent_role", ""),

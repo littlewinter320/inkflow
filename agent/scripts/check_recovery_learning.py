@@ -2,13 +2,17 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from inkflow.engine import InkFlowEngine
+from inkflow.engine import InkFlowEngine, _local_repair_strategy, _finding_evidence_keys
 from inkflow.project import InkFlowProject
 from inkflow.schemas import BookBrief, ReviewFinding, ReviewReport
 from inkflow.utils import content_hash
 
 
 def check():
+    finding = ReviewFinding(category="style", severity="major", evidence="原句", explanation="表达不合要求", repair_instruction="只替换原句")
+    assert "只处理" in _local_repair_strategy([finding], [])
+    assert "不要照抄上次补丁" in _local_repair_strategy([finding], [{"status": "no_change"}])
+    assert _finding_evidence_keys([finding]) == _finding_evidence_keys([finding.model_copy()])
     with TemporaryDirectory() as directory:
         project = InkFlowProject.create(Path(directory) / "book", BookBrief(
             title="恢复记录", genre="现实", premise="只验证失败学习的隔离与归因。", protagonist="林安"))

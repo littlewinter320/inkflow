@@ -4,6 +4,8 @@
 
 本版用户可见变化见 [CHANGELOG](../CHANGELOG.md)，逐项改动和已执行的相关检查见 [后续修复记录](FIXES_2026-10-11.md)、[MiMo契约](MIMO_API_2026-10-11.md)、[界面与音频](UI_PROGRESS_PENDING_AUDIO_2026-10-11.md)及[墨宝媒体](MOBAO_MEDIA_2026-10-11.md)。
 
+10月12—13日的后续源码见[实际运行修复](QUALITY_CACHE_2026-10-12.md)和[直接布局与恢复增量](WORKSPACE_AND_RECOVERY_2026-10-13.md)，由PR #4管理，未重建本页所列安装包或挪动标签。本页原有编译、媒体和发布回执不能作为后续增量的运行验证。
+
 ## 已完成的编译与包身份
 
 - 引擎使用现有 D 盘环境完成一次 PyInstaller 编译，产物为 21,018,667 字节。隔离目录中的一次 `--once` 初始化返回 0.7.5、墨流（InkFlow），未调用模型。桌面和 VSIX 嵌入引擎 SHA256 均为 `9049894705d1cb80ecffa9fba2418a07f32f316d58de00f1bd1ad3654cda23e2`。

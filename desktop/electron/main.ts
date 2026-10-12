@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, Notification, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, Notification, screen, shell } from "electron";
 import { AppUpdater, NsisUpdater, autoUpdater } from "electron-updater";
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -580,7 +580,9 @@ class EngineBridge {
 }
 
 let mainWindow: BrowserWindow | null = null;
-const conversationWindows = new Map<number, { projectRoot: string; conversationId: string }>();
+type WorkspacePanelId = "navigation" | "assistant" | "inspector";
+const conversationWindows = new Map<number, { projectRoot: string; conversationId: string; panel?: WorkspacePanelId; ownerId?: number; relativePath?: string; shared?: boolean }>();
+const workspaceStates = new Map<number, Record<string, unknown>>();
 let bridge: EngineBridge | null = null;
 let updates: UpdateManager | null = null;
 let confirmationPending = false;
@@ -628,11 +630,14 @@ function rememberConversationWindow(projectRoot: string, conversationId: string)
   renameSync(temporary, file);
 }
 
-function loadWorkspace(window: BrowserWindow, conversationId?: string): void {
+function loadWorkspace(window: BrowserWindow, conversationId?: string, panel?: WorkspacePanelId): void {
   const developmentUrl = process.env.VITE_DEV_SERVER_URL;
+  const query: Record<string, string> = { ...(conversationId ? { conversation_id: conversationId } : {}), ...(panel ? { workspace_panel: panel } : {}) };
+  const url = developmentUrl ? new URL(developmentUrl) : null;
+  for (const [key, value] of Object.entries(query)) url?.searchParams.set(key, value);
   const loading = developmentUrl
-    ? window.loadURL(conversationId ? `${developmentUrl}/?conversation_id=${encodeURIComponent(conversationId)}` : developmentUrl)
-    : window.loadFile(path.join(__dirname, "..", "dist", "index.html"), conversationId ? { query: { conversation_id: conversationId } } : {});
+    ? window.loadURL(url!.toString())
+    : window.loadFile(path.join(__dirname, "..", "dist", "index.html"), { query });
   void loading.then(() => {
     if (window.isDestroyed()) return;
     if (window.isMinimized()) window.restore();
@@ -648,7 +653,7 @@ function loadWorkspace(window: BrowserWindow, conversationId?: string): void {
       detail: `${redactEngineDiagnostics(String(cause))}\n启动记录保存在 ${path.join(app.getPath("userData"), "logs")}。`,
       buttons: ["重新载入", "查看启动日志"], defaultId: 0, cancelId: 1,
     }).then(({ response }) => {
-      if (response === 0 && !window.isDestroyed()) loadWorkspace(window, conversationId);
+      if (response === 0 && !window.isDestroyed()) loadWorkspace(window, conversationId, panel);
       else void shell.openPath(path.join(app.getPath("userData"), "logs"));
     }).catch(() => undefined);
   });
@@ -665,11 +670,11 @@ function createConversationWindow(projectRoot: string, requestedId?: string): { 
   }
   rememberConversationWindow(projectRoot, conversationId);
   const window = new BrowserWindow({
-    width: 1160, height: 820, minWidth: 960, minHeight: 650,
+    width: 620, height: 820, minWidth: 320, minHeight: 300,
     title: "墨流 · 独立对话", icon: applicationIconPath(), backgroundColor: "#11110f", show: true, autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
-  conversationWindows.set(window.id, { projectRoot, conversationId });
+  conversationWindows.set(window.id, { projectRoot, conversationId, panel: "assistant" });
   let closeConfirmed = false; let asking = false;
   window.on("close", event => {
     if (closeConfirmed || !bridge?.pendingWorkCount(conversationId)) return;
@@ -679,8 +684,34 @@ function createConversationWindow(projectRoot: string, requestedId?: string): { 
     void dialog.showMessageBox(window, { type: "question", title: "这份对话还有请求未返回", message: "关闭窗口后，当前任务仍会在后台继续，已保存的记录保留。", detail: "重新打开对话历史可核对结果；关闭主工作区会按全应用退出流程处理所有任务。", buttons: ["继续查看", "关闭这份窗口"], defaultId: 0, cancelId: 0, noLink: true }).then(result => { if (result.response === 1 && !window.isDestroyed()) { closeConfirmed = true; window.close(); } }).finally(() => { asking = false; });
   });
   window.once("closed", () => conversationWindows.delete(window.id));
-  loadWorkspace(window, conversationId);
+  loadWorkspace(window, conversationId, "assistant");
   return { conversationId };
+}
+
+function createWorkspacePanel(owner: BrowserWindow, projectRoot: string, panel: WorkspacePanelId, relativePath?: string): void {
+  const existing = [...conversationWindows].find(([, item]) => item.ownerId === owner.id && item.panel === panel && sameProjectRoot(item.projectRoot, projectRoot));
+  const opened = existing ? BrowserWindow.fromId(existing[0]) : null;
+  if (opened && !opened.isDestroyed()) { if (opened.isMinimized()) opened.restore(); opened.focus(); return; }
+  const display = screen.getDisplayMatching(owner.getBounds()).workArea;
+  const width = Math.min(panel === "assistant" ? 620 : 460, display.width), height = Math.min(760, display.height);
+  const bounds = owner.getBounds();
+  const window = new BrowserWindow({
+    x: Math.max(display.x, Math.min(display.x + display.width - width, bounds.x + 48)), y: Math.max(display.y, Math.min(display.y + display.height - height, bounds.y + 48)),
+    width, height, minWidth: Math.min(300, display.width), minHeight: Math.min(260, display.height), title: `墨流 · ${{ navigation: "小说结构", assistant: "墨宝对话", inspector: "批注与版本" }[panel]}`,
+    icon: applicationIconPath(), backgroundColor: "#11110f", show: true, autoHideMenuBar: true,
+    webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true },
+  });
+  const conversationId = conversationWindows.get(owner.id)?.conversationId || "main";
+  conversationWindows.set(window.id, { projectRoot, conversationId, panel, ownerId: owner.id, relativePath, shared: true });
+  const returned = () => {
+    conversationWindows.delete(window.id);
+    owner.removeListener("closed", ownerClosed);
+    if (!owner.isDestroyed()) owner.webContents.send("workspace:event", { type: "returned", panel, projectRoot });
+  };
+  const ownerClosed = () => { if (!window.isDestroyed()) window.close(); workspaceStates.delete(owner.id); };
+  window.once("closed", returned);
+  owner.once("closed", ownerClosed);
+  loadWorkspace(window, conversationId, panel);
 }
 
 function createWindow(): void {
@@ -882,7 +913,7 @@ function createWindow(): void {
     const context = conversationWindows.get(source.id);
     if (context && method === "project.open" && typeof params.project_root === "string" && context.projectRoot !== params.project_root) {
       context.projectRoot = params.project_root;
-      try { rememberConversationWindow(context.projectRoot, context.conversationId); }
+      try { if (!context.shared) rememberConversationWindow(context.projectRoot, context.conversationId); }
       catch { logLifecycle("conversation-windows.write.failed"); }
     }
     return result;
@@ -893,6 +924,50 @@ function createWindow(): void {
     return createConversationWindow(projectRoot ? resolveInkFlowProject(projectRoot) : "", conversationId);
   });
   ipcMain.handle("app:conversation-windows", (_event, projectRoot: string) => recentConversationWindows(projectRoot));
+  ipcMain.handle("workspace:open", (event, projectRoot: string, panel: WorkspacePanelId, relativePath?: string) => {
+    const source = BrowserWindow.fromWebContents(event.sender);
+    if (!source || (source !== mainWindow && !conversationWindows.has(source.id)) || !["navigation", "assistant", "inspector"].includes(panel) || typeof projectRoot !== "string" || !projectRoot) throw new Error("请先打开小说，再移动这个面板。");
+    if (conversationWindows.get(source.id)?.shared) throw new Error("请先回到主工作台，再打开独立面板。");
+    createWorkspacePanel(source, resolveInkFlowProject(projectRoot), panel, typeof relativePath === "string" ? relativePath : undefined);
+  });
+  ipcMain.handle("workspace:return", (event, panel?: WorkspacePanelId) => {
+    const source = BrowserWindow.fromWebContents(event.sender);
+    if (panel && source && (source === mainWindow || conversationWindows.has(source.id))) {
+      if (!["navigation", "assistant", "inspector"].includes(panel)) throw new Error("这个面板不能返回工作台。");
+      const opened = [...conversationWindows].find(([, item]) => item.ownerId === source.id && item.panel === panel);
+      const window = opened ? BrowserWindow.fromId(opened[0]) : null;
+      if (window && !window.isDestroyed()) window.close();
+      return;
+    }
+    const context = source ? conversationWindows.get(source.id) : null;
+    if (!source || !context?.panel) return;
+    const owner = context.ownerId ? BrowserWindow.fromId(context.ownerId) : mainWindow;
+    if (owner && !owner.isDestroyed()) { if (owner.isMinimized()) owner.restore(); owner.focus(); }
+    source.close();
+  });
+  ipcMain.handle("workspace:state", (event, value: unknown) => {
+    const source = BrowserWindow.fromWebContents(event.sender);
+    if (!source || (source !== mainWindow && !conversationWindows.has(source.id)) || conversationWindows.get(source.id)?.shared || !value || typeof value !== "object") return;
+    const state = value as Record<string, unknown>;
+    if (typeof state.projectRoot !== "string" || !state.projectRoot || !Array.isArray(state.messages) || state.messages.length > 200) return;
+    workspaceStates.set(source.id, state);
+    for (const [id, context] of conversationWindows) {
+      if (context.ownerId !== source.id || !context.shared) continue;
+      const window = BrowserWindow.fromId(id);
+      if (!window || window.isDestroyed()) continue;
+      if (!sameProjectRoot(context.projectRoot, state.projectRoot)) window.close();
+      else window.webContents.send("workspace:event", { type: "state", state });
+    }
+  });
+  ipcMain.handle("workspace:command", (event, command: string, value: string, relativePath?: string) => {
+    const source = BrowserWindow.fromWebContents(event.sender), context = source ? conversationWindows.get(source.id) : null;
+    const allowed = context?.panel === "assistant" ? ["chat"] : context?.panel === "navigation" ? ["document"] : ["compare", "annotation"];
+    if (!context?.shared || !context.ownerId || !allowed.includes(command) || typeof value !== "string" || value.length > 100_000) throw new Error("这个面板不能执行这项操作，请回到主工作台处理。");
+    const owner = BrowserWindow.fromId(context.ownerId);
+    if (!owner || owner.isDestroyed()) throw new Error("主工作台已关闭，请重新打开小说。");
+    if (["document", "compare"].includes(command)) { if (owner.isMinimized()) owner.restore(); owner.focus(); }
+    owner.webContents.send("workspace:event", { type: "command", command, value, relativePath, projectRoot: context.projectRoot });
+  });
   ipcMain.handle("dialog:confirm", async (event, message: string) => {
     const window = BrowserWindow.fromWebContents(event.sender);
     if (!window || window.isDestroyed() || (window !== mainWindow && !conversationWindows.has(window.id)) || confirmationPending || typeof message !== "string" || !message.trim()) return false;
@@ -1012,7 +1087,8 @@ function createWindow(): void {
   ipcMain.handle("app:launch-context", event => {
     const source = BrowserWindow.fromWebContents(event.sender);
     const context = source ? conversationWindows.get(source.id) : undefined;
-    return { projectRoot: context ? context.projectRoot || null : projectArgument(), conversationId: context?.conversationId || "main" };
+    const nativePanels = source ? [...conversationWindows.values()].filter(item => item.ownerId === source.id && item.shared && item.panel).map(item => item.panel!) : [];
+    return { projectRoot: context ? context.projectRoot || null : projectArgument(), conversationId: context?.conversationId || "main", panel: context?.panel, relativePath: context?.relativePath, shared: context?.shared, sharedState: context?.shared && context.ownerId ? workspaceStates.get(context.ownerId) : undefined, nativePanels };
   });
   ipcMain.handle("app:update-status", () => updates?.status());
   ipcMain.handle("app:update-check", () => updates?.check());

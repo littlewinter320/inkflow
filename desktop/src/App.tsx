@@ -3,13 +3,15 @@ import { ManualEditMonitor, StorySettings } from "./StorySettings";
 import type { ManualEditJob } from "./StorySettings";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { FormEvent, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, MutableRefObject, PointerEvent as ReactPointerEvent, ReactNode } from "react";
+import type { CSSProperties, MutableRefObject, ReactNode } from "react";
 import { Mascot, MascotShowcase, MobaoGuide, mobaoIdlePoster } from "./Mascot";
 import type { MascotMood } from "./Mascot";
 import { ProjectCenter } from "./ProjectCenter";
 import { VoiceCenter } from "./VoiceCenter";
 import type { VoiceSettings, VoiceSource, VoiceStatus } from "./VoiceCenter";
 import { LocalWavRecorder } from "./voiceRecording";
+import { detachedPanel, useWorkspaceLayout, WorkspaceDropPreview, WorkspaceMenu, WorkspacePanel } from "./Workspace";
+import type { PanelId } from "./workspaceLayout";
 
 const Editor = lazy(() => import("./MonacoEditors").then((module) => ({ default: module.Editor })));
 const DiffEditor = lazy(() => import("./MonacoEditors").then((module) => ({ default: module.DiffEditor })));
@@ -234,32 +236,11 @@ type PersistentUsage = { calls: number; since: string | null; estimated_cost: nu
 type PendingWorkItem = { id: string; kind: string; status: string; reason: string; next_action: string; chapter_no?: number | null; handling?: string; can_process?: boolean; can_reject?: boolean; reject_label?: string; reject_impact?: string; reject_blocked_reason?: string; updated_at?: string; rejection?: { reason?: string; at?: string }; parent_id?: string; processing_attempts?: number; source?: Record<string, unknown>; intent?: { action?: string; batch_id?: string | null; end_chapter_no?: number | null } };
 type CollaborationOverview = { messages: CollaborationMessage[]; pending_work?: PendingWorkItem[]; rejected_work?: PendingWorkItem[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; trace_runs?: TraceRun[]; usage?: UsageSummary & { by_agent_role?: Record<string, UsageSummary>; recent_deepseek_cache?: RecentCacheSummary | null; estimated_cost: number; currency: string; pricing_configured: boolean; accounting?: { available: boolean; warning?: string; project?: PersistentUsage; all_projects?: PersistentUsage } } };
 type PrefillResult = { insertion: string; document_hash: string; cursor_offset: number; confidence: string };
-type WorkspacePreset = "balanced" | "writing" | "planning" | "review";
-type WorkspaceResizeTarget = "navigation" | "assistant" | "inspector";
-function conversationDockTarget(x: number, y: number, bounds: { left: number; right: number; top: number; bottom: number }) {
-  if (x < bounds.left || x > bounds.right || y < bounds.top || y > bounds.bottom) return null;
-  const edge = Math.min(72, (bounds.right - bounds.left) / 4);
-  return x <= bounds.left + edge ? "left" : x >= bounds.right - edge ? "right" : null;
-}
-
 function busyMascotMood(events: EngineEvent[], runId: string | null): MascotMood {
   const current = [...events].reverse().find(event => event.run_id === runId && event.role);
   if (current?.role === "writer") return /outline|planning|plan|detail|window|candidate/.test(current.stage || "") ? "thinking" : "writing";
   return current && ["editor", "reviewer", "memory_keeper"].includes(current.role || "") ? "reviewing" : "thinking";
 }
-
-type WorkspaceLayout = {
-  navigationVisible: boolean;
-  assistantVisible: boolean;
-  inspectorVisible: boolean;
-  assistantPosition: "left" | "right" | "bottom" | "floating";
-  assistantX: number;
-  assistantY: number;
-  assistantHeight: number;
-  navigationWidth: number;
-  assistantWidth: number;
-  inspectorWidth: number;
-};
 
 type ThemeMode = "dark" | "light" | "system";
 type AccentPalette = "lime" | "jade" | "blue" | "violet" | "amber" | "rose";
@@ -293,28 +274,7 @@ type SpeechRecognitionWindow = Window & {
   webkitSpeechRecognition?: new () => SpeechRecognitionLike;
 };
 
-const workspaceLayoutStorageKey = "inkflow.workspace-layout.v2";
 const uiPreferencesStorageKey = "inkflow.ui-preferences.v1";
-const defaultWorkspaceLayout: WorkspaceLayout = {
-  navigationVisible: true,
-  assistantVisible: true,
-  inspectorVisible: false,
-  assistantPosition: "right",
-  assistantX: 80,
-  assistantY: 100,
-  assistantHeight: 600,
-  navigationWidth: 210,
-  assistantWidth: 350,
-  inspectorWidth: 236,
-};
-
-const workspacePresets: Record<WorkspacePreset, WorkspaceLayout> = {
-  balanced: defaultWorkspaceLayout,
-  writing: { ...defaultWorkspaceLayout, navigationWidth: 218, assistantVisible: false, inspectorVisible: false },
-  planning: { ...defaultWorkspaceLayout, navigationWidth: 260, assistantWidth: 500, inspectorVisible: false },
-  review: { ...defaultWorkspaceLayout, navigationWidth: 226, assistantWidth: 390, assistantPosition: "right", inspectorVisible: true },
-};
-
 const defaultUiPreferences: UiPreferences = {
   theme: "dark",
   accent: "amber",
@@ -324,36 +284,6 @@ const defaultUiPreferences: UiPreferences = {
   prefillLength: "medium",
   suggestedPromptsEnabled: true,
 };
-
-function clampWorkspaceWidth(target: WorkspaceResizeTarget, value: number) {
-  const bounds: Record<WorkspaceResizeTarget, [number, number]> = {
-    navigation: [180, 420],
-    assistant: [320, 760],
-    inspector: [170, 420],
-  };
-  const [minimum, maximum] = bounds[target];
-  return Math.round(Math.max(minimum, Math.min(maximum, value)));
-}
-
-function loadWorkspaceLayout(): WorkspaceLayout {
-  try {
-    const stored = JSON.parse(localStorage.getItem(workspaceLayoutStorageKey) || "{}") as Partial<WorkspaceLayout>;
-    return {
-      navigationVisible: stored.navigationVisible !== false,
-      assistantVisible: stored.assistantVisible !== false,
-      inspectorVisible: stored.inspectorVisible ?? defaultWorkspaceLayout.inspectorVisible,
-      assistantPosition: ["left", "right", "bottom", "floating"].includes(String(stored.assistantPosition)) ? stored.assistantPosition as WorkspaceLayout["assistantPosition"] : "right",
-      assistantX: Math.max(0, Math.min(window.innerWidth - 320, Number(stored.assistantX) || 80)),
-      assistantY: Math.max(0, Math.min(window.innerHeight - 80, Number(stored.assistantY) || 100)),
-      assistantHeight: Math.max(260, Math.min(window.innerHeight * .9, Number(stored.assistantHeight) || 600)),
-      navigationWidth: clampWorkspaceWidth("navigation", Number(stored.navigationWidth) || defaultWorkspaceLayout.navigationWidth),
-      assistantWidth: clampWorkspaceWidth("assistant", Number(stored.assistantWidth) || defaultWorkspaceLayout.assistantWidth),
-      inspectorWidth: clampWorkspaceWidth("inspector", Number(stored.inspectorWidth) || defaultWorkspaceLayout.inspectorWidth),
-    };
-  } catch {
-    return defaultWorkspaceLayout;
-  }
-}
 
 function loadUiPreferences(): UiPreferences {
   try {
@@ -426,6 +356,7 @@ function App() {
   const runEventsRef = useRef<EngineEvent[]>([]);
   const runStartedAtRef = useRef("");
   const projectRootRef = useRef("");
+  const sharedWorkspaceRef = useRef(false);
   const projectOpenRequestRef = useRef(0);
   const editorNavigationRef = useRef(0);
   const editorSnapshotRef = useRef<EditorSnapshot>({ session: 0, projectRoot: "", document: null, text: "", savedText: "" });
@@ -448,10 +379,6 @@ function App() {
   const [showManualMonitor, setShowManualMonitor] = useState(false);
   const [manualJobs, setManualJobs] = useState<ManualEditJob[]>([]);
   const [manualMonitorError, setManualMonitorError] = useState("");
-  const conversationPanelRef = useRef<HTMLElement | null>(null);
-  const floatingMoveRef = useRef<{ x: number; y: number; startX: number; startY: number; width: number; height: number; pointerId: number; moved: boolean; dock: "left" | "right" | null } | null>(null);
-  const [conversationDragging, setConversationDragging] = useState(false);
-  const [conversationDock, setConversationDock] = useState<"left" | "right" | null>(null);
   const [showUpdate, setShowUpdate] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
@@ -473,7 +400,7 @@ function App() {
   const [pendingDecisionError, setPendingDecisionError] = useState("");
   const [canonMigration, setCanonMigration] = useState<CanonMigration | null>(null);
   const [showMigration, setShowMigration] = useState(false);
-  const [workspaceLayout, setWorkspaceLayout] = useState<WorkspaceLayout>(loadWorkspaceLayout);
+  const workspace = useWorkspaceLayout(mobaoWorkAreaRef, projectRoot);
   const [uiPreferences, setUiPreferences] = useState<UiPreferences>(loadUiPreferences);
   const [voiceSettings, setVoiceSettings] = useState<VoiceSettings | null>(null);
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus | null>(null);
@@ -494,7 +421,6 @@ function App() {
   const voiceFinalTranscriptRef = useRef("");
   const voiceBaseInputRef = useRef("");
   const startupStartedRef = useRef(false);
-  const resizeRef = useRef<{ target: WorkspaceResizeTarget; startX: number; startWidth: number; direction: 1 | -1 } | null>(null);
   const voiceRecorderRef = useRef<LocalWavRecorder | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioPlaybackSequenceRef = useRef(0);
@@ -508,6 +434,29 @@ function App() {
     setText(content);
     setSavedText(content);
   }, []);
+
+  const applySharedWorkspace = useCallback((state: Record<string, unknown>) => {
+    if (typeof state.projectRoot !== "string") return;
+    projectRootRef.current = state.projectRoot;
+    setProjectRoot(state.projectRoot);
+    setProjectLoading(false);
+    setDashboard((state.dashboard ?? null) as Dashboard | null);
+    setTree((state.tree ?? null) as ProjectTree | null);
+    replaceEditorDocument((state.document ?? null) as DocumentData | null, state.projectRoot);
+    if (Array.isArray(state.messages)) setMessages(state.messages as Message[]);
+    if (Array.isArray(state.events)) setEvents(state.events as EngineEvent[]);
+    if (Array.isArray(state.pendingQuestions)) setPendingQuestions(state.pendingQuestions as QuestionCard[]);
+    setBusy(state.busy === true);
+    setCancelReady(state.cancelReady === true);
+    const runId = typeof state.activeRunId === "string" ? state.activeRunId : null;
+    activeRunIdRef.current = runId; setActiveRunId(runId);
+    runStartedAtRef.current = typeof state.runStartedAt === "string" ? state.runStartedAt : "";
+    runEventsRef.current = Array.isArray(state.events) ? (state.events as EngineEvent[]).filter(item => item.run_id === runId) : [];
+    setCollaboration((state.collaboration ?? null) as CollaborationOverview | null);
+    setContextStatus((state.contextStatus ?? null) as ContextStatus | null);
+    setNotice(typeof state.notice === "string" ? state.notice : "");
+    setError(typeof state.error === "string" ? state.error : "");
+  }, [replaceEditorDocument]);
 
   const changeEditorText = useCallback((value: string) => {
     editorSnapshotRef.current = { ...editorSnapshotRef.current, text: value };
@@ -559,25 +508,6 @@ function App() {
     if (voiceRecorderRef.current) void voiceRecorderRef.current.stop();
   }, []);
 
-  const updateWorkspaceLayout = useCallback((change: Partial<WorkspaceLayout>) => {
-    setWorkspaceLayout((current) => ({ ...current, ...change }));
-  }, []);
-
-  const applyWorkspacePreset = useCallback((preset: WorkspacePreset) => {
-    setWorkspaceLayout({ ...workspacePresets[preset] });
-  }, []);
-
-  const startWorkspaceResize = useCallback((target: WorkspaceResizeTarget, direction: 1 | -1, event: ReactPointerEvent<HTMLDivElement>) => {
-    const widthKey = target === "navigation" ? "navigationWidth" : target === "assistant" ? "assistantWidth" : "inspectorWidth";
-    resizeRef.current = { target, startX: event.clientX, startWidth: workspaceLayout[widthKey], direction };
-    event.preventDefault();
-    window.document.body.classList.add("layout-resizing");
-  }, [workspaceLayout]);
-
-  useEffect(() => {
-    localStorage.setItem(workspaceLayoutStorageKey, JSON.stringify(workspaceLayout));
-  }, [workspaceLayout]);
-
   useEffect(() => {
     localStorage.setItem(uiPreferencesStorageKey, JSON.stringify(uiPreferences));
     const root = window.document.documentElement;
@@ -594,47 +524,6 @@ function App() {
     media.addEventListener("change", applyTheme);
     return () => media.removeEventListener("change", applyTheme);
   }, [uiPreferences]);
-
-  useEffect(() => {
-    const resize = (event: PointerEvent) => {
-      const moving = floatingMoveRef.current;
-      if (moving) {
-        if (moving.pointerId !== event.pointerId || (!moving.moved && Math.hypot(event.clientX - moving.startX, event.clientY - moving.startY) < 6)) return;
-        moving.moved = true;
-        const bounds = mobaoWorkAreaRef.current?.getBoundingClientRect();
-        moving.dock = bounds ? conversationDockTarget(event.clientX, event.clientY, bounds) : null;
-        setConversationDragging(true);
-        setConversationDock(moving.dock);
-        setWorkspaceLayout(current => ({ ...current, assistantPosition: "floating", assistantWidth: moving.width, assistantX: Math.max(0, Math.min(window.innerWidth - moving.width, moving.x + event.clientX - moving.startX)), assistantY: Math.max(0, Math.min(window.innerHeight - Math.min(moving.height, window.innerHeight - 80), moving.y + event.clientY - moving.startY)) }));
-        return;
-      }
-      const activeResize = resizeRef.current;
-      if (!activeResize) return;
-      const width = clampWorkspaceWidth(activeResize.target, activeResize.startWidth + (event.clientX - activeResize.startX) * activeResize.direction);
-      const widthKey = activeResize.target === "navigation" ? "navigationWidth" : activeResize.target === "assistant" ? "assistantWidth" : "inspectorWidth";
-      setWorkspaceLayout((current) => ({ ...current, [widthKey]: width }));
-    };
-    const stop = (event: Event) => {
-      const moving = floatingMoveRef.current;
-      if (moving?.moved && moving.dock && event.type === "pointerup") setWorkspaceLayout(current => ({ ...current, assistantPosition: moving.dock! }));
-      resizeRef.current = null;
-      floatingMoveRef.current = null;
-      setConversationDragging(false);
-      setConversationDock(null);
-      window.document.body.classList.remove("layout-resizing");
-    };
-    window.addEventListener("pointermove", resize);
-    window.addEventListener("pointerup", stop);
-    window.addEventListener("pointercancel", stop);
-    window.addEventListener("blur", stop);
-    return () => {
-      window.removeEventListener("pointermove", resize);
-      window.removeEventListener("pointerup", stop);
-      window.removeEventListener("pointercancel", stop);
-      window.removeEventListener("blur", stop);
-      window.document.body.classList.remove("layout-resizing");
-    };
-  }, []);
 
   const request = useCallback(
     async <T,>(method: string, params: Record<string, unknown> = {}): Promise<T> => {
@@ -712,6 +601,7 @@ function App() {
     }
   }, [projectRoot, provider?.manual_edit_review_enabled, request]);
   useEffect(() => {
+    if (sharedWorkspaceRef.current) return;
     if (!projectRoot) { setManualJobs([]); setManualMonitorError(""); return; }
     let active = true; let polling = false;
     const poll = async () => {
@@ -723,21 +613,37 @@ function App() {
     const timer = window.setInterval(() => void poll(), 8000);
     return () => { active = false; window.clearInterval(timer); };
   }, [projectRoot, refreshManualEdits]);
-  useEffect(() => {
-    const panel = conversationPanelRef.current;
-    if (!panel || workspaceLayout.assistantPosition !== "floating") return;
-    const observer = new ResizeObserver(entries => {
-      const size = entries[0]?.borderBoxSize[0];
-      if (!size) return;
-      setWorkspaceLayout(current => {
-        const width = clampWorkspaceWidth("assistant", size.inlineSize);
-        const height = Math.round(size.blockSize);
-        return current.assistantWidth === width && current.assistantHeight === height ? current : { ...current, assistantWidth: width, assistantHeight: height };
-      });
-    });
-    observer.observe(panel);
-    return () => observer.disconnect();
-  }, [workspaceLayout.assistantPosition, workspaceLayout.assistantVisible]);
+  const compareVersion = async (versionId: string) => {
+    if (sharedWorkspaceRef.current) { await window.inkflow.workspaceCommand("compare", versionId, document?.relative_path); return; }
+    setActiveTab("editor");
+                try {
+                  const version = await request<{ content: string }>("document.version.read", { version_id: versionId });
+                  setCompareContent(version.content);
+                } catch (cause) {
+                  setError(errorMessage(cause));
+                }
+                };
+  const resolveAnnotation = async (annotationId: string) => {
+    if (sharedWorkspaceRef.current) { await window.inkflow.workspaceCommand("annotation", annotationId, document?.relative_path); return; }
+                const sourceEditor = editorSnapshotRef.current;
+                await request("annotation.update", { project_root: sourceEditor.projectRoot, annotation_id: annotationId, status: "resolved" });
+                if (sourceEditor.document) {
+                  const loaded = await request<DocumentData>("document.read", { project_root: sourceEditor.projectRoot, relative_path: sourceEditor.document.relative_path });
+                  if (editorSnapshotRef.current.session === sourceEditor.session && editorSnapshotRef.current.document?.content_hash === loaded.content_hash) {
+                    editorSnapshotRef.current = { ...editorSnapshotRef.current, document: loaded };
+                    setDocument(loaded);
+                  }
+                }
+                };
+  const detachWorkspacePanel = async (panel: PanelId) => {
+    try { if (!window.inkflow.openWorkspacePanel) throw new Error("重启墨流后即可使用独立面板。当前窗口中的拖动和缩放已经可以使用。"); await window.inkflow.openWorkspacePanel(projectRoot, panel, document?.relative_path); workspace.markNative(panel, true); }
+    catch (cause) { setError(errorMessage(cause)); }
+  };
+
+  const returnWorkspacePanel = (panel: PanelId) => {
+    void window.inkflow.returnWorkspacePanel(panel).catch(cause => setError(errorMessage(cause)));
+  };
+
   const openConversationWindow = async (conversationId?: string) => {
     try { await window.inkflow.openConversationWindow(projectRoot, conversationId); }
     catch (cause) { setError(errorMessage(cause)); }
@@ -1024,8 +930,12 @@ function App() {
     // 最近项目只在主界面展示，用户点击后再进入工作区，避免启动时误跳到项目页。
     void window.inkflow.launchContext()
       .then((launch) => {
+        sharedWorkspaceRef.current = launch.shared === true;
+        for (const id of launch.nativePanels || []) workspace.markNative(id, true);
         const projectRootFromArgs = launch.projectRoot;
-        if (projectRootFromArgs) void openProject(projectRootFromArgs, { optimistic: true });
+        if (launch.sharedState) applySharedWorkspace(launch.sharedState);
+        else if (launch.shared && projectRootFromArgs) { projectRootRef.current = projectRootFromArgs; setProjectRoot(projectRootFromArgs); }
+        else if (projectRootFromArgs) void openProject(projectRootFromArgs, { optimistic: true });
       })
       .catch(showStartupError);
     void window.inkflow.request<Record<string, unknown>>("app.initialize").then(setAppInfo).catch(showStartupError);
@@ -1038,6 +948,7 @@ function App() {
   // the one-time startup guard above applies only to initialization requests.
   useEffect(() => {
     const removeEvent = window.inkflow.onEvent((value) => {
+      if (sharedWorkspaceRef.current) return;
       const event = value as EngineEvent;
       if (event.run_id === activeRunIdRef.current) runEventsRef.current.push({ ...event, timestamp: event.timestamp || new Date().toISOString() });
       setEvents((items) => [...items.slice(-199), { ...event, timestamp: new Date().toISOString() }]);
@@ -1085,6 +996,7 @@ function App() {
   }, [projectRoot, uiPreferences.suggestedPromptsEnabled]);
 
   useEffect(() => {
+    if (sharedWorkspaceRef.current) return;
     if (!projectRoot) { setContextStatus(null); setCollaboration(null); contextSnapshotRef.current = null; return; }
     let active = true;
     let polling = false;
@@ -1149,6 +1061,11 @@ function App() {
   }, [projectRoot, activeRunId, batchProgressActive]);
 
   const openDocument = async (item: TreeItem) => {
+    if (sharedWorkspaceRef.current) {
+      try { await window.inkflow.workspaceCommand("document", item.relative_path); }
+      catch (cause) { setError(errorMessage(cause)); }
+      return;
+    }
     const root = projectRootRef.current;
     const navigationId = ++editorNavigationRef.current;
     const isCurrent = () => navigationId === editorNavigationRef.current && root === projectRootRef.current;
@@ -1476,6 +1393,11 @@ function App() {
     event?.preventDefault();
     const message = (overrideMessage ?? chatInput).trim();
     if (!message || !projectRoot) return;
+    if (sharedWorkspaceRef.current) {
+      try { await window.inkflow.workspaceCommand("chat", message); setChatInput(""); }
+      catch (cause) { setError(errorMessage(cause)); }
+      return;
+    }
     if (busy) {
       const queuedAt = new Date().toISOString();
       setChatInput("");
@@ -1884,6 +1806,24 @@ function App() {
   };
 
   const stats = document?.statistics || emptyStatistics;
+  useEffect(() => {
+    if (!projectRoot || sharedWorkspaceRef.current || !window.inkflow.publishWorkspaceState) return;
+    const timer = window.setTimeout(() => { void window.inkflow.publishWorkspaceState({ projectRoot, dashboard, tree, document, messages: messages.slice(-200), events: events.slice(-200), pendingQuestions, busy, cancelReady, activeRunId, runStartedAt: runStartedAtRef.current, collaboration, contextStatus, notice, error }).catch(() => undefined); }, 100);
+    return () => window.clearTimeout(timer);
+  }, [projectRoot, dashboard, tree, document, messages, events, pendingQuestions, busy, cancelReady, activeRunId, collaboration, contextStatus, notice, error]);
+
+  const workspaceActionsRef = useRef<Record<string, (value: string) => Promise<void>>>({});
+  workspaceActionsRef.current = { chat: value => sendChat(undefined, value), document: value => openDocument({ id: value, label: value, relative_path: value, kind: value.startsWith("reviews/") ? "review" : "document" }), compare: compareVersion, annotation: resolveAnnotation };
+  useEffect(() => window.inkflow.onWorkspaceEvent?.(value => {
+    if (value.type === "state" && sharedWorkspaceRef.current && value.state && typeof value.state === "object") { applySharedWorkspace(value.state as Record<string, unknown>); return; }
+    if (value.type === "returned" && ["navigation", "assistant", "inspector"].includes(String(value.panel))) { workspace.markNative(value.panel as PanelId, false); return; }
+    if (value.type !== "command" || value.projectRoot !== projectRootRef.current) return;
+    const input = String(value.value || "");
+    if (["compare", "annotation"].includes(String(value.command)) && value.relativePath !== editorSnapshotRef.current.document?.relative_path) { setError("文档已经切换，请在批注与版本面板中重新选择当前文件的条目。"); return; }
+    const operation = workspaceActionsRef.current[String(value.command)]?.(input);
+    if (operation) void operation.catch(cause => setError(errorMessage(cause)));
+  }), [projectRoot, request, applySharedWorkspace]);
+
   const title = String(dashboard?.brief.title || "墨流");
   const isDirty = Boolean(document && text !== savedText);
   const pendingSummary = collaborationPending(collaboration);
@@ -1935,34 +1875,21 @@ function App() {
         } />}
         {showCreate && <CreateProject onClose={() => setShowCreate(false)} onCreated={openProject} />}
         {showManualMonitor && <Modal title="手动修改核对" subtitle="后台检测、依据和你的决定" onClose={() => setShowManualMonitor(false)} className="manual-monitor-modal"><ManualEditMonitor jobs={manualJobs} error={manualMonitorError} onRefresh={() => void refreshManualEdits()} onDecision={decideManualEdit} /></Modal>}
-      {showSettings && <SettingsDialog projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} layout={workspaceLayout} preferences={uiPreferences} onLayoutChange={updateWorkspaceLayout} onLayoutPreset={applyWorkspacePreset} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
+      {showSettings && <SettingsDialog projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} preferences={uiPreferences} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
         {showUpdate && <UpdateDialog info={updateInfo} onClose={() => setShowUpdate(false)} />}
       </div>
     );
   }
 
-  const workspaceGridClass = [
-    "workspace-grid",
-    workspaceLayout.navigationVisible ? "navigation-visible" : "navigation-hidden",
-    workspaceLayout.assistantVisible ? "assistant-visible" : "assistant-hidden",
-    `assistant-${workspaceLayout.assistantPosition}`,
-  ].join(" ");
-  const workspaceGridStyle = {
-    "--navigation-width": `${workspaceLayout.navigationWidth}px`,
-    "--assistant-width": `${workspaceLayout.assistantWidth}px`,
-    "--chat-x": `${workspaceLayout.assistantX}px`,
-    "--chat-y": `${workspaceLayout.assistantY}px`,
-    "--chat-height": `${workspaceLayout.assistantHeight}px`,
-  } as CSSProperties;
-
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${detachedPanel ? "workspace-detached" : ""}`}>
       <header className="topbar">
         <div className="wordmark"><img src={mobaoIdlePoster} alt="墨宝" /><div><strong>墨流</strong><small>INKFLOW</small></div></div>
         <div className="project-heading">
           <strong>{title}</strong>
           {projectLoading ? <span className="working-dot">正在载入项目</span> : busy && <span className="working-dot">正在工作</span>}
           <ChapterMilestones value={dashboard} />
+          <WorkspaceMenu workspace={workspace} onReturn={returnWorkspacePanel} />
         </div>
         <nav className="top-actions">
           <button onClick={() => setShowCreate(true)}>＋ 新建</button>
@@ -1970,17 +1897,14 @@ function App() {
           <button onClick={() => setShowSearch(true)}>⌕ 搜索</button>
           <button onClick={() => void window.inkflow.openPath(projectRoot)}>打开文件夹</button>
           <button onClick={() => setShowSettings(true)}>设置</button>
-          <button aria-pressed={workspaceLayout.assistantVisible} onClick={() => updateWorkspaceLayout({ assistantVisible: !workspaceLayout.assistantVisible })}>{workspaceLayout.assistantVisible ? "隐藏对话" : "打开对话"}</button>
           <button onClick={() => setShowManualMonitor(true)}>修改核对</button>
           <button onClick={() => setShowUpdate(true)}>{updateInfo.status === "downloaded" ? "安装更新" : "检查更新"}</button>
         </nav>
       </header>
 
-      <main className={workspaceGridClass} style={workspaceGridStyle} ref={mobaoWorkAreaRef}>
-        {conversationDragging && <div className={`conversation-drop-target ${conversationDock || "floating"}`} aria-live="polite">{conversationDock ? `松开后停靠${conversationDock === "left" ? "左侧" : "右侧"}` : "松开后保持浮动"}</div>}
-        {workspaceLayout.navigationVisible && <>
-        <aside className="left-rail">
-          <div className="rail-heading"><span>小说结构</span><button title="新建小说" onClick={() => setShowCreate(true)}>＋</button></div>
+      <main className="workspace-grid workspace-free" data-moving={Boolean(workspace.moving)} ref={mobaoWorkAreaRef}>
+        <WorkspaceDropPreview workspace={workspace} />
+        <WorkspacePanel id="navigation" workspace={workspace} className="left-rail" onDetach={detachWorkspacePanel} actions={<button className="panel-icon" title="新建小说" aria-label="新建小说" onClick={() => setShowCreate(true)}>＋</button>}>
           {Boolean(dashboard?.recovery_warnings?.length) && <details className="rail-recovery"><summary>有 {dashboard?.recovery_warnings?.length} 项文件待核对</summary>{dashboard?.recovery_warnings?.map((warning, index) => <p key={`${index}-${warning}`}>{warning}</p>)}</details>}
           <TreeSection label="故事依据" items={(tree?.items || []).filter(item => ["BOOK.md", "OUTLINE.md", "STORY_DETAIL.md"].includes(item.relative_path))} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
           <TreeSection label="近期章节规划" items={(tree?.items || []).filter(item => item.relative_path === "RECENT_PLAN.md")} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
@@ -1996,31 +1920,8 @@ function App() {
             <div><span>正史</span><strong>{dashboard?.status.chapters?.accepted || 0}</strong></div>
             <div><span>伏笔</span><strong>{dashboard?.status.open_threads || 0}</strong></div>
           </div>
-        </aside>
-        <ResizeHandle className="navigation-resize" label="调整小说结构栏宽度" onResizeStart={(event) => startWorkspaceResize("navigation", 1, event)} />
-        </>}
-
-        {workspaceLayout.assistantVisible && <>
-        <section className="conversation-panel" ref={conversationPanelRef}>
-          <div className="floating-chat-controls">
-            <button type="button" className="chat-drag-handle" title="拖到左边或右边停靠，拖到中间浮动；Alt+左右方向键停靠" aria-label="移动对话面板，Alt加左右方向键停靠" onPointerDown={event => {
-              if (event.button !== 0) return;
-              const bounds = conversationPanelRef.current?.getBoundingClientRect();
-              if (!bounds) return;
-              event.preventDefault();
-              event.currentTarget.setPointerCapture(event.pointerId);
-              floatingMoveRef.current = { x: bounds.left, y: bounds.top, width: Math.max(320, bounds.width), height: bounds.height, startX: event.clientX, startY: event.clientY, pointerId: event.pointerId, moved: false, dock: null };
-            }} onKeyDown={event => {
-              if (event.altKey && ["ArrowLeft", "ArrowRight"].includes(event.key)) { event.preventDefault(); updateWorkspaceLayout({ assistantPosition: event.key === "ArrowLeft" ? "left" : "right" }); return; }
-              const delta = ({ ArrowLeft: [-20, 0], ArrowRight: [20, 0], ArrowUp: [0, -20], ArrowDown: [0, 20] } as Record<string, number[]>)[event.key];
-              const bounds = conversationPanelRef.current?.getBoundingClientRect();
-              if (!delta || !bounds) return;
-              event.preventDefault();
-              updateWorkspaceLayout({ assistantPosition: "floating", assistantX: Math.max(0, Math.min(window.innerWidth - bounds.width, bounds.left + delta[0])), assistantY: Math.max(0, Math.min(window.innerHeight - Math.min(bounds.height, window.innerHeight - 80), bounds.top + delta[1])) });
-            }}>⠿ 对话</button>
-            <button type="button" onClick={() => void openConversationWindow()}>＋ 独立对话</button>
-            <button type="button" className="chat-close" aria-label="关闭对话面板" title="关闭面板，保留对话和运行中的任务" onClick={() => updateWorkspaceLayout({ assistantVisible: false })}>×</button>
-          </div>
+        </WorkspacePanel>
+        <WorkspacePanel id="assistant" workspace={workspace} className="conversation-panel" onDetach={detachWorkspacePanel} actions={<button className="panel-icon" title="新建独立对话" aria-label="新建独立对话" onClick={() => void openConversationWindow()}>＋</button>}>
           {manualJobs.some(job => ["needs_confirmation", "awaiting_confirmation", "waiting_user", "needs_evidence", "revision_requested", "conflict", "blocked", "failed"].includes(job.status)) && <details className="manual-edit-issues"><summary>手动修改有待处理问题</summary><p>原稿已保留，待核对改动不会自动变成正史。</p><button type="button" onClick={() => setShowManualMonitor(true)}>查看证据并决定</button></details>}
           <div className="panel-title">
             <div><h2>和墨宝一起写</h2><p className="panel-status" role="status">{busy ? "任务进行中，可以继续补充想法" : "把想法告诉我。"}</p></div>
@@ -2100,11 +2001,11 @@ function App() {
               </div>
             </div>
           </form>
-        </section>
-        {["left", "right"].includes(workspaceLayout.assistantPosition) && <ResizeHandle className="assistant-resize" label="调整 AI 对话栏宽度" onResizeStart={(event) => startWorkspaceResize("assistant", workspaceLayout.assistantPosition === "left" ? 1 : -1, event)} />}
-        </>}
-
-        <section className="workbench">
+        </WorkspacePanel>
+        <WorkspacePanel id="inspector" workspace={workspace} className="inspection-panel" onDetach={detachWorkspacePanel}>
+          <DocumentInspector document={document} onCompare={compareVersion} onResolve={resolveAnnotation} />
+        </WorkspacePanel>
+        <section className="workbench" style={{ left: workspace.geometry.editor.x, top: workspace.geometry.editor.y, width: workspace.geometry.editor.width, height: workspace.geometry.editor.height }}>
           <div className="tabbar">
             {(["project", "editor", "chapter", "review", "memory", "references", "listen", "process"] as Tab[]).map((tab) => (
               <button key={tab} className={activeTab === tab ? "active" : ""} onClick={() => setActiveTab(tab)}>
@@ -2143,28 +2044,6 @@ function App() {
               onAnnotate={openSelectionActions}
               onListen={openListeningCenter}
               onStopCompare={() => setCompareContent(null)}
-              onCompare={async (versionId) => {
-                try {
-                  const version = await request<{ content: string }>("document.version.read", { version_id: versionId });
-                  setCompareContent(version.content);
-                } catch (cause) {
-                  setError(errorMessage(cause));
-                }
-              }}
-              onResolve={async (annotationId) => {
-                const sourceEditor = editorSnapshotRef.current;
-                await request("annotation.update", { project_root: sourceEditor.projectRoot, annotation_id: annotationId, status: "resolved" });
-                if (sourceEditor.document) {
-                  const loaded = await request<DocumentData>("document.read", { project_root: sourceEditor.projectRoot, relative_path: sourceEditor.document.relative_path });
-                  if (editorSnapshotRef.current.session === sourceEditor.session && editorSnapshotRef.current.document?.content_hash === loaded.content_hash) {
-                    editorSnapshotRef.current = { ...editorSnapshotRef.current, document: loaded };
-                    setDocument(loaded);
-                  }
-                }
-              }}
-              inspectorVisible={workspaceLayout.inspectorVisible}
-              inspectorWidth={workspaceLayout.inspectorWidth}
-              onResizeInspector={(event) => startWorkspaceResize("inspector", -1, event)}
               theme={uiPreferences.theme === "system" ? (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark") : uiPreferences.theme}
               prefillEnabled={uiPreferences.prefillEnabled}
               prefillDelayMs={uiPreferences.prefillDelayMs}
@@ -2177,7 +2056,7 @@ function App() {
           {activeTab === "memory" && <MemoryPanel dashboard={dashboard} workspace={chapterWorkspace} request={request} onRefresh={() => refresh()} />}
           {activeTab === "references" && <ReferencesPanel request={request} />}
           {activeTab === "listen" && <VoiceCenter refreshKey={voiceRevision} projectRoot={projectRoot} source={voiceSource} characterNames={(dashboard?.bible_entries || []).filter((item) => String(item.kind || "") === "character").map((item) => String(item.name || "")).filter(Boolean)} request={request} onNotice={setNotice} onError={setError} onPlay={(path) => playAudioPath(path)} />}
-          {activeTab === "process" && <ProcessPanelCompact events={events} collaboration={collaboration} context={contextStatus} provider={provider} workspace={chapterWorkspace} request={request} referenceDocument={referenceDocument} onOpenReference={openReference} onCloseReference={() => setReferenceDocument(null)} onNavigate={setActiveTab} pendingBoard={<CollaborationBoard value={collaboration} busy={busy || pendingDecisionWorking} onReject={(item) => { setPendingDecisionError(""); setPendingRejection({ root: projectRoot, item, decision: "reject" }); }} onReopen={(item) => { setPendingDecisionError(""); setPendingRejection({ root: projectRoot, item, decision: "reopen" }); }} onProcessAll={() => void sendChat(undefined, "处理所有待办")} onWork={(item, action) => { if (action === "inspect" && item.kind === "manual_edit" && item.handling === "decision") setShowManualMonitor(true); else void sendChat(undefined, `${action === "process" ? "处理待办" : action === "defer" ? "下次再处理待办" : "查看待办"} ${item.id}`); }} onAcceptBatch={(batchId) => void runWorkflow("batch_accept", { batch_id: batchId })} onResumeBatch={(batchId) => void runWorkflow("batch_resume", { batch_id: batchId })} onInspectBatch={(batch) => { updateWorkspaceLayout({ assistantVisible: true }); setChatInput(`请查看批次 ${batch.batch_id}${batch.pending_work_id ? ` 的待处理事项 ${batch.pending_work_id}` : ""}，先说明保留正文及待核范围并询问我是否处理；现在不要改写或补审。`); window.setTimeout(() => chatInputRef.current?.focus(), 0); }} />} />}
+          {activeTab === "process" && <ProcessPanelCompact events={events} collaboration={collaboration} context={contextStatus} provider={provider} workspace={chapterWorkspace} request={request} referenceDocument={referenceDocument} onOpenReference={openReference} onCloseReference={() => setReferenceDocument(null)} onNavigate={setActiveTab} pendingBoard={<CollaborationBoard value={collaboration} busy={busy || pendingDecisionWorking} onReject={(item) => { setPendingDecisionError(""); setPendingRejection({ root: projectRoot, item, decision: "reject" }); }} onReopen={(item) => { setPendingDecisionError(""); setPendingRejection({ root: projectRoot, item, decision: "reopen" }); }} onProcessAll={() => void sendChat(undefined, "处理所有待办")} onWork={(item, action) => { if (action === "inspect" && item.kind === "manual_edit" && item.handling === "decision") setShowManualMonitor(true); else void sendChat(undefined, `${action === "process" ? "处理待办" : action === "defer" ? "下次再处理待办" : "查看待办"} ${item.id}`); }} onAcceptBatch={(batchId) => void runWorkflow("batch_accept", { batch_id: batchId })} onResumeBatch={(batchId) => void runWorkflow("batch_resume", { batch_id: batchId })} onInspectBatch={(batch) => { workspace.toggle("assistant", true); setChatInput(`请查看批次 ${batch.batch_id}${batch.pending_work_id ? ` 的待处理事项 ${batch.pending_work_id}` : ""}，先说明保留正文及待核范围并询问我是否处理；现在不要改写或补审。`); window.setTimeout(() => chatInputRef.current?.focus(), 0); }} />} />}
         </section>
       </main>
       <footer className="status-strip project-body-total" aria-label="正文总字数" title="累计本书当前已保存的正文，草稿与已接受章节各计一次；规划、报告和历史版本不计入。"><span>{typeof dashboard?.written_characters === "number" ? `正文总字 ${dashboard.written_characters.toLocaleString()}` : "正文总字 待读取"}</span></footer>
@@ -2203,7 +2082,7 @@ function App() {
       {(notice || error) && <Toast kind={error ? "error" : "info"} text={error || notice} onClose={() => { setError(""); setNotice(""); setMascotMood("idle"); }} action={error ? (/任务记录|原任务状态/.test(error) ? { label: "查看可恢复任务", onClick: () => setActiveTab("project") } : /API Key|密钥|模型接口|服务商|模型配置需要处理/.test(error) ? { label: "打开设置", onClick: () => setShowSettings(true) } : /音频|播放|语音|朗读|解码/.test(error) ? { label: "查看音频", onClick: () => setActiveTab("listen") } : /重新审查/.test(error) ? { label: "打开审查", onClick: () => setActiveTab("review") } : /上下文容量|上下文占用/.test(error) ? { label: "查看上下文", onClick: () => setActiveTab("process") } : { label: "查看协作台", onClick: () => setActiveTab("process") }) : undefined} />}
       {showCreate && <CreateProject onClose={() => setShowCreate(false)} onCreated={openProject} />}
       {showManualMonitor && <Modal title="手动修改核对" subtitle="后台检测、依据和你的决定" onClose={() => setShowManualMonitor(false)} className="manual-monitor-modal"><ManualEditMonitor jobs={manualJobs} error={manualMonitorError} onRefresh={() => void refreshManualEdits()} onDecision={decideManualEdit} /></Modal>}
-      {showSettings && <SettingsDialog projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} layout={workspaceLayout} preferences={uiPreferences} onLayoutChange={updateWorkspaceLayout} onLayoutPreset={applyWorkspacePreset} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
+      {showSettings && <SettingsDialog projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} preferences={uiPreferences} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
       {showUpdate && <UpdateDialog info={updateInfo} onClose={() => setShowUpdate(false)} />}
       {showSearch && <SearchDialog request={request} result={searchResult} setResult={setSearchResult} onClose={() => setShowSearch(false)} onOpen={async (relativePath) => {
         const item = [...(tree?.items || []), ...(tree?.groups.flatMap((group) => group.items) || [])].find((entry) => entry.relative_path === relativePath);
@@ -2577,19 +2456,13 @@ function EditorPanel(props: {
   onDelete: () => void;
   onAnnotate: () => void;
   onListen: () => void;
-  onCompare: (versionId: string) => void;
   onStopCompare: () => void;
-  onResolve: (annotationId: string) => void;
-  inspectorVisible: boolean;
-  inspectorWidth: number;
-  onResizeInspector: (event: ReactPointerEvent<HTMLDivElement>) => void;
   theme: "dark" | "light";
   prefillEnabled: boolean;
   prefillDelayMs: number;
   prefillLength: PrefillLength;
   onPrefill: (content: string, cursorOffset: number, length: PrefillLength) => Promise<PrefillResult>;
 }) {
-  const [side, setSide] = useState<"comments" | "versions">("comments");
   const [showPrefill, setShowPrefill] = useState(false);
   const [uploadCandidate, setUploadCandidate] = useState<DocumentUploadCandidate | null>(null);
   const [uploadError, setUploadError] = useState("");
@@ -2653,7 +2526,7 @@ function EditorPanel(props: {
       </Modal>}
       {props.document.read_only && <div className="canon-banner"><strong>正史保护</strong>{props.document.reason}</div>}
       {showPrefill && <div className="prefill-bar"><div><strong>预填续写已开启</strong><span>停顿后显示灰字候选；Tab 接受、Esc 忽略。候选不会自动保存，正文一旦变化就会作废。</span></div><button onClick={() => setShowPrefill(false)}>关闭</button></div>}
-      <div className={`editor-body ${props.inspectorVisible ? "inspector-visible" : "inspector-hidden"}`} style={{ "--inspector-width": `${props.inspectorWidth}px` } as CSSProperties}>
+      <div className="editor-body">
         <div className="monaco-wrap">
           {props.compareContent !== null ? (
             <>
@@ -2690,8 +2563,16 @@ function EditorPanel(props: {
             /></Suspense>
           )}
         </div>
-        {props.inspectorVisible && <>
-        <ResizeHandle className="inspector-resize" label="调整批注与版本栏宽度" onResizeStart={props.onResizeInspector} />
+
+      </div>
+    </div>
+  );
+}
+
+function DocumentInspector(props: { document: DocumentData | null; onCompare: (versionId: string) => void; onResolve: (annotationId: string) => void }) {
+  const [side, setSide] = useState<"comments" | "versions">("comments");
+  if (!props.document) return <p className="empty-mini">打开一份文档后，这里会显示它的批注和历史版本。</p>;
+  return (
         <aside className="inspector">
           <div className="inspector-tabs"><button className={side === "comments" ? "active" : ""} onClick={() => setSide("comments")}>批注</button><button className={side === "versions" ? "active" : ""} onClick={() => setSide("versions")}>版本</button></div>
           {side === "comments" ? (
@@ -2716,9 +2597,6 @@ function EditorPanel(props: {
             </div>
           )}
         </aside>
-        </>}
-      </div>
-    </div>
   );
 }
 
@@ -3379,12 +3257,11 @@ const PROVIDER_OPTIONS = [
   { id: "custom", name: "自定义", note: "其他 OpenAI 兼容服务", baseUrl: "", models: [] },
 ] as const;
 
-type SettingsSection = "story_settings" | "author" | "appearance" | "layout" | "models" | "creation" | "voice" | "context" | "review" | "learning" | "advanced";
+type SettingsSection = "story_settings" | "author" | "appearance" | "models" | "creation" | "voice" | "context" | "review" | "learning" | "advanced";
 const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string; note: string }> = [
   { id: "story_settings", label: "本书设定", note: "人物、场景、道具与自定义资料模块" },
   { id: "author", label: "作者习惯与记忆", note: "跨书习惯、本书偏好和来源历史" },
   { id: "appearance", label: "外观", note: "主题、配色与密度" },
-  { id: "layout", label: "布局", note: "面板、位置与宽度" },
   { id: "models", label: "模型", note: "连接、参数与效率" },
   { id: "creation", label: "创作", note: "预设、询问与预填" },
   { id: "voice", label: "语音", note: "输入、朗读与设备" },
@@ -3431,15 +3308,12 @@ function agentContextBudgetsFromProvider(value: unknown): AgentContextBudgets {
   })) as AgentContextBudgets;
 }
 
-function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, layout, preferences, onLayoutChange, onLayoutPreset, onPreferencesChange, onClose, onSaved, onVoiceSaved }: {
+function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, preferences, onPreferencesChange, onClose, onSaved, onVoiceSaved }: {
   projectRoot: string;
   provider: Record<string, unknown> | null;
   voiceSettings: VoiceSettings | null;
   voiceStatus: VoiceStatus | null;
-  layout: WorkspaceLayout;
   preferences: UiPreferences;
-  onLayoutChange: (change: Partial<WorkspaceLayout>) => void;
-  onLayoutPreset: (preset: WorkspacePreset) => void;
   onPreferencesChange: (value: UiPreferences | ((current: UiPreferences) => UiPreferences)) => void;
   onClose: () => void;
   onSaved: (value: Record<string, unknown>) => void;
@@ -3657,7 +3531,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   };
   const activePreset = SETTINGS_PRESETS.find((preset) => preset.reasoning_effort === form.reasoning_effort && preset.inquiry_frequency === form.inquiry_frequency && preset.context_soft_tokens === form.context_soft_tokens && preset.context_hard_tokens === form.context_hard_tokens)?.id;
   const inferredProvider = form.provider_kind;
-  const settingKeywords: Record<SettingsSection, string> = { story_settings: "本书 设定 人物 场景 道具 世界 模板 资料 记录 证据 分类", author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", layout: "布局 面板 宽度 左右", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", learning: "学习 反馈 偏好 恢复 经验", advanced: "高级 temperature top p top k PowerShell" };
+  const settingKeywords: Record<SettingsSection, string> = { story_settings: "本书 设定 人物 场景 道具 世界 模板 资料 记录 证据 分类", author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", learning: "学习 反馈 偏好 恢复 经验", advanced: "高级 temperature top p top k PowerShell" };
   const visibleSections = SETTINGS_SECTIONS.filter((item) => `${item.label}${item.note}${settingKeywords[item.id]}`.toLowerCase().includes(search.trim().toLowerCase()));
   const chooseProvider = (id: string) => {
     const choice = PROVIDER_OPTIONS.find((item) => item.id === id);
@@ -3796,7 +3670,6 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
           <SettingGroup title="配色"><div className="palette-grid">{(["lime", "jade", "blue", "violet", "amber", "rose"] as AccentPalette[]).map((accent) => <button type="button" key={accent} data-palette={accent} className={preferences.accent === accent ? "active" : ""} onClick={() => updatePreferences({ accent })}><i />{({ lime: "青柠", jade: "青玉", blue: "湖蓝", violet: "紫罗兰", amber: "琥珀", rose: "胭脂" } as Record<AccentPalette, string>)[accent]}</button>)}</div></SettingGroup>
           <SettingGroup title="界面密度"><div className="choice-row"><button type="button" className={preferences.density === "comfortable" ? "active" : ""} onClick={() => updatePreferences({ density: "comfortable" })}>舒适</button><button type="button" className={preferences.density === "compact" ? "active" : ""} onClick={() => updatePreferences({ density: "compact" })}>紧凑</button></div></SettingGroup>
         </SettingsPane>}
-        {section === "layout" && <SettingsPane title="布局" note="正文始终占据剩余空间；关闭面板不会删除任何内容。"><WorkspaceLayoutPane layout={layout} onChange={onLayoutChange} onPreset={onLayoutPreset} onReset={() => onLayoutChange({ ...defaultWorkspaceLayout })} /></SettingsPane>}
         {section === "models" && <SettingsPane title="模型" note="先选服务商，再填写该服务商当前有效的模型 ID。">
           <div className="provider-grid">{PROVIDER_OPTIONS.map((item) => <button type="button" key={item.id} className={inferredProvider === item.id ? "active" : ""} onClick={() => chooseProvider(item.id)}><strong>{item.name}</strong><span>{item.note}</span></button>)}</div>
           <div className={`provider-status ${provider?.api_key_configured ? "ready" : "missing"}`}><strong>{provider?.api_key_configured ? "模型密钥已保存" : "尚未保存模型密钥"}</strong><span>{provider?.api_key_configured ? `凭据来源：${credentialLabel(String(provider?.api_key_storage || ""))}` : "密钥只交给本机引擎，并保存在系统凭据库。"}</span></div>
@@ -3889,48 +3762,6 @@ function VoiceInstallProgressCard({ value }: { value: VoiceInstallProgress | nul
   if (!value || (!value.summary && value.status === "idle")) return null;
   const stage = ({ dependencies: "安装依赖", retrying: "自动重试", models: "下载模型", ready: "安装完成", failed: "安装失败" } as Record<string, string>)[value.stage] || value.stage || "准备中";
   return <div className={`voice-install-progress ${value.status}`}><header><strong>{stage}</strong><span>{Math.max(0, Math.min(100, value.progress)).toFixed(0)}%</span></header><div><i style={{ width: `${Math.max(0, Math.min(100, value.progress))}%` }} /></div><p>{value.error || value.summary}{value.downloaded_mb > 0 ? ` · 当前写入约 ${value.downloaded_mb.toFixed(0)}MB` : ""}</p>{value.status === "failed" && <small>{value.retryable ? "可以直接点击重新安装，稳定缓存会复用已经下载的文件。" : "请根据上方原因处理后再试。"}</small>}</div>;
-}
-
-function WorkspaceLayoutPane({ layout, onChange, onPreset, onReset }: { layout: WorkspaceLayout; onChange: (change: Partial<WorkspaceLayout>) => void; onPreset: (preset: WorkspacePreset) => void; onReset: () => void }) {
-  const presets: Array<{ id: WorkspacePreset; name: string; note: string }> = [
-    { id: "balanced", name: "均衡", note: "导航、对话和正文同时可见" },
-    { id: "writing", name: "专注写作", note: "收起对话与批注，正文最大化" },
-    { id: "planning", name: "规划协作", note: "加宽 Coordinator 对话，保留导航" },
-    { id: "review", name: "审查对照", note: "AI 置右，批注与版本保持展开" },
-  ];
-  const setWidth = (target: WorkspaceResizeTarget, value: number) => {
-    const key = target === "navigation" ? "navigationWidth" : target === "assistant" ? "assistantWidth" : "inspectorWidth";
-    onChange({ [key]: clampWorkspaceWidth(target, value) });
-  };
-  return <div className="layout-pane">
-    <section className="layout-presets"><div><strong>快速布局</strong><small>切换后仍可继续微调</small></div><div className="layout-preset-grid">{presets.map((preset) => <button key={preset.id} type="button" onClick={() => onPreset(preset.id)}><strong>{preset.name}</strong><span>{preset.note}</span></button>)}</div></section>
-    <section className="layout-settings-section">
-      <div className="layout-settings-heading"><strong>显示哪些面板</strong><small>关闭不会删除内容，随时可从顶部“布局”重新打开。</small></div>
-      <div className="layout-toggles">
-        <label><input type="checkbox" checked={layout.navigationVisible} onChange={(event) => onChange({ navigationVisible: event.target.checked })} /><span><strong>小说结构</strong><small>文档树、上下文容量与协作看板</small></span></label>
-        <label><input type="checkbox" checked={layout.assistantVisible} onChange={(event) => onChange({ assistantVisible: event.target.checked })} /><span><strong>Coordinator 对话</strong><small>自然语言协作与工作流入口</small></span></label>
-        <label><input type="checkbox" checked={layout.inspectorVisible} onChange={(event) => onChange({ inspectorVisible: event.target.checked })} /><span><strong>批注与版本</strong><small>正文编辑器右侧的检查面板</small></span></label>
-      </div>
-    </section>
-    <section className="layout-settings-section">
-      <div className="layout-settings-heading"><strong>对话位置</strong><small>让对话跟随你的阅读与输入习惯。</small></div>
-      <div className="layout-position-switch">{(["left", "right", "bottom", "floating"] as WorkspaceLayout["assistantPosition"][]).map(position => <button type="button" key={position} className={layout.assistantPosition === position ? "active" : ""} onClick={() => onChange({ assistantPosition: position })}>{({ left: "正文左侧", right: "正文右侧", bottom: "正文下方", floating: "自由浮动" })[position]}</button>)}</div>
-      <p className="form-hint">浮动面板可拖动标题上的“移动”按钮，并从右下角调整大小；也可使用方向键微调位置。独立对话窗口可以自由移动到其他屏幕，每个窗口保留自己的对话和待答卡。</p>
-    </section>
-    <section className="layout-settings-section">
-      <div className="layout-settings-heading"><strong>精确宽度</strong><small>也可以直接拖拽工作区中的发光分隔线。</small></div>
-      <div className="layout-sliders">
-        <label>小说结构 <output>{layout.navigationWidth}px</output><input type="range" min="180" max="420" value={layout.navigationWidth} onChange={(event) => setWidth("navigation", Number(event.target.value))} /></label>
-        <label>Coordinator 对话 <output>{layout.assistantWidth}px</output><input type="range" min="320" max="760" value={layout.assistantWidth} onChange={(event) => setWidth("assistant", Number(event.target.value))} /></label>
-        <label>批注与版本 <output>{layout.inspectorWidth}px</output><input type="range" min="170" max="420" value={layout.inspectorWidth} onChange={(event) => setWidth("inspector", Number(event.target.value))} /></label>
-      </div>
-    </section>
-    <div className="dialog-actions"><button type="button" onClick={onReset}>恢复默认布局</button></div>
-  </div>;
-}
-
-function ResizeHandle({ className, label, onResizeStart }: { className: string; label: string; onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void }) {
-  return <div className={`resize-handle ${className}`} role="separator" aria-orientation="vertical" aria-label={label} onPointerDown={onResizeStart}><span /></div>;
 }
 
 function SearchDialog({ request, result, setResult, onClose, onOpen }: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; result: Record<string, unknown> | null; setResult: (value: Record<string, unknown> | null) => void; onClose: () => void; onOpen: (path: string) => void }) {

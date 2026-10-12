@@ -33,7 +33,7 @@ assert.equal(readProbe.pendingWorkCount(), 0, "Background polling must not displ
 const workProbe = new pendingProbe.PendingProbe([{method:"conversation.send",conversationId:"a"}, {method:"document.save",conversationId:"b"}, {method:"voice.moss.install",conversationId:"b"}]);
 assert.equal(workProbe.pendingWorkCount(), 3, "Generation, saving and installation still protect exit");
 assert.equal(workProbe.pendingWorkCount("a"), 1, "Closing one conversation must not count another conversation's work");
-const names = ["conversationDockTarget", "busyMascotMood", "batchChapterAccepted", "batchChapterReviewed", "batchChapterWritten", "batchMilestones", "chapterMilestones", "collaborationPending", "pendingWorkLabel", "pendingDecisionPayload", "BatchProgressStatus", "completionReference", "canPollWorkspace", "chatRefreshScope", "audioPlaybackFailure", "workflowStageState", "processElapsed", "publicProcessSteps", "collectPublicSummaries", "isSensitivePresentationKey"];
+const names = ["busyMascotMood", "batchChapterAccepted", "batchChapterReviewed", "batchChapterWritten", "batchMilestones", "chapterMilestones", "collaborationPending", "pendingWorkLabel", "pendingDecisionPayload", "BatchProgressStatus", "completionReference", "canPollWorkspace", "chatRefreshScope", "audioPlaybackFailure", "workflowStageState", "processElapsed", "publicProcessSteps", "collectPublicSummaries", "isSensitivePresentationKey"];
 names.push("readableWorkMessage", "readableWorkReason");
 const functions = parsed.statements.filter(node => ts.isFunctionDeclaration(node) && names.includes(node.name?.text));
 assert.equal(functions.length, names.length);
@@ -50,16 +50,10 @@ runInNewContext(ts.transpileModule(messageFunction.getText(parsed), {}).outputTe
 assert.equal(context.errorMessage("原步骤暂时不能完成\n已保留：已经保存的正文保持当前状态。"), "原步骤暂时不能完成");
 assert.ok(context.errorMessage("'stop_reason'").includes("任务衔接的程序问题"));
 assert.equal(context.errorMessage("第42章审查暂停。\n服务商拒绝了当前请求（403）。\n下一步：检查账号权限"), "第42章审查暂停。\n服务商拒绝了当前请求（403）。\n下一步：检查账号权限");
-const dockBounds = { left: 10, right: 1010, top: 90, bottom: 800 };
 assert.equal(context.busyMascotMood([{ run_id: "now", role: "editor", stage: "chapter.review" }], "now"), "reviewing");
 assert.equal(context.busyMascotMood([{ run_id: "now", role: "writer", stage: "outline.writer" }], "now"), "thinking");
 assert.equal(context.busyMascotMood([{ run_id: "now", role: "writer", stage: "chapter.write" }], "now"), "writing");
 assert.equal(context.busyMascotMood([{ run_id: "old", role: "writer", stage: "chapter.write" }], "now"), "thinking");
-assert.equal(context.conversationDockTarget(25, 300, dockBounds), "left");
-assert.equal(context.conversationDockTarget(980, 300, dockBounds), "right");
-assert.equal(context.conversationDockTarget(500, 300, dockBounds), null);
-assert.equal(context.conversationDockTarget(25, 40, dockBounds), null, "Dropping above the workspace must not dock");
-assert.ok(source.includes('setPointerCapture(event.pointerId)') && source.includes('"pointercancel", stop'), "Dragging must survive leaving the handle and end on cancellation");
 assert.ok(!source.includes("conversation-layout-select"), "Conversation docking must not require a position setting");
 assert.ok(!readFileSync(new URL("../src/ProjectCenter.tsx", import.meta.url), "utf8").includes("planning.cleanup.preview"), "Opening the project center must not scan planning history");
 const mascotSource = readFileSync(new URL("../src/Mascot.tsx", import.meta.url), "utf8");

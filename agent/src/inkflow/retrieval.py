@@ -1,6 +1,8 @@
 """Authority-aware hybrid retrieval for a single compiled Context Packet."""
 from __future__ import annotations
 
+from math import isfinite
+
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -95,13 +97,23 @@ class HybridRetriever:
         factors = self._adaptive_factors(query, candidates, chapter_no)
         limit = top_k if top_k is not None else self._adaptive_top_k(query, len(candidates), factors)
         limit = max(0, min(int(limit), 32, len(candidates)))
-        semantic = self._semantic_ranking(query, candidates) if self.embedding_model else []
+        optional_failures = []
+        semantic = []
+        if self.embedding_model:
+            try:
+                semantic = self._semantic_ranking(query, candidates)
+            except (ImportError, OSError, RuntimeError, ValueError) as exc:
+                optional_failures.append({"channel": "semantic", "error_type": type(exc).__name__,
+                    "reason": str(exc), "fallback": "exact_and_bm25"})
         rankings = (("精确", exact), ("BM25", lexical), ("语义", semantic))
         scores: dict[str, float] = {}
         reasons: dict[str, list[str]] = {}
         for label, ranking in rankings:
             for rank, (source_id, raw_score) in enumerate(ranking, 1):
-                scores[source_id] = scores.get(source_id, 0.0) + 1.0 / (50 + rank) + min(0.01, raw_score * 0.001)
+                if not isfinite(raw_score) or raw_score <= 0:
+                    continue
+                # RRF fuses rank positions; BM25 and cosine raw scores have different scales.
+                scores[source_id] = scores.get(source_id, 0.0) + 1.0 / (50 + rank)
                 reasons.setdefault(source_id, []).append(label)
         for candidate in candidates:
             source_id = candidate["source_id"]
@@ -127,11 +139,21 @@ class HybridRetriever:
                 if source_id in relation_ids else reasons.get(source_id, ["关系扩展"]))
             hits.append(item)
         if self.reranker_model and len(hits) > 1:
-            hits = self._rerank(query, hits)
-        result = hits[:limit]
+            try:
+                hits = self._rerank(query, hits)
+            except (ImportError, OSError, RuntimeError, ValueError) as exc:
+                optional_failures.append({"channel": "reranker", "error_type": type(exc).__name__,
+                    "reason": str(exc), "fallback": "rrf"})
+        # Backfill rejected derived summaries with already ranked, unselected sources.
+        backfill = [source_id for source_id in ranked_ids if source_id not in selected][:6] if limit else []
+        hits.extend({**by_id[source_id], "score": round(scores[source_id], 6),
+            "retrieval_reasons": reasons[source_id], "backfilled": True} for source_id in backfill)
+        result = hits
         source_reads = []
         validated = []
         for hit in result:
+            if len(validated) >= limit:
+                break
             if hit["source_type"] != "chapter_summary":
                 validated.append(hit)
                 continue
@@ -144,13 +166,14 @@ class HybridRetriever:
                          for offset in range(0, len(text), 1000)]
                 ranked_spans = self._bm25_ranking(query, spans)
                 offset = int(ranked_spans[0][0]) if ranked_spans else 0
-                hit = {**hit, "summary_body": hit["body"], "body": text[offset:offset + 5000],
-                    "summary_content_hash": hit.get("content_hash"), "content_hash": content_hash(text[offset:offset + 5000]),
+                excerpt, offset, end = _paragraph_excerpt(text, offset)
+                hit = {**hit, "summary_body": hit["body"], "body": excerpt,
+                    "summary_content_hash": hit.get("content_hash"), "content_hash": content_hash(excerpt),
                     "identity": "accepted_source_excerpt", "body_kind": "accepted_prose",
                     "authority": "已接受正文定点回查；摘要仅作定位线索",
                     "resolved_source": {"source_id": f"chapter:{hit['chapter_no']:05d}",
                         "chapter_no": hit["chapter_no"], "version": source["version"],
-                        "source_hash": source["content_hash"], "start": offset, "end": min(len(text), offset + 5000)}}
+                        "source_hash": source["content_hash"], "start": offset, "end": end}}
                 source_reads.append({**hit["resolved_source"], "state": "read", "via": "chapter_summary"})
                 validated.append(hit)
             except (ValueError, OSError, UnicodeError) as exc:
@@ -164,6 +187,8 @@ class HybridRetriever:
             "source_gaps": self.source_gaps,
             "branches": branches, "overlaps": overlaps, "source_conflicts": conflicts,
             "source_reads": source_reads,
+            "optional_failures": optional_failures,
+            "backfilled_source_ids": [item["source_id"] for item in result if item.get("backfilled")],
             "relation_expansion": {"included": sorted(relation_ids), "replaced": sorted(initial_ids - set(selected)),
                                    "budget": limit},
             "query": query,
@@ -573,7 +598,9 @@ class HybridRetriever:
 
     def _rerank(self, query: str, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
         model = _cached_cross_encoder(self.reranker_model)
-        scores = model.predict([(query, item["title"] + "\n" + item["body"]) for item in hits])
+        scores = [float(score) for score in model.predict([(query, item["title"] + "\n" + item["body"]) for item in hits])]
+        if len(scores) != len(hits) or any(not isfinite(score) for score in scores):
+            raise ValueError("重排模型没有返回与候选对应的有效分数，继续采用排名融合结果。")
         for item, score in zip(hits, scores, strict=True):
             item["reranker_score"] = float(score)
         return sorted(hits, key=lambda item: (item["authority_rank"], -item["reranker_score"], -item["score"]))
@@ -586,9 +613,15 @@ class HybridRetriever:
         reserve = min(4, max(1, limit // 4), limit - 1)
         anchors = selected[:max(1, limit - reserve)]
         entities = {entity for source_id in anchors for entity in by_id[source_id]["entities"]}
+        evidence_anchors = [by_id[source_id] for source_id in anchors if by_id[source_id].get("source_type") == "canon_fact"
+                            and by_id[source_id].get("version") is not None]
+        def evidence_link(item: dict[str, Any]) -> bool:
+            return item.get("source_type") in {"canon_source", "chapter_summary"} and any(
+                anchor.get("chapter_no") == item.get("chapter_no") and anchor["version"] == item.get("version")
+                for anchor in evidence_anchors)
         related = sorted((item for item in candidates if item["source_id"] not in selected
-                          and entities.intersection(item["entities"])),
-                         key=lambda item: (item["authority_rank"], -len(entities.intersection(item["entities"])), item["source_id"]))
+                          and (evidence_link(item) or entities.intersection(item["entities"]))),
+                         key=lambda item: (item["authority_rank"], not evidence_link(item), -len(entities.intersection(item["entities"])), item["source_id"]))
         if not related:
             return selected[:limit]
         additions = [item["source_id"] for item in related[:reserve]]
@@ -606,7 +639,7 @@ def _cached_sentence_model(model_name: str):
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:
             raise RuntimeError("启用 BGE-M3 语义召回前，请安装 `pip install -e .[rag]`。") from exc
-        _MODEL_CACHE[key] = SentenceTransformer(model_name, trust_remote_code=True)
+        _MODEL_CACHE[key] = SentenceTransformer(model_name, trust_remote_code=False, local_files_only=True)
     return _MODEL_CACHE[key]
 
 
@@ -617,8 +650,21 @@ def _cached_cross_encoder(model_name: str):
             from sentence_transformers import CrossEncoder
         except ImportError as exc:
             raise RuntimeError("启用 BGE reranker 前，请安装 `pip install -e .[rag]`。") from exc
-        _MODEL_CACHE[key] = CrossEncoder(model_name, trust_remote_code=True)
+        _MODEL_CACHE[key] = CrossEncoder(model_name, trust_remote_code=False, local_files_only=True)
     return _MODEL_CACHE[key]
+
+
+def _paragraph_excerpt(text: str, offset: int) -> tuple[str, int, int]:
+    """Keep nearby paragraph boundaries while retaining exact source offsets."""
+    offset = max(0, min(len(text), offset))
+    boundary = text.rfind("\n", max(0, offset - 300), offset)
+    start = boundary + 1 if boundary >= 0 else offset
+    end = min(len(text), start + 5000)
+    if end < len(text):
+        boundary = text.rfind("\n", max(start + 1, end - 300), end)
+        if boundary > start:
+            end = boundary
+    return text[start:end], start, end
 
 
 def _remember_vector(key: tuple[str, str, str], vector: list[float]) -> None:

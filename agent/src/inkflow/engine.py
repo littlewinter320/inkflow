@@ -36,6 +36,7 @@ from .prompts import (
     REVIEW_SAME_CHAPTER_SYSTEM,
     REVIEWER_SYSTEM,
     REVISER_SYSTEM,
+    LOCAL_REVISER_SYSTEM,
     SCENE_DRAFT_SYSTEM,
     SELECTION_REVISER_SYSTEM,
     LENGTH_EXPAND_SYSTEM,
@@ -3294,6 +3295,7 @@ class InkFlowEngine:
         trace = TraceRecorder(project.root, f"recover-{chapter_no:05d}", self.settings.trace_level)
         recovery = await self._native_recovery_attempts(project, "chapter.revision", chapter_no, limit=max_revision_rounds)
         revisions = recovery["attempts"]
+        progress = [item for item in recovery.get("progress", []) if isinstance(item, dict)] if isinstance(recovery.get("progress", []), list) else []
         rechecked_versions: set[int] = set()
         async def review_current(*, recheck_report: ReviewReport | None = None) -> dict[str, Any]:
             return await self.review_chapter(
@@ -3351,33 +3353,68 @@ class InkFlowEngine:
                 recovery = await self._native_recovery_attempts(project, "chapter.revision", chapter_no,
                                                                limit=max_revision_rounds, reserve=True)
                 revisions = recovery["attempts"]
-                strategy = clarity_strategy or (
-                    "逐项修复当前审查报告中有证据的硬问题，保留有效剧情和叙事留白。"
-                    if revisions == 1 else
-                    "上一轮局部修补未通过。改为检查问题所在场景的动作、信息来源和因果顺序，重构该局部场景；不要原样重复上次修改，不改变章节卡或已接受正史。"
-                )
-                trace.record("recovery.revise", "started", f"第 {revisions} 轮自动修订", details=strategy,
-                             metadata={"findings": reviewed.get("findings", []), "chapter_no": chapter_no})
+                record_before = project.db.latest_review_record(chapter_no)
+                strategy = clarity_strategy or _local_repair_strategy(record_before["report"].findings if record_before else [], progress)
+                before_hash = str(chapter["content_hash"])
+                trace.record("recovery.strategy", "selected", "按具体问题选择局部修订方法", details=strategy,
+                             metadata={"findings": reviewed.get("findings", []), "chapter_no": chapter_no}, public=False)
+                trace.record("recovery.revise", "started", f"正在修订第 {chapter_no} 章的问题片段", metadata={"chapter_no": chapter_no})
                 revised = await self.revise_chapter(
                     root, chapter_no, (instruction + "\n\n" + strategy).strip(),
                     provisional_chapters=provisional_chapters,
                     local_only=True,
                 )
                 if revised.get("unchanged"):
-                    trace.record("recovery.no_change", "warning", "正文没有变化，保留原审核结论并切换修订策略")
+                    progress.append(await self._record_revision_progress(project, chapter_no, revisions, before_hash, record_before, trace, instruction=instruction, provisional_chapters=provisional_chapters, unchanged=True))
+                    trace.record("recovery.no_change", "warning", "正文没有变化，保留原审核结论并切换修订策略", public=False)
                     continue
                 trace.record("recovery.revise", "completed", "Writer 已修改，交回 Editor 检查新版本", metadata={"trace_id": revised["trace_id"], "version": revised["version"]})
                 reviewed = await review_current()
+                progress.append(await self._record_revision_progress(project, chapter_no, revisions, before_hash, record_before, trace, instruction=instruction, provisional_chapters=provisional_chapters))
             trace.finish(summary="当前版本已通过，交接所需审核已就绪")
             return {**reviewed, "trace_id": reviewed.get("trace_id", trace.run_id), "revision_rounds": revisions, "recovery_trace_id": trace.run_id}
         except asyncio.CancelledError:
             trace.finish(status="cancelled", summary="用户停止；保留已完成版本，不自动重启")
             raise
+
         except Exception as exc:
             if revisions >= 2:
                 exc.recovery_node, exc.recovery_attempts, exc.recovery_exhausted = "chapter.revision", revisions, True
             trace.finish(status="failed", summary=f"自恢复未完成；已完成版本保留：{exc}")
             raise
+
+    async def _record_revision_progress(self, project: InkFlowProject, chapter_no: int, attempt: int,
+            before_hash: str, before: dict[str, Any] | None, trace: TraceRecorder, *, instruction: str = "", provisional_chapters: list[dict[str, Any]] | None = None, unchanged: bool = False) -> dict[str, Any]:
+        """Record observed repair effects, independently of the Writer's explanation."""
+        scope, runtime = active_task_settings.get(), active_runtime.get()
+        chapter, review = project.db.get_chapter(chapter_no), project.db.latest_review_record(chapter_no)
+        current = bool(chapter and review and review["chapter_version"] == chapter["version"]
+                       and review["report"].source_hash == chapter["content_hash"])
+        verified = bool(not unchanged and current and self.current_pass_review(project, chapter_no, instruction=instruction, provisional_chapters=provisional_chapters) is not None)
+        old_keys = _finding_evidence_keys(before["report"].findings if before else [])
+        new_keys = _finding_evidence_keys(review["report"].findings if current else [])
+        result = {"attempt": attempt, "status": "no_change" if unchanged else "verified" if verified else "unresolved",
+            "before_hash": before_hash, "source_hash": chapter["content_hash"] if chapter else "",
+            "chapter_version": chapter["version"] if chapter else None, "review_id": review["id"] if current else None,
+            "matched_evidence_count": len(old_keys & new_keys), "finding_count": len(new_keys),
+            "review_verdict": review["report"].verdict if current else "unknown", "role": "writer",
+            "task_id": scope.task_id if scope else "", "snapshot_hash": scope.snapshot_hash if scope else "",
+            "run_id": runtime.run_id if runtime else "", "recovery_trace_id": trace.run_id}
+        key = "native_recovery:" + content_hash(json_dumps([result["task_id"], "chapter.revision", chapter_no]))
+        async with project_write_lock(project.root):
+            state = project.db.get_metadata(key, {})
+            if state.get("task_id") != result["task_id"] or state.get("snapshot_hash") != result["snapshot_hash"]:
+                raise ValidationGateError("局部修订记录与原任务配置不一致，未重置补救计数。")
+            previous = state.get("progress", [])
+            state["progress"] = [*(previous if isinstance(previous, list) else []), result][-2:]
+            project.db.set_metadata(key, state)
+        trace.record("recovery.reflection", result["status"], "局部修订的差异与审核结果已核对", metadata=result, public=False)
+        try:
+            project.db.record_learning_event("review_recovery", {**result, "action": "local_revision"},
+                chapter_no=chapter_no, chapter_version=result["chapter_version"])
+        except Exception as exc:
+            trace.record("recovery.learning", "failed", "学习记录未写入，修订结果仍按实际审核处理", details=str(exc), public=False)
+        return result
 
     @chapter_operation_locked
     async def review_chapter_mode(
@@ -4891,7 +4928,11 @@ class InkFlowEngine:
                 instruction = ("先对照当前新卡与已接受正文修订旧草稿；消除已发生事件的重复首次、知识倒退和旧路线依赖，"
                                "保留仍有效的内容，不编造正史。\n" + str(plan_revision.get("instruction") or "") + "\n" + instruction)
             else:
-                review_text = (project.root / review_record["path"]).read_text(encoding="utf-8")
+                report = review_record["report"]
+                review_text = json_dumps({"verdict": report.verdict, "summary": report.summary,
+                    "strengths_to_preserve": report.strengths, "findings": [item.model_dump(mode="json") for item in report.findings],
+                    "missing_source_ids": report.missing_source_ids,
+                    "instruction": "逐项对照evidence与repair_instruction。verdict和已定位依据决定修订范围，summary不是放行依据；unsupported、uncertain和资料缺口先核源，不当成已证实正文错误。"})
             task = f"修订第 {chapter_no} 章。用户补充：{instruction or '无'}"
             current_characters = _content_char_count(current_draft)
             target_characters = int(card["target_words"])
@@ -4929,37 +4970,34 @@ class InkFlowEngine:
                 + "\n\n# 修订要求\n\n"
                 + (instruction or "逐项处理有证据的问题，保留审查确认有效的内容。")
                 + "\n只修改本次明确定位的问题原句、段落或场景及必要的相邻转场，未受影响的正文逐字保留，不因审核未过重写整章。"
-                + "在decision_summary逐项说明原问题位置、实际修改和保留内容；资料或引文缺口不当作正文问题。"
-                + "\n\n# 篇幅硬门槛\n\n"
-                + f"当前正文有效字符约 {current_characters}；本章目标 {target_characters}，"
-                + f"本次交稿必须落在 {lower_bound}～{upper_bound} 之间。"
-                + f"请直接瞄准 {target_characters} 个有效字符，不要贴着下限交稿；"
-                + "返回前必须核对完整正文，不得在 decision_summary 中宣称达标却原样返回。"
-                + "若当前版本偏短，请补足承载本章冲突、选择和后果的具体场景与感官动作；"
-                + "不得用重复解释、空泛总结、提纲或标题凑数。"
+                + ("在reason" if local_only else "在decision_summary")
+                + "逐项说明原问题位置、实际修改和保留内容；资料或引文缺口不当作正文问题。"
             )
+            if not local_only:
+                user_prompt += "\n\n# 篇幅硬门槛\n\n" + (
+                    f"当前正文有效字符约 {current_characters}；本章目标 {target_characters}，"
+                    + f"本次交稿必须落在 {lower_bound}～{upper_bound} 之间。"
+                    + f"请直接瞄准 {target_characters} 个有效字符，不要贴着下限交稿；"
+                    + "返回前必须核对完整正文，不得在 decision_summary 中宣称达标却原样返回。"
+                    + "若当前版本偏短，请补足承载本章冲突、选择和后果的具体场景与感官动作；"
+                    + "不得用重复解释、空泛总结、提纲或标题凑数。"
+                )
             user_prompt += self._continuity_anchor(project, chapter_no, current_draft + "\n" + instruction)
-            revision_system = REVISER_SYSTEM
+            revision_system = LOCAL_REVISER_SYSTEM if local_only else REVISER_SYSTEM
             revision_limit = self.settings.max_output_tokens
             if local_only:
-                revision_system += ("\n本次只输出AcceptedContinuityPatch：edits中逐项给正文唯一的target_excerpt和replacement，"
-                    "最多四处原句替换，reason说明各处修改依据。不返回完整改写稿，不改标题；范围外正文由代码原样保留。"
-                    "只处理当前有据问题与必要转场，选取能唯一定位的完整原文，不因篇幅或格式要求扩大范围。")
                 revision_limit = min(revision_limit, 6_000)
             if self._revision_source_fingerprint(project, chapter_no) != source_fingerprint:
                 raise ValidationGateError("构建 Writer 修订输入期间依据已变化；模型请求未发送，请核对当前版本。")
             # DeepSeek Flash can consume the structured-output budget in
             # hidden reasoning and then emit only `{}`.  The Context Packet,
             # Reviewer evidence and deterministic post-gates already carry
-            # the reasoning contract, so reserve the response for DraftOutput.
+            # the reasoning contract, so reserve the response for the requested edits.
             revision_thinking = not self.settings.is_deepseek
             trace.record_model_started(
                 "writer.revise",
                 model=self.settings.model,
                 agent_role="writer",
-                # Revisions should be shorter than creative drafting: the
-                # existing prose is supplied in the prompt and only a
-                # complete replacement plus its decision summary is needed.
                 max_tokens=revision_limit,
                 timeout_seconds=self.settings.request_timeout_seconds,
                 thinking=revision_thinking,
@@ -8754,6 +8792,25 @@ def _assert_new_plan_cards(project: InkFlowProject, arc: ArcPlan) -> None:
 
 def _content_char_count(content: str) -> int:
     return effective_character_count(content)
+
+
+def _finding_evidence_keys(findings: list[ReviewFinding]) -> set[str]:
+    return {content_hash(json_dumps([item.rule_id, item.category, sorted(item.canon_refs), item.evidence.strip(), item.reference_evidence.strip()]))
+            for item in findings if item.severity in {"major", "blocking"}}
+
+
+def _local_repair_strategy(findings: list[ReviewFinding], progress: list[dict[str, Any]]) -> str:
+    categories = {item.category for item in findings if item.severity in {"major", "blocking"}}
+    repeated = bool(progress and progress[-1].get("status") in {"no_change", "unresolved"})
+    if repeated:
+        method = "上次修改没有通过实测核对。根据残留引文检查这一局部场景的动作、知识来源和前后因果，换一处能消除根因的原句替换；不要照抄上次补丁，不扩展到无关场景。"
+    elif categories and categories <= {"style", "pacing", "format"}:
+        method = "本次只处理报告定位的表达、节奏或格式，保留事件、事实、人物选择和未受影响的原句。"
+    else:
+        method = "对照当前报告中已定位的问题与repair_instruction，局部修复动作或信息的因果关系；保留正史、有效剧情、叙事留白和所有无关原文。"
+    if progress:
+        method += "\n先对照原任务的实际修订结果，未通过不代表需要改全章：" + json_dumps(progress[-2:])
+    return method
 
 
 def _apply_unique_replacements(source: str, replacements: list[tuple[str, str]]) -> str:

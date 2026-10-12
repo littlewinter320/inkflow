@@ -7,6 +7,15 @@ contextBridge.exposeInMainWorld("inkflow", {
     ipcRenderer.invoke("engine:request", method, { ...params, conversation_id: conversationId }),
   openConversationWindow: (projectRoot: string, conversationId?: string) => ipcRenderer.invoke("app:conversation-window", projectRoot, conversationId),
   conversationWindows: (projectRoot: string) => ipcRenderer.invoke("app:conversation-windows", projectRoot),
+  openWorkspacePanel: (projectRoot: string, panel: string, relativePath?: string) => ipcRenderer.invoke("workspace:open", projectRoot, panel, relativePath),
+  returnWorkspacePanel: (panel?: string) => ipcRenderer.invoke("workspace:return", panel),
+  publishWorkspaceState: (state: unknown) => ipcRenderer.invoke("workspace:state", state),
+  workspaceCommand: (command: string, value: string, relativePath?: string) => ipcRenderer.invoke("workspace:command", command, value, relativePath),
+  onWorkspaceEvent: (listener: (event: unknown) => void) => {
+    const wrapped = (_event: unknown, value: unknown) => listener(value);
+    ipcRenderer.on("workspace:event", wrapped);
+    return () => ipcRenderer.removeListener("workspace:event", wrapped);
+  },
   confirm: (message: string): Promise<boolean> => ipcRenderer.invoke("dialog:confirm", message),
   chooseFolder: (title: string) => ipcRenderer.invoke("dialog:choose-folder", title),
   recentProjects: () => ipcRenderer.invoke("project:recent-list"),

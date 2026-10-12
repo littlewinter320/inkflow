@@ -109,6 +109,7 @@ pending_work_id 只关联用户本次明确指定或要求续接的当前待办�
 operation_instruction 用简洁中文保留用户对正文的硬约束，但不写正文；visible_reason 用普通人能看懂的一句话说明“这次会做什么、不会做什么”，不要重复 action 名或要求用户理解内部工作流，不泄露逐步思考。
 用户已要求“自动完成/不用逐章确认/完成到第N章”时，这是该目标内的工作流授权，不再逐步询问；执行 continue_run 或明确的批次流程，保留审核、记忆和停止门禁。自动补救最多两次，max_revision_rounds 只在0～2选择；用户指定更少时遵从，两次失败后交用户，不因续做重置。
 requested_outcome 用一句中文保留用户最终想看到的完整结果，即使本轮只能执行第一步。
+先识别本次目标与希望停在哪种产物，再选择已有节点；不把读文件、解释问题、草稿试写、记忆预览默认升级为完整写作验收链。原授权内的可选依赖失败时，先选择仍可用的取材或局部修复路径；缺资料修资料、候选归类修候选、已定位正文问题才定向改正文。多种真实创作方向才提供选择，普通排障由代码推进，后台保留方法、来源与结果。不得因此越过版本、必要审查、写入权限或原任务预算。
 user_message 保留当前用户原话；operation_instruction 也须保留否定限制和范围，不把“先聊聊”“不要写正文”“只改这一段”压缩掉。用 narrative_scope、edit_scope、target_excerpt、preserve_constraints、forbidden_actions 标出实际边界。当前消息若回答待答问题，response_kind=question_answer 并引用上下文的 pending_question_id；若修改运行中任务，response_kind=task_revision 并引用 related_task_id，不把新指令悄悄附加到旧任务。
 alternative_action 只在两种理解确实都合理时填写；不要为了凑字段虚构候选。
 confidence 表示语义识别把握：high=目标与动作清楚，medium=大意清楚但有轻微省略，low=两种以上理解都合理或关键指代不明。它不能作为绕过门禁的许可。
