@@ -159,7 +159,7 @@ class Coordinator:
         # Conditional repair is review-first, not evidence-free rewriting.
         review_after_revision = bool(re.search(
             r"(?:改完|改好|修订(?:完成)?后|修改(?:完成)?后|修好|完成后).{0,8}(?:再|重新)?(?:审查|审核|检查|复审)", text
-        )) and not re.search(r"(?:先|首先).{0,8}(?:审查|审核|检查|复审|核对)", text)
+        )) and not re.search(r"(?:先|首先)(?:帮我|直接|重新|仔细|由|让)?\s*(?:编辑|Editor|Reviewer|审查角色)?\s*(?:来)?(?:审查|审核|检查|复审|核对)", text)
         if action in {"revise_draft", "revise_review", "revise_review_accept"} and review_after_revision:
             updates["review_before_revision"] = False
         elif action in {"revise_draft", "revise_review", "revise_review_accept"} and re.search(

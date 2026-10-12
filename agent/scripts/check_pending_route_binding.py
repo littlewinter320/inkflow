@@ -107,7 +107,7 @@ def check():
     assert routed.action == "revise_review" and routed.review_before_revision and "accept" in routed.forbidden_actions
     routed = Coordinator.normalize_intent(TerminalIntent(action="revise_review_accept",chapter_no=43,
         authorization="approved",review_before_revision=True),
-        "按新规划定向修订第43章已有草稿。完成后审查当前新版本；若仍有正文问题，只在问题段内续修。")
+        "按新规划定向修订第43章已有草稿。完成后审查当前新版本；资料问题先修审核依据；若仍有正文问题，只在问题段内续修。")
     assert routed.action == "revise_review_accept" and not routed.review_before_revision
     session = TerminalSession.__new__(TerminalSession)
     session.engine = SimpleNamespace(settings=Settings())
