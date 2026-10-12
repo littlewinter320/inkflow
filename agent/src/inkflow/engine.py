@@ -1517,11 +1517,12 @@ class InkFlowEngine:
                 accepted = project.db.latest_accepted_chapter_no()
                 next_volume = next((volume for volume in active_v2[1].volumes
                                     if volume.chapter_start <= accepted + 1 <= volume.chapter_end), None)
-                if (chapter_range[0] == accepted + 1 and chapter_range[1] > window.chapters[-1].chapter_no
+                if (chapter_range[0] == accepted + 1 and chapter_range[1] >= window.chapters[-1].chapter_no
+                        and (chapter_range[1] > window.chapters[-1].chapter_no or accepted > window.anchor_chapter)
                         and next_volume is not None and chapter_range[1] <= next_volume.chapter_end):
                     return await self.redesign_story(
                         root, anchor=accepted, end=chapter_range[1],
-                        instruction=(f"{instruction.strip()}\n以第 {accepted} 章正史为锚续开第 {accepted + 1}～{chapter_range[1]} 章近期窗口；"
+                        instruction=(f"{instruction.strip()}\n重排第 {accepted + 1}～{chapter_range[1]} 章近期规划，以第 {accepted} 章正史为锚；"
                                      "沿用生效大纲，进入下一卷时仅补齐该卷细纲并审核，不重写正史或全书方向。"),
                         focus="chapter-window",
                         total_chapters=total_chapters, volume_count=volume_count,
@@ -4928,6 +4929,8 @@ class InkFlowEngine:
                 + review_text
                 + "\n\n# 修订要求\n\n"
                 + (instruction or "逐项处理有证据的问题，保留审查确认有效的内容。")
+                + "\n只修改本次明确定位的问题原句、段落或场景及必要的相邻转场，未受影响的正文逐字保留，不因审核未过重写整章。"
+                + "在decision_summary逐项说明原问题位置、实际修改和保留内容；资料或引文缺口不当作正文问题。"
                 + "\n\n# 篇幅硬门槛\n\n"
                 + f"当前正文有效字符约 {current_characters}；本章目标 {target_characters}，"
                 + f"本次交稿必须落在 {lower_bound}～{upper_bound} 之间。"

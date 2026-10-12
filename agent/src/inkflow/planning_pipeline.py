@@ -914,6 +914,10 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
     preserved_candidates: dict[str, Any] = {}
     preserved_outline: BookOutlineV2 | None = None
     new_window = False
+    focus_range = re.search(
+        r"(?<!不)(?<!别)(?<!勿)(?:只|仅)?(?:需|要)?(?:改|调整|修|修正|校正|重排|重构|重新规划|重新安排|梳理|优化)(?:当前|现行|生效)?第\s*(\d+)\s*(?:到|至|～|~|—|-)\s*(\d+)\s*章",
+        instruction,
+    )
     if focus in {"volume-detail", "outline"}:
         active = load_active_planning(project)
         if active is None or end != active[3].chapters[-1].chapter_no or anchor != active[3].anchor_chapter:
@@ -929,11 +933,14 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         active = load_active_planning(project)
         next_volume = next((volume for volume in active[1].volumes
                             if volume.chapter_start <= anchor + 1 <= volume.chapter_end), None) if active else None
+        reanchored_window = bool(active and anchor == project.db.latest_accepted_chapter_no()
+                                 and anchor > active[3].anchor_chapter
+                                 and end == active[3].chapters[-1].chapter_no)
         new_window = bool(active and anchor == project.db.latest_accepted_chapter_no()
                           and anchor >= active[0].get("accepted_anchor", 0)
                           and end > active[3].chapters[-1].chapter_no
                           and next_volume is not None and end <= next_volume.chapter_end)
-        if active is None or (not new_window and (active[0].get("accepted_anchor") != anchor
+        if active is None or (not new_window and not reanchored_window and (active[0].get("accepted_anchor") != anchor
                                                     or active[0].get("chapter_window") != [anchor, end])):
             raise ValidationGateError("当前三层规划的锚点或范围已变化；请先核对受影响章节，不会改写旧稿。")
         manifest, active_outline, active_detail, _active_window = active
@@ -943,10 +950,6 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         if not new_window:
             active_source_run = source_run
             previous_run = source_run
-    focus_range = re.search(
-        r"(?<!不)(?<!别)(?<!勿)(?:只|仅)?(?:需|要)?(?:改|调整|修|修正|校正|重排|重构|重新规划|重新安排|梳理|优化)(?:当前|现行|生效)?第\s*(\d+)\s*(?:到|至|～|~|—|-)\s*(\d+)\s*章",
-        instruction,
-    )
     focus_single = re.search(r"(?<!不)(?<!别)(?<!勿)(?:只|仅)?(?:需|要)?(?:改|调整|修|修正|校正|重排|重构|重新规划|重新安排|梳理|优化)(?:当前|现行|生效)?第\s*(\d+)\s*章", instruction)
     focus_chapters = (set(range(anchor + 1, end + 1)) if new_window else
                       set(range(int(focus_range.group(1)), int(focus_range.group(2)) + 1))
@@ -1155,10 +1158,10 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             if not focus_chapters.issubset(revised):
                 raise ValidationGateError("修订候选缺少目标章节，原规划保持不变。")
             resumed_candidate = resumed_candidate.model_copy(update={
-                "anchor_chapter": original.anchor_chapter,
-                "anchor_summary": original.anchor_summary,
+                "anchor_chapter": anchor,
+                "anchor_summary": resumed_candidate.anchor_summary if anchor != original.anchor_chapter else original.anchor_summary,
                 "chapters": [revised[item.chapter_no] if item.chapter_no in focus_chapters else item
-                             for item in original.chapters],
+                             for item in original.chapters if item.chapter_no > anchor],
             })
             previous_candidate = _stage_text(resumed_candidate)
             prior_review_path = previous_run / "chapter-window-review.json" if previous_run else None
@@ -1233,10 +1236,10 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                     if not focus_chapters.issubset(changed):
                         raise ValidationGateError("Writer 未返回完整目标章节修订，原规划保持不变。")
                     candidate = candidate.model_copy(update={
-                        "anchor_chapter": original.anchor_chapter,
-                        "anchor_summary": original.anchor_summary,
+                        "anchor_chapter": anchor,
+                        "anchor_summary": candidate.anchor_summary if anchor != original.anchor_chapter else original.anchor_summary,
                         "chapters": [changed[item.chapter_no] if item.chapter_no in focus_chapters else item
-                                     for item in original.chapters],
+                                     for item in original.chapters if item.chapter_no > anchor],
                     })
                 previous_candidate = _stage_text(candidate)
             atomic_write_text(candidate_path, candidate.model_dump_json(indent=2))

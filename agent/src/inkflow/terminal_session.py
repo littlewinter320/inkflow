@@ -857,8 +857,10 @@ class TerminalSession:
                     first, last = active_plan["chapter_window"]
                     if (active_plan.get("status") == "active" and selected
                             and all(first < number <= last for number in selected)):
+                        accepted = project.db.latest_accepted_chapter_no()
+                        planning_anchor = accepted if all(number > accepted for number in selected) else first
                         raw_intent = raw_intent.model_copy(update={
-                            "action": "redesign_story", "chapter_no": first,
+                            "action": "redesign_story", "chapter_no": planning_anchor,
                             "end_chapter_no": last, "operation_instruction": text,
                             "authorization": "approved" if re.search(
                                 r"^(?:墨宝[，,]\s*)?(?:请|现在|继续)", text.strip()
