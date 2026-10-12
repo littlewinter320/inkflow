@@ -445,13 +445,13 @@ export function ProjectCenter({
 
       <section className="project-section plan-overview">
         <div className="project-section-title"><div><h3>故事依据</h3><p>先定方向，再安排近期章节；任何一层都能单独修改。</p></div>{nextFoundation && <button onClick={() => onPrompt(foundationPrompt)}>继续：{nextFoundation.label}</button>}</div>
-        {dashboard?.pending_planning_publication && <div className="planning-impact"><strong>新版三层规划已审核通过，等待你确认</strong><p>候选范围：第 {dashboard.pending_planning_publication.anchor + 1}～{dashboard.pending_planning_publication.end} 章；候选编号：{dashboard.pending_planning_publication.run_id}。当前正式版及其编号尚未改变。</p><button onClick={() => onPrompt(`确认采用候选 ${dashboard.pending_planning_publication?.run_id} 的三层规划，正式发布新版。`)}>把确认指令放入对话框</button></div>}
+        {dashboard?.pending_planning_publication && <div className="planning-impact"><strong>新规划已审核通过，等待你确认</strong><p>安排第 {dashboard.pending_planning_publication.anchor + 1}～{dashboard.pending_planning_publication.end} 章；采用后才更新正式版。当前规划继续生效。</p><button onClick={() => onPrompt(`确认采用候选 ${dashboard.pending_planning_publication?.run_id} 的三层规划，正式发布新版。`)}>把确认指令放入对话框</button></div>}
         <div className="foundation-flow" aria-label="故事资料层级">{foundation.map((item) => {
           const documentItem = documentItems.find((doc) => doc.relative_path === item.path);
           return <button key={item.path} type="button" disabled={!documentItem} className={documentItem ? "ready" : "missing"} onClick={() => documentItem && onOpen(documentItem)}><strong>{item.label}</strong><small>{documentItem ? item.note : "待建立"}</small></button>;
         })}</div>
         {!hasRecentPlan && !!dashboard?.planning_impact?.affected.length && <div className="planning-impact"><strong>依据已有变化</strong><p>{dashboard.planning_impact.affected.join("；")}。{dashboard.planning_impact.next_step}</p><button onClick={() => onPrompt("大纲或设定改过了，请先核对细纲与还没写的章节安排，指出影响范围；保留已接受的正文。")}>让墨流核对未来安排</button></div>}
-        {hasRecentPlan && <div className={`current-planning-note ${planningPublication}`}><strong>{planningPublication === "active" ? `三层规划第 ${planningRevisionNo || 1} 版已生效` : planningPublication === "changed" ? "规划文档与生效记录不一致" : planningPublication === "unknown" ? "规划文档已存在，生效状态待核对" : "正在核对规划状态"}</strong><p>点击上方卡片查看当前大纲、卷细纲与近期章节规划。已接受正文仍以正史为准；旧版未来章节卡已退出当前数据库规划。</p></div>}
+        {hasRecentPlan && <div className={`current-planning-note ${planningPublication}`}><strong title="正式版号累计记录本书已采用的规划更新，不是自动重试次数。审核未过、中断和等待确认不会增加版号；补救次数见本次任务记录。">{planningPublication === "active" ? `当前规划已生效 · 正式第 ${planningRevisionNo || 1} 版` : planningPublication === "changed" ? "规划文档与生效记录不一致" : planningPublication === "unknown" ? "规划文档已存在，生效状态待核对" : "正在核对规划状态"}</strong><p>点击上方卡片查看当前大纲、卷细纲与近期章节规划。已接受正文仍以正史为准；旧版未来章节卡已退出当前数据库规划。</p></div>}
         {!hasRecentPlan && !currentPlan && <div className="plan-empty"><strong>还没有近期章节规划</strong><p>先确定大纲与细纲，再安排接下来的章节。</p></div>}
         {currentPlan && <>
           <p className="legacy-plan-note">以下卷、篇章及章节卡来自旧版规划记录，仅供核对。当前三层规划完成后，请查看上方文档。</p>

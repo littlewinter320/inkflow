@@ -1456,6 +1456,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                     "已保留单层候选和当前正式版；请确认是否同时修订受影响下游，原请求不会自动扩大。")
             feedback = (f"【审核对整体推进的观察，仅下列逐字证据作为阻断依据】\n{review.summary}\n"
                         f"【已定位的需修问题】\n{findings}\n"
+                        f"【审核的具体修订要求，只采用有据且在授权范围内的部分】\n{review.repair_instruction}\n"
                         "只处理上面有原句依据的问题，并顺读前后章节确认因果；"
                         "未定位的附加建议不是硬要求。若重复动作跨越整个目标窗口，可重组这些章节，"
                         "不要只替换几句收尾；其他已成立的事实保持原样。")
