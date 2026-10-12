@@ -157,7 +157,12 @@ class Coordinator:
         updates: dict[str, object] = {"user_message": text[:4_000]}
         action = intent.action
         # Conditional repair is review-first, not evidence-free rewriting.
-        if action in {"revise_draft", "revise_review", "revise_review_accept"} and re.search(
+        review_after_revision = bool(re.search(
+            r"(?:改完|改好|修订(?:完成)?后|修改(?:完成)?后|修好|完成后).{0,8}(?:再|重新)?(?:审查|审核|检查|复审)", text
+        )) and not re.search(r"(?:先|首先).{0,8}(?:审查|审核|检查|复审|核对)", text)
+        if action in {"revise_draft", "revise_review", "revise_review_accept"} and review_after_revision:
+            updates["review_before_revision"] = False
+        elif action in {"revise_draft", "revise_review", "revise_review_accept"} and re.search(
             r"(?:有|发现|如果|若).{0,10}(?:问题|错误|不通过|没过).{0,12}(?:改|修)", text
         ) and re.search(r"审|检查|核对", text):
             action = "revise_review_accept" if action.endswith("_accept") else "revise_review"

@@ -3709,7 +3709,7 @@ class TerminalSession:
             current_review = bool(record and chapter
                 and record["chapter_version"] == chapter["version"]
                 and record["report"].source_hash == chapter["content_hash"])
-            if current_review and not intent.review_before_revision:
+            if (current_review or project.db.pending_plan_revision(chapter_no)) and not intent.review_before_revision:
                 revised = self._reuse_workflow_writer(project, chapter_no, "revise", instruction)
                 revised = revised or await self._run_step(
                     "writer.revise", self.engine.revise_chapter(root, chapter_no, instruction)
@@ -3822,7 +3822,7 @@ class TerminalSession:
         if workflow_result_status(response) == "waiting_user":
             if response.get("questions"):
                 return {"label": "回答待处理选择", "reason": "已保留当前成果；回答这张关联提问卡后继续具体任务。", "prompt": "查看待处理工作"}
-            return {"label": "重新确认方向", "reason": "已在安全节点停下，新补充尚未应用；下一轮会重新判断范围和目标。", "prompt": "根据我刚才补充的要求，先重新判断下一步，不要直接续跑旧任务"}
+            return {"label": "查看未完成原因", "reason": str(response.get("next_action") or workflow_failure_reason(response) or "当前任务仍有待处理条件，请核对具体断点。"), "prompt": "查看本次未完成的具体原因和可执行的下一步"}
         if workflow_result_status(response) == "waiting_condition":
             return {"label": "核对待处理条件", "reason": str(response.get("next_action") or "任务停在必要依据或审核缺口处，先核对具体问题再续接。"), "prompt": "查看待处理工作"}
         if workflow_failure_reason(response) or response.get("needs_clarification"):

@@ -78,7 +78,7 @@ def check():
     wrapper.body.append(revision_branch)
     record = {"chapter_version": 1, "report": SimpleNamespace(source_hash="body")}
     project = SimpleNamespace(db=SimpleNamespace(latest_review_record=lambda number: record,
-        get_chapter=lambda number: {"version": 1, "content_hash": "body"}))
+        get_chapter=lambda number: {"version": 1, "content_hash": "body"}, pending_plan_revision=lambda number: None))
     namespace = {"InkFlowProject": lambda root: project}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper],type_ignores=[])),str(source),"exec"),namespace)
     calls = []
@@ -105,6 +105,10 @@ def check():
         authorization="approved",visible_reason="本章核对"),
         "先核对第31章，确实有正文问题才在本章必要位置修复并复审，不验收")
     assert routed.action == "revise_review" and routed.review_before_revision and "accept" in routed.forbidden_actions
+    routed = Coordinator.normalize_intent(TerminalIntent(action="revise_review_accept",chapter_no=43,
+        authorization="approved",review_before_revision=True),
+        "按新规划定向修订第43章已有草稿。完成后审查当前新版本；若仍有正文问题，只在问题段内续修。")
+    assert routed.action == "revise_review_accept" and not routed.review_before_revision
     session = TerminalSession.__new__(TerminalSession)
     session.engine = SimpleNamespace(settings=Settings())
     read_only = session._deterministic_workflow_intent("墨宝，现在只补审现有临时批次 batch-current 的第31至40章当前草稿。复用已写正文，不调用Writer改正文，不重写或新增章节，不验收。完成现有十章核对就停。")
