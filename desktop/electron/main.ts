@@ -477,7 +477,7 @@ class EngineBridge {
   pendingWorkCount(conversationId?: string): number {
     const reads = new Set(["project.open", "project.status", "project.tree", "collaboration.overview", "collaboration.list",
       "context.status", "task.status", "task.list", "document.read", "document.read_reference", "document.version.read", "document.search",
-      "settings.get", "voice.status", "voice.settings.get", "voice.job.list", "voice.job.status", "voice.profile.list", "voice.roles.get", "project.trash.list", "project.canon_migration.status"]);
+      "settings.get", "computer.actions.list", "voice.status", "voice.settings.get", "voice.job.list", "voice.job.status", "voice.profile.list", "voice.roles.get", "project.trash.list", "project.canon_migration.status"]);
     // Unknown requests still protect exit; only known status and read requests are passive.
     return [...this.pending.values()].filter(item => (!conversationId || item.conversationId === conversationId)
       && !reads.has(item.method) && item.method !== "run.cancel"

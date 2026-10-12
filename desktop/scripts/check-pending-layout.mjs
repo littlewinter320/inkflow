@@ -28,7 +28,7 @@ const bridgeClass = mainParsed.statements.find(node => ts.isClassDeclaration(nod
 const workCounter = bridgeClass.members.find(node => ts.isMethodDeclaration(node) && node.name.getText(mainParsed) === "pendingWorkCount");
 const pendingProbe = {};
 runInNewContext(ts.transpileModule(`globalThis.PendingProbe = class { constructor(entries) { this.pending = new Map(entries.map((item, i) => [i, item])); } ${workCounter.getText(mainParsed)} }`, {}).outputText, pendingProbe);
-const readProbe = new pendingProbe.PendingProbe([{method:"project.status"}, {method:"collaboration.overview"}]);
+const readProbe = new pendingProbe.PendingProbe([{method:"project.status"}, {method:"collaboration.overview"}, {method:"computer.actions.list"}]);
 assert.equal(readProbe.pendingWorkCount(), 0, "Background polling must not display unfinished work on exit");
 const workProbe = new pendingProbe.PendingProbe([{method:"conversation.send",conversationId:"a"}, {method:"document.save",conversationId:"b"}, {method:"voice.moss.install",conversationId:"b"}]);
 assert.equal(workProbe.pendingWorkCount(), 3, "Generation, saving and installation still protect exit");
