@@ -145,8 +145,9 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .learning-event { margin-top: 3px; color: #aaa69c; font-size: 8px; }
 
 .conversation-panel { display: flex; flex-direction: column; background: #171714; }
-.conversation-panel > .panel-title, .conversation-panel > .quick-row, .conversation-panel > .composer { flex: 0 0 auto; }
-.conversation-panel > .messages { flex: 1 1 0; min-height: 0; overflow-y: auto; }
+.conversation-panel > .panel-title, .conversation-panel > .quick-row, .conversation-panel > .composer,
+.conversation-panel > .workspace-panel-content > :not(.messages) { flex: 0 0 auto; }
+.conversation-panel > .messages, .conversation-panel > .workspace-panel-content > .messages { flex: 1 1 0; min-height: 0; overflow-y: auto; overflow-x: hidden; }
 .panel-title { display: flex; justify-content: space-between; align-items: center; min-width: 0; padding: 16px 18px 10px; }
 .panel-title > div:first-child { min-width: 0; }
 .panel-title h2 { margin: 0; font-family: "Noto Serif SC", serif; font-size: 22px; }
@@ -167,7 +168,7 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .message .avatar { display: grid; place-items: center; width: 28px; height: 28px; border: 1px solid #474238; color: var(--accent); font-family: "Noto Serif SC", serif; font-size: 12px; }
 .message.user .avatar { color: #d8aa54; border-color: #56462e; }
 .message.system .avatar { color: #8cb1c4; border-color: #344a54; }
-.message p { margin: 3px 0 0; color: #d1cec5; font-size: 14px; line-height: 1.72; white-space: pre-wrap; }
+.message p { margin: 3px 0 0; color: #d1cec5; font-size: 14px; line-height: 1.72; white-space: pre-wrap; overflow-wrap: anywhere; }
 .message.user p { color: #f0ede5; }
 .message-time { display: block; margin-top: 5px; color: var(--faint); font-size: 9px; font-variant-numeric: tabular-nums; }
 .message details { margin-top: 8px; color: var(--muted); font-size: 11px; }
@@ -1164,3 +1165,6 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .batch-state-table { width: 100%; margin: 6px 0; border-collapse: collapse; font-size: 10px; }
 .batch-state-table caption { text-align: left; padding-bottom: 4px; }
 .batch-state-table th, .batch-state-table td { text-align: left; vertical-align: top; padding: 4px; border-bottom: 1px solid #373b2c; overflow-wrap: anywhere; }
+
+.message-indices { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.message-indices button { padding: 5px 8px; font-size: 11px; color: var(--accent-dim); }

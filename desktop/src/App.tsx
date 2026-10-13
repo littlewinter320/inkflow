@@ -125,19 +125,11 @@ type EngineEvent = {
     stop_conditions?: string[];
   };
 };
-type Message = { id: string; role: "user" | "assistant" | "system"; text: string; details?: string; reasoning?: string[]; animate?: boolean; createdAt?: string; process?: { startedAt: string; finishedAt: string; status: string; steps: EngineEvent[] } };
+type Message = { id: string; role: "user" | "assistant" | "system"; text: string; details?: string; indices?: TreeItem[]; reasoning?: string[]; animate?: boolean; createdAt?: string; process?: { startedAt: string; finishedAt: string; status: string; steps: EngineEvent[] } };
 type ConversationHistoryEntry = { id: string; user: string; assistant: string; action_note: string; recorded_at: string };
-type SuggestedPromptItem = { label: string; prompt: string };
+type SuggestedPromptItem = { label: string; prompt: string; reason?: string };
 
-// 输入区动态提示词的本地兜底：模型预测失败或尚未返回时显示这组固定建议。
-const defaultSuggestedPrompts: SuggestedPromptItem[] = [
-  { label: "先问我", prompt: "先不要执行任务。请根据当前项目状态和最近讨论，用选项卡主动问我一到三个最值得确认、容易回答的问题。" },
-  { label: "规划当前篇章", prompt: "帮我规划当前篇章" },
-  { label: "生成独立大纲", prompt: "生成第 1 到第 10 章的独立大纲" },
-  { label: "写当前章", prompt: "写当前章的草稿，先不要审查" },
-  { label: "审查当前章", prompt: "审查当前章" },
-  { label: "查看状态", prompt: "查看当前项目状态" },
-];
+const defaultSuggestedPrompts: SuggestedPromptItem[] = [];
 type PromptOptimizationResult = {
   original_prompt: string;
   optimized_prompt: string;
@@ -444,6 +436,7 @@ function App() {
     setTree((state.tree ?? null) as ProjectTree | null);
     replaceEditorDocument((state.document ?? null) as DocumentData | null, state.projectRoot);
     if (Array.isArray(state.messages)) setMessages(state.messages as Message[]);
+    if (Array.isArray(state.suggestedPrompts)) setSuggestedPrompts(state.suggestedPrompts as SuggestedPromptItem[]);
     if (Array.isArray(state.events)) setEvents(state.events as EngineEvent[]);
     if (Array.isArray(state.pendingQuestions)) setPendingQuestions(state.pendingQuestions as QuestionCard[]);
     setBusy(state.busy === true);
@@ -1319,7 +1312,7 @@ function App() {
     void sendChat(undefined, target.text);
   };
 
-  // Stage suggestions are local; no conversation payload is needed.
+  // Read the Coordinator recommendations saved with the actual result; refreshing never calls a model.
   const refreshSuggestedPrompts = async (root = projectRootRef.current) => {
     if (!uiPreferences.suggestedPromptsEnabled || !root || root !== projectRootRef.current) return;
     if (suggestionRefreshRef.current?.root === root) return suggestionRefreshRef.current.promise;
@@ -1329,7 +1322,7 @@ function App() {
         if (root !== projectRootRef.current) return;
         if (Array.isArray(result?.suggestions)) {
           const cleaned = result.suggestions.map(item => ({ label: String(item?.label || "继续"), prompt: String(item?.prompt || "").trim() })).filter(item => item.prompt);
-          if (cleaned.length > 0) setSuggestedPrompts(cleaned);
+          setSuggestedPrompts(cleaned);
         }
       } catch { /* Keep the existing local suggestions; writing can continue. */ }
     })();
@@ -1442,15 +1435,19 @@ function App() {
     setActiveRunId(runId);
     let refreshSuggestions = false;
     try {
-      const result = await request<unknown>("conversation.send", { message, run_id: runId });
+      const result = await request<unknown>("conversation.send", { message, run_id: runId, include_suggestions: uiPreferences.suggestedPromptsEnabled });
       const visible = visibleResult(result);
+      if (runRoot === projectRootRef.current && result && typeof result === "object") {
+        const choices = (result as Record<string, unknown>).suggested_prompts;
+        setSuggestedPrompts(Array.isArray(choices) ? choices as SuggestedPromptItem[] : []);
+      }
       const refreshScope = chatRefreshScope(result);
       refreshSuggestions = Boolean(refreshScope === "project" && result && typeof result === "object"
         && ["completed", "accepted", "resolved"].includes(String((result as Record<string, unknown>).status || "")));
       const questionSource = result && typeof result === "object" ? (result as Record<string, unknown>).questions : null;
       if (Array.isArray(questionSource)) setPendingQuestions(questionSource as QuestionCard[]);
       const assistantMessageId = crypto.randomUUID();
-      setMessages((items) => [...items, { id: assistantMessageId, role: "assistant", text: visible.summary, details: visible.details, reasoning: visible.reasoning, animate: true, createdAt: new Date().toISOString(), process: { startedAt: runStartedAtRef.current, finishedAt: new Date().toISOString(), status: String((result as Record<string, unknown>)?.status || "completed"), steps: [...runEventsRef.current] } }]);
+      setMessages((items) => [...items, { id: assistantMessageId, role: "assistant", text: visible.summary, details: visible.details, indices: resultIndices(result, runRoot), reasoning: visible.reasoning, animate: true, createdAt: new Date().toISOString(), process: { startedAt: runStartedAtRef.current, finishedAt: new Date().toISOString(), status: String((result as Record<string, unknown>)?.status || "completed"), steps: [...runEventsRef.current] } }]);
       if (result && typeof result === "object" && (result as Record<string, unknown>).settings_updated) {
         // Coordinator settings changes are persisted by the engine. Refresh
         // the two settings snapshots so reopening Settings immediately shows
@@ -1482,7 +1479,7 @@ function App() {
       } })();
       const resultState = result && typeof result === "object" ? String((result as Record<string, unknown>).status || "") : "";
       if (["failed", "interrupted", "waiting_condition"].includes(resultState) && runRoot === projectRootRef.current) {
-        setSuggestedPrompts([{ label: "查看待办与恢复条件", prompt: "查看待办" }]);
+        setSuggestedPrompts([]);
       }
       const completedIntent = result && typeof result === "object" ? (result as Record<string, unknown>).intent as Record<string, unknown> | undefined : undefined;
       if (["completed", "accepted", "resolved"].includes(resultState) && runRoot === projectRootRef.current &&
@@ -1504,7 +1501,7 @@ function App() {
       }]);
       if (!cancelled) setError(messageText);
       setMascotMood(cancelled ? "waiting" : "rest");
-      if (runRoot === projectRootRef.current) setSuggestedPrompts([{ label: "查看待办与恢复条件", prompt: "查看待办" }]);
+      if (runRoot === projectRootRef.current) setSuggestedPrompts([]);
     } finally {
       if (activeRunIdRef.current === runId) {
         activeRunIdRef.current = null;
@@ -1682,17 +1679,21 @@ function App() {
     setActiveRunId(runId);
     try {
       const result = await request<unknown>("workflow.run", {
-        action,
+        action, include_suggestions: uiPreferences.suggestedPromptsEnabled,
         run_id: runId,
         ...(chapterNo ? { chapter_no: chapterNo } : {}),
         authorization_source: action === "batch_accept" || (action === "batch_draft" && acceptanceMode === "batch_once") ? "batch_preapproval" : action === "accept" ? "per_chapter_click" : acceptanceMode === "auto_after_review" && ["review", "batch_draft"].includes(action) ? "settings_auto_accept" : "current_request",
         ...extra,
       });
       const visible = visibleResult(result);
+      if (runRoot === projectRootRef.current && result && typeof result === "object") {
+        const choices = (result as Record<string, unknown>).suggested_prompts;
+        setSuggestedPrompts(Array.isArray(choices) ? choices as SuggestedPromptItem[] : []);
+      }
       const assistantMessageId = crypto.randomUUID();
       setMessages((items) => [
         ...items,
-        { id: assistantMessageId, role: "assistant", text: visible.summary, details: visible.details, reasoning: visible.reasoning, animate: true, process: { startedAt: runStartedAtRef.current, finishedAt: new Date().toISOString(), status: String((result as Record<string, unknown>)?.status || "completed"), steps: [...runEventsRef.current] } },
+        { id: assistantMessageId, role: "assistant", text: visible.summary, details: visible.details, indices: resultIndices(result, runRoot), reasoning: visible.reasoning, animate: true, process: { startedAt: runStartedAtRef.current, finishedAt: new Date().toISOString(), status: String((result as Record<string, unknown>)?.status || "completed"), steps: [...runEventsRef.current] } },
       ]);
       if (runRoot === projectRootRef.current) await refresh(runRoot);
       const resultRecord = result && typeof result === "object" ? result as Record<string, unknown> : {};
@@ -1809,9 +1810,9 @@ function App() {
   const stats = document?.statistics || emptyStatistics;
   useEffect(() => {
     if (!projectRoot || sharedWorkspaceRef.current || !window.inkflow.publishWorkspaceState) return;
-    const timer = window.setTimeout(() => { void window.inkflow.publishWorkspaceState({ projectRoot, dashboard, tree, document, messages: messages.slice(-200), events: events.slice(-200), pendingQuestions, busy, cancelReady, activeRunId, runStartedAt: runStartedAtRef.current, collaboration, contextStatus, notice, error }).catch(() => undefined); }, 100);
+    const timer = window.setTimeout(() => { void window.inkflow.publishWorkspaceState({ projectRoot, dashboard, tree, document, messages: messages.slice(-200), suggestedPrompts, events: events.slice(-200), pendingQuestions, busy, cancelReady, activeRunId, runStartedAt: runStartedAtRef.current, collaboration, contextStatus, notice, error }).catch(() => undefined); }, 100);
     return () => window.clearTimeout(timer);
-  }, [projectRoot, dashboard, tree, document, messages, events, pendingQuestions, busy, cancelReady, activeRunId, collaboration, contextStatus, notice, error]);
+  }, [projectRoot, dashboard, tree, document, messages, events, pendingQuestions, busy, cancelReady, activeRunId, collaboration, contextStatus, notice, error, suggestedPrompts]);
 
   const workspaceActionsRef = useRef<Record<string, (value: string) => Promise<void>>>({});
   workspaceActionsRef.current = { chat: value => sendChat(undefined, value), document: value => openDocument({ id: value, label: value, relative_path: value, kind: value.startsWith("reviews/") ? "review" : "document" }), compare: compareVersion, annotation: resolveAnnotation };
@@ -1937,10 +1938,10 @@ function App() {
             </div>
           </div>
           <BatchProgressStatus batches={collaboration?.batches || []} events={events} activeRunId={activeRunId} />
-          {uiPreferences.suggestedPromptsEnabled && (
+          {uiPreferences.suggestedPromptsEnabled && suggestedPrompts.length > 0 && (
             <div className="quick-row">
-              {suggestedPrompts.slice(0, 2).map((item) => (
-                <button key={item.prompt} type="button" title={item.prompt} onClick={() => void sendChat(undefined, item.prompt)}>{item.label}</button>
+              {suggestedPrompts.slice(0, 4).map((item) => (
+                <button key={item.prompt} type="button" title={item.reason ? `${item.reason}\n${item.prompt}` : item.prompt} onClick={() => setChatInput(item.prompt)}>{item.label}</button>
               ))}
             </div>
           )}
@@ -1950,6 +1951,7 @@ function App() {
                 <span className="avatar">{message.role === "user" ? "你" : message.role === "system" ? "记" : "墨"}</span>
                 <div>
                   <p>{message.role === "assistant" && message.text.startsWith("这次没有完成：") ? errorMessage(message.text.replace(/^这次没有完成：\s*/, "")) : readableWorkMessage(message.text, collaborationPending(collaboration).work)}</p>
+                  {message.indices?.length ? <div className="message-indices">{message.indices.map(item => <button key={item.id} onClick={() => void openDocument(item)}>{item.label}</button>)}</div> : null}
                   {message.process && <ProcessDisclosure {...message.process} reasoning={message.reasoning} />}
                   {message.createdAt && <time className="message-time" dateTime={message.createdAt}>{formatTime(message.createdAt)}</time>}
                   <div className="message-actions">
@@ -2278,7 +2280,7 @@ function BatchProgressStatus({ batches, events, activeRunId }: { batches: BatchS
 function collaborationPending(value: CollaborationOverview | null) {
   const items = [...new Map((value?.pending_work || []).filter(item => !["completed", "superseded", "rejected", "cancelled"].includes(item.status)).map(item => [item.id, item])).values()];
   const suggestions = items.filter(item => item.can_reject === true && item.can_process === false
-    && ["memory_summary", "optimization"].includes(item.kind) && item.status !== "deferred");
+    && ["memory_summary", "optimization", "coordinator_recovery", "development_repair", "recovery_decision"].includes(item.kind) && item.status !== "deferred");
   const work = items.filter(item => !suggestions.includes(item) && (!item.parent_id || !items.some(parent => parent.id === item.parent_id)));
   const historicalBatches = (value?.batches || []).filter(batch => batch.historical);
   const batches = (value?.batches || []).filter(batch => !batch.historical && !(batch.chapters.length && batch.chapters.every(batchChapterAccepted))
@@ -2396,7 +2398,7 @@ function CollaborationBoard({ value, busy, onProcessAll, onWork, onReject, onReo
     {chapterNumbers.map(number => <section className="pending-chapter-group" key={number}><h4>{number ? `第 ${number} 章` : "项目收尾"}<span>{active.filter(item => (item.chapter_no || 0) === number).length} 项</span></h4>{active.filter(item => (item.chapter_no || 0) === number).sort((a, b) => rank(a) - rank(b)).map(renderWork)}</section>)}
     {pending.resumableBatches.length + pending.readyBatches.length + pending.pendingBatches.length > 0 && <details className="pending-board-disclosure"><summary>批次来源与保存断点 <span>{pending.resumableBatches.length + pending.readyBatches.length + pending.pendingBatches.length}</span></summary><p>每个批次保留自己的产物与审核来源；不会叠加成当前工作数量，也不代表全书正史进度。</p>{pending.resumableBatches.map(batch => renderBatch(batch, "resume"))}{pending.readyBatches.map(batch => renderBatch(batch, "accept"))}{pending.pendingBatches.map(batch => renderBatch(batch, "inspect"))}</details>}
     {deferred.length > 0 && <details className="pending-board-disclosure"><summary>留到下次的事项 <span>{deferred.length}</span></summary>{deferred.map(renderWork)}</details>}
-    {pending.suggestions.length > 0 && <details className="pending-board-disclosure"><summary>摘要与优化建议 <span>{pending.suggestions.length}</span></summary><p>这些建议不单独阻断写作，也不计入待审核数量。相关审核读到完整来源时可同次整理；你也可以选择不采用并留档。</p>{pending.suggestions.map(renderWork)}</details>}
+    {pending.suggestions.length > 0 && <details className="pending-board-disclosure"><summary>可选建议与恢复记录 <span>{pending.suggestions.length}</span></summary><p>这些建议不单独阻断写作，也不计入待审核数量。相关审核读到完整来源时可同次整理；你也可以选择不采用并留档。</p>{pending.suggestions.map(renderWork)}</details>}
     {pending.messages.length > 0 && <details className="pending-board-disclosure"><summary>Agent 协作讨论 <span>{pending.messages.length}</span></summary><p>这里保留角色交接和待回应问题，具体处理与运行记录见下方「Agent」。</p>{pending.messages.map(item => <article className="pending-discussion" key={item.message_id}><header><strong>{item.chapter_no ? `第 ${item.chapter_no} 章 · ` : ""}{messageTypeLabel(item.message_type)}</strong><span>{roleLabel(item.sender_role)} → {roleLabel(item.recipient_role)}</span></header><p>{item.claim}</p></article>)}</details>}
     {pending.historicalBatches.length > 0 && <details className="pending-board-disclosure"><summary>已被当前成果接管的批次历史 <span>{pending.historicalBatches.length}</span></summary>{pending.historicalBatches.map(batch => <article className="pending-discussion" key={batch.batch_id}><header><strong>第 {batch.start_chapter_no}—{batch.end_chapter_no} 章</strong><span>仅历史记录</span></header><p>{batch.history_reason}</p><BatchStateDetails batch={batch} /></article>)}</details>}
     {pending.rejected.length > 0 && <details className="pending-board-disclosure"><summary>已拒绝的建议与工作 <span>{pending.rejected.length}</span></summary><p>拒绝记录保留；恢复安排保留原任务处理次数，不立即执行，也不表示问题已经解决。</p>{pending.rejected.map(item => <article className="pending-discussion" key={item.id}><header><strong>{item.chapter_no ? `第 ${item.chapter_no} 章 · ` : ""}{pendingWorkLabel(item)}</strong><span>已拒绝，保留记录</span></header><p>{item.rejection?.reason || item.reason}</p>{item.reject_impact && <p>{item.reject_impact}</p>}<div className="pending-work-actions"><button type="button" disabled={busy} onClick={() => onReopen(item)}>恢复安排</button></div><small>{item.id}</small></article>)}</details>}
@@ -2646,14 +2648,40 @@ function ChapterPanel({ workspace, request, onPrompt }: { workspace: Record<stri
   </div>;
 }
 
+function resultIndices(result: unknown, root: string): TreeItem[] {
+  const found = new Map<string, TreeItem>();
+  const prefix = root.replace(/\\/g, "/").replace(/\/$/, "") + "/";
+  const visit = (value: unknown, depth: number) => {
+    if (!value || typeof value !== "object" || depth > 5) return;
+    const item = value as Record<string, unknown>;
+    for (const key of ["review_path", "draft_path", "path"]) {
+      if (typeof item[key] !== "string") continue;
+      let path = item[key].replace(/\\/g, "/");
+      if (path.toLowerCase().startsWith(prefix.toLowerCase())) path = path.slice(prefix.length);
+      const match = path.match(/^(chapters|reviews)\/chapter_(\d{5})[^/]*\.md$/);
+      if (!match) continue;
+      const review = match[1] === "reviews";
+      found.set(path, { id: path, relative_path: path, kind: review ? "review" : "chapter", chapter_no: Number(match[2]),
+        label: `第 ${Number(match[2])} 章 · ${review ? "核对结果" : "查看正文"}` });
+    }
+    for (const key of ["result", "steps", "chapters", "results"]) {
+      const nested = item[key];
+      if (Array.isArray(nested)) nested.forEach(child => visit(child, depth + 1));
+      else visit(nested, depth + 1);
+    }
+  };
+  visit(result, 0);
+  return [...found.values()];
+}
+
 function ReviewPanel({ document, reviewDocument, tree, workspace, request, onOpen, onPrompt }: { document: DocumentData | null; reviewDocument: DocumentData | null; tree: ProjectTree | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; onOpen: (item: TreeItem) => void; onPrompt: (value: string) => void }) {
-  const reviews = tree?.groups.find((group) => group.id === "reviews")?.items || [];
+  const currentReview = workspace?.review as { path?: string; report?: { summary?: string; findings?: Array<{ evidence?: string; explanation?: string; repair_instruction?: string }> } } | undefined;
   const [panelResult, setPanelResult] = useState<Record<string, unknown> | null>(null);
   const [panelWorking, setPanelWorking] = useState(false);
   const panelSequence = useRef(0);
   const chapterMatch = document?.relative_path.match(/chapter_(\d+)(?:\.draft)?\.md$/);
   const reviewChapterMatch = reviewDocument?.relative_path.match(/chapter_(\d+)\.review\.md$/);
-  const chapterNo = Number(chapterMatch?.[1] || reviewChapterMatch?.[1] || 0);
+  const chapterNo = Number(workspace?.chapter_no || chapterMatch?.[1] || reviewChapterMatch?.[1] || 0);
   const sourceKey = `${chapterNo}:${document?.content_hash || ""}:${JSON.stringify(workspace?.record || {})}`;
   const currentPanelSource = useRef(sourceKey);
   currentPanelSource.current = sourceKey;
@@ -2671,13 +2699,14 @@ function ReviewPanel({ document, reviewDocument, tree, workspace, request, onOpe
   };
   const panelFindings = (panelResult?.merged_findings || []) as Array<Record<string, unknown>>;
   return <div className="scroll-panel review-panel">
-    <div className="section-heading"><p className="eyebrow">审查</p><h2>证据化审查</h2><p>每个扣分项都应指向正文、章节卡或正史依据；旧审查不能批准新版本。量表百分比是证据化规则符合度，模型自报把握度另列；分值需结合原文、必需审查覆盖和已证实问题判断。</p></div>
+    <div className="section-heading"><p className="eyebrow">审查</p><h2>本章检查</h2><p>先看本章实际问题；需要时展开对应依据或完整报告。</p></div>
     {workspace && <ChapterStatusStrip workspace={workspace} />}
-    {reviewDocument && <article className="markdown-preview review-document"><header><strong>{reviewDocument.relative_path}</strong><span>审查报告 · 只读</span></header><pre>{reviewDocument.content}</pre><small>审查报告单独显示；正文仍在编辑器中打开，不会被报告覆盖。</small></article>}
+    {reviewDocument && <details className="markdown-preview review-document"><summary>已选择的章节报告 · 展开完整内容</summary><pre>{reviewDocument.content}</pre></details>}
     {reviewChapterMatch && chapterMatch && Number(reviewChapterMatch[1]) !== chapterNo && <p className="form-hint">已打开第 {Number(reviewChapterMatch[1])} 章报告；本次预审和精修目标为编辑器中的第 {chapterNo} 章。</p>}
     {chapterNo > 0 && <section className="stack-section"><h3>Editor 多维预审 · 第 {chapterNo} 章</h3><p className="form-hint">Editor 分别检查连续性、人物、叙事和表达，再按证据去重；不会直接修改正文。</p><button disabled={panelWorking} onClick={() => void runPanel()}>{panelWorking ? "正在审查本章…" : "运行多维预审"}</button>{panelResult && <div>{panelFindings.length === 0 && <p className="empty-mini">没有发现可引用的问题。</p>}{panelFindings.map((finding, index) => <article className="thread-card" key={index}><strong>[{String(finding.severity || "info")}] {String(finding.category || "阅读体验")}</strong><p>原文：{String(finding.evidence || "未提供")}</p><p>影响：{String(finding.explanation || "未单独说明")}</p><small>修订方向：{String(finding.repair_instruction || "由作者决定是否调整")}</small></article>)}</div>}</section>}
     {chapterNo > 0 && <button className="wide-action" onClick={() => onPrompt(`请根据第 ${chapterNo} 章当前版本的 Editor 审查证据进入精修模式：先输出可审计的场景蓝图，再由 Writer 定点修订并让 Editor 重审新版本；不要验收。`)}>把审查意见交给 Writer 精修</button>}
-    <section className="stack-section"><h3>审查记录</h3>{reviews.length === 0 && <p className="empty-mini">还没有审查报告。</p>}{reviews.map((item) => <button className="review-link" key={item.id} onClick={() => void onOpen(item)}><span>✓</span><strong>{item.label}</strong><small>打开报告</small></button>)}</section>
+    {currentReview?.report && <section className="stack-section"><h3>本章核对要点</h3><p>{currentReview.report.summary}</p><details><summary>查看具体问题与修改依据 · {currentReview.report.findings?.length || 0} 项</summary>{currentReview.report.findings?.map((finding, index) => <article className="thread-card" key={index}><blockquote>{finding.evidence}</blockquote><p>{finding.explanation}</p><p>{finding.repair_instruction}</p></article>)}</details>{currentReview.path && <button onClick={() => onOpen({ id: currentReview.path!, relative_path: currentReview.path!, label: "本章完整报告", kind: "review", chapter_no: Number(workspace?.chapter_no || chapterNo) })}>选择本章完整报告</button>}</section>}
+
   </div>;
 }
 
@@ -3696,7 +3725,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, pre
           <SettingGroup title="章节检查"><div className="settings-fields two"><label>结尾钩子<select value={form.hook_strategy} onChange={(event) => updateForm({ hook_strategy: event.target.value })}><option value="most_chapters">大多数章节保留期待</option><option value="key_chapters">重点章节使用明确钩子</option><option value="natural_afterglow">自然余味优先</option></select></label><label>字数容差 <small>上下 {(form.chapter_length_tolerance * 100).toFixed(0)}%</small><input type="range" min={0.05} max={0.3} step={0.05} value={form.chapter_length_tolerance} onChange={(event) => updateForm({ chapter_length_tolerance: Number(event.target.value) })} /></label><label>自动通过最低审查符合度 <small>{(Math.max(0.8, form.review_min_confidence) * 100).toFixed(0)}%</small><input type="range" min={0.8} max={1} step={0.05} value={Math.max(0.8, form.review_min_confidence)} onChange={(event) => updateForm({ review_min_confidence: Number(event.target.value) })} /></label></div><p className="form-hint">默认字数±10%。自动通过须必需项无硬问题、来源证据齐全且加权符合度达到设置值（至少80%）。百分比不是正确概率；缺资料先补审，不让 Writer 为漏读改稿。</p></SettingGroup>
           <SettingGroup title="验收确认策略" note="只改变何时取得你的授权；Editor 审查通过、正文哈希和记忆服务事务门禁始终保留。"><label>确认方式<select value={form.acceptance_confirmation_mode} onChange={(event) => updateForm({ acceptance_confirmation_mode: event.target.value })}><option value="auto_after_review">Editor 审查通过后自动验收（默认）</option><option value="batch_once">批次提交前确认一次</option><option value="per_chapter">逐章确认</option></select></label><p className="form-hint">“自动验收”只在当前版本没有硬问题且 Editor 审查通过时生效；尚未完成的审查不会伪装成通过。切换设置只影响之后的操作。</p></SettingGroup>
           <SettingGroup title="预填续写" note="启用后，编辑停顿会调用当前 Writer 模型，因此可能产生费用。"><label className="setting-check"><input type="checkbox" checked={preferences.prefillEnabled} onChange={(event) => updatePreferences({ prefillEnabled: event.target.checked })} />允许在编辑器中手动开启灰字预填候选</label><div className="settings-fields two"><label>等待时间 <small>{preferences.prefillDelayMs} 毫秒</small><input type="range" min="300" max="3000" step="100" value={preferences.prefillDelayMs} onChange={(event) => updatePreferences({ prefillDelayMs: Number(event.target.value) })} /></label><label>候选长度<select value={preferences.prefillLength} onChange={(event) => updatePreferences({ prefillLength: event.target.value as PrefillLength })}><option value="short">短句</option><option value="medium">一小段</option><option value="long">长段落</option></select></label></div></SettingGroup>
-          <SettingGroup title="智能提示词" note="输入框上方的快捷按钮根据最近对话和项目阶段提供下一步建议。"><label className="setting-check"><input type="checkbox" checked={preferences.suggestedPromptsEnabled} onChange={(event) => updatePreferences({ suggestedPromptsEnabled: event.target.checked })} />显示下一步提示词 <small>自动快捷建议在本地生成，不额外调用付费模型；关闭后隐藏整行快捷按钮</small></label></SettingGroup>
+          <SettingGroup title="智能提示词" note="输入框上方的快捷按钮根据最近对话和项目阶段提供下一步建议。"><label className="setting-check"><input type="checkbox" checked={preferences.suggestedPromptsEnabled} onChange={(event) => updatePreferences({ suggestedPromptsEnabled: event.target.checked })} />显示下一步提示词 <small>执行结束后由Coordinator结合实际结果生成建议，会计入当前任务模型用量；关闭后不生成建议</small></label></SettingGroup>
           <SettingGroup title="对话历史" note="记录只写入项目里的 DIALOGUE.md，不保存原始思维链、API Key 或模型内部推理。"><div className="settings-fields two"><label>保存方式<select value={form.dialogue_history_mode} onChange={(event) => updateForm({ dialogue_history_mode: event.target.value })}><option value="auto">主动保存（自动写入）</option><option value="manual">被动保存（只在对话历史里手动保存）</option><option value="both">两者都有</option></select></label><label>最多保留 <small>条记录</small><input type="number" min={5} max={1000} value={form.dialogue_history_limit} onChange={(event) => updateForm({ dialogue_history_limit: Number(event.target.value) })} /></label></div><div className="settings-fields"><label>自动保存间隔 <small>每 N 轮写入一次</small><input type="number" min={1} max={50} value={form.dialogue_history_interval} disabled={form.dialogue_history_mode === "manual"} onChange={(event) => updateForm({ dialogue_history_interval: Number(event.target.value) })} /></label></div><p className="form-hint">主动保存会在满 N 轮时写入一次；“两者都有”同时开放对话历史里的手动保存。超出保留上限时只删除最旧的记录，不会改动正史。</p></SettingGroup>
         </SettingsPane>}
         {section === "voice" && <SettingsPane title="语音" note="按用途选择已就绪的语音组件；安装完成不会自动切换。">

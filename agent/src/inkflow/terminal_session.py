@@ -126,7 +126,7 @@ target_characters 只表示“已接受正文”的有效字符目标，不把�
 - 用户在讨论题材、人物、节奏、选择、方案或表达意见，而没有明确要求执行时，action 必须是 discuss。conversation_reply 用自然中文复述已理解的重点、给出一个建议和下一步确认问句；不调用 Writer、Reviewer 或 记忆服务。
 - 用户用任何明确肯定表达接受最近方案时，可结合本次 Context Packet 中的最近对话，将其路由为相应既有 action；不要要求固定口令。
 - 用户只要求“写草稿”“先写出来我看看”“不要审查”时，action=write_draft；只让 Writer 写草稿，绝不自动审查或接收。
-- 用户只要求“审查第 N 章”时，action=review；只让 Editor 审查，绝不接收。只有明确说“审查通过后入正史/验收并接收”才可使用 review_accept。
+- 用户只要求“审查第 N 章”或补核该章的Writer说明、设定对照及书籍要求时，action=review；这仍是章节审查，不是story_settings_manage。只让责任角色审查，绝不接收。只有明确说“审查通过后入正史/验收并接收”才可使用 review_accept。
 - 用户说“复审第 X 到第 Y 章并和规划对比”时，action=arc_audit；它不能暗中触发重规划。用户说“根据复审重规划”但没有明确确认时，保持 plan_change_confirmed=false。
 - 用户说“按复审结论修正这批草稿”“修第 9 到第 10 章并保留当前批次”时，action=batch_repair；它只修订临时批次并逐章重审，不等于接收，也不重写已接受正史。
 - 用户只要求“按意见修改第 N 章，先给我看”时，action=revise_draft；只让 Writer 修订，不自动重审。
@@ -617,6 +617,7 @@ class TerminalSession:
         consume_steering: Callable[[], Awaitable[list[str]]] | None = None,
         emit: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         opened_project: InkFlowProject | None = None,
+        include_suggestions: bool = False,
     ) -> dict[str, Any]:
         # Desktop dispatch already opened/recovered this project. Other
         # entrypoints open it off the event loop so a competing chapter lock
@@ -1196,9 +1197,11 @@ class TerminalSession:
             }
             payload["status"] = outcome
             payload["pending_work"] = project.pending_work()
-            recommendation = self._recommend_next_step(intent, response)
-            if recommendation:
-                payload["next_step"] = recommendation
+            if include_suggestions and not response.get("questions") and not set(intent.forbidden_actions) & {"extra_calls", "extra_model_calls"}:
+                suggestions = await self._suggest_after_result(project, intent, response, trace)
+                payload["suggested_prompts"] = suggestions
+                if suggestions:
+                    payload["next_step"] = suggestions[0]
             return payload
         except asyncio.CancelledError:
             try:
@@ -1732,6 +1735,13 @@ class TerminalSession:
 
     @staticmethod
     def _deterministic_single_chapter_review(text: str) -> TerminalIntent | None:
+        retry = re.fullmatch(r"\s*(?:请)?(?:审查|审核|复核)第\s*(\d+)\s*章[。；;]\s*本次授权额外一次\s*Writer\s*说明短答[。！!\s]*", text)
+        if retry and int(retry.group(1)) > 0:
+            return TerminalIntent(action="review", chapter_no=int(retry.group(1)), requested_outcome=text,
+                operation_instruction="仅补核当前正文的说明与审核依据；保留正文、原失败记录和次数。", user_message=text,
+                authorization="approved", authorization_source="current_request", confidence="high", max_revision_rounds=0,
+                forbidden_actions=["write", "revise", "accept", "coordinator_recovery"],
+                visible_reason="用户明确授权一次Writer说明短答，进入章节审查，不转成设定维护。")
         match = re.fullmatch(r"\s*(?:墨宝[，,\s]*)?(?:请|帮我)?(?:重新|再次)?(?:审查|审核|复核)(并(?:验收|接受|接收))?第\s*(\d+)\s*章(?:的?(?:当前|现有)?草稿)?[。！!\s]*", text)
         if not match or int(match.group(2)) < 1:
             return None
@@ -3862,44 +3872,39 @@ class TerminalSession:
                 return "Agent 生成参数：" + "、".join(items)
         return f"{TerminalSession._setting_label(key)}：{TerminalSession._setting_value_label(key, before)} → {TerminalSession._setting_value_label(key, after)}"
 
-    @staticmethod
-    def _recommend_next_step(intent: TerminalIntent, response: dict[str, Any]) -> dict[str, str] | None:
-        """Return one short, user-controlled next action for the Coordinator UI."""
-
-        if response.get("resumable") is True and response.get("status") == "interrupted":
-            return {"label": "继续断点", "reason": "执行片段已到上限，已保存成果可复用。", "prompt": "继续上次任务"}
-        if response.get("needs_clarification"):
-            return None
-        if workflow_result_status(response) == "waiting_user":
-            if response.get("questions"):
-                return {"label": "回答待处理选择", "reason": "已保留当前成果；回答这张关联提问卡后继续具体任务。", "prompt": "查看待处理工作"}
-            return {"label": "查看未完成原因", "reason": str(response.get("next_action") or workflow_failure_reason(response) or "当前任务仍有待处理条件，请核对具体断点。"), "prompt": "查看本次未完成的具体原因和可执行的下一步"}
-        if workflow_result_status(response) == "waiting_condition":
-            return {"label": "核对待处理条件", "reason": str(response.get("next_action") or "任务停在必要依据或审核缺口处，先核对具体问题再续接。"), "prompt": "查看待处理工作"}
-        if workflow_failure_reason(response) or response.get("needs_clarification"):
-            return None
-        if intent.action == "outline":
-            if intent.outline_level == "story":
-                return {"label": "查看并确认大纲", "reason": "先审读新走向和伏笔衔接，再决定是否展开细纲。", "prompt": "打开刚生成的大纲，帮我概括第二卷改动和需要我确认的走向；现在先不要生成细纲。"}
-            return {"label": "安排近期章节", "reason": "参考设定、大纲与细纲安排实际写作。", "prompt": "参考设定、大纲和细纲，安排接下来三章怎么写。"}
-        suggestions: dict[str, tuple[str, str, str]] = {
-            "scene_draft": ("查看场景草稿", "候选场景与章节正文隔离，先阅读再决定是否采用。", "查看刚生成的场景草稿，不要改动正史"),
-            "story_setting_edit": ("核对设定影响", "设定已保存新版本，先看差异及受影响内容。", "查看刚才的设定差异和受影响范围"),
-            "plan": ("查看第一章规划", "先看章节卡，再决定从哪一章写草稿。", "查看当前规划"),
-            "write_draft": ("审查这章", "草稿还没有进入正史，先读一遍或交给 Editor。", "审查当前章"),
-            "write_review": ("查看审查结果", "Writer 和 Editor 已完成当前版本的交接。", "打开当前审查报告"),
-            "review": ("处理审查意见", "根据报告决定修订，或在通过后明确验收。", "按审查意见修改当前章"),
-            "revise_draft": ("重新审查", "修订产生了新版本，旧报告不能替代新版本审查。", "重新审查当前章"),
-            "revise_review": ("查看新的审查", "新版本已完成复审，可以继续阅读结果。", "打开当前审查报告"),
-            "batch_draft": ("查看批次", "草稿批次仍在临时区，先查看逐章结果再决定是否验收。", "查看批次进度"),
-            "settings_update": ("继续安排任务", "新设置会从下一次任务开始生效。", "查看当前项目状态"),
-            "status": ("选择下一步", "Coordinator 已读完当前状态，可以直接告诉我想推进哪一项。", "先问我下一步建议"),
-        }
-        item = suggestions.get(intent.action)
-        if not item:
-            return None
-        label, reason, prompt = item
-        return {"label": label, "reason": reason, "prompt": prompt}
+    async def _suggest_after_result(self, project, intent, response, trace):
+        from .schemas import SuggestedPrompts
+        try:
+            basis = self._work_source(project)
+            work = project.pending_work()
+            context = {"当前目标": intent.requested_outcome or intent.user_message,
+                "已完成与失败": {"status": workflow_result_status(response), "summary": str(response.get("reply") or response.get("summary") or workflow_failure_reason(response))[:1800],
+                    "steps": [{"step": item.get("step"), "status": workflow_result_status(item),
+                               "reason": workflow_failure_reason(item)[:300]} for item in response.get("steps", [])[-6:]]},
+                "小说进度": project.db.project_status(),
+                "待办": [{key: item.get(key) for key in ("kind", "chapter_no", "status", "reason", "handling", "can_process", "can_reject", "next_action")}
+                         for item in work[:8]],
+                "最近用户要求": [item["user"][:400] for item in self.history(project.root, limit=3)]}
+            result = await self.engine.provider.generate_json(system_prompt=(
+                "你是墨流Coordinator。依据本次实际结果、当前进度和用户目标，提出2至4个具体且有差异的下一步提示词。"
+                "label用普通中文短标题，prompt是可直接发送的自然语言要求，reason说明当前为何值得做。"
+                "不能复制固定工作流菜单。完成事项不再推荐重做；必要缺口在原授权内补原节点，可选建议允许不补。"
+                "次数耗尽不推荐无授权重试；缺审核不得建议跳过门禁或生成依赖章节。"
+                "区分只查看、定点补核、当前任务续接与新增创作选择，不用笼统的查看状态敷衍。建议不执行、不扩大已有授权。"),
+                user_prompt=json_dumps(context, indent=None), output_model=SuggestedPrompts,
+                agent_role="coordinator", max_tokens=self.engine.settings.effective_output_tokens(1000, "coordinator"), thinking=False)
+            if basis != self._work_source(project):
+                return []
+            suggestions = [item.model_dump(mode="json") for item in result.data.suggestions]
+            async with project_write_lock(project.root):
+                if basis != self._work_source(project):
+                    return []
+                project.db.set_metadata(conversation_key("next_step_suggestions"), {"basis": basis, "suggestions": suggestions, "run_id": trace.run_id})
+            trace.record_model("coordinator.next_steps", result, "Coordinator已根据实际结果生成下一步选项")
+            return suggestions
+        except Exception as exc:
+            trace.record("coordinator.next_steps", "not_run", "下一步建议暂未生成，已有工作结果有效", str(exc))
+            return []
 
     def _reuse_current_pass_review(self, project: InkFlowProject, chapter_no: int) -> dict[str, Any] | None:
         """Return a safe handoff when the current draft already has a pass report."""

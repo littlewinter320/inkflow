@@ -623,13 +623,13 @@ class InkFlowAppService:
                 "source_method": "critique_then_synthesize",
             }
         if method == "assistant.suggest":
-            # This route is called automatically on project/message changes.
-            # Suggestions are optional UI aids, not a reason to spend writing
-            # budget or transmit recent conversations in the background.
             project = self._try_project(params.get("workspace_root") or params.get("project_root"))
+            from .conversation_scope import conversation_key
+            saved = project.db.get_metadata(conversation_key("next_step_suggestions"), {}) if project else {}
+            valid = bool(project and saved.get("basis") == TerminalSession._work_source(project))
             return {
-                "suggestions": _local_suggested_prompts(project),
-                "model": "", "fallback": False, "source": "local",
+                "suggestions": saved.get("suggestions", []) if valid else [],
+                "model": "", "fallback": False, "source": "coordinator" if valid else "none",
             }
         if method == "project.ideate":
             from .preferences import preference_prompt
@@ -887,6 +887,8 @@ class InkFlowAppService:
 
             def read_overview() -> dict[str, Any]:
                 project = InkFlowProject(root, recover_on_open=False)
+                engine = self._engine(root)
+                project.reconcile_pending_work(current_pass=lambda number: engine.current_pass_review(project, number))
                 return {
                     "threads": project.db.list_collaboration_threads(),
                     "messages": project.db.list_collaboration_messages(active_only=False, limit=int(params.get("limit", 80))),
@@ -1610,6 +1612,7 @@ class InkFlowAppService:
                 consume_steering=consume_steering,
                 emit=emit,
                 opened_project=project,
+                include_suggestions=params.get("include_suggestions", True) is True,
             )
             self._schedule_manual_reviews(project)
             session_result = result.get("session") if isinstance(result, dict) else None
@@ -2005,10 +2008,15 @@ class InkFlowAppService:
                     result["reply"] = acceptance["reply"]
                     if acceptance.get("post_commit_status") == "waiting_condition":
                         result["next_action"] = acceptance.get("next_action", "继续原任务，仅恢复未完成投影与本地收尾。")
-        if isinstance(result, dict) and not workflow_failure_reason(result):
-            recommendation = _workflow_next_step(action, result)
-            if recommendation:
-                result = {**result, "next_step": recommendation}
+        if isinstance(result, dict) and params.get("include_suggestions", True) is True:
+            trace = TraceRecorder(project.root, "next-step-guide", engine.settings.trace_level)
+            intent = TerminalIntent(action="discuss", visible_reason="解释实际工作流结果并建议下一步",
+                requested_outcome=str(params.get("instruction") or "") + f" 本次已执行{action}，请据实际结果建议。")
+            suggestions = await TerminalSession(engine)._suggest_after_result(project, intent, result, trace)
+            result = {**result, "suggested_prompts": suggestions}
+            if suggestions:
+                result["next_step"] = suggestions[0]
+            trace.finish(summary="下一步引导已处理")
         await emit({"type": f"workflow.{workflow_result_status(result)}", "action": action, "summary": _visible_result_summary(result)})
         return result
 
@@ -3114,43 +3122,6 @@ def _visible_result_summary(result: Any) -> str:
     return "工作流返回了可查看结果。"
 
 
-def _workflow_next_step(action: str, result: dict[str, Any]) -> dict[str, str] | None:
-    """给桌面按钮触发的固定工作流也提供同一套用户可控引导。"""
-
-    acceptance = result.get("automatic_acceptance") or result
-    if (isinstance(acceptance, dict) and acceptance.get("status") == "accepted"
-            and (acceptance.get("post_commit_status") == "waiting_condition" or acceptance.get("projection_status") == "pending")):
-        return {"label": "恢复接受收尾", "reason": "正史与记忆已入库；按原任务断点恢复尚未完成的投影或本地收尾，不重复接受。",
-                "prompt": f"查看第 {acceptance.get('chapter_no', '')} 章接受收尾的绑定待处理事项，仅从原任务未完成节点恢复。"}
-    if action == "review" and result.get("automatic_acceptance"):
-        return {"label": "继续下一章", "reason": "本次审查已通过且当前设置已自动验收，可以继续安排下一章。", "prompt": "推荐下一章安排"}
-    if action == "review":
-        if result.get("verdict") == "pass":
-            return {"label": "查看审查报告", "reason": "本次审查已通过；是否入正史仍按接受授权和引擎门禁决定。", "prompt": "打开当前审查报告"}
-        if result.get("verdict") == "unknown":
-            return {"label": "补足审查依据", "reason": "本次审查资料不足，先核对缺失来源，不改动已保存草稿。", "prompt": "查看当前审查缺口"}
-        return {"label": "查看需修问题", "reason": "先核对审查指出的原文问题，再决定定向修订。", "prompt": "打开当前审查报告"}
-    if action == "batch_draft" and result.get("authorization_source") in {"batch_preapproval", "settings_auto_accept"}:
-        return {"label": "查看已提交批次", "reason": "本批次已按当前确认策略处理，先查看提交结果再继续。", "prompt": "查看当前项目状态"}
-
-    suggestions = {
-        "plan": ("查看章节规划", "先核对章节卡，再决定从哪一章开始写。", "查看当前规划"),
-        "outline": ("从大纲开始写", "独立大纲已保存，选择起点后再生成草稿。", "根据大纲生成草稿"),
-        "write": ("审查当前章节", "草稿已生成，下一步按当前模式检查这一版本。", "审查当前章"),
-        "revise": ("重新审查", "修订产生了新版本，旧报告不能替代新版本审查。", "重新审查当前章"),
-        "accept": ("继续下一章", "当前章节已经完成正史提交，可以继续安排下一章。", "推荐下一章安排"),
-        "batch_draft": ("查看批次进度", "批量草稿仍在临时区，先查看逐章结果再决定是否验收。", "查看批次进度"),
-        "batch_accept": ("安排后续章节", "批次提交完成，可以继续规划或生成下一段。", "推荐后续章节安排"),
-        "arc_audit": ("查看复审报告", "跨章复审只生成报告，先查看风险与规划差异。", "打开篇章复审报告"),
-        "checkpoint_create": ("继续创作", "检查点已经保存，接下来可以继续写作。", "推荐下一步"),
-    }
-    item = suggestions.get(action)
-    if not item:
-        return None
-    label, reason, prompt = item
-    return {"label": label, "reason": reason, "prompt": prompt}
-
-
 def _batch_resume_params(project: InkFlowProject, manifest: dict[str, Any], source_run: dict[str, Any] | None) -> dict[str, Any]:
     """Restore the recorded workflow rather than guessing it from a repair history."""
     original = (source_run or {}).get("params") or {}
@@ -3343,9 +3314,9 @@ def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
     """只记录恢复任务所需的小参数，不复制正文、API Key 或模型输出。"""
 
     allowed_by_method = {
-        "conversation.send": {"message", "collaboration_mode"},
+        "conversation.send": {"message", "collaboration_mode", "include_suggestions"},
         "workflow.run": {
-            "action",
+            "include_suggestions", "action",
             "chapter_no",
             "start_chapter_no",
             "end_chapter_no",

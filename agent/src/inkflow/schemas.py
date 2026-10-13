@@ -123,10 +123,11 @@ class SuggestedPrompt(StrictModel):
 
     label: str = Field(min_length=1, max_length=24)
     prompt: str = Field(min_length=1, max_length=200)
+    reason: str = Field(default="", max_length=180)
 
 
 class SuggestedPrompts(StrictModel):
-    """对话输入区的动态提示词预测结果；失败时由本地规则兜底。"""
+    """Coordinator 根据实际结果提出的下一步选项，不代表执行授权。"""
 
     suggestions: list[SuggestedPrompt] = Field(min_length=1, max_length=5)
 

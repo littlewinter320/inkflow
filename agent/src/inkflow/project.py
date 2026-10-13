@@ -146,9 +146,9 @@ class InkFlowProject:
                     handling = "blocked"
             item["handling"] = "deferred" if item["status"] == "deferred" else handling
             item["can_process"] = item["status"] != "rejected" and handling in {"resume", "local", "manual", "review"}
-            optional = item["kind"] in {"optimization", "memory_summary", "workflow", "context_source"}
+            optional = item["kind"] in {"optimization", "memory_summary", "workflow", "context_source", "coordinator_recovery", "development_repair", "recovery_decision"}
             item["can_reject"] = optional and handling != "running" and item["status"] != "rejected"
-            item["reject_label"] = "不重建这份摘要" if item["kind"] == "memory_summary" else "不执行这项额外工作" if item["kind"] == "optimization" else "暂不补充这份依据" if item["kind"] == "context_source" else "放弃这次任务"
+            item["reject_label"] = "不再使用这一恢复方案" if item["kind"] in {"coordinator_recovery", "development_repair", "recovery_decision"} else "不重建这份摘要" if item["kind"] == "memory_summary" else "不执行这项额外工作" if item["kind"] == "optimization" else "暂不补充这份依据" if item["kind"] == "context_source" else "放弃这次任务"
             item["reject_impact"] = ("旧摘要继续隔离；需要资料时核对当前已接受原文，正史不变。" if item["kind"] == "memory_summary" else
                 "停止安排本项资料补充并留档；后续任务仍核实际来源，缺必要依据时仍会暂停，不代表问题已通过审核。" if item["kind"] == "context_source" else
                 "停止安排这项工作并保留拒绝记录；已有成果保留，关联审查与依赖仍独立核验。")
@@ -237,8 +237,11 @@ class InkFlowProject:
         validated: dict[int, dict[str, Any] | None] = {}
         with self.db.connect() as connection:
             rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
+        self._reconcile_workflow_outputs([json.loads(row["value_json"]) for row in rows])
+        with self.db.connect() as connection:
+            rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
         finished_tasks = {item["source"].get("task_id"): item for row in rows
-                          if (item := json.loads(row["value_json"])).get("kind") == "workflow" and item.get("status") == "completed" and item.get("source", {}).get("task_id")}
+                          if (item := json.loads(row["value_json"])).get("kind") == "workflow" and item.get("status") in {"completed", "superseded"} and item.get("source", {}).get("task_id")}
         for item in self.pending_work():
             if item["kind"] == "workflow" and item.get("intent", {}).get("pending_work_id"):
                 target_id = item["intent"]["pending_work_id"]
@@ -282,7 +285,7 @@ class InkFlowProject:
                 continue
             parent = finished_tasks.get(item.get("source", {}).get("task_id"))
             if parent and item["kind"] in {"coordinator_recovery", "development_repair", "recovery_decision"}:
-                self.update_pending_work(item["id"], status="completed",
+                self.update_pending_work(item["id"], status=parent["status"],
                     resolution={"workflow_id": parent["id"], "progress": parent.get("progress", {})})
                 continue
             if item["kind"] == "optimization" and current_source is not None and item["source"] != current_source:
@@ -348,6 +351,63 @@ class InkFlowProject:
                 if active:
                     self.update_pending_work(item["id"], status="completed",
                         resolution={"run_id": active[0]["trace_id"], "revision_no": active[0].get("revision_no", 1)})
+
+    def _reconcile_workflow_outputs(self, items: list[dict[str, Any]]) -> None:
+        """Reconcile concrete later outputs, without replaying old requests or accepting prose."""
+        if self.db.canonical_content_migration_required():
+            return
+        from datetime import datetime
+        def later(value: str | None, created: str | None) -> bool:
+            try:
+                return bool(value and created and datetime.fromisoformat(value) >= datetime.fromisoformat(created))
+            except (ValueError, TypeError):
+                return False
+        active = None
+        active_checked = False
+        accept_actions = {"accept", "review_accept", "write_review_accept", "revise_review_accept",
+                          "continue_run", "batch_accept", "batch_draft_accept"}
+        for item in items:
+            if item.get("kind") != "workflow" or item.get("status") in {"completed", "superseded", "rejected", "running"}:
+                continue
+            intent = item.get("intent") or {}
+            action = intent.get("action")
+            first, last = intent.get("chapter_no"), intent.get("end_chapter_no") or intent.get("chapter_no")
+            if not isinstance(first, int) or not isinstance(last, int) or not 1 <= first <= last:
+                continue
+            status, resolution = None, None
+            if action in accept_actions or action == "review":
+                chapters = [self.db.get_chapter(number) for number in range(first, last + 1)]
+                if (all(chapter and chapter["status"] == "accepted" and later(chapter.get("accepted_at"), item.get("created_at")) for chapter in chapters)
+                        and not any(work.get("kind") == "accept_finalization" and work.get("chapter_no") in range(first, last + 1)
+                                    and work.get("status") not in {"completed", "superseded"} for work in items)
+                        and all((body := self.db.canonical_chapter_content(chapter["chapter_no"]))
+                                and content_hash(body) == chapter["content_hash"] for chapter in chapters)):
+                    status = "superseded" if action == "review" else "completed"
+                    resolution = {"reason": "后续正式验收已完成目标范围，旧请求不再重复执行。",
+                        "chapters": [{key: chapter[key] for key in ("chapter_no", "version", "content_hash")} for chapter in chapters]}
+            elif action in {"plan", "redesign_story", "plan_next_arc"}:
+                if not active_checked:
+                    from .planning_pipeline import load_active_planning
+                    try:
+                        active = load_active_planning(self)
+                    except (ProjectError, ValidationGateError, ValueError, OSError):
+                        pass
+                    active_checked = True
+                if active and later(active[0].get("published_at"), item.get("created_at")):
+                    start = first + 1 if action == "redesign_story" else first
+                    covered = set(self.db.accepted_chapter_numbers(start, last)) | {card.chapter_no for card in active[3].chapters}
+                    if (all(number in covered for number in range(start, last + 1))
+                            and (not intent.get("planning_total_chapters") or intent["planning_total_chapters"] == max(volume.chapter_end for volume in active[1].volumes))
+                            and (not intent.get("planning_volume_count") or intent["planning_volume_count"] == len(active[1].volumes))):
+                        status = "superseded"
+                        resolution = {"reason": "后续正式规划已覆盖这一范围，旧失败任务留档，继续使用当前生效版。",
+                                      "run_id": active[0]["trace_id"], "revision_no": active[0].get("revision_no")}
+            if status:
+                self.update_pending_work(item["id"], status=status, resolution=resolution)
+                key = item.get("source", {}).get("conversation")
+                pending = self.db.get_metadata(key) if isinstance(key, str) and key else None
+                if isinstance(pending, dict) and pending.get("task_id") == item.get("source", {}).get("task_id"):
+                    self.db.set_metadata(key, {**pending, "status": status})
 
     @classmethod
     def create(cls, root: str | Path, brief: BookBrief) -> "InkFlowProject":

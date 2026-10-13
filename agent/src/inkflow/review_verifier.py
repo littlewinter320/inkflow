@@ -193,6 +193,32 @@ def setting_review_gaps(output: Any, content: str, packet: ContextPacket) -> lis
     return gaps
 
 
+def mode_output_model(packet: ContextPacket, *, primary: bool) -> type:
+    """Require structural coverage in the existing Provider format retry, before a second review."""
+    from pydantic import create_model, model_validator
+    from .schemas import ModeCheckOutput
+    if not primary:
+        return ModeCheckOutput
+    sources = packet_sources(packet)
+    required = {key for key in ("book:requirements", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md") if key in sources}
+    section = next((item for item in packet.sections if item.key == "CSET"), None)
+    payload = json.loads(section.content) if section else {}
+    records = {record["record_id"]: record["revision"] for collection in payload.get("collections", []) for record in collection.get("records", [])}
+    def coverage(output):
+        seen = [check.record_id for check in output.context_use_audit.setting_checks]
+        missing = required - {resolve_packet_source_id(item.source_id, sources) for item in output.source_comparisons}
+        if missing or set(records) - set(seen) or len(seen) != len(set(seen)):
+            raise ValueError("本次结构覆盖不完整：source_comparisons须分别包含 " + "、".join(sorted(required))
+                + "；setting_checks须逐条包含且不重复 " + "、".join(records))
+        if any(records.get(check.record_id) != check.record_revision for check in output.context_use_audit.setting_checks):
+            raise ValueError("设定核对编号与修订号须复制本次实际读取条目，不能串用或补造。")
+        return output
+    model = create_model("ModeCheckOutput", __base__=ModeCheckOutput,
+        __validators__={"current_coverage": model_validator(mode="after")(coverage)})
+    model.__doc__ = ModeCheckOutput.__doc__
+    return model
+
+
 def evidence_matches(evidence: str, content: str) -> bool:
     """Match exact excerpts and conservative ellipsis-compressed excerpts."""
 

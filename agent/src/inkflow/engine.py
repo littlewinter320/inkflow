@@ -1489,7 +1489,7 @@ class InkFlowEngine:
         }))
 
     @staticmethod
-    def _review_source_fingerprint(project: InkFlowProject, chapter_no: int) -> str:
+    def _review_source_fingerprint(project: InkFlowProject, chapter_no: int, *, writer_notes_hash: str | None = None) -> str:
         """Also reject a competing review committed for the same chapter."""
         with project.db.connect() as connection:
             prior_id = connection.execute(
@@ -1498,7 +1498,7 @@ class InkFlowEngine:
         return content_hash(json_dumps({
             "writer_sources": InkFlowEngine._writer_source_fingerprint(project, chapter_no),
             "latest_review_id": prior_id,
-            "writer_notes_hash": notes_hash(version_notes(project, chapter_no)),
+            "writer_notes_hash": writer_notes_hash if writer_notes_hash is not None else notes_hash(version_notes(project, chapter_no)),
         }))
 
     @staticmethod
@@ -3502,6 +3502,7 @@ class InkFlowEngine:
             hard_code_issue = any(item.severity in {"major", "blocking"} for item in code_findings)
 
             async def run_role(role: str) -> ModeCheckOutput:
+                nonlocal source_fingerprint, writer_notes
                 checks = [name for name, owner in owners.items() if owner == role]
                 packet = self._context_builder(project, role).build(
                     chapter_no, f"第 {chapter_no} 章{role}限定检查。{instruction}", mode="review",
@@ -3510,6 +3511,8 @@ class InkFlowEngine:
                 packet = _review_evidence_packet(project, packet, chapter_no,
                     recheck_report.missing_source_ids if recheck_report else [])
                 packets[role] = packet
+                from .review_verifier import mode_output_model
+                output_model = mode_output_model(packet, primary=role == (owners.get("general") or owners.get("logic_continuity")))
                 user_prompt = (
                     packet.to_model_prompt() + "\n\n# 当前正文\n" + content
                     + "\n\n# 唯一分配给你的检查项\n" + json_dumps(checks)
@@ -3616,7 +3619,7 @@ class InkFlowEngine:
                     "system_prompt": systems[role], "user_prompt": user_prompt}))
                 result = await self.provider.generate_json(
                     system_prompt=systems[role], user_prompt=user_prompt,
-                    output_model=ModeCheckOutput, effort=self.settings.reasoning_effort,
+                    output_model=output_model, effort=self.settings.reasoning_effort,
                     max_tokens=min(8_000, self.settings.max_output_tokens),
                     timeout_seconds=120, thinking=not self.settings.is_deepseek,
                     agent_role=role,
@@ -3641,7 +3644,7 @@ class InkFlowEngine:
                                 user_prompt=resolved_packet.to_model_prompt() + "\n# 本次取舍\n" + json_dumps(decisions)
                                     + "\n# 当前正文\n" + content + "\n# 分工\n" + json_dumps({"checks": checks, "memory_owner": owners["memory"]})
                                     + "\n# 当前要求\n" + instruction + notes_prompt(writer_notes),
-                                output_model=ModeCheckOutput, effort=self.settings.reasoning_effort,
+                                output_model=output_model, effort=self.settings.reasoning_effort,
                                 max_tokens=min(8_000, self.settings.max_output_tokens), timeout_seconds=120,
                                 thinking=not self.settings.is_deepseek, agent_role=role)
                         packet = resolved_packet
@@ -3670,6 +3673,15 @@ class InkFlowEngine:
                 if role != owners["memory"] and (candidate.memory_patch is not None or candidate.source_summary_rebuilds):
                     raise ValidationGateError(f"{role} 越权提交记忆候选，未作为有效检查保存。")
                 async with project_write_lock(project.root):
+                    clarification = recovery.get("writer_note_clarification", {})
+                    current_notes = version_notes(project, chapter_no)
+                    if (clarification.get("status") == "answered"
+                            and clarification.get("writer_notes_hash") == notes_hash(writer_notes)
+                            and clarification.get("story_fingerprint") == story_fingerprint
+                            and current_notes.get("clarification_source", {}).get("artifact_id") == clarification.get("artifact_id")
+                            and self._review_source_fingerprint(project, chapter_no, writer_notes_hash=notes_hash(writer_notes)) == source_fingerprint):
+                        writer_notes = current_notes
+                        source_fingerprint = self._review_source_fingerprint(project, chapter_no)
                     if self._review_source_fingerprint(project, chapter_no) != source_fingerprint:
                         raise ValidationGateError("审查结果返回时正文或审查依据已变化；迟到结果未写回。")
                     if _recovered_sources_changed(project, recovery):
@@ -4228,7 +4240,7 @@ class InkFlowEngine:
             tail = repair_tail + "\n\n# 本次可选择的逐字原文，代码按编号回填，语义仍由你核对\n" + json_dumps(quote_choices) + choice_note
             try:
                 repair_prompt, _ = self._fit_review_prompt(project, packet,
-                    system_prompt=system_prompt, tail=tail, output_model=type(output), role=agent_role)
+                    system_prompt=system_prompt, tail=tail, output_model=output_model, role=agent_role)
                 break
             except ValidationGateError as exc:
                 if quote_choices:
@@ -4244,9 +4256,11 @@ class InkFlowEngine:
         recovery["compressed_sections"] = [section.title for section in packet.sections if before_sections[section.key] != section.content]
         recovery["omitted_quote_choices"] = choice_count - len(quote_choices)
         try:
+            from .review_verifier import mode_output_model
+            output_model = mode_output_model(packet, primary=primary)
             result = await self.provider.generate_json(
                 system_prompt=system_prompt, user_prompt=repair_prompt,
-                output_model=type(output), effort="low", max_tokens=output_reserve,
+                output_model=output_model, effort="low", max_tokens=output_reserve,
                 timeout_seconds=120, thinking=False, agent_role=agent_role,
             )
         except (RunBudgetExceeded, ValidationGateError):
