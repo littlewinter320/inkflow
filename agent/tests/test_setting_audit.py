@@ -42,6 +42,42 @@ def test_setting_evidence_uses_shared_typed_identity():
     assert workflow_result_status({"result": {"status": "needs_evidence"}}) == "waiting_condition"
 
 
+def test_setting_review_decodes_only_its_own_shared_sources():
+    from inkflow.schemas import ModeCheckOutput, ContextUseAudit, SettingUseCheck
+    from inkflow.review_verifier import resolve_review_quote_refs
+    output = ModeCheckOutput(verdict="pass", confidence=1, summary="对照同一条记录",
+        context_use_audit=ContextUseAudit(setting_checks=[SettingUseCheck(record_id="setting-a",
+            record_revision=2, disposition="compatible", setting_quote="@quote:0",
+            chapter_quote="@quote:1", reason="对应本条人物")]))
+    quotes = {"@quote:0": {"source_id": "setting-a", "quote": "人物怕水。"},
+              "@quote:1": {"source_id": "当前正文", "quote": "他停在水边。"}}
+    decoded = resolve_review_quote_refs(output, quotes).context_use_audit.setting_checks[0]
+    assert decoded.setting_quote == "人物怕水。" and decoded.chapter_quote == "他停在水边。"
+    quotes["@quote:0"]["source_id"] = "setting-b"
+    assert resolve_review_quote_refs(output, quotes).context_use_audit.setting_checks[0].setting_quote == "@quote:0"
+
+
+def test_writer_note_budget_fits_current_handoff_and_does_not_reset_attempt(tmp_path):
+    from inkflow.schemas import ContextPacket, WriterNoteClarification, HookNote
+    from inkflow.trace import TraceRecorder
+    project = project_fixture(tmp_path)
+    chapter = project.db.get_chapter(10)
+    notes = {"chapter_version": chapter["version"], "hook_note": {"why_keep": "原有说明需要完整保留。" * 200}}
+    provider = ScriptedProvider([WriterNoteClarification(answers=["已核对原句"], corrected_hook_note=HookNote())])
+    settings = Settings()
+    engine = InkFlowEngine(provider, settings)
+    packet = ContextPacket(project_id=project.project_id, chapter_no=10, task="仅更正说明", sections=[], estimated_tokens=0)
+    trace = TraceRecorder(project.root, "note-budget", "full")
+    async def run():
+        first = await engine._clarify_writer_notes(project, notes, ["核对说明原句"], project.db.canonical_chapter_content(10), packet, trace)
+        second = await engine._clarify_writer_notes(project, notes, ["核对说明原句"], project.db.canonical_chapter_content(10), packet, trace)
+        return first, second
+    first, second = asyncio.run(run())
+    assert first["status"] == "answered" and second["reused"]
+    assert len(provider.calls) == 1
+    assert 2000 < provider.calls[0]["max_tokens"] <= settings.effective_output_tokens(8000, "writer")
+
+
 def test_rule_correction_requires_unique_old_rule_and_real_source():
     correction = SettingRuleCorrection(old_rule="旧要求", new_rule="新要求", reason="用户已改规模",
         source_id="OUTLINE.md", source_quote="完整的新要求")

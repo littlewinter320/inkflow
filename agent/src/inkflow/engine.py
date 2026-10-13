@@ -4011,13 +4011,15 @@ class InkFlowEngine:
         prompt += ("\n\n# 仅回答以下问题，保留有效说明，不改正文\n" + json_dumps(questions)
             + f"\n本次共{len(questions)}题，answers必须恰好{len(questions)}项并按原顺序逐题对应；说明中的条目不是额外问题。")
         _, hard_limit = self.settings.context_budget_for("writer")
-        if estimate_tokens(WRITER_NOTE_CLARIFICATION_SYSTEM + prompt) + min(2_000, self.settings.max_output_tokens) > hard_limit:
+        output_budget = self.settings.effective_output_tokens(
+            min(8_000, 1_200 + 2 * estimate_tokens(notes_prompt(notes)) + 300 * len(questions)), "writer")
+        if estimate_tokens(WRITER_NOTE_CLARIFICATION_SYSTEM + prompt) + output_budget > hard_limit:
             return {**data, "status": "context_budget_exhausted", "artifact_id": attempt["artifact_id"]}
         try:
             result = await self.provider.generate_json(
                 system_prompt=WRITER_NOTE_CLARIFICATION_SYSTEM, user_prompt=prompt,
                 output_model=WriterNoteClarification, agent_role="writer", effort="low",
-                max_tokens=min(2_000, self.settings.max_output_tokens), timeout_seconds=90, thinking=False,
+                max_tokens=output_budget, timeout_seconds=90, thinking=False,
             )
             reply = WriterNoteClarification.model_validate(result.data)
             trace.record_model("writer.note_clarification", result, "Writer说明短答已返回，核验题数和来源后采用")
@@ -4166,14 +4168,14 @@ class InkFlowEngine:
         })
         sources = packet_sources(packet)
         windows = {}
-        for source_id in ("OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md"):
+        for source_id in ("book:requirements", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md"):
             body = sources.get(source_id, "")
             heading = re.search(rf"第\s*{boundary}\s*章", body)
             start = max(0, heading.start() - 80) if heading else 0
             windows[source_id] = body[start:start + 2000]
         repair_prompt += ("\n\n# 当前来源的原文定位窗口（节选，完整资料仍在前文；不能把概述改写成引文）\n"
             + json_dumps(windows)
-            + "\n保留已核实的各来源对照，完整返回三份当前规划及紧邻前章的source_comparisons。"
+            + "\n保留已核实的各来源对照，完整返回book:requirements、三份当前规划及紧邻前章的source_comparisons。"
               "focus_observation的两句都只能逐字取当前正文，不能取规划；不得用一份文件的句子冒充另一份文件。")
         rejected_quotes = []
         focus = getattr(output, "focus_observation", None)
@@ -4196,6 +4198,8 @@ class InkFlowEngine:
                          if source_id.startswith(("chapter:", "batch:"))
                          and source_id.endswith(f"chapter:{boundary - 1:05d}")}
         quote_sources.update(prior_sources)
+        quote_sources.update({source_id: body for source_id, body in sources.items()
+                              if source_id.startswith("setting-record-")})
         for comparison in [*getattr(output, "source_comparisons", []), *output.assessments]:
             source_id = resolve_packet_source_id(comparison.source_id, sources)
             if source_id:
@@ -4209,8 +4213,9 @@ class InkFlowEngine:
                     if len(quote) >= 4:
                         quote_choices[f"@quote:{len(quote_choices)}"] = {"source_id": source_id, "quote": quote}
         repair_tail = repair_prompt[len(repair_prefix):]
-        choice_note = ("\n已提供可支持判断的片段时，source_evidence、chapter_evidence、goal_evidence、change_evidence及事实evidence必须填写对应@quote:编号，"
+        choice_note = ("\n已提供可支持判断的片段时，source_evidence、chapter_evidence、goal_evidence、change_evidence、setting_quote、chapter_quote及事实evidence必须填写对应@quote:编号，"
               "只选语义支持且source_id一致的片段；也可逐字摘录其他已读原文，不能填概述。"
+              "setting_quote必须属于当前record_id；chapter_quote必须属于当前正文，类似人物的行为不能代替本条对象的对照。"
               "填写source_evidence编号时，source_id必须逐字等于该编号记录的source_id；不要把RECENT_PLAN.md选项标成plan:chapter等另一个来源。"
             + ("当前角色负责记忆，memory_patch必须完整返回并修正候选引文，不能遗漏原有效交接。" if memory_required else ""))
         if prior_sources:

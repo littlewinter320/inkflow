@@ -42,6 +42,9 @@ def resolve_review_quote_refs(output: Any, quotes: dict[str, dict[str, str]]) ->
         allowed = item.get("canon_refs") or ["当前正文"]
         if entry and entry["source_id"] in allowed:
             item["reference_evidence"] = entry["quote"]
+    for check in data.get("context_use_audit", {}).get("setting_checks", []):
+        check["setting_quote"] = resolve(check["setting_quote"], check["record_id"])
+        check["chapter_quote"] = resolve(check["chapter_quote"], "当前正文")
     patch = data.get("memory_patch")
     if patch:
         def resolve_reference(item: dict[str, Any]) -> None:
