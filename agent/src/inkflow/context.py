@@ -1280,7 +1280,7 @@ class ContextBuilder:
         prefix_sections = [item for _, item in ordered if item.cache_scope in {"global", "book"}]
         prefix_hashes = {
             item.key: hashlib.sha256((
-                f"## {item.key}. {item.title}\n\n{item.content or '（无）'}\n\n"
+                f"## {item.key}. {item.title}\n\n{item.model_content()}\n\n"
                 f"来源：{', '.join(sorted(item.source_ids))}"
             ).encode("utf-8")).hexdigest()
             for item in prefix_sections
@@ -1360,7 +1360,7 @@ class ContextBuilder:
                 "changed_sections": changed_keys,
                 "first_changed_section": changed_keys[0] if changed_keys else None,
                 "reason": "首次记录该角色书籍段" if not old_hashes else ("书籍段内容、标题或来源已变化" if changed_keys else "书籍段未变化；还须对照调用记录中的模型、系统契约与前段输入指纹"),
-                "estimated_prefix_tokens": estimate_tokens("\n".join(item.content for item in prefix_sections)),
+                "estimated_prefix_tokens": estimate_tokens("\n".join(item.model_content() for item in prefix_sections)),
             },
             "prefix_history_by_role": prefix_history,
             "warnings": packet.warnings,

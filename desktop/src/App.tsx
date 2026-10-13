@@ -1093,10 +1093,11 @@ function App() {
         setActiveTab("editor");
       }
       if (isCurrent()) setOpeningDocumentPath(null);
-      if (item.chapter_no) {
+      const openedChapter = item.chapter_no || currentChapter(loaded.relative_path);
+      if (openedChapter) {
         const workspace = await window.inkflow.request<Record<string, unknown>>("chapter.workspace", {
           project_root: root,
-          chapter_no: item.chapter_no,
+          chapter_no: openedChapter,
         });
         if (isCurrent()) setChapterWorkspace(workspace);
       } else {

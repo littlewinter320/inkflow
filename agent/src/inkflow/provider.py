@@ -773,11 +773,11 @@ def _model_from_json_content(content: str, output_model: type[T]) -> T:
                     "context_use_audit": {},
                 }
                 try:
-                    return output_model.model_validate(wrapped)
+                    return output_model.model_validate(wrapped, context={"model_generation": True})
                 except ValidationError as exc:
                     last_validation = exc
         try:
-            return output_model.model_validate(candidate)
+            return output_model.model_validate(candidate, context={"model_generation": True})
         except ValidationError as exc:
             last_validation = exc
             errors = exc.errors(include_input=False)
@@ -786,7 +786,7 @@ def _model_from_json_content(content: str, output_model: type[T]) -> T:
                 pruned = _prune_extra_json_fields(candidate, root_schema, root_schema)
                 if pruned != candidate:
                     try:
-                        return output_model.model_validate(pruned)
+                        return output_model.model_validate(pruned, context={"model_generation": True})
                     except ValidationError as pruned_error:
                         last_validation = pruned_error
             # 模型有时会在合法结构外附带一两个顶层说明字段（例如
@@ -798,7 +798,7 @@ def _model_from_json_content(content: str, output_model: type[T]) -> T:
                 if known_fields and set(candidate) - known_fields:
                     trimmed = {key: value for key, value in candidate.items() if key in known_fields}
                     try:
-                        return output_model.model_validate(trimmed)
+                        return output_model.model_validate(trimmed, context={"model_generation": True})
                     except ValidationError as trimmed_error:
                         last_validation = trimmed_error
     assert last_validation is not None

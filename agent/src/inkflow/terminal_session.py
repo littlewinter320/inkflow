@@ -773,6 +773,7 @@ class TerminalSession:
                     or self._confirmed_planning_intent(text, self._pending_question(project))
                     or self._confirmed_question_intent(text, self._pending_question(project))
                     or self._deterministic_workflow_intent(text, project=project)
+                    or self._deterministic_single_chapter_review(text)
                     or self._deterministic_single_chapter_write(text)
                 )
                 if local_intent is not None:
@@ -1725,6 +1726,18 @@ class TerminalSession:
                 else f"直接生成第 {start_chapter}～{end_chapter} 章临时草稿，不进入正史。"
             ),
         )
+
+    @staticmethod
+    def _deterministic_single_chapter_review(text: str) -> TerminalIntent | None:
+        match = re.fullmatch(r"\s*(?:墨宝[，,\s]*)?(?:请|帮我)?(?:重新|再次)?(?:审查|审核|复核)(并(?:验收|接受|接收))?第\s*(\d+)\s*章(?:的?(?:当前|现有)?草稿)?[。！!\s]*", text)
+        if not match or int(match.group(2)) < 1:
+            return None
+        accepts = bool(match.group(1))
+        return TerminalIntent(action="review_accept" if accepts else "review", chapter_no=int(match.group(2)),
+            requested_outcome=text, operation_instruction=text, authorization="approved", confidence="high",
+            authorization_source="current_request", max_revision_rounds=0,
+            forbidden_actions=["write", "revise", *([] if accepts else ["accept"])],
+            visible_reason="只核对现有草稿与当前依据，通过后由引擎按本次授权接受。" if accepts else "只核对现有草稿与当前依据，不改正文、不接受。")
 
     @staticmethod
     def _deterministic_single_chapter_write(text: str) -> TerminalIntent | None:

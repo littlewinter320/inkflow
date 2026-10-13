@@ -110,7 +110,7 @@ from .schemas import (
     VoiceCloneReadingScript,
 )
 from .studio import StudioService, chapter_retry_state
-from .writer_notes import annotation_gaps, notes_hash, notes_prompt, recent_approved_notes, version_notes
+from .writer_notes import annotation_gaps, clarify_annotation_quotes, notes_hash, notes_prompt, recent_approved_notes, version_notes
 from .trace import TraceRecorder
 from .runtime import RunBudgetExceeded, active_runtime
 from .task_settings import TASK_SETTINGS_FIELDS, TaskSettingsError, active_task_settings, use_task_settings
@@ -2653,7 +2653,8 @@ class InkFlowEngine:
                 f"{int(int(card['target_words']) * (1 + self.settings.chapter_length_tolerance))}；"
                 "交稿前必须把正文写到该范围内，不能用提纲、说明或重复标题代替正文。\n"
                 f"本章创意镜头软建议：{creative_lens}。只有在不违背正史、章节卡和人物动机时采用；"
-                "它用于改变信息呈现方式，不得凭空增加事件。"
+                "它用于改变信息呈现方式，不得凭空增加事件。\n"
+                "创作说明的statement写解释，quote只能复制当前正文一处连续原句，不能填概述或拼合多句；无原句支持的设想标future或unknown。"
             )
             packet = self._context_builder(project, "writer").build(
                 chapter_no, task, mode="draft", provisional_chapters=provisional_chapters
@@ -3534,7 +3535,10 @@ class InkFlowEngine:
                     data = item["data"]
                     if (item["role"] == role
                             and item["status"] == "verified" and data.get("call_key") == call_key):
-                        candidate = ModeCheckOutput.model_validate(data["output"])
+                        try:
+                            candidate = ModeCheckOutput.model_validate(data["output"], context={"model_generation": True})
+                        except ValueError:
+                            continue
                         recovery = data.get("evidence_recovery", {})
                         gaps = recovery.get("remaining_gaps") or []
                         if (candidate.verdict == "unknown" and recovery.get("status") == "remaining_gaps"
@@ -3963,7 +3967,10 @@ class InkFlowEngine:
                         or previous["data"].get("story_fingerprint") != story_fingerprint):
                     return {"status": "attempt_limit", "artifact_id": previous["artifact_id"],
                             "reason": "同一正文已经追问过；说明变化不重置次数，保留问题供定向处理。"}
-                return {**previous["data"], "artifact_id": previous["artifact_id"], "reused": True}
+                reused = dict(previous["data"])
+                if isinstance(reused.get("reply"), dict):
+                    reused["reply"] = clarify_annotation_quotes(notes.get("hook_note", {}), reused.get("questions", []), reused["reply"], content)
+                return {**reused, "artifact_id": previous["artifact_id"], "reused": True}
             data = {"status": "attempted", "source_hash": body_hash,
                     "writer_notes_hash": notes_hash(notes), "story_fingerprint": story_fingerprint, "questions": questions}
             if manual_retry:
@@ -3972,7 +3979,12 @@ class InkFlowEngine:
                 artifact_type="writer_note_clarification", run_id=trace.run_id, role="writer",
                 chapter_no=chapter_no, chapter_version=notes["chapter_version"], data=data,
             )
-        prompt = packet.to_model_prompt() + "\n\n# 当前正文\n" + content + notes_prompt(notes)
+        # Intent clarification needs current prose and task rules, not the entire historical retrieval packet.
+        intent_packet = packet.model_copy(update={"sections": [section for section in packet.sections
+            if section.key in {"A", "A0", "C", "J", "J2"}]})
+        intent_packet.estimated_tokens = estimate_tokens("\n".join(section.model_content() for section in intent_packet.sections)
+                                                        + content + notes_prompt(notes))
+        prompt = intent_packet.to_model_prompt() + "\n\n# 当前正文\n" + content + notes_prompt(notes)
         prompt += ("\n\n# 仅回答以下问题，保留有效说明，不改正文\n" + json_dumps(questions)
             + f"\n本次共{len(questions)}题，answers必须恰好{len(questions)}项并按原顺序逐题对应；说明中的条目不是额外问题。")
         _, hard_limit = self.settings.context_budget_for("writer")
@@ -3988,7 +4000,12 @@ class InkFlowEngine:
             trace.record_model("writer.note_clarification", result, "Writer说明短答已返回，核验题数和来源后采用")
             if len(reply.answers) != len(questions):
                 raise ValueError("Writer未逐题回答，短答不能作为已解决问题")
-            data.update(status="answered", reply=reply.model_dump(mode="json"))
+            reply_data = clarify_annotation_quotes(notes.get("hook_note", {}), questions, reply.model_dump(mode="json"), content)
+            corrected_note = reply_data.get("corrected_hook_note") or notes.get("hook_note", {})
+            if annotation_gaps(corrected_note, content):
+                data.update(status="incomplete", reply=reply_data, reason="说明引文仍未定位；回答可定位不等于已经更正。")
+            else:
+                data.update(status="answered", reply=reply_data)
         except (RunBudgetExceeded, ValidationGateError):
             raise
         except Exception as exc:

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from .role_protocol import AgentRole, CollaborationMode, ROLE_PROTOCOL_VERSION, adapt_role, new_task_mode
 
@@ -856,6 +857,13 @@ class ModeCheckOutput(UnifiedRoleModel):
     hook_assessment: HookAssessment | None = None
     context_use_audit: ContextUseAudit = Field(default_factory=ContextUseAudit)
 
+    @model_validator(mode="after")
+    def consistent_generation_verdict(self, info: ValidationInfo) -> "ModeCheckOutput":
+        if (info.context and info.context.get("model_generation") and self.verdict == "patch"
+                and not self.findings and not (self.memory_patch and self.memory_patch.unresolved_conflicts)):
+            raise ValueError("审核标为需要修订，却没有列出问题。请核对本次结论：存在问题须给有据findings；资料不足用unknown；必要检查完成且没有问题用pass。返回memory_patch本身不表示正文需要修订。")
+        return self
+
 
 # Import-name compatibility only; no separate output contract or execution path.
 ReviewModelOutput = ModeCheckOutput
@@ -1021,6 +1029,38 @@ class ContextSection(StrictModel):
     # Unknown/new sources default to the dynamic tail, never the cache prefix.
     cache_scope: Literal["global", "book", "canon", "chapter", "request"] = "request"
 
+    def model_content(self) -> str:
+        """Keep source text intact while excluding duplicated operational diagnostics."""
+        try:
+            value = json.loads(self.content)
+        except (ValueError, TypeError):
+            return self.content or "（无）"
+        if self.key == "MEMORY" and isinstance(value, dict):
+            value.pop("query_input", None)
+            retrieval = value.get("retrieval")
+            if isinstance(retrieval, dict):
+                for key in ("query", "discarded", "discarded_display_limit", "branches", "overlaps", "selected", "source_reads"):
+                    retrieval.pop(key, None)
+        elif self.key == "WORK" and isinstance(value, list):
+            for work in value:
+                if not isinstance(work, dict):
+                    continue
+                if isinstance(work.get("source"), dict):
+                    work["source"].pop("failure_case", None)
+                if isinstance(work.get("progress"), dict):
+                    work["progress"].pop("original_node_receipts", None)
+        elif self.key == "F" and isinstance(value, dict):
+            for hit in value.get("自适应结果", []):
+                if not isinstance(hit, dict):
+                    continue
+                for key in ("score", "reranker_score", "retrieval_reasons", "entities"):
+                    hit.pop(key, None)
+                if hit.get("body_kind") == "accepted_prose" and hit.get("resolved_source"):
+                    for key in ("summary_body", "summary_content_hash", "summary_origin"):
+                        hit.pop(key, None)
+        # JSON whitespace is not source prose; strings, quotes and source identities remain exact.
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":")) if isinstance(value, (dict, list)) else self.content
+
 
 class ContextPacket(StrictModel):
     project_id: str
@@ -1066,7 +1106,7 @@ class ContextPacket(StrictModel):
 
         output = ["# 墨流编译上下文", ""]
         for _, section in sorted(enumerate(self.sections), key=priority):
-            output.extend([f"## {section.key}. {section.title}", "", section.content or "（无）", ""])
+            output.extend([f"## {section.key}. {section.title}", "", section.model_content(), ""])
             if section.source_ids:
                 output.extend([f"来源：{', '.join(sorted(section.source_ids))}", ""])
         output.extend([
