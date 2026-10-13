@@ -461,7 +461,8 @@ class ContextBuilder:
         craft_guides = select_craft_guides(task=task, genre=brief.genre, card=card, limit=1)
         plan_view = _plan_for_model(bundle, card)
         from .story_settings import StorySettingsService
-        setting_payload = StorySettingsService(self.project).context_payload(chapter_no=chapter_no, query=task, actor=self.actor)
+        setting_payload = StorySettingsService(self.project).context_payload(chapter_no=chapter_no, query=task, actor=self.actor,
+            max_chars=min(64000, max(1000, self.hard_token_limit // 8)))
         setting_context = json.dumps(setting_payload, ensure_ascii=False)
         sections = [
             ContextSection(key="A", title="当前任务与用户要求", content=task, hard=True),

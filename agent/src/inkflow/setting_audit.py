@@ -56,13 +56,14 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
         source_id = f"chapter:{chapter['chapter_no']:05d}"
         sources[source_id] = project.db.canonical_chapter_content(chapter["chapter_no"]) or ""
         canon.append(chapter["chapter_no"])
-    payload = service.context_payload(chapter_no=latest + 1, actor=role)
+    payload = service.context_payload(chapter_no=latest + 1, actor=role,
+        max_chars=min(64000, max(1000, engine.settings.context_budget_for(role)[1] // 8)))
     prompt = json_dumps({"当前书籍资料": brief.model_dump(mode="json"),
         "来源": {key: value for key, value in sources.items() if key != "近期对话·用户"}, "设定读取范围": payload,
         "正史事实": project.db.current_facts()[:128], "未结线索": project.db.open_threads()[:64],
         "范围说明": "正文只读取所列章节和有界正史记录；不可声称逐章审完全部小说。",
         "补充来源": {"近期对话·用户": sources["近期对话·用户"]},
-        "近期对话（区分用户原话与模型回复）": conversation_context, "用户目标": instruction})
+        "用户目标": instruction})
     record_capacity = min(8, 2 * sum(bool(item.get("recording_allowed")) for item in payload["collections"]))
     requested_output = 4096 + record_capacity * 1000 + min(4000, 2 * estimate_tokens(json_dumps(brief.user_rules)))
     output_budget = engine.settings.effective_output_tokens(requested_output, role)
@@ -78,12 +79,14 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
             "用户已明确改变的目标与过期规则冲突时，可在rule_corrections提出完整旧规则和完整新规则，保留其余未被取代的约束，"
             "每项给当前来源ID、连续原句及原因；不能仅凭模型偏好改规则或把规划假设当已发生事实。"
             "近期用户明确改过的目标优先于旧规则中的不可改写标签，不再次询问已确定选择；模型先前回复不等于用户批准。old_rule必须复制当前user_rules中完整的一条，new_rule只改过期部分、保留其他要求。"
+            "以本次当前书籍资料、设定coverage与records为现状；历史用户要求只用来确认选择，不把其中提及的旧问题误当作现在仍存在。索引已有对象必须沿record_id与revision更新；未装入不等于空合集。"
             "仅建议已有明确依据的书籍规则同步，不改规划或正文、不新增设定合集、不降低审核门禁。"
             "无法判断哪项仍有效时放入needs_choice，给差异明确的可选方向、推荐理由和影响；已有明确要求不再重复询问。"
             "实际需要选择时同时填写questions，复用结构化提问卡，每题2至4个具体options及description，最多一个recommended；不列只有其他的空选项卡。"
             "需要用户取舍的条目不能同时放入rule_corrections；无关疑问不能阻止其他有明确依据的修正。"
             "已有设定合集缺记录时，判断所给已接受正文中是否有值得持续追踪的对象；在setting_updates同次返回必要的首次建档或补充，每条有canonical来源章号和连续原句，epistemic_status用objective/belief/rumor。只提取已有文字，不凭空创造、不补满未知字段；已有同一对象复用record_id与expected_revision。没有有用资料就明确空缺。"
             "世界基础设定中的明确用户边界可从BOOK.md原句整理，epistemic_status=user_constraint、source_kind=planning、path=BOOK.md；用户约定不是已经发生的情节，不推测未写出的世界细节。"
+            "基础合集不要求所有字段填满：年代未说明，不代表已有背景、前提与边界都无法记录。缺什么字段就留空，只把有明确原句的部分保存。已有同名条目必须用其record_id和revision补充，不能当空合集再创建。"
             "summary和findings用自然中文解释具体问题和证据，不输出内部编号或长路径；不声称未执行的修改已完成。"),
             user_prompt=prompt + "\n报告保持精简：summary不超过400字，findings只列需处理的问题，不逐项复述正常情节。设定候选只填有用字段，每字段一两句，每条最多两处200字以内的连续原句；相同对象合并，不写重复长报告。",
             output_model=StorySettingsAudit, max_tokens=output_budget,
@@ -113,6 +116,15 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
         candidates = list(report.setting_updates)
         if changes and changes.get("after"):
             sources["BOOK.md"] = changes["after"]
+        if apply_corrections and not changes and allow_evidence_repair:
+            manual = ManualEditsService(project)
+            for job in manual.jobs().values():
+                if (job.get("relative_path") == "BOOK.md" and job.get("status") in {"pending", "failed"}
+                        and int(job.get("attempts", 0)) < 2 and job.get("current_hash") == content_hash(sources["BOOK.md"])):
+                    checked = await manual.review(job["job_id"], engine, resume=True)
+                    if checked.get("status") != "passed":
+                        rule_pending.append("当前书籍要求的原核对尚未通过：" + str(checked.get("summary") or "请查看该核对记录"))
+                    break
         invalid = []
         if apply_corrections:
             for index, candidate in enumerate(candidates):

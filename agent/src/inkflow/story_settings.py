@@ -418,6 +418,9 @@ class StorySettingsService:
             if actor != "user" and not collection.get("auto_record", True):
                 raise ProjectError("这项设定已关闭自动记录，已有内容仍可查看；本次未自动补写。")
             old = self._get(record_id, "record") if record_id else None
+            if actor in REVIEW_ROLES and old is None and any(
+                    item["title"] == (title or name).strip() for item in self.records(collection_id)):
+                raise ProjectError("这份设定已有同名条目，请读取其编号和修订号后补充；不会再新建重复记录。")
             if record_id and old is None and not re.fullmatch(r"setting-record-[A-Za-z0-9_-]{1,100}", record_id):
                 raise ProjectError("新增设定记录编号无效。")
             if record_id and ((old is None and operation != "new") or (old is not None and old["collection_id"] != collection_id)):
@@ -629,9 +632,11 @@ class StorySettingsService:
                     eligible.append(item)
             # User requirements must not lose their budget to ordinary references.
             eligible.sort(key=lambda item: (item.get("epistemic_status") != "user_constraint", item["title"].casefold() not in query))
+            audit["available_record_count"] = len(eligible)
+            audit["record_index"] = [{"record_id": item["record_id"], "title": item["title"], "revision": item["revision"]} for item in eligible[:32]]
             for item in eligible:
                 trial = {**payload, "records": [*payload["records"], item]}
-                if len(json_dumps(trial)) > remaining:
+                if len(json_dumps(trial, indent=None)) > remaining:
                     audit["omitted"].append({"record_id": item["record_id"], "title": item["title"],
                         "reason": "超过本次资料预算", "required": item.get("epistemic_status") == "user_constraint"})
                     continue
@@ -640,7 +645,7 @@ class StorySettingsService:
             audit["status"] = "loaded" if payload["records"] else "not_loaded" if eligible else "empty"
             if not eligible:
                 audit["reason"] = "本章范围内尚无具体内容；模板字段不算设定，也不算已审查。"
-            text = json_dumps(payload)
+            text = json_dumps(payload, indent=None)
             if len(text) <= remaining:
                 sections.append(payload)
                 remaining -= len(text)
@@ -649,7 +654,7 @@ class StorySettingsService:
             "coverage": coverage, "collections": sections}
 
     def context(self, chapter_no: int | None = None, query: str = "", actor: str = "writer", max_chars: int = 16000) -> str:
-        return json_dumps(self.context_payload(chapter_no, query, actor, max_chars))
+        return json_dumps(self.context_payload(chapter_no, query, actor, max_chars), indent=None)
 
     def impact_summary(self, collection_id: str | None = None) -> dict[str, Any]:
         collections = self.list_collections(include_archived=True)

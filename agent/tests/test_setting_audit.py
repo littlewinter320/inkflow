@@ -11,6 +11,23 @@ from inkflow.setting_audit import corrected_rules
 from setting_fixture import project_fixture
 
 
+def test_setting_missing_target_explains_actual_choice(tmp_path, monkeypatch):
+    from inkflow.terminal_session import TerminalSession
+    from inkflow.schemas import TerminalIntent
+    project = project_fixture(tmp_path)
+    engine = InkFlowEngine(ScriptedProvider([]), Settings())
+    async def missing_target(*args, **kwargs):
+        return {"status": "needs_input", "reason": "请选择需要补充的设定。",
+                "collections": [{"name": "人物设定"}, {"name": "世界设定"}]}
+    monkeypatch.setattr(engine, "manage_story_settings", missing_target)
+    result = asyncio.run(TerminalSession(engine)._dispatch(project.root,
+        TerminalIntent(action="story_settings_manage", visible_reason="补充指定设定", authorization="approved",
+            setting_change={"operation": "record_supplement"})))
+    assert result["reply"] == "请选择需要补充的设定。"
+    assert result["needs_clarification"]
+    assert [item["label"] for item in result["questions"][0]["options"]] == ["人物设定", "世界设定", "其他"]
+
+
 def test_setting_evidence_uses_shared_typed_identity():
     from pydantic import ValidationError
     from inkflow.utils import workflow_result_status

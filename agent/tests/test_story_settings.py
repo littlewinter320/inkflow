@@ -68,6 +68,19 @@ def test_base_settings_and_optional_recording_switch():
             values={"premise": "主角在旧城寻找失踪亲人的故事与线索。"}, epistemic_status="user_constraint", actor="editor",
             evidence_refs=[{"source_kind": "planning", "path": "BOOK.md", "quote": "主角在旧城寻找失踪亲人的故事与线索。"}])
         assert constraint["epistemic_status"] == "user_constraint" and project.db.current_facts() == []
+        try:
+            service.save_record(world["collection_id"], title="当前人物边界",
+                values=constraint["values"], epistemic_status="user_constraint", actor="editor",
+                evidence_refs=constraint["evidence_refs"])
+        except ProjectError as exc:
+            assert "同名条目" in str(exc)
+        else:
+            raise AssertionError("A missing record ID must not duplicate an existing reviewed object")
+        limited = service.context_payload(actor="editor", max_chars=1000)
+        world_coverage = next(item for item in limited["coverage"] if item["collection_id"] == world["collection_id"])
+        assert world_coverage["available_record_count"] == 1
+        assert world_coverage["record_index"][0]["record_id"] == constraint["record_id"]
+        assert world_coverage["status"] != "empty"
         for base in bases:
             try:
                 service.archive_collection(base["collection_id"], base["revision"])
