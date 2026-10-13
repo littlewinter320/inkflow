@@ -14,11 +14,13 @@ def corrected_rules(rules, corrections, sources):
     result = list(rules)
     seen = set()
     for correction in corrections:
-        if correction.old_rule in seen or rules.count(correction.old_rule) != 1:
-            raise ValidationGateError("待纠正的旧要求无法唯一定位，未改动书籍设定。")
         source = sources.get(correction.source_id, "")
         if not correction.source_quote.strip() or correction.source_quote not in source:
             raise ValidationGateError("设定纠正缺少当前依据的原句，未采用模型建议。")
+        if correction.old_rule not in rules and rules.count(correction.new_rule) == 1:
+            continue
+        if correction.old_rule in seen or rules.count(correction.old_rule) != 1:
+            raise ValidationGateError("待纠正的旧要求无法唯一定位，未改动书籍设定。")
         seen.add(correction.old_rule)
         result[rules.index(correction.old_rule)] = correction.new_rule
     return result

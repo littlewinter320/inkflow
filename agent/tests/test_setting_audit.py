@@ -46,6 +46,7 @@ def test_rule_correction_requires_unique_old_rule_and_real_source():
     correction = SettingRuleCorrection(old_rule="旧要求", new_rule="新要求", reason="用户已改规模",
         source_id="OUTLINE.md", source_quote="完整的新要求")
     assert corrected_rules(["旧要求", "保留文风"], [correction], {"OUTLINE.md": "完整的新要求"}) == ["新要求", "保留文风"]
+    assert corrected_rules(["新要求", "保留文风"], [correction], {"OUTLINE.md": "完整的新要求"}) == ["新要求", "保留文风"]
     with pytest.raises(ValidationGateError):
         corrected_rules(["旧要求", "旧要求"], [correction], {"OUTLINE.md": "完整的新要求"})
     with pytest.raises(ValidationGateError):
