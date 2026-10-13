@@ -75,8 +75,8 @@ TERMINAL_ROUTER_SYSTEM = """
 - outline：仅生成单层大纲或卷细纲时使用；全书大纲与逐卷细纲不同于逐章规划。旧版 outline 流程尚未迁移到新契约时应说明，不能把逐章摘要冒充全书大纲。
 - 项目已有正式三层规划时，改其大纲或卷细纲应选择 redesign_story，以上一章已接受正文为锚点，并审核受影响的三层后发布；独立旧入口不能直接覆盖生效的一层。只改近期窗口时仍通过正式链修订，不绕回旧数据库重排入口。
 - scene_draft：用户明确要试写一个场景、片段或短草稿时使用。只由 Writer 产出隔离候选，narrative_scope=scene，不覆盖章节正文，不审查、验收或入正史。
-- story_settings_manage：设定是持续维护的合集，可记录人物、场景、道具、世界等及自定义字段，不仅开书资料。由语义理解用户请求，不靠固定关键词。setting_change.operation 选择 collection_create/collection_update/collection_archive/record_generate/record_supplement/record_save/record_archive/list；可用collection_id或collection_name唯一定位，更新删除须读取当前revision作为expected_revision。用户定义name/category/template_id/instructions/fields。生成新的设定交Writer，补证纠正交当前审查或记忆所有者；你只提取目标与参数，不编写设定正文，不更改正史、不永久删除。若回答后台手动核对疑问，可用manual_decide，必须绑定上下文中的job_id与current_hash作为expected_hash，decision为keep_pending/request_revision/confirm_exception/discard_candidate，reason保留用户解释；只有具体解释可请求一次限次复核，简单同意不覆盖硬正史。不明确合集或取舍时只问必要问题；有据记录、创作假设、人物信念分别标注。
-- story_setting_edit：用户明确要求修改书籍设定、大纲或剧情细纲时使用。document_kind 为 book、outline 或 story_detail；book 的 setting_change 只填明确要改的 BookBrief 字段，大纲和细纲只填唯一原文 old_text 与替换文字 new_text。不要把“讨论怎么改”解释为执行，也不要修改已接受正文。
+- story_settings_manage：设定是持续维护的合集，可记录人物、场景、道具、世界等及自定义字段，不仅开书资料。由语义理解用户请求，不靠固定关键词。用户要求检查设定与规划、正文一致性时，使用operation=audit，不需要先选合集或提供替换原文。setting_change.apply_corrections仅在用户明确要求处理或整改时为true；只查看时为false。由实际审查角色读取资料、提出有据修正，Coordinator不能凭自己的概括代替审查。范围已说明时直接执行，不再把原话改写成确认题。其余setting_change.operation 选择 collection_create/collection_update/collection_archive/record_generate/record_supplement/record_save/record_archive/list；可用collection_id或collection_name唯一定位，更新删除须读取当前revision作为expected_revision。用户定义name/category/template_id/instructions/fields。生成新的设定交Writer，补证纠正交当前审查或记忆所有者；你只提取目标与参数，不编写设定正文，不更改正史、不永久删除。若回答后台手动核对疑问，可用manual_decide，必须绑定上下文中的job_id与current_hash作为expected_hash，decision为keep_pending/request_revision/confirm_exception/discard_candidate，reason保留用户解释；只有具体解释可请求一次限次复核，简单同意不覆盖硬正史。不明确合集或取舍时只问必要问题；有据记录、创作假设、人物信念分别标注。
+- story_setting_edit：用户明确要求修改书籍设定、大纲或剧情细纲时使用。document_kind 为 book、outline 或 story_detail；book 的 setting_change 只填明确要改的 BookBrief 字段；用户明确更改总字数、卷数或章节规模时，同时检查 user_rules 是否仍含旧要求，仅替换已明确被取代的部分并保留其余题材、人物与文风要求，不能只改 estimated_chapters 后继续把旧字数当硬规则；历史原话由版本记录保留，不冠以“不可改写”继续作为生效要求，大纲和细纲只填唯一原文 old_text 与替换文字 new_text。不要把“讨论怎么改”解释为执行，也不要修改已接受正文。
 - plan：近期章节安排，参考设定、独立大纲、剧情细纲与已写正文，再切分章节和字数；用户未指定范围时只展开接下来约三章。逐章场景安排属于计划，不是细纲。
 - 用户要求“理顺/修改几章的安排、别重复已发生的事”属于 plan。若随后要求“按新安排修好这些章节，检查后接收”，用 batch_draft_accept，并采用 latest_pending_plan_revision 给出的明确窗口；不得扩回旧批次更大的范围。计划任务本身不写正文。
 - plan_brief：当前篇章已全部进入正史后，让 Writer 先生成下一篇章的公开判断单。它只展示依据、约束、取舍、章节节拍和待核对风险，写入 planning/，不改 PLAN.md、正文或 SQLite；绝不要求或输出隐藏思维链。
@@ -115,7 +115,7 @@ alternative_action 只在两种理解确实都合理时填写；不要为了凑�
 confidence 表示语义识别把握：high=目标与动作清楚，medium=大意清楚但有轻微省略，low=两种以上理解都合理或关键指代不明。它不能作为绕过门禁的许可。
 authorization 表示当前话语行为：none=询问/讨论，proposed=提出可能方案或条件句，approved=明确要求现在执行或明确接受最近待确认方案。
 missing_fields 列出无法从本条消息、最近对话和项目状态可靠确定的必要字段；clarification_question 兼容只写一句最小澄清问题，无需让用户重述全部需求。
-更适合用选项回答时填写 clarification_questions：每问都要有简短 header、question、why_it_matters、single/multiple 选择方式和 2～4 个差异明确的 options；每个选项说明会怎样影响成品，最多标一个 recommended。不要自行添加“其他”，宿主会固定把自由填写放在最后。
+更适合用选项回答时填写 clarification_questions：每问都要有简短 header、question、why_it_matters、single/multiple 选择方式和 2～4 个差异明确的 options；每个选项说明会怎样影响成品，最多标一个 recommended。不要自行添加“其他”，宿主会固定把自由填写放在最后。创作选择须根据当前小说给出具体可行方向、推荐理由和取舍，不用“按主要理解/另一种理解”等空选项；已知范围与明确授权不得重复确认。确实只能由用户提供的原文或事实才用自由输入。
 若用户明确要求“先问我”“向我提问”或“帮我补全想法”，action=discuss，clarification_questions 应主动提出 1～3 个最有价值、容易回答的问题，conversation_reply 只说明为什么此时值得问；不要执行小说工作流。
 当存在可选但会明显改变成品的未知项时，可以填写 clarification_question。若当前消息是在回答上一轮问题，或用户明确说“直接开始/不用再问”，不要重复追问。
 checkpoint_id 与 confirmation_token 必须逐字复制用户输入；用户未提供时设为 null。
@@ -2898,6 +2898,8 @@ class TerminalSession:
                         "书名": brief.title,
                         "题材": brief.genre,
                         "单章目标字数": brief.target_chapter_words,
+                        "预计章节": brief.estimated_chapters,
+                        "预计卷数": brief.estimated_volumes,
                         "用户规则": brief.user_rules,
                     }
                 ),
@@ -3329,8 +3331,27 @@ class TerminalSession:
                 scene_packet, chapter_no=intent.chapter_no,
             )}
         if intent.action == "story_settings_manage":
-            return {"result": await self.engine.manage_story_settings(root, change=intent.setting_change,
-                instruction=intent.operation_instruction or intent.user_message)}
+            result = await self.engine.manage_story_settings(root, change=intent.setting_change,
+                instruction=intent.operation_instruction or intent.user_message,
+                conversation_context="\n".join(section.content for section in (packet.sections if packet else []) if section.key == "F"))
+            response = {"result": result}
+            if intent.setting_change.get("operation") == "audit":
+                lines = [result["summary"], *result.get("findings", [])]
+                coverage = result.get("coverage", {})
+                chapters = coverage.get("canonical_chapters", [])
+                if chapters:
+                    lines.append("正文对照范围：第 " + "、".join(map(str, chapters)) + " 章，另参考现有正史记录；未逐章审查全书正文。")
+                for collection in coverage.get("settings", []):
+                    count = len(collection.get("selected_record_ids", []))
+                    lines.append(f"{collection['name']}：{f'读取了 {count} 条具体记录' if count else '本次没有可核对的具体条目，未计作审查通过'}。")
+                lines.extend(result.get("needs_choice", []))
+                response["reply"] = "\n\n".join(lines)
+                if result.get("questions"):
+                    from .schemas import ClarificationQuestion
+                    choices = intent.model_copy(update={"clarification_questions": [
+                        ClarificationQuestion.model_validate(item) for item in result["questions"]]})
+                    response.update(needs_clarification=True, status="waiting_user", questions=self._question_cards(choices))
+            return response
         if intent.action == "story_setting_edit":
             if intent.document_kind not in {"book", "outline", "story_detail"}:
                 return {"gate": "请明确要修改书籍设定、大纲还是剧情细纲；不会猜测修改范围。"}

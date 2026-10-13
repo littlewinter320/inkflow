@@ -51,6 +51,10 @@ class InkFlowProject:
                 self.recovery_warnings.append(warning)
         self.db.reconcile_collaboration_queue()
         self.reconcile_pending_work()
+        if not self.db.get_metadata("base_story_settings_initialized", False):
+            from .story_settings import StorySettingsService
+            StorySettingsService(self).ensure_defaults()
+            self.db.set_metadata("base_story_settings_initialized", True)
 
     def pending_work(self, *, chapter_no: int | None = None, include_rejected: bool = False) -> list[dict[str, Any]]:
         with self.db.connect() as connection:

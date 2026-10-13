@@ -561,6 +561,23 @@ class SettingRecordSet(StrictModel):
     records: list[SettingRecordProposal] = Field(min_length=1, max_length=8)
 
 
+class SettingRuleCorrection(StrictModel):
+    old_rule: str = Field(min_length=1)
+    new_rule: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    source_id: str = Field(min_length=1)
+    source_quote: str = Field(min_length=4)
+
+
+class StorySettingsAudit(StrictModel):
+    summary: str = Field(min_length=1, max_length=2400)
+    findings: list[str] = Field(default_factory=list, max_length=12)
+    rule_corrections: list[SettingRuleCorrection] = Field(default_factory=list, max_length=8)
+    needs_choice: list[str] = Field(default_factory=list, max_length=3)
+    setting_updates: list[SettingRecordProposal] = Field(default_factory=list, max_length=8)
+    questions: list["ClarificationQuestion"] = Field(default_factory=list, max_length=3)
+
+
 class DraftOutput(StrictModel):
     setting_updates: list[SettingRecordProposal] = Field(default_factory=list, max_length=8)
     title: str
@@ -725,6 +742,15 @@ class ReviewScoreDimension(StrictModel):
     deductions: list[ReviewFinding] = Field(default_factory=list)
 
 
+class SettingUseCheck(StrictModel):
+    record_id: str = Field(min_length=1)
+    record_revision: int | None = Field(default=None, ge=1)
+    disposition: Literal["compatible", "conflict", "not_applicable", "needs_evidence"]
+    setting_quote: str = Field(min_length=1, max_length=400)
+    chapter_quote: str = Field(default="", max_length=400)
+    reason: str = Field(min_length=1, max_length=500)
+
+
 class ContextUseAudit(StrictModel):
     """Reviewer 对 Writer 是否正确使用上下文的公开核对结果。"""
 
@@ -732,6 +758,7 @@ class ContextUseAudit(StrictModel):
     missing_required_source_ids: list[str] = Field(default_factory=list)
     conflicting_source_ids: list[str] = Field(default_factory=list)
     summary: str = ""
+    setting_checks: list[SettingUseCheck] = Field(default_factory=list)
 
 
 class ReviewFocusObservation(StrictModel):
@@ -1519,3 +1546,4 @@ class ClarificationQuestion(StrictModel):
 
 ReviewReport.model_rebuild()
 ModeCheckOutput.model_rebuild()
+StorySettingsAudit.model_rebuild()

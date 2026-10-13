@@ -512,16 +512,24 @@ class InkFlowEngine:
             try:
                 candidate=SettingRecordProposal.model_validate(data)
                 args=candidate.model_dump()
+                for ref in args["evidence_refs"]:
+                    if ref.get("source_kind") == "draft" and ref.get("chapter_no") == chapter_no:
+                        ref.update(source_kind="canonical", source_version=chapter_version,
+                                   source_hash=chapter["content_hash"])
+                existing = None
                 if actor=="writer":
                     if candidate.record_id:
                         raise ValidationGateError("Writer同次交稿只能另建设定候选，不能覆盖已核记录。")
+                if not candidate.record_id:
                     args["record_id"]="setting-record-"+content_hash(json_dumps({"chapter":chapter_no,"version":chapter_version,"candidate":data,"actor":actor}))[:32]
                     existing = next((record for record in service.records(candidate.collection_id,include_archived=True)
                                      if record["record_id"] == args["record_id"]), None)
                     if existing and (existing["status"] == "archived" or existing["values"] != candidate.values):
                         raise ValidationGateError("原设定候选在提交后已被修改或留档，未按旧提案覆盖；请定点核对。")
-                record=service.save_record(**args,actor=actor,operation="new" if actor=="writer" else "supplement",chapter_no=chapter_no)
+                record=existing or service.save_record(**args,actor=actor,operation="new" if not candidate.record_id else "supplement",chapter_no=chapter_no)
                 applied.append(record["record_id"])
+                if existing and existing["status"] == "verified_reference":
+                    continue
                 if actor != "writer" or index + 1 in approved_writer_indices:
                     # Reuse the same-version review of the public handoff; this certifies a reference, never canon.
                     service.record_review(record["record_id"], expected_revision=record["revision"],
@@ -535,13 +543,17 @@ class InkFlowEngine:
                 warnings.append(f"设定参考候选{index+1}待处理：{exc}")
         return {"record_ids":applied,"warnings":warnings,"authority":"reference_only"}
 
-    async def manage_story_settings(self, root, *, change, instruction=""):
+    async def manage_story_settings(self, root, *, change, instruction="", conversation_context=""):
         from .story_settings import StorySettingsService
         from .manual_edits import ManualEditsService
         from .schemas import SettingRecordSet
         project = InkFlowProject(root)
         service = StorySettingsService(project)
         operation = change.get("operation", "list")
+        if operation == "audit":
+            from .setting_audit import audit_story_settings
+            return await audit_story_settings(self, project, instruction=instruction,
+                apply_corrections=change.get("apply_corrections") is True, conversation_context=conversation_context)
         if operation == "manual_decide":
             job_id = str(change.get("job_id") or "")
             job = ManualEditsService(project).jobs().get(job_id)
@@ -560,7 +572,7 @@ class InkFlowEngine:
                 return {"status":"needs_input","reason":"请从设定合集列表选择唯一目标。","collections":collections}
             collection_id = matches[0]["collection_id"]
         if operation in {"collection_create","collection_update"}:
-            allowed={"name","template_id","category","instructions","fields","read_roles","write_roles","expected_revision"}
+            allowed={"name","template_id","category","instructions","fields","read_roles","write_roles","expected_revision","auto_record"}
             args={key:change[key] for key in allowed if key in change}
             if operation == "collection_update":
                 args["collection_id"] = collection_id
@@ -609,14 +621,18 @@ class InkFlowEngine:
         if operation=="record_supplement" and not change.get("record_id"):
             return {"status":"needs_input","reason":"请选择需要补证或纠正的记录；新创作设定交Writer建立候选。","records":collection["records"]}
         reference_text=service.context(actor=canonical_role,max_chars=16000)
+        reference_text += "\n当前书籍要求：\n" + json_dumps(project.db.get_brief().model_dump(mode="json"))
+        plan = project.db.get_current_plan_bundle()
+        if plan:
+            reference_text += "\n当前规划（未来假设，不是已发生事实）：\n" + plan.model_dump_json()
         if operation=="record_supplement":
             selected_record = next((record for record in collection["records"] if record["record_id"] == change.get("record_id")), None)
             if not selected_record:
                 return {"status":"needs_input", "reason":"目标设定记录不存在或已移出使用，请选择当前记录。"}
             reference_text += "\n指定记录的当前字段与修订号：\n" + json_dumps({key:value for key,value in selected_record.items() if key not in {"history","updated_at"}})
-            reference_text+="\n当前正史事实与伏笔：\n"+json_dumps({"facts":project.db.current_facts()[:128],"threads":project.db.open_threads()[:64]})
-            for item in project.db.accepted_chapters()[-3:]:
-                reference_text+=f"\n已接受第{item['chapter_no']}章 {item['path']}：\n"+(project.db.canonical_chapter_content(int(item["chapter_no"])) or "")[:10000]
+        reference_text+="\n当前正史事实与伏笔：\n"+json_dumps({"facts":project.db.current_facts()[:128],"threads":project.db.open_threads()[:64]})
+        for item in project.db.accepted_chapters()[-3:]:
+            reference_text+=f"\n已接受第{item['chapter_no']}章 {item['path']}：\n"+(project.db.canonical_chapter_content(int(item["chapter_no"])) or "")[:10000]
         setting_prompt=reference_text+"\n指定合集：\n"+json_dumps({key:value for key,value in collection.items() if key not in {"history","records"}})+"\n本次操作：\n"+json_dumps(change)+"\n用户原话：\n"+instruction
         from .utils import estimate_tokens
         if estimate_tokens(setting_prompt)+5000>self.settings.context_budget_for(model_role)[1]:
@@ -652,7 +668,8 @@ class InkFlowEngine:
                 "canon_changed":False,"summary":"已保存条目与未完成条目分别列出；设定只作参考，原文引用与语义审查分开，不自动写成正史。"}
 
     async def edit_story_setting(self, root: str | Path, *, document_kind: str,
-                                 setting_change: dict[str, Any], instruction: str = "") -> dict[str, Any]:
+                                 setting_change: dict[str, Any], instruction: str = "",
+                                 expected_book_hash: str | None = None) -> dict[str, Any]:
         """Apply only an explicit, version-checked setting edit; never edit accepted prose."""
         project = InkFlowProject(root)
         targets = {"book": "BOOK.md", "outline": "OUTLINE.md", "story_detail": "STORY_DETAIL.md"}
@@ -664,6 +681,8 @@ class InkFlowEngine:
             if not path.is_file():
                 raise ValidationGateError(f"设定文件 {relative} 不存在，未创建替代版本。")
             old_text = path.read_text(encoding="utf-8")
+            if expected_book_hash is not None and content_hash(old_text) != expected_book_hash:
+                raise ValidationGateError("书籍资料在检查后发生变化，未将旧建议覆盖当前版本。")
             studio = StudioService(project)
             if document_kind == "book":
                 allowed = set(BookBrief.model_fields)
@@ -8416,7 +8435,11 @@ def _review_evidence_gaps(output: Any, content: str, packet: ContextPacket, *, p
     boundary = source_boundary if source_boundary is not None else packet.chapter_no
     gaps = [f"待补来源：{value}" for value in output.missing_source_ids]
     if primary:
+        from .review_verifier import setting_review_gaps
+        gaps.extend(setting_review_gaps(output, content, packet))
         comparisons = anchored_comparisons(output.source_comparisons, content, packet)
+        if "book:requirements" in sources and not any(item.source_id == "book:requirements" for item in comparisons):
+            gaps.append("尚未用具体原句对照当前书籍要求，不能只检查章节卡而漏掉全书约束")
         scope = active_task_settings.get()
         deferred = {"readability"} if isinstance(output, ModeCheckOutput) and scope is not None and check_owners_for_mode(scope.collaboration_mode).get("expression") else set()
         _, _, errors = score_review(output.assessments,

@@ -200,6 +200,9 @@ class ManualEditsService:
         self.project.db.set_metadata("manual_edit_jobs", jobs)
 
     def collection_changed(self, previous, current):
+        from .story_settings import collection_requires_recheck
+        if previous and not collection_requires_recheck(current, previous["revision"]):
+            return
         if not previous or not current.get("changed") or not any(previous.get(key) != current.get(key)
                 for key in ("instructions", "fields", "read_roles", "write_roles")):
             return
@@ -333,6 +336,9 @@ class ManualEditsService:
                 record = next((item for item in (collection or {}).get("records", []) if item["record_id"] == record_id), None)
                 if not record or record["revision"] != job["record_revision"]:
                     raise ValidationGateError("设定记录在核对开始前已变化，未发送旧候选。")
+                from .story_settings import has_setting_content
+                if not has_setting_content(record.get("values")):
+                    raise ValidationGateError("这条设定还没有具体内容，请先填写；没有调用模型审查空条目。")
                 if canonical_role not in collection["read_roles"]:
                     raise ValidationGateError("当前审核角色没有读取这份设定的权限；请明确调整权限或选择已启用的审核职责。")
             if job["kind"] != "setting_record":
@@ -368,7 +374,7 @@ class ManualEditsService:
                     estimated_tokens=0)
                 plan_bundle = self.project.db.get_current_plan_bundle()
                 plan_text = plan_bundle.model_dump_json() if plan_bundle else ""
-                planning_required = job["kind"] == "setting_document" and bool(plan_bundle)
+                planning_required = job["kind"] in {"setting_document", "setting_record"} and bool(plan_bundle)
                 structural_gap = planning_required and (job["relative_path"] in {"PLAN.md", "RECENT_PLAN.md"}
                     or (job["relative_path"] in {"OUTLINE.md", "STORY_DETAIL.md"}
                         and (self.project.root / "planning" / "active-v2.json").is_file()))

@@ -461,11 +461,13 @@ class ContextBuilder:
         craft_guides = select_craft_guides(task=task, genre=brief.genre, card=card, limit=1)
         plan_view = _plan_for_model(bundle, card)
         from .story_settings import StorySettingsService
-        setting_context = StorySettingsService(self.project).context(chapter_no=chapter_no, query=task, actor=self.actor)
+        setting_payload = StorySettingsService(self.project).context_payload(chapter_no=chapter_no, query=task, actor=self.actor)
+        setting_context = json.dumps(setting_payload, ensure_ascii=False)
         sections = [
             ContextSection(key="A", title="当前任务与用户要求", content=task, hard=True),
             ContextSection(key="CSET", title="用户定制设定：创作假设与证据参考（非正史）",
-                           content=setting_context, hard=False, cache_scope="chapter"),
+                           content=setting_context, hard=True, cache_scope="chapter",
+                           source_ids=[record["record_id"] for collection in setting_payload["collections"] for record in collection["records"]]),
             *outline_sections(self.project.root, chapter_no, chapter_no),
             ContextSection(
                 key="A0",
@@ -643,7 +645,9 @@ class ContextBuilder:
                     {
                         "题材": brief.genre,
                         "读者": brief.target_audience,
-                        "目标字数": brief.target_chapter_words,
+                        "单章目标字数": brief.target_chapter_words,
+                        "全书预计章节": brief.estimated_chapters,
+                        "全书预计卷数": brief.estimated_volumes,
                         "核心卖点": brief.core_selling_point,
                         "本书硬规则": brief.user_rules,
                         "强制记忆": forced_texts,
@@ -652,7 +656,7 @@ class ContextBuilder:
                     ensure_ascii=False,
                     indent=2,
                 ),
-                source_ids=[str(item["preference_id"]) for item in forced_preferences],
+                source_ids=["book:requirements", *[str(item["preference_id"]) for item in forced_preferences]],
                 hard=True,
                 cache_scope="book",
             ),

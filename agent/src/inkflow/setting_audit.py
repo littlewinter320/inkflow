@@ -1,0 +1,152 @@
+"""On-demand settings diagnosis through the existing editor and versioned edit service."""
+from __future__ import annotations
+
+from .errors import ValidationGateError
+from .role_protocol import check_owners_for_mode
+from .schemas import StorySettingsAudit
+from .story_settings import StorySettingsService
+from .task_settings import active_task_settings
+from .utils import content_hash, estimate_tokens, json_dumps
+
+
+def corrected_rules(rules, corrections, sources):
+    result = list(rules)
+    seen = set()
+    for correction in corrections:
+        if correction.old_rule in seen or rules.count(correction.old_rule) != 1:
+            raise ValidationGateError("待纠正的旧要求无法唯一定位，未改动书籍设定。")
+        source = sources.get(correction.source_id, "")
+        if not correction.source_quote.strip() or correction.source_quote not in source:
+            raise ValidationGateError("设定纠正缺少当前依据的原句，未采用模型建议。")
+        seen.add(correction.old_rule)
+        result[rules.index(correction.old_rule)] = correction.new_rule
+    return result
+
+
+async def audit_story_settings(engine, project, *, instruction, apply_corrections=False, conversation_context=""):
+    from .manual_edits import ManualEditsService
+    from .trace import TraceRecorder
+    scope = active_task_settings.get()
+    owners = check_owners_for_mode(scope.collaboration_mode if scope else "everyday")
+    role = owners.get("general") or owners.get("logic_continuity")
+    service = StorySettingsService(project)
+    brief = project.db.get_brief()
+    latest = project.db.latest_accepted_chapter_no()
+    before = engine._planning_source_fingerprint(project, 1, max(1, latest + 1))
+    sources = {name: (project.root / name).read_text(encoding="utf-8")
+               for name in ("BOOK.md", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md")
+               if (project.root / name).is_file()}
+    from .terminal_session import TerminalSession
+    def user_history():
+        return "\n\n".join(item["user"] for item in TerminalSession.history(project.root, limit=20))[-12000:]
+    sources["近期对话·用户"] = user_history()
+    from .context import named_prior_chapters
+    accepted = project.db.accepted_chapters()
+    named = named_prior_chapters(sources.get("RECENT_PLAN.md", ""), latest + 1, set())
+    selected = list(accepted[-3:])
+    selected_numbers = {item["chapter_no"] for item in selected}
+    by_number = {item["chapter_no"]: item for item in accepted}
+    for number in named:
+        if number in by_number and number not in selected_numbers and len(selected) < 6:
+            selected.append(by_number[number])
+            selected_numbers.add(number)
+    canon = []
+    for chapter in sorted(selected, key=lambda item: item["chapter_no"]):
+        source_id = f"chapter:{chapter['chapter_no']:05d}"
+        sources[source_id] = project.db.canonical_chapter_content(chapter["chapter_no"]) or ""
+        canon.append(chapter["chapter_no"])
+    payload = service.context_payload(chapter_no=latest + 1, actor=role)
+    prompt = json_dumps({"用户目标": instruction, "近期对话（区分用户原话与模型回复）": conversation_context,
+        "当前书籍资料": brief.model_dump(mode="json"),
+        "来源": sources, "设定读取范围": payload,
+        "正史事实": project.db.current_facts()[:128], "未结线索": project.db.open_threads()[:64],
+        "范围说明": "正文只读取所列章节和有界正史记录；不可声称逐章审完全部小说。"})
+    if estimate_tokens(prompt) + 6000 > engine.settings.context_budget_for(role)[1]:
+        raise ValidationGateError("本次设定与规划超过当前审核角色的资料预算，请缩小检查范围。")
+    trace = TraceRecorder(project.root, "setting-audit", engine.settings.trace_level)
+    try:
+        result = await engine.provider.generate_json(system_prompt=(
+            "你是当前设定审查责任角色。先阅读实际资料，主动比较书籍要求、正式规划和正文依据，不等待用户告诉你错误位置。"
+            "区分书籍要求、模板、具体设定参考与正史事实；空合集只报告尚未填写，不冒充审查通过，也不强行填满不必要的分类。"
+            "用户已明确改变的目标与过期规则冲突时，可在rule_corrections提出完整旧规则和完整新规则，保留其余未被取代的约束，"
+            "每项给当前来源ID、连续原句及原因；不能仅凭模型偏好改规则或把规划假设当已发生事实。"
+            "近期用户明确改过的目标优先于旧规则中的不可改写标签，不再次询问已确定选择；模型先前回复不等于用户批准。old_rule必须复制当前user_rules中完整的一条，new_rule只改过期部分、保留其他要求。"
+            "仅建议已有明确依据的书籍规则同步，不改规划或正文、不新增设定合集、不降低审核门禁。"
+            "无法判断哪项仍有效时放入needs_choice，给差异明确的可选方向、推荐理由和影响；已有明确要求不再重复询问。"
+            "实际需要选择时同时填写questions，复用结构化提问卡，每题2至4个具体options及description，最多一个recommended；不列只有其他的空选项卡。"
+            "需要用户取舍的条目不能同时放入rule_corrections；无关疑问不能阻止其他有明确依据的修正。"
+            "已有设定合集缺记录时，判断所给已接受正文中是否有值得持续追踪的对象；在setting_updates同次返回必要的首次建档或补充，每条有canonical来源章号和连续原句，epistemic_status用objective/belief/rumor。只提取已有文字，不凭空创造、不补满未知字段；已有同一对象复用record_id与expected_revision。没有有用资料就明确空缺。"
+            "summary和findings用自然中文解释具体问题和证据，不输出内部编号或长路径；不声称未执行的修改已完成。"),
+            user_prompt=prompt, output_model=StorySettingsAudit, max_tokens=min(6000, engine.settings.max_output_tokens),
+            thinking=False, agent_role=role)
+        trace.record_model("settings.audit", result, "设定审查返回，核对当前来源与修正范围")
+        if (before != engine._planning_source_fingerprint(project, 1, max(1, latest + 1))
+                or sources["近期对话·用户"] != user_history()):
+            raise ValidationGateError("检查期间设定或规划发生变化，结论已留档，未覆盖当前资料。")
+        report = result.data
+        changes = None
+        rule_pending = []
+        if apply_corrections and report.rule_corrections:
+            try:
+                rules = corrected_rules(brief.user_rules, report.rule_corrections, sources)
+                changes = await engine.edit_story_setting(project.root, document_kind="book",
+                    setting_change={"user_rules": rules}, instruction=instruction,
+                    expected_book_hash=content_hash(sources.get("BOOK.md", "")))
+                job = changes.get("manual_review")
+                if job and job.get("job_id"):
+                    changes["verification"] = await ManualEditsService(project).review(job["job_id"], engine)
+            except ValidationGateError as exc:
+                rule_pending.append(str(exc))
+        adopted, pending = [], rule_pending
+        if apply_corrections:
+            for candidate in report.setting_updates:
+                try:
+                    args = candidate.model_dump()
+                    args["evidence_refs"] = service._evidence(candidate.evidence_refs)
+                    for ref in args["evidence_refs"]:
+                        source_id = f"chapter:{int(ref.get('chapter_no', 0)):05d}"
+                        if (ref.get("source_kind") != "canonical" or not ref.get("quote")
+                                or ref["quote"] not in sources.get(source_id, "")
+                                or project.db.canonical_chapter_content(int(ref["chapter_no"])) != sources[source_id]):
+                            raise ValidationGateError("设定引文没有绑定本次实际读取且仍有效的正文")
+                    record = service.save_record(**args, actor=role,
+                        operation="supplement" if candidate.record_id else "new")
+                    if role == owners["memory"]:
+                        service.record_review(record["record_id"], record["revision"], actor=role,
+                            decision="verified_reference", source_fingerprint=service.source_fingerprint())
+                    else:
+                        manual = ManualEditsService(project)
+                        job = manual.enqueue("story-setting:" + record["record_id"], json_dumps(record),
+                            kind="setting_record", record_revision=record["revision"])
+                        checked = await manual.review(job["job_id"], engine)
+                        if checked.get("status") != "passed":
+                            pending.append(f"《{record['title']}》已记录，等待当前记忆责任角色完成核对")
+                            continue
+                    adopted.append({"title": record["title"], "record_id": record["record_id"], "evidence_refs": record["evidence_refs"]})
+                except Exception as exc:
+                    pending.append(f"《{candidate.title}》尚未保存通过：{exc}")
+        status = "needs_input" if report.needs_choice else "needs_evidence" if pending else "reviewed"
+        if changes:
+            status = "corrected" if (changes.get("verification") or {}).get("status") == "passed" else "needs_evidence"
+        if pending:
+            status = "needs_evidence"
+        if report.needs_choice or report.questions:
+            status = "needs_input"
+        summary = report.summary
+        if changes:
+            summary += "\n" + ("已同步过期的书籍要求，并核对了当前规划。" if (changes.get("verification") or {}).get("status") == "passed" else "书籍要求已保存修订，仍需完成其与当前规划的核对。")
+        elif report.rule_corrections:
+            summary += "\n已找到需要同步的要求，本次尚未写回。"
+        if adopted:
+            summary += "\n已根据原文整理设定：" + "、".join(item["title"] for item in adopted) + "；每条都保存了来源章节、原句和版本。"
+        if pending:
+            summary += "\n" + "；".join(pending)
+        trace.finish(summary=summary)
+        return {"status": status, "summary": summary, "findings": report.findings,
+                "needs_choice": report.needs_choice, "changes": changes, "adopted_settings": adopted, "pending_settings": pending,
+                "questions": [question.model_dump(mode="json") for question in report.questions],
+                "coverage": {"documents": list(sources), "canonical_chapters": canon,
+                             "settings": payload["coverage"]}, "trace_id": trace.run_id}
+    except Exception as exc:
+        trace.finish(status="failed", summary=str(exc))
+        raise

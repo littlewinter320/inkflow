@@ -929,11 +929,11 @@ class InkFlowAppService:
             if method == "story_settings.templates":
                 return {"templates": service.templates()}
             if method == "story_settings.list":
-                return {"collections": service.list_collections(include_archived=bool(params.get("include_archived")))}
+                return {"collections": service.list_collections(include_archived=bool(params.get("include_archived")), include_review_links=True)}
             if method == "story_settings.records":
                 return {"records": service.records(str(params["collection_id"]),include_archived=bool(params.get("include_archived")))}
             if method == "story_settings.save":
-                allowed = {"collection_id","template_id","name","category","instructions","fields","read_roles","write_roles","expected_revision"}
+                allowed = {"collection_id","template_id","name","category","instructions","fields","read_roles","write_roles","expected_revision","auto_record"}
                 old = next((item for item in service.list_collections()
                     if item["collection_id"] == params.get("collection_id")), None)
                 result = await asyncio.to_thread(service.save_collection, **{key:params[key] for key in allowed if key in params})

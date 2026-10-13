@@ -86,6 +86,16 @@ def restore_review_quote_choices(registry: dict[str, dict[str, str]], sources: d
 def packet_sources(packet: ContextPacket) -> dict[str, str]:
     sources: dict[str, str] = {}
     for section in packet.sections:
+        if section.key == "CSET":
+            try:
+                payload = json.loads(section.content)
+            except ValueError:
+                continue
+            for collection in payload.get("collections", []):
+                for record in collection.get("records", []):
+                    if record["record_id"] in section.source_ids:
+                        sources[record["record_id"]] = json.dumps(record["values"], ensure_ascii=False)
+            continue
         if section.key in {"B2", "E0"}:
             try:
                 payload = json.loads(section.content)
@@ -141,6 +151,43 @@ def packet_sources(packet: ContextPacket) -> dict[str, str]:
             scoped = chapter_chunks.get(int(chapter_match.group(1))) if chapter_match else None
             sources[ref] = sources.get(ref, "") + "\n" + (scoped or section.content)
     return sources
+
+
+def setting_review_gaps(output: Any, content: str, packet: ContextPacket) -> list[str]:
+    """Require a source-bound readback, never infer that a tool call read a setting."""
+    section = next((item for item in packet.sections if item.key == "CSET"), None)
+    if section is None:
+        return []
+    try:
+        payload = json.loads(section.content)
+    except ValueError:
+        return ["设定资料格式无法读取，尚不能确认核对范围"]
+    records = {record["record_id"]: record for collection in payload.get("collections", [])
+               for record in collection.get("records", [])}
+    checks = getattr(output.context_use_audit, "setting_checks", [])
+    seen, gaps = set(), []
+    for check in checks:
+        record = records.get(check.record_id)
+        if record is None or check.record_id in seen:
+            gaps.append("设定核对包含未装入或重复的条目；空模板不能记作已审核")
+            continue
+        seen.add(check.record_id)
+        if check.record_revision != record.get("revision"):
+            gaps.append(f"设定《{record['title']}》核对的修订号与本次读取不一致")
+        values = json.dumps(record["values"], ensure_ascii=False)
+        if not check.setting_quote.strip() or not evidence_matches(check.setting_quote, values):
+            gaps.append(f"设定《{record['title']}》的核对原句未定位")
+        if check.disposition in {"compatible", "conflict"} and (
+                not check.chapter_quote.strip() or not evidence_matches(check.chapter_quote, content)):
+            gaps.append(f"设定《{record['title']}》缺少本章对照原句")
+        if check.disposition in {"conflict", "needs_evidence"}:
+            gaps.append(f"设定《{record['title']}》仍待核对：{check.reason}")
+        if record.get("status") in {"stale_evidence", "configuration_changed"} and check.disposition == "compatible":
+            gaps.append(f"设定《{record['title']}》来源已变化，不能沿用旧的通过结论")
+    gaps.extend(f"尚未核对设定《{record['title']}》的本章适用性" for key, record in records.items() if key not in seen)
+    for collection in payload.get("coverage", []):
+        gaps.extend(f"用户约定《{item['title']}》未装入：{item['reason']}" for item in collection.get("omitted", []) if item.get("required"))
+    return gaps
 
 
 def evidence_matches(evidence: str, content: str) -> bool:

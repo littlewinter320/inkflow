@@ -30,3 +30,9 @@
 .setting-field-row > * { min-width: 0; }
 .document-upload-modal { width: min(1200px, 95vw); }
 .document-upload-diff { height: min(560px, 55vh); min-height: 260px; border: 1px solid var(--line); }
+
+.setting-collection-group { display: grid; gap: 8px; }
+.setting-collection-group h4 { margin: 8px 0 2px; color: var(--muted); font-size: 12px; }
+.setting-collection-card { border: 1px solid var(--line); border-radius: 10px; padding: 10px; display: grid; gap: 10px; }
+.setting-collection-card > button { display: grid; gap: 6px; text-align: left; border: 0; background: transparent; padding: 0; height: auto; }
+.setting-collection-card > label { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }

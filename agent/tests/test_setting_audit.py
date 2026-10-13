@@ -1,0 +1,119 @@
+import asyncio
+import pytest
+
+from inkflow.config import Settings
+from inkflow.engine import InkFlowEngine
+from inkflow.errors import ValidationGateError
+from inkflow.manual_edits import ManualEditReview
+from inkflow.provider import ScriptedProvider
+from inkflow.schemas import StorySettingsAudit, SettingRuleCorrection, SettingRecordProposal
+from inkflow.setting_audit import corrected_rules
+from setting_fixture import project_fixture
+
+
+def test_rule_correction_requires_unique_old_rule_and_real_source():
+    correction = SettingRuleCorrection(old_rule="旧要求", new_rule="新要求", reason="用户已改规模",
+        source_id="OUTLINE.md", source_quote="完整的新要求")
+    assert corrected_rules(["旧要求", "保留文风"], [correction], {"OUTLINE.md": "完整的新要求"}) == ["新要求", "保留文风"]
+    with pytest.raises(ValidationGateError):
+        corrected_rules(["旧要求", "旧要求"], [correction], {"OUTLINE.md": "完整的新要求"})
+    with pytest.raises(ValidationGateError):
+        corrected_rules(["旧要求"], [correction], {"OUTLINE.md": "无对应引文"})
+
+
+@pytest.mark.parametrize("invalid_rule", [False, True])
+def test_setting_audit_reads_real_material_then_uses_existing_edit_review(tmp_path, monkeypatch, invalid_rule):
+    project = project_fixture(tmp_path)
+    brief = project.db.get_brief().model_copy(update={"user_rules": ["旧规模要求", "保持日常对白"]})
+    from inkflow.project import render_book_brief
+    project.db.set_brief(brief)
+    (project.root / "BOOK.md").write_text(render_book_brief(brief), encoding="utf-8")
+    original = (project.root / "BOOK.md").read_text(encoding="utf-8")
+    settings = Settings()
+    monkeypatch.setattr(Settings, "from_env", lambda *_: settings)
+    from inkflow.story_settings import StorySettingsService
+    service = StorySettingsService(project)
+    collection = service.save_collection(name="地点", template_id="location")
+    audit = StorySettingsAudit(summary="发现旧要求需同步", rule_corrections=[SettingRuleCorrection(
+        old_rule="缺失的旧规则" if invalid_rule else "旧规模要求", new_rule="沿已有证据逐步对清疑问。", reason="按现行依据同步",
+        source_id="OUTLINE.md", source_quote="沿已有证据逐步对清疑问。")],
+        setting_updates=[SettingRecordProposal(collection_id=collection["collection_id"], title="已核对记录",
+            values={"description": "此前已核对的事实。"}, epistemic_status="objective",
+            evidence_refs=[{"source_chapter": 10, "quote": "此前已核对的事实。", "relation": "support"}])])
+    review = ManualEditReview(verdict="pass", summary="与当前规划相容", planning_decision="compatible",
+        planning_quotes=[project.db.get_current_plan_bundle().book.reader_promise])
+    provider = ScriptedProvider([audit, review])
+    engine = InkFlowEngine(provider, settings)
+    canon = project.db.accepted_chapters()
+    result = asyncio.run(engine.manage_story_settings(project.root, change={"operation": "audit", "apply_corrections": True},
+        instruction="检查并处理本书设定与规划的不一致"))
+    assert result["status"] == ("needs_evidence" if invalid_rule else "corrected")
+    assert len(provider.calls) == (1 if invalid_rule else 2) and all(call["agent_role"] == "editor" for call in provider.calls)
+    assert "旧规模要求" in provider.calls[0]["user_prompt"] and "OUTLINE.md" in provider.calls[0]["user_prompt"]
+    assert project.db.get_brief().user_rules[-1] == "保持日常对白"
+    assert project.db.accepted_chapters() == canon
+    if invalid_rule:
+        assert result["changes"] is None and (project.root / "BOOK.md").read_text(encoding="utf-8") == original
+    else:
+        assert result["changes"]["before"] == original
+    assert len(result["adopted_settings"]) == 1
+    stored = service.records(collection["collection_id"])[0]
+    assert stored["status"] == "verified_reference"
+    assert stored["evidence_refs"][0]["source_hash"] == project.db.get_chapter(10)["content_hash"]
+    assert stored["record_id"] in service.context(chapter_no=11, actor="writer")
+    assert project.db.current_facts() == []
+
+
+def test_accepted_chapter_adopts_editor_reference_once(tmp_path):
+    from inkflow.story_settings import StorySettingsService
+    from inkflow.writer_notes import version_notes, notes_hash
+    from inkflow.schemas import ReviewReport, MemoryPatch
+    project = project_fixture(tmp_path)
+    service = StorySettingsService(project)
+    collection = service.save_collection(name="地点", template_id="location")
+    chapter = project.db.get_chapter(10)
+    proposal = SettingRecordProposal(collection_id=collection["collection_id"], title="已核条目",
+        values={"description": "此前已核对的事实。"}, epistemic_status="objective",
+        evidence_refs=[{"source_kind": "draft", "chapter_no": 10, "quote": "此前已核对的事实。"}])
+    artifact = project.db.save_agent_artifact(artifact_type="mode_check_candidate", run_id="audit-test",
+        role="editor", chapter_no=10, chapter_version=chapter["version"], dimension="everyday", status="verified",
+        data={"source_hash": chapter["content_hash"], "story_fingerprint": "story", "snapshot_hash": "snapshot",
+              "output": {"verdict": "pass", "setting_updates": [proposal.model_dump(mode="json")]}})
+    report = ReviewReport(verdict="pass", confidence=1, summary="正文及参考候选通过",
+        source_hash=chapter["content_hash"], writer_notes_hash=notes_hash(version_notes(project, 10)))
+    review = {"chapter_version": chapter["version"], "report": report,
+        "mode_bundle": {"mode": "everyday", "story_fingerprint": "story", "snapshot_hash": "snapshot",
+                        "candidate_artifact_ids": {"editor": artifact["artifact_id"]}}}
+    engine = InkFlowEngine(ScriptedProvider([]), Settings())
+    patch = MemoryPatch(chapter_no=10, chapter_summary="已核事实")
+    first = engine._adopt_setting_proposals(project, 10, chapter["version"], patch, review)
+    assert len(first["record_ids"]) == 1 and not first["warnings"]
+    record = service.records(collection["collection_id"])[0]
+    assert record["evidence_refs"][0]["source_kind"] == "canonical"
+    assert record["status"] == "verified_reference"
+    second = engine._adopt_setting_proposals(project, 10, chapter["version"], patch, review)
+    assert first == second
+    assert len(service.records(collection["collection_id"])) == 1
+    assert service.records(collection["collection_id"])[0]["revision"] == record["revision"]
+
+
+def test_setting_page_reads_the_same_versioned_review(tmp_path):
+    from inkflow.story_settings import StorySettingsService
+    from inkflow.schemas import ReviewReport, ContextUseAudit, SettingUseCheck
+    project = project_fixture(tmp_path)
+    service = StorySettingsService(project)
+    collection = service.save_collection(name="地点", template_id="location")
+    record = service.save_record(collection["collection_id"], title="线索", values={"description": "此前已核对的事实。"})
+    chapter = project.db.get_chapter(10)
+    report = ReviewReport(verdict="pass", confidence=1, summary="逐条核对", source_hash=chapter["content_hash"],
+        context_use_audit=ContextUseAudit(setting_checks=[SettingUseCheck(record_id=record["record_id"],
+            record_revision=record["revision"], disposition="compatible", setting_quote="此前已核对的事实。",
+            chapter_quote="此前已核对的事实。", reason="原句支持")]))
+    project.db.save_review(10, chapter["version"], report, "reviews/test.md")
+    def links():
+        return next(item for item in service.list_collections(include_review_links=True)
+                    if item["collection_id"] == collection["collection_id"])["records"][0]["review_links"]
+    assert links()[0]["current"] and links()[0]["chapter_no"] == 10
+    service.save_record(collection["collection_id"], title="线索", record_id=record["record_id"],
+        expected_revision=record["revision"], values={"description": "未来另有线索。"})
+    assert links()[0]["current"] is False

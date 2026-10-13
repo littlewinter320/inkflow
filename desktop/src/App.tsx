@@ -3774,6 +3774,7 @@ function SearchDialog({ request, result, setResult, onClose, onOpen }: { request
 function QuestionDialog({ questions, onClose, onSubmit }: { questions: QuestionCard[]; onClose: () => void; onSubmit: (answer: string) => void }) {
   const [answers, setAnswers] = useState<Record<string, string[]>>({});
   const [otherText, setOtherText] = useState<Record<string, string>>({});
+  const freeTextOnly = (question: QuestionCard) => !question.options.some(option => option.kind !== "other");
   const choose = (question: QuestionCard, option: QuestionOption) => {
     setAnswers((current) => {
       const selected = current[question.id] || [];
@@ -3782,6 +3783,7 @@ function QuestionDialog({ questions, onClose, onSubmit }: { questions: QuestionC
     });
   };
   const isComplete = questions.every((question) => {
+    if (freeTextOnly(question)) return Boolean(otherText[question.id]?.trim());
     const selected = answers[question.id] || [];
     if (selected.length === 0) return false;
     const other = question.options.find((option) => option.kind === "other");
@@ -3792,14 +3794,14 @@ function QuestionDialog({ questions, onClose, onSubmit }: { questions: QuestionC
     const lines = ["我来回答刚才的问题："];
     questions.forEach((question, index) => {
       const selected = answers[question.id] || [];
-      const labels = question.options.filter((option) => selected.includes(option.id)).map((option) => option.kind === "other" ? `其他：${otherText[question.id].trim()}` : option.label);
+      const labels = freeTextOnly(question) ? [otherText[question.id].trim()] : question.options.filter((option) => selected.includes(option.id)).map((option) => option.kind === "other" ? `其他：${otherText[question.id].trim()}` : option.label);
       lines.push(`${index + 1}. ${question.question}`);
       lines.push(`我的回答：${labels.join("；")}`);
     });
     lines.push("请结合这些答案继续理解原来的目标；如果此前已经明确要求执行且信息足够，就继续原任务，否则先总结你理解到的方案。");
     onSubmit(lines.join("\n"));
   };
-  return <div className="modal-backdrop question-backdrop"><section className="modal question-dialog" role="dialog" aria-modal="true" aria-labelledby="question-title"><button className="modal-close" onClick={onClose}>×</button><p className="eyebrow">墨流想先弄清楚</p><h2 id="question-title">回答几个关键选择</h2><p className="modal-subtitle">没有标准答案。选择最接近的方向，或使用每题最后的“其他”自己填写。</p><div className="question-list">{questions.map((question, index) => <fieldset className="question-card" key={question.id}><legend><span>{index + 1}</span><div><small>{question.header}</small><strong>{question.question}</strong></div></legend>{question.why_it_matters && <p className="question-why">为什么问：{question.why_it_matters}</p>}<div className="question-options">{question.options.map((option) => { const checked = (answers[question.id] || []).includes(option.id); return <div className={`question-option ${checked ? "selected" : ""}`} key={option.id}><label><input type={question.selection === "multiple" ? "checkbox" : "radio"} name={question.id} checked={checked} onChange={() => choose(question, option)} /><span><strong>{option.label}{option.recommended ? " · 建议" : ""}</strong>{option.description && <small>{option.description}</small>}</span></label>{option.kind === "other" && checked && <textarea autoFocus value={otherText[question.id] || ""} onChange={(event) => setOtherText((value) => ({ ...value, [question.id]: event.target.value }))} placeholder="用自己的话回答，越具体越容易贴近你的想法。" />}</div>; })}</div>{question.selection === "multiple" && <small className="multiple-hint">这一题可以选择多个答案。</small>}</fieldset>)}</div><div className="dialog-actions"><button onClick={onClose}>暂不回答</button><button className="primary" disabled={!isComplete} onClick={submit}>提交回答并继续</button></div></section></div>;
+  return <div className="modal-backdrop question-backdrop"><section className="modal question-dialog" role="dialog" aria-modal="true" aria-labelledby="question-title"><button className="modal-close" onClick={onClose}>×</button><p className="eyebrow">墨流想先弄清楚</p><h2 id="question-title">{questions.every(freeTextOnly) ? "还需要补充的信息" : questions.length === 1 ? "选择接下来的方向" : "一起确定几个关键选择"}</h2><p className="modal-subtitle">{questions.every(freeTextOnly) ? "直接写下你的想法，已有要求不必重复。" : "看看各方案会带来什么变化，选择更贴近你想法的方向，也可以自行补充。"}</p><div className="question-list">{questions.map((question, index) => <fieldset className="question-card" key={question.id}><legend><span>{index + 1}</span><div><small>{question.header}</small><strong>{question.question}</strong></div></legend>{question.why_it_matters && <p className="question-why">为什么问：{question.why_it_matters}</p>}{freeTextOnly(question) ? <textarea aria-label={question.question} autoFocus={index === 0} value={otherText[question.id] || ""} onChange={event => setOtherText(current => ({ ...current, [question.id]: event.target.value }))} placeholder="直接填写你的想法" /> : <div className="question-options">{question.options.map((option) => { const checked = (answers[question.id] || []).includes(option.id); return <div className={`question-option ${checked ? "selected" : ""}`} key={option.id}><label><input type={question.selection === "multiple" ? "checkbox" : "radio"} name={question.id} checked={checked} onChange={() => choose(question, option)} /><span><strong>{option.label}{option.recommended ? " · 建议" : ""}</strong>{option.description && <small>{option.description}</small>}</span></label>{option.kind === "other" && checked && <textarea autoFocus value={otherText[question.id] || ""} onChange={(event) => setOtherText((value) => ({ ...value, [question.id]: event.target.value }))} placeholder="用自己的话回答，越具体越容易贴近你的想法。" />}</div>; })}</div>}{!freeTextOnly(question) && question.selection === "multiple" && <small className="multiple-hint">这一题可以选择多个答案。</small>}</fieldset>)}</div><div className="dialog-actions"><button onClick={onClose}>暂不回答</button><button className="primary" disabled={!isComplete} onClick={submit}>提交回答并继续</button></div></section></div>;
 }
 
 function UpdateDialog({ info, onClose }: { info: UpdateInfo; onClose: () => void }) {
