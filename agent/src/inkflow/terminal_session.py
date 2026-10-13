@@ -1615,8 +1615,8 @@ class TerminalSession:
         prose, and states whether it should be accepted does not.
         """
 
-        from_to_matches = list(_CHAPTER_FROM_TO_PATTERN.finditer(text))
-        range_matches = from_to_matches or list(_CHAPTER_RANGE_PATTERN.finditer(text))
+        from_to_matches = self._operative_range_matches(text, _CHAPTER_FROM_TO_PATTERN)
+        range_matches = from_to_matches or self._operative_range_matches(text, _CHAPTER_RANGE_PATTERN)
         # "接着写到20章" is a complete goal when the active project's next
         # canonical chapter supplies the start. Other ambiguous ranges still
         # belong to Coordinator rather than a fabricated chapter number.
@@ -2509,19 +2509,28 @@ class TerminalSession:
         return patch
 
     @staticmethod
+    def _operative_range_matches(message: str, pattern: re.Pattern) -> list[re.Match]:
+        matches = []
+        for match in pattern.finditer(message):
+            prefix = re.split(r"[。！？；\n，,]", message[:match.start()])[-1]
+            if not re.search(r"(?:保留|保护|不(?:再)?(?:重写|修改|改动|覆盖)|不要(?:重写|修改|改动|覆盖))[^。！？；\n，,]*$", prefix):
+                matches.append(match)
+        return matches
+
+    @staticmethod
     def _explicit_chapter_range(message: str) -> tuple[int | None, int | None]:
         # A natural request can quote an audit scope before naming its real
         # target, e.g. "根据第 1 到 10 章复审，修第 9 到第 10 章".  The
         # final explicit range is normally the operative object, while the
         # earlier one is supporting evidence.
-        explicit_spans = list(_CHAPTER_FROM_TO_PATTERN.finditer(message))
+        explicit_spans = TerminalSession._operative_range_matches(message, _CHAPTER_FROM_TO_PATTERN)
         if explicit_spans:
             span = explicit_spans[-1]
             start = int(span.group(1))
             end = int(span.group(2))
             if start >= 1 and end >= start:
                 return start, end
-        range_matches = list(_CHAPTER_RANGE_PATTERN.finditer(message))
+        range_matches = TerminalSession._operative_range_matches(message, _CHAPTER_RANGE_PATTERN)
         if range_matches:
             range_match = range_matches[-1]
             start = int(range_match.group(1))
