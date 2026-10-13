@@ -3887,12 +3887,12 @@ class TerminalSession:
                 "最近用户要求": [item["user"][:400] for item in self.history(project.root, limit=3)]}
             result = await self.engine.provider.generate_json(system_prompt=(
                 "你是墨流Coordinator。依据本次实际结果、当前进度和用户目标，提出2至4个具体且有差异的下一步提示词。"
-                "label用普通中文短标题，prompt是可直接发送的自然语言要求，reason说明当前为何值得做。"
+                "label用12字以内普通中文短标题，prompt是70字以内可直接发送的自然语言要求，reason在40字内说明当前为何值得做。"
                 "不能复制固定工作流菜单。完成事项不再推荐重做；必要缺口在原授权内补原节点，可选建议允许不补。"
                 "次数耗尽不推荐无授权重试；缺审核不得建议跳过门禁或生成依赖章节。"
                 "区分只查看、定点补核、当前任务续接与新增创作选择，不用笼统的查看状态敷衍。建议不执行、不扩大已有授权。"),
                 user_prompt=json_dumps(context, indent=None), output_model=SuggestedPrompts,
-                agent_role="coordinator", max_tokens=self.engine.settings.effective_output_tokens(1000, "coordinator"), thinking=False)
+                agent_role="coordinator", max_tokens=self.engine.settings.effective_output_tokens(1500, "coordinator"), thinking=False)
             if basis != self._suggestion_basis(project):
                 return []
             suggestions = [item.model_dump(mode="json") for item in result.data.suggestions]

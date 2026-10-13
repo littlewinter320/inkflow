@@ -130,6 +130,22 @@ type ConversationHistoryEntry = { id: string; user: string; assistant: string; a
 type SuggestedPromptItem = { label: string; prompt: string; reason?: string };
 
 const defaultSuggestedPrompts: SuggestedPromptItem[] = [];
+
+function initialSuggestedPrompts(dashboard: Dashboard | null, busy: boolean, waitingForAnswer: boolean): SuggestedPromptItem[] {
+  const accepted = dashboard?.chapter_progress?.accepted_through || 0;
+  const written = dashboard?.chapter_progress?.written_through || accepted;
+  const current = written > 0 ? `第${written}章` : "当前小说";
+  const first = waitingForAnswer
+    ? { label: "帮我比较选项", prompt: "解释这次需要我决定的几个方向，各自会怎样影响故事；先不要替我选择。" }
+    : busy
+      ? { label: "看看当前进度", prompt: "说明当前任务已经完成什么、现在进行到哪里；只查看，不重新生成。" }
+      : written > accepted
+        ? { label: `看看第${written}章`, prompt: `查看第${written}章的正文和最新审查，说明还有哪些问题、哪些已经解决；先不要改稿。` }
+        : { label: "接下来怎么写", prompt: `结合已接受的${accepted > 0 ? `前${accepted}章` : "故事方向"}和现行规划，给我几个下一段剧情的方向，先不生成正文。` };
+  return [first,
+    { label: "想想新点子", prompt: `围绕${current}的剧情和人物，提出几个符合已有设定的新点子，先作为建议。` },
+    { label: "对照当前设定", prompt: `说明${current}实际用了哪些人物和世界设定，找出需要核对的地方；先不要修改。` }];
+}
 type PromptOptimizationResult = {
   original_prompt: string;
   optimized_prompt: string;
@@ -1321,7 +1337,7 @@ function App() {
         const result = await request<{ suggestions: SuggestedPromptItem[] }>("assistant.suggest", { project_root: root, workspace_root: root });
         if (root !== projectRootRef.current) return;
         if (Array.isArray(result?.suggestions)) {
-          const cleaned = result.suggestions.map(item => ({ label: String(item?.label || "继续"), prompt: String(item?.prompt || "").trim() })).filter(item => item.prompt);
+          const cleaned = result.suggestions.map(item => ({ label: String(item?.label || "继续"), prompt: String(item?.prompt || "").trim(), reason: item.reason })).filter(item => item.prompt);
           setSuggestedPrompts(cleaned);
         }
       } catch { /* Keep the existing local suggestions; writing can continue. */ }
@@ -1478,9 +1494,6 @@ function App() {
         setNotice(`本次对话结果已返回；只是项目面板没有刷新，已提交的正文不会因此撤回。\n刷新失败原因：${reason}\n可稍后点“刷新”核对章节状态。`);
       } })();
       const resultState = result && typeof result === "object" ? String((result as Record<string, unknown>).status || "") : "";
-      if (["failed", "interrupted", "waiting_condition"].includes(resultState) && runRoot === projectRootRef.current) {
-        setSuggestedPrompts([]);
-      }
       const completedIntent = result && typeof result === "object" ? (result as Record<string, unknown>).intent as Record<string, unknown> | undefined : undefined;
       if (["completed", "accepted", "resolved"].includes(resultState) && runRoot === projectRootRef.current &&
           !(Array.isArray(questionSource) && questionSource.length) && completedIntent?.action !== "discuss" &&
@@ -1938,10 +1951,10 @@ function App() {
             </div>
           </div>
           <BatchProgressStatus batches={collaboration?.batches || []} events={events} activeRunId={activeRunId} />
-          {uiPreferences.suggestedPromptsEnabled && suggestedPrompts.length > 0 && (
-            <div className="quick-row">
-              {suggestedPrompts.slice(0, 4).map((item) => (
-                <button key={item.prompt} type="button" title={item.reason ? `${item.reason}\n${item.prompt}` : item.prompt} onClick={() => setChatInput(item.prompt)}>{item.label}</button>
+          {uiPreferences.suggestedPromptsEnabled && (
+            <div className="quick-row" role="toolbar" aria-label="下一步推荐输入">
+              {(suggestedPrompts.length ? suggestedPrompts : initialSuggestedPrompts(dashboard, busy, pendingQuestions.length > 0)).slice(0, 4).map((item) => (
+                <button key={item.prompt} type="button" title={item.reason ? `${item.reason}\n${item.prompt}` : item.prompt} onClick={() => { setChatInput(item.prompt); chatInputRef.current?.focus(); }}>{item.label}</button>
               ))}
             </div>
           )}

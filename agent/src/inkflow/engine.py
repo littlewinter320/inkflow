@@ -220,7 +220,7 @@ class InkFlowEngine:
     def _fit_review_prompt(self, project: InkFlowProject, packet: ContextPacket, *,
                            system_prompt: str, tail: str, output_model: type, role: str) -> tuple[str, list[str]]:
         system = _json_system_prompt(system_prompt, output_model)
-        reserve = self.settings.effective_output_tokens(8_000, role)
+        reserve = self._mode_output_budget(packet, role) if issubclass(output_model, ModeCheckOutput) else self.settings.effective_output_tokens(8_000, role)
         _, hard_limit = self.settings.context_budget_for(role)
         def input_tokens(prompt: str) -> int:
             return estimate_tokens(json.dumps([{"role": "system", "content": system},
@@ -235,6 +235,12 @@ class InkFlowEngine:
             raise ValidationGateError(f"{role}完整JSON请求与报告预留超过当前{hard_limit:,} tokens上下文；"
                 "正文与必要来源保留，请缩小资料范围后从本节点继续。")
         return prompt, compressed
+
+    def _mode_output_budget(self, packet: ContextPacket, role: str) -> int:
+        section = next((item for item in packet.sections if item.key == "CSET"), None)
+        payload = json.loads(section.content) if section else {}
+        count = sum(len(collection.get("records", [])) for collection in payload.get("collections", []))
+        return self.settings.effective_output_tokens(8_000 + 350 * count, role)
 
     @staticmethod
     def _writer_skills(packet: ContextPacket, *built_in: str) -> list[str]:
@@ -3610,7 +3616,7 @@ class InkFlowEngine:
                     raise ValidationGateError("审查请求前正文或审查依据已变化。")
                 trace.record_model_started(
                     f"mode.{role}", model=self.settings.model_for(role), agent_role=role,
-                    max_tokens=min(8_000, self.settings.max_output_tokens),
+                    max_tokens=self._mode_output_budget(packet, role),
                     timeout_seconds=120, thinking=not self.settings.is_deepseek,
                 )
                 atomic_write_text(trace.run_dir / f"mode-{role}-input.json", json_dumps({
@@ -3620,7 +3626,7 @@ class InkFlowEngine:
                 result = await self.provider.generate_json(
                     system_prompt=systems[role], user_prompt=user_prompt,
                     output_model=output_model, effort=self.settings.reasoning_effort,
-                    max_tokens=min(8_000, self.settings.max_output_tokens),
+                    max_tokens=self._mode_output_budget(packet, role),
                     timeout_seconds=120, thinking=not self.settings.is_deepseek,
                     agent_role=role,
                 )
@@ -3645,7 +3651,7 @@ class InkFlowEngine:
                                     + "\n# 当前正文\n" + content + "\n# 分工\n" + json_dumps({"checks": checks, "memory_owner": owners["memory"]})
                                     + "\n# 当前要求\n" + instruction + notes_prompt(writer_notes),
                                 output_model=output_model, effort=self.settings.reasoning_effort,
-                                max_tokens=min(8_000, self.settings.max_output_tokens), timeout_seconds=120,
+                                max_tokens=self._mode_output_budget(packet, role), timeout_seconds=120,
                                 thinking=not self.settings.is_deepseek, agent_role=role)
                         packet = resolved_packet
                         candidate = ModeCheckOutput.model_validate(result.data)
@@ -4233,7 +4239,7 @@ class InkFlowEngine:
         if prior_sources:
             choice_note += ("\n必须对照紧邻前章正文来源：" + "、".join(prior_sources)
                 + "；batch-memory是临时记忆，不是前章正文，不能替代这项对照。")
-        output_reserve = self.settings.effective_output_tokens(8_000, agent_role)
+        output_reserve = self._mode_output_budget(packet, agent_role)
         choice_count = len(quote_choices)
         from .review_verifier import mode_output_model
         output_model = mode_output_model(packet, primary=primary)

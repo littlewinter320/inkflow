@@ -129,7 +129,7 @@ class SuggestedPrompt(StrictModel):
 class SuggestedPrompts(StrictModel):
     """Coordinator 根据实际结果提出的下一步选项，不代表执行授权。"""
 
-    suggestions: list[SuggestedPrompt] = Field(min_length=1, max_length=5)
+    suggestions: list[SuggestedPrompt] = Field(min_length=2, max_length=4)
 
 
 class VolumeCompass(StrictModel):
