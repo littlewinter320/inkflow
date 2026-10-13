@@ -626,7 +626,7 @@ class InkFlowAppService:
             project = self._try_project(params.get("workspace_root") or params.get("project_root"))
             from .conversation_scope import conversation_key
             saved = project.db.get_metadata(conversation_key("next_step_suggestions"), {}) if project else {}
-            valid = bool(project and saved.get("basis") == TerminalSession._work_source(project))
+            valid = bool(project and saved.get("basis") == TerminalSession._suggestion_basis(project))
             return {
                 "suggestions": saved.get("suggestions", []) if valid else [],
                 "model": "", "fallback": False, "source": "coordinator" if valid else "none",

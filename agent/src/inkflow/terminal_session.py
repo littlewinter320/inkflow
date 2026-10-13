@@ -3875,7 +3875,7 @@ class TerminalSession:
     async def _suggest_after_result(self, project, intent, response, trace):
         from .schemas import SuggestedPrompts
         try:
-            basis = self._work_source(project)
+            basis = self._suggestion_basis(project)
             work = project.pending_work()
             context = {"当前目标": intent.requested_outcome or intent.user_message,
                 "已完成与失败": {"status": workflow_result_status(response), "summary": str(response.get("reply") or response.get("summary") or workflow_failure_reason(response))[:1800],
@@ -3893,11 +3893,11 @@ class TerminalSession:
                 "区分只查看、定点补核、当前任务续接与新增创作选择，不用笼统的查看状态敷衍。建议不执行、不扩大已有授权。"),
                 user_prompt=json_dumps(context, indent=None), output_model=SuggestedPrompts,
                 agent_role="coordinator", max_tokens=self.engine.settings.effective_output_tokens(1000, "coordinator"), thinking=False)
-            if basis != self._work_source(project):
+            if basis != self._suggestion_basis(project):
                 return []
             suggestions = [item.model_dump(mode="json") for item in result.data.suggestions]
             async with project_write_lock(project.root):
-                if basis != self._work_source(project):
+                if basis != self._suggestion_basis(project):
                     return []
                 project.db.set_metadata(conversation_key("next_step_suggestions"), {"basis": basis, "suggestions": suggestions, "run_id": trace.run_id})
             trace.record_model("coordinator.next_steps", result, "Coordinator已根据实际结果生成下一步选项")
@@ -3905,6 +3905,17 @@ class TerminalSession:
         except Exception as exc:
             trace.record("coordinator.next_steps", "not_run", "下一步建议暂未生成，已有工作结果有效", str(exc))
             return []
+
+    @staticmethod
+    def _suggestion_basis(project):
+        reviews = []
+        for number in project.db.chapter_numbers_by_status("draft"):
+            review = project.db.latest_review_record(number)
+            if review:
+                reviews.append([number, review["id"], review["chapter_version"], review["report"].verdict])
+        return {**TerminalSession._work_source(project), "reviews": reviews,
+                "pending": sorted([item["id"], item["status"], item.get("processing_attempts", 0), item.get("can_process")]
+                                  for item in project.pending_work())}
 
     def _reuse_current_pass_review(self, project: InkFlowProject, chapter_no: int) -> dict[str, Any] | None:
         """Return a safe handoff when the current draft already has a pass report."""

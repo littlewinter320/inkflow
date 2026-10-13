@@ -4235,6 +4235,8 @@ class InkFlowEngine:
                 + "；batch-memory是临时记忆，不是前章正文，不能替代这项对照。")
         output_reserve = self.settings.effective_output_tokens(8_000, agent_role)
         choice_count = len(quote_choices)
+        from .review_verifier import mode_output_model
+        output_model = mode_output_model(packet, primary=primary)
         before_sections = {section.key: section.content for section in packet.sections}
         while True:
             tail = repair_tail + "\n\n# 本次可选择的逐字原文，代码按编号回填，语义仍由你核对\n" + json_dumps(quote_choices) + choice_note
