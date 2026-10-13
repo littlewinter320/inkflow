@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Annotated, Any, Literal
+from typing_extensions import Required, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
@@ -547,14 +548,74 @@ class SceneBlueprintItem(StrictModel):
     reading_promise: str = ""
 
 
+class SettingEvidenceRef(TypedDict, total=False):
+    source_kind: Required[Literal["canonical", "draft", "planning", "writer_hook"]]
+    chapter_no: int | None
+    path: str | None
+    artifact_id: str | None
+    quote: Required[str]
+    relation: Literal["support", "counter", "belief", "reference"]
+    source_hash: str | None
+    source_version: int | None
+
+
 class SettingRecordProposal(StrictModel):
     collection_id: str = Field(min_length=1, max_length=180)
     record_id: str | None = Field(default=None, max_length=180)
-    expected_revision: int | None = Field(default=None, ge=1)
+    expected_revision: int | None = Field(default=None, ge=0)
     title: str = Field(min_length=1, max_length=160)
     values: dict[str, Any] = Field(min_length=1, max_length=40)
-    evidence_refs: list[dict[str, Any]] = Field(default_factory=list, max_length=12)
+    evidence_refs: list[SettingEvidenceRef] = Field(default_factory=list, max_length=12)
     epistemic_status: Literal["hypothesis", "objective", "belief", "rumor", "user_constraint"] = "hypothesis"
+
+    @field_validator("evidence_refs", mode="before")
+    @classmethod
+    def normalize_evidence_identity(cls, value):
+        if not isinstance(value, list):
+            return value
+        result = []
+        for item in value:
+            if not isinstance(item, dict):
+                result.append(item)
+                continue
+            ref = dict(item)
+            source = ref.pop("source_chapter", None)
+            source_id = ref.pop("source_id", None)
+            if source is not None and source_id is not None and source != source_id:
+                raise ValueError("设定引用包含不同的来源身份，不能猜测采用哪一个")
+            source = source if source is not None else source_id
+            explicit_kind = ref.get("source_kind")
+            if "source_kind" not in ref:
+                ref["source_kind"] = "canonical"
+            if ref.get("chapter_no") is not None and source is not None:
+                chapter = source if type(source) is int else int(source[8:]) if isinstance(source, str) and source.startswith("chapter:") and source[8:].isdigit() else None
+                if chapter != ref["chapter_no"]:
+                    raise ValueError("设定引用的新旧章号不一致，不能串用来源")
+            if ref.get("chapter_no") is None and source is not None:
+                if type(source) is int:
+                    ref["chapter_no"] = source
+                elif isinstance(source, str) and source.startswith("chapter:") and source[8:].isdigit():
+                    ref["chapter_no"] = int(source[8:])
+                elif source in {"BOOK.md", "PLAN.md", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md"}:
+                    if explicit_kind not in {None, "planning"} or ref.get("path") not in {None, source}:
+                        raise ValueError("设定引用的文件与来源类型不一致")
+                    ref.update(source_kind="planning", path=source)
+                else:
+                    raise ValueError("设定来源必须是明确章号或当前文档名称，不能把未知文字当章号")
+            result.append(ref)
+        return result
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def require_evidence_location(cls, values):
+        for ref in values:
+            if not ref["quote"].strip():
+                raise ValueError("设定依据须填写连续原句")
+            if ref["source_kind"] in {"canonical", "draft"} and (type(ref.get("chapter_no")) is not int or ref["chapter_no"] < 1):
+                raise ValueError("正文设定依据须填写chapter_no正整数章号；文档引用用planning及path")
+            if ref["source_kind"] == "planning" and ref.get("path") not in {"BOOK.md", "PLAN.md", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md"}:
+                raise ValueError("规划设定依据须填写当前文档path")
+        return values
 
 
 class SettingRecordSet(StrictModel):

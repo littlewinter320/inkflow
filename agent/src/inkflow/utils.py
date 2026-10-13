@@ -48,6 +48,8 @@ def workflow_result_status(result: Any) -> str:
         return "waiting_condition"
     if status == "needs_input":
         return "waiting_user"
+    if status == "needs_evidence":
+        return "waiting_condition"
     if status in ("waiting_user", "waiting_condition"):
         return str(status)
     if result.get("resumable") is True and status == "interrupted":

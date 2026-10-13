@@ -11,6 +11,20 @@ from inkflow.setting_audit import corrected_rules
 from setting_fixture import project_fixture
 
 
+def test_setting_evidence_uses_shared_typed_identity():
+    from pydantic import ValidationError
+    from inkflow.utils import workflow_result_status
+    def proposal(ref):
+        return SettingRecordProposal(collection_id="setting-base-world", title="边界", values={"limits": "约定"}, evidence_refs=[ref])
+    assert proposal({"source_chapter": "BOOK.md", "quote": "当前书籍约定"}).evidence_refs[0]["source_kind"] == "planning"
+    assert proposal({"source_chapter": "chapter:00044", "quote": "明确的正文原句"}).evidence_refs[0]["chapter_no"] == 44
+    with pytest.raises(ValidationError):
+        proposal({"source_kind": "canonical", "quote": "没有章号"})
+    with pytest.raises(ValidationError):
+        proposal({"chapter_no": 43, "source_chapter": "chapter:00044", "quote": "串用了章号"})
+    assert workflow_result_status({"result": {"status": "needs_evidence"}}) == "waiting_condition"
+
+
 def test_rule_correction_requires_unique_old_rule_and_real_source():
     correction = SettingRuleCorrection(old_rule="旧要求", new_rule="新要求", reason="用户已改规模",
         source_id="OUTLINE.md", source_quote="完整的新要求")
