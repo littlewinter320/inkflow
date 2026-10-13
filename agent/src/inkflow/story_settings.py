@@ -442,9 +442,11 @@ class StorySettingsService:
             if actor in REVIEW_ROLES:
                 if not refs:
                     raise ProjectError("审查与记忆角色记录设定必须提供可定位的原文依据。")
-                if old is None and (epistemic_status not in {"objective", "belief", "rumor"}
-                                    or any(ref["source_kind"] != "canonical" for ref in refs)):
-                    raise ProjectError("首次整理设定须来自已接受正文，并区分客观记录、信念或传闻；新创作设想仍由 Writer 提出。")
+                canon_reference = epistemic_status in {"objective", "belief", "rumor"} and all(ref["source_kind"] == "canonical" for ref in refs)
+                book_requirement = epistemic_status == "user_constraint" and all(
+                    ref["source_kind"] == "planning" and ref.get("path") == "BOOK.md" for ref in refs)
+                if old is None and not (canon_reference or book_requirement):
+                    raise ProjectError("首次整理须引用已接受正文，或以用户约定性质引用当前书籍要求；新创作设想仍由 Writer 提出。")
             if actor == "writer":
                 epistemic_status = "hypothesis"
             if actor in REVIEW_ROLES and old and operation == "supplement":

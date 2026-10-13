@@ -63,6 +63,11 @@ def test_base_settings_and_optional_recording_switch():
         assert {item["template_id"] for item in bases} == {"character", "world"}
         service.ensure_defaults()
         assert len(service.list_collections()) == 2
+        world = next(item for item in bases if item["template_id"] == "world")
+        constraint = service.save_record(world["collection_id"], title="当前人物边界",
+            values={"premise": "主角在旧城寻找失踪亲人的故事与线索。"}, epistemic_status="user_constraint", actor="editor",
+            evidence_refs=[{"source_kind": "planning", "path": "BOOK.md", "quote": "主角在旧城寻找失踪亲人的故事与线索。"}])
+        assert constraint["epistemic_status"] == "user_constraint" and project.db.current_facts() == []
         for base in bases:
             try:
                 service.archive_collection(base["collection_id"], base["revision"])

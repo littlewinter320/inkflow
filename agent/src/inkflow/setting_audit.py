@@ -76,6 +76,7 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
             "实际需要选择时同时填写questions，复用结构化提问卡，每题2至4个具体options及description，最多一个recommended；不列只有其他的空选项卡。"
             "需要用户取舍的条目不能同时放入rule_corrections；无关疑问不能阻止其他有明确依据的修正。"
             "已有设定合集缺记录时，判断所给已接受正文中是否有值得持续追踪的对象；在setting_updates同次返回必要的首次建档或补充，每条有canonical来源章号和连续原句，epistemic_status用objective/belief/rumor。只提取已有文字，不凭空创造、不补满未知字段；已有同一对象复用record_id与expected_revision。没有有用资料就明确空缺。"
+            "世界基础设定中的明确用户边界可从BOOK.md原句整理，epistemic_status=user_constraint、source_kind=planning、path=BOOK.md；用户约定不是已经发生的情节，不推测未写出的世界细节。"
             "summary和findings用自然中文解释具体问题和证据，不输出内部编号或长路径；不声称未执行的修改已完成。"),
             user_prompt=prompt, output_model=StorySettingsAudit, max_tokens=min(6000, engine.settings.max_output_tokens),
             thinking=False, agent_role=role)
@@ -104,6 +105,12 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
                     args = candidate.model_dump()
                     args["evidence_refs"] = service._evidence(candidate.evidence_refs)
                     for ref in args["evidence_refs"]:
+                        if ref["source_kind"] == "planning" and ref.get("path") == "BOOK.md" and candidate.epistemic_status == "user_constraint":
+                            current_book = (project.root / "BOOK.md").read_text(encoding="utf-8")
+                            expected = changes["after"] if changes else sources["BOOK.md"]
+                            if current_book != expected or ref["quote"] not in sources["BOOK.md"]:
+                                raise ValidationGateError("书籍约定已变化，不能沿用这份设定候选")
+                            continue
                         source_id = f"chapter:{int(ref.get('chapter_no', 0)):05d}"
                         if (ref.get("source_kind") != "canonical" or not ref.get("quote")
                                 or ref["quote"] not in sources.get(source_id, "")
