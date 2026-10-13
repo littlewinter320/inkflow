@@ -237,7 +237,7 @@ class InkFlowProject:
         validated: dict[int, dict[str, Any] | None] = {}
         with self.db.connect() as connection:
             rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
-        self._reconcile_workflow_outputs([json.loads(row["value_json"]) for row in rows])
+        self._reconcile_workflow_outputs([json.loads(row["value_json"]) for row in rows], current_pass=current_pass)
         with self.db.connect() as connection:
             rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
         finished_tasks = {item["source"].get("task_id"): item for row in rows
@@ -352,7 +352,7 @@ class InkFlowProject:
                     self.update_pending_work(item["id"], status="completed",
                         resolution={"run_id": active[0]["trace_id"], "revision_no": active[0].get("revision_no", 1)})
 
-    def _reconcile_workflow_outputs(self, items: list[dict[str, Any]]) -> None:
+    def _reconcile_workflow_outputs(self, items: list[dict[str, Any]], *, current_pass: Callable[[int], dict[str, Any] | None] | None = None) -> None:
         """Reconcile concrete later outputs, without replaying old requests or accepting prose."""
         if self.db.canonical_content_migration_required():
             return
@@ -364,6 +364,7 @@ class InkFlowProject:
                 return False
         active = None
         active_checked = False
+        validated: dict[int, dict[str, Any] | None] = {}
         accept_actions = {"accept", "review_accept", "write_review_accept", "revise_review_accept",
                           "continue_run", "batch_accept", "batch_draft_accept"}
         for item in items:
@@ -385,6 +386,21 @@ class InkFlowProject:
                     status = "superseded" if action == "review" else "completed"
                     resolution = {"reason": "后续正式验收已完成目标范围，旧请求不再重复执行。",
                         "chapters": [{key: chapter[key] for key in ("chapter_no", "version", "content_hash")} for chapter in chapters]}
+                elif action == "review" and current_pass is not None:
+                    reports = []
+                    for number in range(first, last + 1):
+                        if number not in validated:
+                            validated[number] = current_pass(number)
+                        record = self.db.latest_review_record(number)
+                        reviewed = validated[number]
+                        if not reviewed or not record:
+                            break
+                        if not later(record.get("created_at"), item.get("created_at")):
+                            break
+                        reports.append({"chapter_no": number, "review_id": record["id"], "source_hash": reviewed["source_hash"]})
+                    if len(reports) == last - first + 1:
+                        status = "superseded"
+                        resolution = {"reason": "同范围已取得当前来源的有效通过报告，旧审查断点留档，不重复补审。", "reviews": reports}
             elif action in {"plan", "redesign_story", "plan_next_arc"}:
                 if not active_checked:
                     from .planning_pipeline import load_active_planning

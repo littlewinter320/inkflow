@@ -509,12 +509,26 @@ class InkFlowEngine:
             if (data.get("source_hash") == chapter["content_hash"] and data.get("story_fingerprint") == bundle.get("story_fingerprint")
                     and data.get("snapshot_hash") == bundle.get("snapshot_hash") and item["dimension"] == bundle.get("mode")
                     and output.get("verdict") == "pass"):
+                # Older candidates kept quote aliases; restore only excerpts from this accepted source.
+                choices = restore_review_quote_choices(data.get("evidence_recovery", {}).get("quote_choices", {}),
+                    {"当前正文": project.db.canonical_chapter_content(chapter_no) or ""})
+                output = resolve_review_quote_refs(ModeCheckOutput.model_validate(output), choices, chapter_no=chapter_no).model_dump(mode="json")
                 proposals.extend((actor, candidate) for candidate in output.get("setting_updates", []))
         proposals.extend((memory_owner,candidate.model_dump(mode="json")) for candidate in patch.setting_updates)
+        # Identical record content proposed by its reviewer does not need a second Writer copy.
+        def identity(candidate):
+            return json_dumps({key: candidate.get(key) for key in ("collection_id", "record_id", "title", "values", "epistemic_status")})
+        owner_proposals = {identity(candidate) for actor, candidate in proposals
+                           if actor == memory_owner and candidate.get("epistemic_status") != "hypothesis"}
+        writer_hypotheses = {identity(candidate) for actor, candidate in proposals
+                            if actor == "writer" and candidate.get("epistemic_status") == "hypothesis"}
+        proposals = [(index, actor, candidate) for index, (actor, candidate) in enumerate(proposals, 1)
+                     if not (actor == "writer" and identity(candidate) in owner_proposals)
+                     and not (actor == memory_owner and identity(candidate) in writer_hypotheses)]
         applied=[]
         warnings=[]
         approved_writer_indices = set(review_record["report"].approved_setting_proposals)
-        for index,(actor,data) in enumerate(proposals):
+        for index,actor,data in proposals:
             try:
                 candidate=SettingRecordProposal.model_validate(data)
                 args=candidate.model_dump()
@@ -527,6 +541,7 @@ class InkFlowEngine:
                     if candidate.record_id:
                         raise ValidationGateError("Writer同次交稿只能另建设定候选，不能覆盖已核记录。")
                 if not candidate.record_id:
+                    args["expected_revision"] = 0
                     args["record_id"]="setting-record-"+content_hash(json_dumps({"chapter":chapter_no,"version":chapter_version,"candidate":data,"actor":actor}))[:32]
                     existing = next((record for record in service.records(candidate.collection_id,include_archived=True)
                                      if record["record_id"] == args["record_id"]), None)
@@ -536,7 +551,7 @@ class InkFlowEngine:
                 applied.append(record["record_id"])
                 if existing and existing["status"] == "verified_reference":
                     continue
-                if actor != "writer" or index + 1 in approved_writer_indices:
+                if actor != "writer" or index in approved_writer_indices:
                     # Reuse the same-version review of the public handoff; this certifies a reference, never canon.
                     service.record_review(record["record_id"], expected_revision=record["revision"],
                         actor=memory_owner if actor == "writer" else actor, decision="verified_reference",
@@ -546,7 +561,7 @@ class InkFlowEngine:
                     ManualEditsService(project).enqueue("story-setting:"+record["record_id"],json_dumps(record),
                         kind="setting_record", chapter_no=chapter_no, record_revision=record["revision"])
             except Exception as exc:
-                warnings.append(f"设定参考候选{index+1}待处理：{exc}")
+                warnings.append(f"设定参考候选{index}待处理：{exc}")
         return {"record_ids":applied,"warnings":warnings,"authority":"reference_only"}
 
     async def manage_story_settings(self, root, *, change, instruction="", conversation_context="", allow_evidence_repair=True):
@@ -3580,12 +3595,12 @@ class InkFlowEngine:
                                 [f"chapter:{loaded['chapter_no']:05d}" for loaded in recovery.get("loaded_sources", [])])
                             choices = restore_review_quote_choices(recovery.get("quote_choices", {}),
                                 {"当前正文": content, **packet_sources(packet)})
-                            decoded = resolve_review_quote_refs(candidate, choices)
+                            decoded = resolve_review_quote_refs(candidate, choices, chapter_no=chapter_no)
                             saved_run = (project.internal / "runs" / item["run_id"]).resolve()
                             outputs = list(saved_run.glob("review.source_recovery.*.output.json")) if saved_run.is_relative_to(project.internal.resolve()) else []
                             if len(outputs) == 1:
                                 try:
-                                    original = resolve_review_quote_refs(ModeCheckOutput.model_validate_json(outputs[0].read_text(encoding="utf-8")), choices)
+                                    original = resolve_review_quote_refs(ModeCheckOutput.model_validate_json(outputs[0].read_text(encoding="utf-8")), choices, chapter_no=chapter_no)
                                 except (OSError, ValueError):
                                     original = None
                                 if (original is not None and original.verdict == "pass"
@@ -4279,7 +4294,7 @@ class InkFlowEngine:
             atomic_write_text(trace_path, json_dumps(recovery))
             return output.model_copy(update={"verdict": "unknown"}), packet, recovery
         trace.record_model("review.source_recovery", result, "同责任角色补核已返回，核验来源与交接后采用")
-        repaired = resolve_review_quote_refs(result.data, quote_choices)
+        repaired = resolve_review_quote_refs(result.data, quote_choices, chapter_no=chapter_no)
         recovery["quote_choices"] = {key: {"source_id": value["source_id"], "quote_hash": content_hash(value["quote"])}
             for key, value in quote_choices.items()}
         # An omitted or merely relabelled concrete two-quote conflict still

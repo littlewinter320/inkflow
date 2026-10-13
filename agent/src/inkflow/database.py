@@ -959,7 +959,7 @@ class ProjectDatabase:
     def latest_review_record(self, chapter_no: int) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
-                """SELECT id, chapter_version, data_json, path, role_protocol_version, review_role
+                """SELECT id, chapter_version, data_json, path, created_at, role_protocol_version, review_role
                 FROM reviews WHERE chapter_no=? ORDER BY id DESC LIMIT 1""",
                 (chapter_no,),
             ).fetchone()
@@ -979,7 +979,7 @@ class ProjectDatabase:
         return {
             "id": int(row["id"]), "chapter_version": int(row["chapter_version"]),
             "report": ReviewReport.model_validate_json(row["data_json"]),
-            "path": str(row["path"]), "review_role": stored["review_role"],
+            "path": str(row["path"]), "created_at": str(row["created_at"]), "review_role": stored["review_role"],
             "canonical_role": stored["review_role"], "mode_bundle": mode_bundle,
         }
 

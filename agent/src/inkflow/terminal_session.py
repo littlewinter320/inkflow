@@ -1735,6 +1735,12 @@ class TerminalSession:
 
     @staticmethod
     def _deterministic_single_chapter_review(text: str) -> TerminalIntent | None:
+        accept = re.fullmatch(r"\s*(?:墨宝[，,\s]*)?(?:请|帮我)?(?:验收|接受|接收)第\s*(\d+)\s*章(?:的?(?:当前|现有)?草稿)?[。！!\s]*", text)
+        if accept and int(accept.group(1)) > 0:
+            return TerminalIntent(action="accept", chapter_no=int(accept.group(1)), requested_outcome=text,
+                operation_instruction=text, user_message=text, authorization="approved", confidence="high",
+                authorization_source="current_request", max_revision_rounds=0, forbidden_actions=["write", "revise", "review"],
+                visible_reason="明确验收现有章节，复用有效通过报告并校验接受门禁，不重新审查或写稿。")
         retry = re.fullmatch(r"\s*(?:请)?(?:审查|审核|复核)第\s*(\d+)\s*章[。；;]\s*本次授权额外一次\s*Writer\s*说明短答[。！!\s]*", text)
         if retry and int(retry.group(1)) > 0:
             return TerminalIntent(action="review", chapter_no=int(retry.group(1)), requested_outcome=text,
@@ -3875,12 +3881,18 @@ class TerminalSession:
     async def _suggest_after_result(self, project, intent, response, trace):
         from .schemas import SuggestedPrompts
         try:
+            project.reconcile_pending_work(current_pass=lambda number: self.engine.current_pass_review(project, number))
             basis = self._suggestion_basis(project)
             work = project.pending_work()
+            steps = []
+            for item in response.get("steps", [])[-6:]:
+                result = item.get("result") or {}
+                steps.append({"step": item.get("step"), "status": workflow_result_status(item),
+                    "reason": workflow_failure_reason(item)[:300],
+                    "result": {key: result.get(key) for key in ("chapter_no", "verdict", "status", "accepted", "reused", "summary", "finding_count", "post_commit_status") if key in result}})
             context = {"当前目标": intent.requested_outcome or intent.user_message,
                 "已完成与失败": {"status": workflow_result_status(response), "summary": str(response.get("reply") or response.get("summary") or workflow_failure_reason(response))[:1800],
-                    "steps": [{"step": item.get("step"), "status": workflow_result_status(item),
-                               "reason": workflow_failure_reason(item)[:300]} for item in response.get("steps", [])[-6:]]},
+                    "steps": steps},
                 "小说进度": project.db.project_status(),
                 "待办": [{key: item.get(key) for key in ("kind", "chapter_no", "status", "reason", "handling", "can_process", "can_reject", "next_action")}
                          for item in work[:8]],
@@ -3889,6 +3901,7 @@ class TerminalSession:
                 "你是墨流Coordinator。依据本次实际结果、当前进度和用户目标，提出2至4个具体且有差异的下一步提示词。"
                 "label用12字以内普通中文短标题，prompt是70字以内可直接发送的自然语言要求，reason在40字内说明当前为何值得做。"
                 "不能复制固定工作流菜单。完成事项不再推荐重做；必要缺口在原授权内补原节点，可选建议允许不补。"
+                "本次步骤的实际通过/接受回执优先于旧失败记录；已通过审查但未接受时，区分验收与新一轮审查。"
                 "次数耗尽不推荐无授权重试；缺审核不得建议跳过门禁或生成依赖章节。"
                 "区分只查看、定点补核、当前任务续接与新增创作选择，不用笼统的查看状态敷衍。建议不执行、不扩大已有授权。"),
                 user_prompt=json_dumps(context, indent=None), output_model=SuggestedPrompts,

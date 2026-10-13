@@ -20,7 +20,7 @@ HARD_RULES = {
 _SAME_CHAPTER_CONFLICT_NOTE = "本章双处逐字引文待核"
 
 
-def resolve_review_quote_refs(output: Any, quotes: dict[str, dict[str, str]]) -> Any:
+def resolve_review_quote_refs(output: Any, quotes: dict[str, dict[str, str]], *, chapter_no: int | None = None) -> Any:
     """Resolve explicit choices from this call's source-bound excerpts, never fuzzy-match claims."""
     data = output.model_dump(mode="json")
     def resolve(value: str, source_id: str) -> str:
@@ -46,6 +46,18 @@ def resolve_review_quote_refs(output: Any, quotes: dict[str, dict[str, str]]) ->
         check["setting_quote"] = resolve(check["setting_quote"], check["record_id"])
         check["chapter_quote"] = resolve(check["chapter_quote"], "当前正文")
     patch = data.get("memory_patch")
+    boundary = chapter_no or (patch or {}).get("chapter_no")
+    for proposal in [*data.get("setting_updates", []), *(patch or {}).get("setting_updates", [])]:
+        for reference in proposal.get("evidence_refs", []):
+            entry = quotes.get(reference.get("quote", ""))
+            number = reference.get("chapter_no")
+            if not entry or not isinstance(number, int) or not boundary or number > boundary:
+                continue
+            source = entry["source_id"]
+            if ((number == boundary and source == "当前正文")
+                    or source == f"chapter:{number:05d}"
+                    or (source.startswith("batch:") and source.endswith(f":chapter:{number:05d}"))):
+                reference["quote"] = entry["quote"]
     if patch:
         def resolve_reference(item: dict[str, Any]) -> None:
             entry = quotes.get(item.get("quote", ""))
