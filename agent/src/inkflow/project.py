@@ -138,7 +138,7 @@ class InkFlowProject:
             if item["kind"] in {"workflow", "accept_finalization"} and not (item.get("run_id") and item.get("source", {}).get("task_id")):
                 handling = "blocked"
             task_id = item.get("source", {}).get("task_id")
-            if task_id and handling == "resume":
+            if task_id and handling == "resume" and item["kind"] != "accept_finalization":
                 with self.db.connect() as connection:
                     records = connection.execute("SELECT value_json FROM metadata WHERE key LIKE ?", (f"coordinator_recovery:{task_id}:%",)).fetchall()
                 if any(len(record.get("attempts", [])) >= 2 or record.get("status") == "waiting_user"
@@ -379,8 +379,8 @@ class InkFlowProject:
             if action in accept_actions or action == "review":
                 chapters = [self.db.get_chapter(number) for number in range(first, last + 1)]
                 if (all(chapter and chapter["status"] == "accepted" and later(chapter.get("accepted_at"), item.get("created_at")) for chapter in chapters)
-                        and not any(work.get("kind") == "accept_finalization" and work.get("chapter_no") in range(first, last + 1)
-                                    and work.get("status") not in {"completed", "superseded"} for work in items)
+                        and (action == "review" or not any(work.get("kind") == "accept_finalization" and work.get("chapter_no") in range(first, last + 1)
+                                    and work.get("status") not in {"completed", "superseded"} for work in items))
                         and all((body := self.db.canonical_chapter_content(chapter["chapter_no"]))
                                 and content_hash(body) == chapter["content_hash"] for chapter in chapters)):
                     status = "superseded" if action == "review" else "completed"
