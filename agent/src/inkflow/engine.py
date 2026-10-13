@@ -671,7 +671,7 @@ class InkFlowEngine:
                                  setting_change: dict[str, Any], instruction: str = "",
                                  expected_book_hash: str | None = None) -> dict[str, Any]:
         """Apply only an explicit, version-checked setting edit; never edit accepted prose."""
-        project = InkFlowProject(root)
+        project = await asyncio.to_thread(InkFlowProject, root)
         targets = {"book": "BOOK.md", "outline": "OUTLINE.md", "story_detail": "STORY_DETAIL.md"}
         if document_kind not in targets or not setting_change:
             raise ValidationGateError("请明确要改书籍设定、大纲还是细纲，并说出具体改动；不会猜测或覆盖正文。")
@@ -732,10 +732,10 @@ class InkFlowEngine:
                       "after_hash": content_hash(new_text), "instruction": instruction.strip(),
                       "changed_fields": sorted(setting_change)},
             )
-        from .manual_edits import ManualEditsService
-        from .story_settings import StorySettingsService
-        job = ManualEditsService(project).mark_saved(relative,new_text,content_hash(old_text),source="story_setting_edit")
-        impact = StorySettingsService(project).impact_summary()
+            from .manual_edits import ManualEditsService
+            from .story_settings import StorySettingsService
+            job = ManualEditsService(project).mark_saved(relative,new_text,content_hash(old_text),source="story_setting_edit")
+            impact = StorySettingsService(project).impact_summary()
         return {"changed": True, "document": relative, "before_hash": content_hash(old_text),
                 "after_hash": content_hash(new_text), "before": old_text, "after": new_text,
                 "changes": setting_change, "impact":impact,"manual_review":job,

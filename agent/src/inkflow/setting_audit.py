@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from .errors import ValidationGateError
+from .project_lock import project_write_lock
 from .role_protocol import check_owners_for_mode
 from .schemas import StorySettingsAudit
 from .story_settings import StorySettingsService
@@ -56,15 +57,21 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
         sources[source_id] = project.db.canonical_chapter_content(chapter["chapter_no"]) or ""
         canon.append(chapter["chapter_no"])
     payload = service.context_payload(chapter_no=latest + 1, actor=role)
-    prompt = json_dumps({"用户目标": instruction, "近期对话（区分用户原话与模型回复）": conversation_context,
-        "当前书籍资料": brief.model_dump(mode="json"),
-        "来源": sources, "设定读取范围": payload,
+    prompt = json_dumps({"当前书籍资料": brief.model_dump(mode="json"),
+        "来源": {key: value for key, value in sources.items() if key != "近期对话·用户"}, "设定读取范围": payload,
         "正史事实": project.db.current_facts()[:128], "未结线索": project.db.open_threads()[:64],
-        "范围说明": "正文只读取所列章节和有界正史记录；不可声称逐章审完全部小说。"})
-    if estimate_tokens(prompt) + 6000 > engine.settings.context_budget_for(role)[1]:
+        "范围说明": "正文只读取所列章节和有界正史记录；不可声称逐章审完全部小说。",
+        "补充来源": {"近期对话·用户": sources["近期对话·用户"]},
+        "近期对话（区分用户原话与模型回复）": conversation_context, "用户目标": instruction})
+    record_capacity = min(8, 2 * sum(bool(item.get("recording_allowed")) for item in payload["collections"]))
+    requested_output = 4096 + record_capacity * 1000 + min(4000, 2 * estimate_tokens(json_dumps(brief.user_rules)))
+    output_budget = engine.settings.effective_output_tokens(requested_output, role)
+    if estimate_tokens(prompt) + output_budget > engine.settings.context_budget_for(role)[1]:
         raise ValidationGateError("本次设定与规划超过当前审核角色的资料预算，请缩小检查范围。")
     trace = TraceRecorder(project.root, "setting-audit", engine.settings.trace_level)
     try:
+        trace.record("settings.audit", "started", "正在对照本书设定、当前规划和已读取正文",
+            metadata={"role": role, "source_count": len(sources), "output_budget": output_budget})
         result = await engine.provider.generate_json(system_prompt=(
             "你是当前设定审查责任角色。先阅读实际资料，主动比较书籍要求、正式规划和正文依据，不等待用户告诉你错误位置。"
             "区分书籍要求、模板、具体设定参考与正史事实；空合集只报告尚未填写，不冒充审查通过，也不强行填满不必要的分类。"
@@ -78,7 +85,8 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
             "已有设定合集缺记录时，判断所给已接受正文中是否有值得持续追踪的对象；在setting_updates同次返回必要的首次建档或补充，每条有canonical来源章号和连续原句，epistemic_status用objective/belief/rumor。只提取已有文字，不凭空创造、不补满未知字段；已有同一对象复用record_id与expected_revision。没有有用资料就明确空缺。"
             "世界基础设定中的明确用户边界可从BOOK.md原句整理，epistemic_status=user_constraint、source_kind=planning、path=BOOK.md；用户约定不是已经发生的情节，不推测未写出的世界细节。"
             "summary和findings用自然中文解释具体问题和证据，不输出内部编号或长路径；不声称未执行的修改已完成。"),
-            user_prompt=prompt, output_model=StorySettingsAudit, max_tokens=min(6000, engine.settings.max_output_tokens),
+            user_prompt=prompt + "\n报告保持精简：summary不超过400字，findings只列需处理的问题，不逐项复述正常情节。设定候选只填有用字段，每字段一两句，每条最多两处200字以内的连续原句；相同对象合并，不写重复长报告。",
+            output_model=StorySettingsAudit, max_tokens=output_budget,
             thinking=False, agent_role=role)
         trace.record_model("settings.audit", result, "设定审查返回，核对当前来源与修正范围")
         if (before != engine._planning_source_fingerprint(project, 1, max(1, latest + 1))
@@ -116,15 +124,17 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
                                 or ref["quote"] not in sources.get(source_id, "")
                                 or project.db.canonical_chapter_content(int(ref["chapter_no"])) != sources[source_id]):
                             raise ValidationGateError("设定引文没有绑定本次实际读取且仍有效的正文")
-                    record = service.save_record(**args, actor=role,
-                        operation="supplement" if candidate.record_id else "new")
-                    if role == owners["memory"]:
-                        service.record_review(record["record_id"], record["revision"], actor=role,
-                            decision="verified_reference", source_fingerprint=service.source_fingerprint())
-                    else:
-                        manual = ManualEditsService(project)
-                        job = manual.enqueue("story-setting:" + record["record_id"], json_dumps(record),
-                            kind="setting_record", record_revision=record["revision"])
+                    async with project_write_lock(project.root):
+                        record = service.save_record(**args, actor=role,
+                            operation="supplement" if candidate.record_id else "new")
+                        if role == owners["memory"]:
+                            service.record_review(record["record_id"], record["revision"], actor=role,
+                                decision="verified_reference", source_fingerprint=service.source_fingerprint())
+                        else:
+                            manual = ManualEditsService(project)
+                            job = manual.enqueue("story-setting:" + record["record_id"], json_dumps(record),
+                                kind="setting_record", record_revision=record["revision"])
+                    if role != owners["memory"]:
                         checked = await manual.review(job["job_id"], engine)
                         if checked.get("status") != "passed":
                             pending.append(f"《{record['title']}》已记录，等待当前记忆责任角色完成核对")

@@ -9,7 +9,7 @@ from typing import Literal
 from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 from .errors import ValidationGateError
-from .project_lock import project_write_lock_sync, _pid_alive
+from .project_lock import project_write_lock, project_write_lock_sync, _pid_alive
 from .studio import StudioService
 from .utils import SOURCE_RECOVERY_TOKEN_LIMIT, content_hash, utc_now
 
@@ -262,7 +262,7 @@ class ManualEditsService:
         if not job:
             raise ValidationGateError("找不到这次手动编辑。")
         if resume and job["status"] == "failed" and int(job.get("attempts", 0)) < 2:
-            with project_write_lock_sync(self.project.root):
+            async with project_write_lock(self.project.root):
                 jobs = self.jobs()
                 current = jobs.get(job_id)
                 if current and current["status"] == "failed" and current["current_hash"] == job["current_hash"]:
@@ -280,7 +280,7 @@ class ManualEditsService:
                 settings=lambda: engine.settings, workspace_root=self.project.root,
                 collaboration_mode=None if job.get("task_id") else original_scope.collaboration_mode if original_scope else "everyday")
         except Exception as exc:
-            with project_write_lock_sync(self.project.root):
+            async with project_write_lock(self.project.root):
                 jobs = self.jobs()
                 if jobs.get(job_id, {}).get("status") == "pending":
                     jobs[job_id] = {**jobs[job_id], "status": "failed", "summary": "配置断点无法恢复：" + str(exc)[:1500], "updated_at": utc_now()}
@@ -307,7 +307,7 @@ class ManualEditsService:
             return job
         if not engine.settings.manual_edit_review_enabled:
             return {**job, "auto_review_disabled": True}
-        with project_write_lock_sync(self.project.root):
+        async with project_write_lock(self.project.root):
             jobs = self.jobs()
             job = jobs[job_id]
             if job["status"] != "pending":
@@ -457,7 +457,7 @@ class ManualEditsService:
                 summary = report.summary
                 if planning_gap:
                     summary += "；当前规划仍须按这份修改核对或重新发布，旧章节卡未自动更新。"
-            with project_write_lock_sync(self.project.root):
+            async with project_write_lock(self.project.root):
                 jobs = self.jobs()
                 current = jobs.get(job_id)
                 visible_valid = True
@@ -510,7 +510,7 @@ class ManualEditsService:
                 self.project.db.set_metadata("manual_edit_jobs",jobs)
                 return jobs[job_id]
         except (Exception, asyncio.CancelledError) as exc:
-            with project_write_lock_sync(self.project.root):
+            async with project_write_lock(self.project.root):
                 jobs=self.jobs()
                 current=jobs.get(job_id)
                 if current and current["status"]=="reviewing":

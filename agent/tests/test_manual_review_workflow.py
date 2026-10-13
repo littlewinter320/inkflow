@@ -75,3 +75,25 @@ def test_setting_review_cannot_skip_existing_plan(tmp_path, monkeypatch):
     assert len(provider.calls) == 1
     assert "当前结构化规划" in provider.calls[0]["user_prompt"]
     assert service.records(collection["collection_id"])[0]["status"] != "verified_reference"
+
+
+def test_manual_review_waits_for_short_project_write(tmp_path, monkeypatch):
+    from inkflow.project_lock import project_write_lock
+    project = project_fixture(tmp_path)
+    settings = Settings()
+    monkeypatch.setattr(Settings, "from_env", lambda *_: settings)
+    service = StorySettingsService(project)
+    collection = service.save_collection(name="人物", template_id="character")
+    record = service.save_record(collection["collection_id"], title="设想", values={"state": "未来回城"})
+    provider = ScriptedProvider([ManualEditReview(verdict="pass", summary="与当前规划相容", planning_decision="compatible",
+        planning_quotes=[project.db.get_current_plan_bundle().book.reader_promise])])
+    manual = ManualEditsService(project)
+    job = enqueue_record(project, record)
+    async def run():
+        async with project_write_lock(project.root):
+            pending = asyncio.create_task(manual.review(job["job_id"], InkFlowEngine(provider, settings)))
+            await asyncio.sleep(.02)
+            assert not pending.done()
+        return await pending
+    result = asyncio.run(run())
+    assert result["status"] == "passed" and len(provider.calls) == 1

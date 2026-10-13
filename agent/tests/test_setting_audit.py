@@ -49,6 +49,7 @@ def test_setting_audit_reads_real_material_then_uses_existing_edit_review(tmp_pa
         instruction="检查并处理本书设定与规划的不一致"))
     assert result["status"] == ("needs_evidence" if invalid_rule else "corrected")
     assert len(provider.calls) == (1 if invalid_rule else 2) and all(call["agent_role"] == "editor" for call in provider.calls)
+    assert 6000 < provider.calls[0]["max_tokens"] <= settings.max_output_tokens
     assert "旧规模要求" in provider.calls[0]["user_prompt"] and "OUTLINE.md" in provider.calls[0]["user_prompt"]
     assert project.db.get_brief().user_rules[-1] == "保持日常对白"
     assert project.db.accepted_chapters() == canon
