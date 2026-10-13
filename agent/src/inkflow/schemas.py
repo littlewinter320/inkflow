@@ -619,7 +619,7 @@ class SettingRecordProposal(StrictModel):
 
 
 class SettingRecordSet(StrictModel):
-    records: list[SettingRecordProposal] = Field(min_length=1, max_length=8)
+    records: list[SettingRecordProposal] = Field(default_factory=list, max_length=8)
 
 
 class SettingRuleCorrection(StrictModel):

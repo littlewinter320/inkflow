@@ -467,8 +467,9 @@ class StorySettingsService:
                 "collection_revision": collection["revision"]}
             if old is not None:
                 # Re-saving identical content must not manufacture an edit or clear approval.
-                keys = ("title", "values", "evidence_refs", "epistemic_status", "source_chapter", "collection_revision")
-                if all(old.get(key) == data.get(key) for key in keys) and old["status"] != "archived":
+                keys = ("title", "values", "evidence_refs", "epistemic_status", "source_chapter")
+                if (all(old.get(key) == data.get(key) for key in keys) and old["status"] != "archived"
+                        and not collection_requires_recheck(collection, old["collection_revision"])):
                     return {**old, "changed": False}
                 if actor == "writer" and old["status"] in {"verified_reference", "user_kept_hypothesis"}:
                     raise ProjectError("Writer 不能改写已核对设定；请另建设想候选，由审查或记忆角色有据补充。")

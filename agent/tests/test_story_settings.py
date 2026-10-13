@@ -92,6 +92,11 @@ def test_base_settings_and_optional_recording_switch():
         else:
             raise AssertionError("Opted-out settings must not receive model writes")
         assert service.records(advanced["collection_id"])[0]["values"] == record["values"]
+        service.save_collection(name=advanced["name"], collection_id=advanced["collection_id"],
+            expected_revision=disabled["revision"], auto_record=True)
+        unchanged = service.save_record(advanced["collection_id"], record_id=record["record_id"],
+            expected_revision=record["revision"], title=record["title"], values=record["values"], actor="writer")
+        assert not unchanged["changed"] and unchanged["revision"] == record["revision"]
 
 
 def test_setting_revisions_evidence_and_writer_authority():

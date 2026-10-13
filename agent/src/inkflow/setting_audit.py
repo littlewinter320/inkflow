@@ -1,10 +1,10 @@
 """On-demand settings diagnosis through the existing editor and versioned edit service."""
 from __future__ import annotations
 
-from .errors import ValidationGateError
+from .errors import ProjectError, ProviderError, ValidationGateError
 from .project_lock import project_write_lock
 from .role_protocol import check_owners_for_mode
-from .schemas import StorySettingsAudit
+from .schemas import StorySettingsAudit, SettingRecordSet
 from .story_settings import StorySettingsService
 from .task_settings import active_task_settings
 from .utils import content_hash, estimate_tokens, json_dumps
@@ -24,7 +24,7 @@ def corrected_rules(rules, corrections, sources):
     return result
 
 
-async def audit_story_settings(engine, project, *, instruction, apply_corrections=False, conversation_context=""):
+async def audit_story_settings(engine, project, *, instruction, apply_corrections=False, conversation_context="", allow_evidence_repair=True):
     from .manual_edits import ManualEditsService
     from .trace import TraceRecorder
     scope = active_task_settings.get()
@@ -94,6 +94,7 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
             raise ValidationGateError("检查期间设定或规划发生变化，结论已留档，未覆盖当前资料。")
         report = result.data
         changes = None
+        rules_unchanged = False
         rule_pending = []
         if apply_corrections and report.rule_corrections:
             try:
@@ -102,20 +103,55 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
                     setting_change={"user_rules": rules}, instruction=instruction,
                     expected_book_hash=content_hash(sources.get("BOOK.md", "")))
                 job = changes.get("manual_review")
+                if not changes.get("changed"):
+                    rules_unchanged = True
+                    changes = None
                 if job and job.get("job_id"):
                     changes["verification"] = await ManualEditsService(project).review(job["job_id"], engine)
             except ValidationGateError as exc:
                 rule_pending.append(str(exc))
+        candidates = list(report.setting_updates)
+        if changes and changes.get("after"):
+            sources["BOOK.md"] = changes["after"]
+        invalid = []
+        if apply_corrections:
+            for index, candidate in enumerate(candidates):
+                try:
+                    service._evidence(candidate.evidence_refs)
+                except ProjectError as exc:
+                    invalid.append({"index": index, "candidate": candidate.model_dump(mode="json"), "reason": str(exc)})
+        if invalid and allow_evidence_repair:
+            # One joint, same-owner evidence repair; valid candidates are never regenerated.
+            trace.record("settings.evidence_repair", "started", "仅补核未定位的设定依据，保留有效候选",
+                metadata={"attempt": 1, "candidate_count": len(invalid)})
+            repair_sources = {key: value for key, value in sources.items() if key.startswith("chapter:") or key == "BOOK.md"}
+            try:
+                repaired = await engine.provider.generate_json(system_prompt=(
+                    "你仅修复本次设定候选的证据定位与归类。保持collection_id、record_id及title，不新增对象、不写正文。"
+                    "只从给出的原文逐字摘连续短句；实际发生引用canonical及正整数chapter_no；BOOK.md用户约定用planning/path与user_constraint。"
+                    "旧规划不能代替已发生事实。没有实际支持的候选不返回，records可以为空。"),
+                    user_prompt=json_dumps({"待补核候选": invalid, "实际原文": repair_sources}),
+                    output_model=SettingRecordSet, max_tokens=engine.settings.effective_output_tokens(2000 + 1000 * len(invalid), role),
+                    thinking=False, agent_role=role)
+                trace.record_model("settings.evidence_repair", repaired, "原责任角色已补核设定引用")
+                by_identity = {(item.collection_id, item.record_id, item.title): item for item in repaired.data.records}
+                for failure in invalid:
+                    old = candidates[failure["index"]]
+                    replacement = by_identity.get((old.collection_id, old.record_id, old.title))
+                    if replacement is not None:
+                        candidates[failure["index"]] = replacement
+            except ProviderError as exc:
+                trace.record("settings.evidence_repair", "failed", "设定引用补核未完成，仍保存其他有据条目", str(exc))
         adopted, pending = [], rule_pending
         if apply_corrections:
-            for candidate in report.setting_updates:
+            for candidate in candidates:
                 try:
                     args = candidate.model_dump()
                     args["evidence_refs"] = service._evidence(candidate.evidence_refs)
                     for ref in args["evidence_refs"]:
                         if ref["source_kind"] == "planning" and ref.get("path") == "BOOK.md" and candidate.epistemic_status == "user_constraint":
                             current_book = (project.root / "BOOK.md").read_text(encoding="utf-8")
-                            expected = changes["after"] if changes else sources["BOOK.md"]
+                            expected = changes.get("after", sources["BOOK.md"]) if changes else sources["BOOK.md"]
                             if current_book != expected or ref["quote"] not in sources["BOOK.md"]:
                                 raise ValidationGateError("书籍约定已变化，不能沿用这份设定候选")
                             continue
@@ -125,21 +161,27 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
                                 or project.db.canonical_chapter_content(int(ref["chapter_no"])) != sources[source_id]):
                             raise ValidationGateError("设定引文没有绑定本次实际读取且仍有效的正文")
                     async with project_write_lock(project.root):
+                        expected_collection = next((item for item in payload["collections"] if item["collection_id"] == candidate.collection_id), None)
+                        current_collection = service._get(candidate.collection_id, "collection")
+                        if (not expected_collection or not expected_collection.get("recording_allowed")
+                                or not current_collection or current_collection["revision"] != expected_collection["revision"]):
+                            raise ValidationGateError("这份设定未授权本轮记录或配置已变化，未写入旧候选")
                         record = service.save_record(**args, actor=role,
                             operation="supplement" if candidate.record_id else "new")
-                        if role == owners["memory"]:
+                        unchanged_verified = not record.get("changed") and record["status"] == "verified_reference"
+                        if role == owners["memory"] and not unchanged_verified:
                             service.record_review(record["record_id"], record["revision"], actor=role,
                                 decision="verified_reference", source_fingerprint=service.source_fingerprint())
-                        else:
+                        elif role != owners["memory"] and not unchanged_verified:
                             manual = ManualEditsService(project)
                             job = manual.enqueue("story-setting:" + record["record_id"], json_dumps(record),
                                 kind="setting_record", record_revision=record["revision"])
-                    if role != owners["memory"]:
+                    if role != owners["memory"] and not unchanged_verified:
                         checked = await manual.review(job["job_id"], engine)
                         if checked.get("status") != "passed":
                             pending.append(f"《{record['title']}》已记录，等待当前记忆责任角色完成核对")
                             continue
-                    adopted.append({"title": record["title"], "record_id": record["record_id"], "evidence_refs": record["evidence_refs"]})
+                    adopted.append({"title": record["title"], "record_id": record["record_id"], "collection_id": record["collection_id"], "changed": bool(record.get("changed")), "evidence_refs": record["evidence_refs"]})
                 except Exception as exc:
                     pending.append(f"《{candidate.title}》尚未保存通过：{exc}")
         status = "needs_input" if report.needs_choice else "needs_evidence" if pending else "reviewed"
@@ -153,11 +195,14 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
         if changes:
             summary += "\n" + ("已同步过期的书籍要求，并核对了当前规划。" if (changes.get("verification") or {}).get("status") == "passed" else "书籍要求已保存修订，仍需完成其与当前规划的核对。")
         elif report.rule_corrections:
-            summary += "\n已找到需要同步的要求，本次尚未写回。"
+            summary += "\n" + ("当前书籍要求已经与这份建议一致，没有重复保存或增加版本。" if rules_unchanged else "已找到需要同步的要求，本次尚未写回。")
         if adopted:
-            summary += "\n已根据原文整理设定：" + "、".join(item["title"] for item in adopted) + "；每条都保存了来源章节、原句和版本。"
+            summary += "\n已核对可用的设定：" + "、".join(item["title"] for item in adopted) + "；每条都有来源、原句和版本。"
         if pending:
             summary += "\n" + "；".join(pending)
+        for item in payload["coverage"]:
+            item["stored_record_count"] = len(service.records(item["collection_id"]))
+            item["adopted_record_count"] = sum(record["collection_id"] == item["collection_id"] and record["changed"] for record in adopted)
         trace.finish(summary=summary)
         return {"status": status, "summary": summary, "findings": report.findings,
                 "needs_choice": report.needs_choice, "changes": changes, "adopted_settings": adopted, "pending_settings": pending,

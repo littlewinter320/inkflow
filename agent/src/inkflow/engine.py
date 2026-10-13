@@ -543,7 +543,7 @@ class InkFlowEngine:
                 warnings.append(f"设定参考候选{index+1}待处理：{exc}")
         return {"record_ids":applied,"warnings":warnings,"authority":"reference_only"}
 
-    async def manage_story_settings(self, root, *, change, instruction="", conversation_context=""):
+    async def manage_story_settings(self, root, *, change, instruction="", conversation_context="", allow_evidence_repair=True):
         from .story_settings import StorySettingsService
         from .manual_edits import ManualEditsService
         from .schemas import SettingRecordSet
@@ -553,7 +553,8 @@ class InkFlowEngine:
         if operation == "audit":
             from .setting_audit import audit_story_settings
             return await audit_story_settings(self, project, instruction=instruction,
-                apply_corrections=change.get("apply_corrections") is True, conversation_context=conversation_context)
+                apply_corrections=change.get("apply_corrections") is True, conversation_context=conversation_context,
+                allow_evidence_repair=allow_evidence_repair)
         if operation == "manual_decide":
             job_id = str(change.get("job_id") or "")
             job = ManualEditsService(project).jobs().get(job_id)
@@ -654,6 +655,9 @@ class InkFlowEngine:
                 raise ValidationGateError("模型返回了授权范围之外的设定记录，未写入。")
         records=[]
         failures=[]
+        if not result.data.records:
+            return {"records": [], "failures": [], "status": "needs_evidence", "canon_changed": False,
+                    "summary": "本次没有返回有依据的设定条目，尚未新增记录；请补充来源或缩小需要整理的对象。"}
         for index, candidate in enumerate(result.data.records):
             try:
                 record=service.save_record(**candidate.model_dump(), actor=canonical_role,

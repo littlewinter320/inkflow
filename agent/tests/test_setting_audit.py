@@ -132,3 +132,44 @@ def test_setting_page_reads_the_same_versioned_review(tmp_path):
     service.save_record(collection["collection_id"], title="线索", record_id=record["record_id"],
         expected_revision=record["revision"], values={"description": "未来另有线索。"})
     assert links()[0]["current"] is False
+
+
+@pytest.mark.parametrize("allow_repair", [False, True])
+def test_setting_evidence_repairs_only_failed_candidates(tmp_path, allow_repair):
+    from inkflow.schemas import SettingRecordSet
+    from inkflow.story_settings import StorySettingsService
+    project = project_fixture(tmp_path)
+    service = StorySettingsService(project)
+    collection = service.save_collection(name="地点", template_id="location")
+    valid = SettingRecordProposal(collection_id=collection["collection_id"], title="有效条目",
+        values={"description": "此前已核对的事实。"}, epistemic_status="objective",
+        evidence_refs=[{"source_kind": "canonical", "chapter_no": 10, "quote": "此前已核对的事实。"}])
+    bad = valid.model_copy(update={"title": "待修引文", "evidence_refs": [{"source_kind": "canonical", "chapter_no": 10, "quote": "不存在的原句"}]})
+    fixed = valid.model_copy(update={"title": "待修引文"})
+    provider = ScriptedProvider([StorySettingsAudit(summary="检查设定依据", setting_updates=[valid, bad]), SettingRecordSet(records=[fixed])])
+    result = asyncio.run(InkFlowEngine(provider, Settings()).manage_story_settings(project.root,
+        change={"operation": "audit", "apply_corrections": True}, instruction="维护设定", allow_evidence_repair=allow_repair))
+    assert len(provider.calls) == (2 if allow_repair else 1)
+    assert len(service.records(collection["collection_id"])) == (2 if allow_repair else 1)
+    assert result["status"] == ("reviewed" if allow_repair else "needs_evidence")
+    if allow_repair:
+        assert "有效条目" not in provider.calls[1]["user_prompt"]
+
+
+def test_unchanged_book_does_not_block_world_record(tmp_path):
+    from inkflow.project import render_book_brief
+    from inkflow.story_settings import StorySettingsService
+    project = project_fixture(tmp_path)
+    brief = project.db.get_brief().model_copy(update={"user_rules": ["主角不能拥有超自然能力。"]})
+    project.db.set_brief(brief)
+    (project.root / "BOOK.md").write_text(render_book_brief(brief), encoding="utf-8")
+    provider = ScriptedProvider([StorySettingsAudit(summary="整理世界边界", rule_corrections=[SettingRuleCorrection(
+        old_rule=brief.user_rules[0], new_rule=brief.user_rules[0], reason="已一致", source_id="BOOK.md", source_quote=brief.user_rules[0])],
+        setting_updates=[SettingRecordProposal(collection_id="setting-base-world", title="能力边界",
+            values={"limits": brief.user_rules[0]}, epistemic_status="user_constraint",
+            evidence_refs=[{"source_kind": "planning", "path": "BOOK.md", "quote": brief.user_rules[0]}])])])
+    result = asyncio.run(InkFlowEngine(provider, Settings()).manage_story_settings(project.root,
+        change={"operation": "audit", "apply_corrections": True}, instruction="维护设定"))
+    assert result["status"] == "reviewed" and result["changes"] is None
+    assert len(provider.calls) == 1 and not result["pending_settings"]
+    assert StorySettingsService(project).records("setting-base-world")[0]["status"] == "verified_reference"

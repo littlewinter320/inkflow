@@ -1371,6 +1371,9 @@ class TerminalSession:
         outcome = workflow_result_status(response)
         if intent.action == "pending_work" or outcome not in {"failed", "waiting_condition"} or response.get("questions"):
             return response
+        if intent.action == "story_settings_manage" and intent.setting_change.get("operation") == "audit":
+            return response | {"coordinator_recovery": {"status": "not_run",
+                "reason": "设定引用在原责任节点有界补核；保留已保存条目，不用外围诊断重跑整份审查。"}}
         if intent.action in {"plan", "plan_next_arc", "outline", "redesign_story", "planning_publish_reviewed"}:
             return response | {"coordinator_recovery": {"status": "not_run",
                 "reason": "规划候选须在原规划节点定点修订；正文复审不能修复规划，未增加外围模型调用。"}}
@@ -3333,7 +3336,8 @@ class TerminalSession:
         if intent.action == "story_settings_manage":
             result = await self.engine.manage_story_settings(root, change=intent.setting_change,
                 instruction=intent.operation_instruction or intent.user_message,
-                conversation_context="\n".join(section.content for section in (packet.sections if packet else []) if section.key == "F"))
+                conversation_context="\n".join(section.content for section in (packet.sections if packet else []) if section.key == "F"),
+                allow_evidence_repair=not bool(set(intent.forbidden_actions) & {"extra_calls", "extra_model_calls"}))
             response = {"result": result}
             if intent.setting_change.get("operation") == "audit":
                 lines = [result["summary"], *result.get("findings", [])]
@@ -3343,7 +3347,7 @@ class TerminalSession:
                     lines.append("正文对照范围：第 " + "、".join(map(str, chapters)) + " 章，另参考现有正史记录；未逐章审查全书正文。")
                 for collection in coverage.get("settings", []):
                     count = len(collection.get("selected_record_ids", []))
-                    lines.append(f"{collection['name']}：{f'读取了 {count} 条具体记录' if count else '本次没有可核对的具体条目，未计作审查通过'}。")
+                    lines.append(f"{collection['name']}：开始时读取 {count} 条，本次保存 {collection.get('adopted_record_count', 0)} 条，当前共有 {collection.get('stored_record_count', count)} 条记录。")
                 lines.extend(result.get("needs_choice", []))
                 response["reply"] = "\n\n".join(lines)
                 if result.get("questions"):
