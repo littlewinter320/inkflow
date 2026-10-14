@@ -57,6 +57,8 @@ class InkFlowProject:
             self.db.set_metadata("base_story_settings_initialized", True)
 
     def pending_work(self, *, chapter_no: int | None = None, include_rejected: bool = False) -> list[dict[str, Any]]:
+        from .manual_edits import ManualEditsService
+        ManualEditsService(self).reconcile_setting_reviews()
         with self.db.connect() as connection:
             rows = connection.execute(
                 "SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%' ORDER BY updated_at DESC"

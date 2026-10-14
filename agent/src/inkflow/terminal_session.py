@@ -1662,6 +1662,12 @@ class TerminalSession:
         # belong to Coordinator rather than a fabricated chapter number.
         if len(range_matches) == 1:
             start_chapter, end_chapter = (int(value) for value in range_matches[0].groups())
+        elif len(range_matches) > 1:
+            start_chapter, end_chapter = self._explicit_chapter_range(text)
+            if (start_chapter is None or end_chapter is None or not all(
+                    start_chapter <= int(match.group(1)) <= int(match.group(2)) <= end_chapter
+                    for match in range_matches)):
+                return None
         elif len(range_matches) == 0 and project is not None:
             target = re.search(r"(?:继续|接着|往下|一路|一直)[^。！？；\n]{0,16}(?:写|续写|创作|完成)(?:到|至)第?\s*(\d+)\s*章", text)
             if not target or re.search(r"先聊|只讨论|先别写|不写|不要写|能不能|可不可以|为什么|怎么", text):
@@ -2553,7 +2559,9 @@ class TerminalSession:
         matches = []
         for match in pattern.finditer(message):
             prefix = re.split(r"[。！？；\n，,]", message[:match.start()])[-1]
-            if not re.search(r"(?:保留|保护|不(?:再)?(?:重写|修改|改动|覆盖)|不要(?:重写|修改|改动|覆盖))[^。！？；\n，,]*$", prefix):
+            suffix = re.split(r"[。！？；\n，,]", message[match.end():], maxsplit=1)[0]
+            protected_after = re.match(r"\s*(?:的)?(?:正史|已接受正文|正文|原稿)?\s*(?:保持不动|保持原样|不动|不改|不要改|不重写|不要重写|仅作参考)", suffix)
+            if not protected_after and not re.search(r"(?:保留|保护|不(?:再)?(?:重写|修改|改动|覆盖)|不要(?:重写|修改|改动|覆盖))[^。！？；\n，,]*$", prefix):
                 matches.append(match)
         return matches
 
@@ -2564,13 +2572,24 @@ class TerminalSession:
         # final explicit range is normally the operative object, while the
         # earlier one is supporting evidence.
         explicit_spans = TerminalSession._operative_range_matches(message, _CHAPTER_FROM_TO_PATTERN)
+        range_matches = TerminalSession._operative_range_matches(message, _CHAPTER_RANGE_PATTERN)
+        # A batch can contain a smaller revision range. Do not replace its
+        # overall goal with that substep or with a protected canon range.
+        spans = explicit_spans or range_matches
+        for candidate in spans:
+            clause_start = re.split(r"[。！？；\n，,]", message[:candidate.start()])[-1]
+            clause_end = re.split(r"[。！？；\n，,]", message[candidate.end():], maxsplit=1)[0]
+            clause = clause_start + candidate.group(0) + clause_end
+            if (re.search(r"批次|批量|整批", clause) and re.search(r"继续|接着|完成|生成|写完", clause)
+                    and not re.search(r"参考|根据|之前|以前|原来|旧的", clause)
+                    and all(int(candidate.group(1)) <= int(item.group(1)) <= int(item.group(2)) <= int(candidate.group(2)) for item in spans)):
+                return int(candidate.group(1)), int(candidate.group(2))
         if explicit_spans:
             span = explicit_spans[-1]
             start = int(span.group(1))
             end = int(span.group(2))
             if start >= 1 and end >= start:
                 return start, end
-        range_matches = TerminalSession._operative_range_matches(message, _CHAPTER_RANGE_PATTERN)
         if range_matches:
             range_match = range_matches[-1]
             start = int(range_match.group(1))

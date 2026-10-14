@@ -73,10 +73,44 @@ class ManualEditsService:
 
     def status(self):
         from .utils import source_display_name
+        self.reconcile_setting_reviews()
         jobs = [{**item, "display_name": source_display_name(self.project, item["relative_path"])}
                 for item in sorted(self.jobs().values(), key=lambda item: item["updated_at"], reverse=True)]
         return {"jobs": jobs, "issues": [item for item in jobs if item["status"] in
                 {"awaiting_confirmation", "needs_evidence", "failed", "revision_requested"}]}
+
+    def reconcile_setting_reviews(self):
+        """A current, verified successor retires its old setting-review job."""
+        from .story_settings import StorySettingsService
+        with project_write_lock_sync(self.project.root):
+            jobs = self.jobs()
+            candidates = [job for job in jobs.values() if job.get("kind") == "setting_record"
+                and job.get("applied") and type(job.get("record_revision")) is int
+                and job.get("status") in {"pending", "awaiting_confirmation", "needs_evidence", "failed", "revision_requested", "paused"}]
+            if not candidates:
+                return
+            service = StorySettingsService(self.project)
+            records = {"story-setting:" + record["record_id"]: (record, collection)
+                for collection in service.list_collections() for record in collection["records"]}
+            changed, cache = False, {}
+            for job in candidates:
+                pair = records.get(job["relative_path"])
+                if not pair:
+                    continue
+                record, collection = pair
+                if (record["revision"] <= job["record_revision"] or record["status"] != "verified_reference"
+                        or record.get("review", {}).get("decision") != "verified_reference"):
+                    continue
+                live = service._context_record(record, collection, None, cache)
+                if not live or live["status"] != "verified_reference":
+                    continue
+                jobs[job["job_id"]] = {**job, "status": "superseded", "updated_at": utc_now(),
+                    "summary": "这份设定已有更新版本完成核对，旧候选待办已收尾。",
+                    "resolution": {"type": "verified_setting_successor", "record_id": record["record_id"],
+                        "record_revision": record["revision"], "previous_record_revision": job["record_revision"]}}
+                changed = True
+            if changed:
+                self.project.db.set_metadata("manual_edit_jobs", jobs)
 
     def enqueue(self, relative_path, content, *, previous_hash="", kind="document", chapter_no=None, applied=True, record_revision=None):
         relative_path = str(relative_path).replace("\\", "/")
