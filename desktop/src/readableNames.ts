@@ -28,6 +28,12 @@ export function readableSourceText(text: string, names: Array<[string, string]> 
     .replace(/(?:story-setting:)?setting-record-[A-Za-z0-9_-]+/g, "设定参考条目")
     .replace(/(?:chapters|reviews|planning|batches|\.inkflow)[/\\][^\s，。；、<>“”‘’"'：:（）()\[\]{}]+/g, value => documentLabel(value))
     .replace(/\b(?:BOOK|OUTLINE|STORY_DETAIL|RECENT_PLAN|PLAN|STATE|DIALOGUE)\.md\b/g, value => documentLabel(value))
+    .replace(/\brevision\s*(\d+)\b/gi, "第$1版")
+    .replace(/\b(?:epistemic_status|verified_reference|needs_evidence|pending_review|user_constraint|hypothesis|objective|status)\b/g, value => ({
+      epistemic_status: "记录性质", verified_reference: "已核对可用", needs_evidence: "仍需核对依据",
+      pending_review: "等待核对", user_constraint: "作者明确要求", hypothesis: "未确认设想",
+      objective: "客观记录", status: "处理状态",
+    } as Record<string, string>)[value])
     .replace(/[（(](?:哈希|编号|ID)\s*[:：]?\s*[a-f0-9]{12,64}[）)]/gi, "")
     .replace(/\b(?:write|review|recover|revise|accept)-0*(\d+)\b/g, value => {
       const [action, number] = value.split("-");

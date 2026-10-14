@@ -4706,7 +4706,7 @@ class InkFlowEngine:
                             "取出物件后若紧接着要使用或装入随身袋，不得先把它放回原处；若已放回，必须写出再次取出。"
                             "若审读者指出后文新矛盾，须连同它一起修好，不要只重复上一轮补句。"
                             "若仅需纠正线索来源或人物知识，只替换错误句，不新增物件移动或位置解释。"
-                            "最多改四小处，不改人物选择、伏笔、结局或别章。新增文字不要用顿号。"
+                            "最多改四小处，不改人物选择、伏笔、结局或别章。标点按当前书籍要求与内置表达习惯自然使用。"
                         ),
                         user_prompt=(base + "\n审读者的具体方向：" + repair_direction
                                      + ("\n当前隔离候选正文：\n" + candidate if candidate != current else "")),
@@ -6497,6 +6497,11 @@ class InkFlowEngine:
                         }
                 chapter_instruction = instruction
                 chapter = project.db.get_chapter(chapter_no)
+                latest_review = project.db.latest_review_record(chapter_no) if chapter else None
+                guidance_reviewed = bool(latest_review and chapter
+                    and latest_review["chapter_version"] == int(chapter["version"])
+                    and latest_review["report"].source_hash == chapter["content_hash"]
+                    and latest_review["report"].instruction_hash == content_hash(instruction.strip()))
                 if chapter is None:
                     written = await self.write_chapter(
                         project.root,
@@ -6534,7 +6539,7 @@ class InkFlowEngine:
                         f"第 {chapter_no} 章当前版本已经通过，按用户要求直接复用",
                         metadata={"version": int(chapter["version"])},
                     )
-                elif instruction.strip() and not unchanged_guidance:
+                elif instruction.strip() and (not unchanged_guidance or not guidance_reviewed):
                     # A resumed batch must not silently ignore new user guidance.
                     record = project.db.latest_review_record(chapter_no)
                     if (not record or record["chapter_version"] != int(chapter["version"])
@@ -9895,10 +9900,7 @@ def _regression_check(content: str, chapter_no: int, metrics: dict[str, Any]) ->
     warnings: list[str] = []
     punctuation = metrics.get("punctuation") if isinstance(metrics.get("punctuation"), dict) else {}
     dense = int(punctuation.get("comma_dense_sentences") or 0) if isinstance(punctuation, dict) else 0
-    enumeration = int(punctuation.get("enumeration_commas") or 0) if isinstance(punctuation, dict) else 0
     unquoted_speech = int(punctuation.get("unquoted_speech_cues") or 0) if isinstance(punctuation, dict) else 0
-    if enumeration:
-        warnings.append(f"正文有 {enumeration} 个禁用顿号，必须由 Writer 修订后重新审查")
     if dense:
         warnings.append(f"有 {dense} 句包含较多逗号，仅供审核核对意脉；连贯长句可保留，不据此自动拆句或阻断")
     if unquoted_speech:

@@ -933,6 +933,13 @@ class ModeCheckOutput(UnifiedRoleModel):
         if (info.context and info.context.get("model_generation") and self.verdict == "patch"
                 and not self.findings and not (self.memory_patch and self.memory_patch.unresolved_conflicts)):
             raise ValueError("审核标为需要修订，却没有列出问题。请核对本次结论：存在问题须给有据findings；资料不足用unknown；必要检查完成且没有问题用pass。返回memory_patch本身不表示正文需要修订。")
+        if info.context and info.context.get("model_generation"):
+            failed_required = [item.criterion for item in self.assessments
+                if item.criterion in {"continuity", "causality", "requirements"}
+                and item.status in {"partial", "failed"}]
+            if failed_required and not any(item.severity in {"major", "blocking"} and item.rule_id
+                    for item in self.findings):
+                raise ValueError("必需项判为未满足，却只给出普通表达问题或未标明规则的指控。请由当前审核角色纠正结论：已证实硬矛盾须在findings给适用rule_id及双方原句；资料不足用data_missing；仅有普通表达弱点不能把已完成的核心结果判为partial或failed，应在质量项说明。不得编造硬问题来凑结论。")
         return self
 
 
