@@ -48,7 +48,7 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .welcome-shell { position: relative; display: grid; grid-template-columns: minmax(280px, 430px) minmax(540px, 780px); align-items: center; justify-content: center; gap: 70px; width: 100%; height: 100%; padding: 8vw; background: radial-gradient(circle at 20% 25%, rgba(137, 166, 72, .1), transparent 31%), linear-gradient(125deg, #10100e 0 55%, #181813 55%); }
 .welcome-shell::after { content: ""; position: absolute; inset: 36px; border: 1px solid rgba(255, 255, 255, .05); pointer-events: none; }
 .brand-mark { position: relative; display: grid; place-items: center; aspect-ratio: 1; max-width: 390px; border: 1px solid #484438; color: var(--accent); font-family: "Source Han Serif SC", "SimSun", serif; font-size: clamp(130px, 19vw, 280px); font-weight: 700; line-height: 1; background: repeating-linear-gradient(90deg, transparent 0 54px, rgba(255,255,255,.022) 55px), repeating-linear-gradient(0deg, transparent 0 54px, rgba(255,255,255,.018) 55px); box-shadow: inset 0 0 80px rgba(0,0,0,.4), var(--shadow); }
-.mascot-stage { overflow: hidden; background-color: #11110f; }
+.mascot-stage { overflow: hidden; background: transparent; }
 .mobao { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; margin: 0; }
 .mobao-video { display: block; width: 100%; height: 100%; object-fit: contain; }
 .mobao figcaption { color: #8e897d; font-size: 9px; line-height: 1.3; white-space: nowrap; }
@@ -109,6 +109,7 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .tree-label { display: grid; grid-template-columns: 16px 1fr auto; align-items: center; width: 100%; padding: 8px 14px; border: 0; border-radius: 0; background: transparent; color: #a8a398; text-align: left; font-size: 12px; font-weight: 600; }
 .tree-label:hover:not(:disabled) { background: #1b1a16; border: 0; }
 .tree-label small { color: var(--faint); font-weight: 400; }
+.tree-setting-entry { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tree-items { padding: 2px 8px 7px; }
 .tree-items button { display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: center; width: 100%; padding: 7px 9px; border: 0; border-radius: 5px; background: transparent; color: #8f8b81; text-align: left; }
 .tree-items button:hover:not(:disabled), .tree-items button.active { background: #23221c; color: var(--text); }
@@ -1030,7 +1031,6 @@ pre { white-space: pre-wrap; word-break: break-word; }
 :root[data-theme="light"] .section-heading h2,
 :root[data-theme="light"] .panel-title h2 { color: var(--text); }
 :root[data-theme="light"] .welcome-copy .lede { color: var(--muted); }
-:root[data-theme="light"] .mascot-stage,
 :root[data-theme="light"] .topbar,
 :root[data-theme="light"] .left-rail,
 :root[data-theme="light"] .rail-heading,
@@ -1206,3 +1206,15 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .message-indices { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
 .message-indices button { padding: 5px 8px; font-size: 11px; color: var(--accent-dim); }
 .record-summary { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.65; }
+
+.chapter-tree-groups { padding-left: 7px; }
+.mobao-companion { position: fixed; width: 76px; height: 76px; z-index: 38; transition: left 3.3s ease-in-out, top 3.3s ease-in-out; }
+.mobao-companion[data-dragging="true"] { transition: none; }
+.mobao-companion-body { width: 76px; height: 76px; border: 0; padding: 0; background: transparent !important; cursor: grab; touch-action: none; }
+.mobao-companion-body > .mobao { width: 100%; height: 100%; }
+.mobao-companion-return { position: absolute; right: -4px; top: -6px; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 50%; background: var(--panel-2); opacity: 0; font-size: 13px; }
+.mobao-companion:hover .mobao-companion-return, .mobao-companion:focus-within .mobao-companion-return { opacity: .8; }
+.mascot-conversation[role="button"] { cursor: grab; }
+
+.message .avatar.mobao-message-avatar { border: 0; background: transparent; width: 32px; height: 32px; }
+.mobao-message-avatar img { width: 100%; height: 100%; object-fit: contain; }

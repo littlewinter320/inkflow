@@ -88,6 +88,7 @@ PERSISTED_SETTING_NAMES = {
     "voice_segment_chars",
     "voice_cache_limit_mb",
     "voice_debug",
+    "voice_data_dir",
     "input_price_per_million",
     "output_price_per_million",
 }
@@ -281,6 +282,7 @@ class Settings:
     voice_segment_chars: int = 360
     voice_cache_limit_mb: int = 1024
     voice_debug: bool = False
+    voice_data_dir: str = ""
     input_price_per_million: float = 0.0
     output_price_per_million: float = 0.0
     workspace_root: Path | None = None
@@ -572,6 +574,7 @@ class Settings:
                 8192,
             ),
             voice_debug=_as_bool(value.get("voice_debug", defaults.voice_debug)),
+            voice_data_dir=str(value.get("voice_data_dir", defaults.voice_data_dir) or "").strip(),
             input_price_per_million=_non_negative_float(
                 value.get("input_price_per_million", defaults.input_price_per_million), "输入单价"
             ),

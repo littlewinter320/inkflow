@@ -13,7 +13,7 @@ import waitingVideo from "./assets/mascot/animations/mobao-clean-waiting-user.we
 import waitingSheet from "./assets/mascot/animations/mobao-clean-waiting-user.sheet.png";
 import welcomePoster from "./assets/mascot/animations/mobao-clean-welcome.poster.png";
 import welcomeVideo from "./assets/mascot/animations/mobao-clean-welcome.webm";
-import logo from "./assets/mascot/mobao-logo-original.png";
+import logo from "./assets/mascot/mobao-logo-clean-alpha.png";
 import writingImage from "./assets/mascot/animations/mobao-clean-writing.poster.png";
 import writingVideo from "./assets/mascot/animations/mobao-clean-writing.webm";
 import reviewingImage from "./assets/mascot/animations/mobao-clean-reviewing.poster.png";
@@ -24,10 +24,16 @@ import pointPoster from "./assets/mascot/animations/mobao-clean-point-result.pos
 import pointVideo from "./assets/mascot/animations/mobao-clean-point-result.webm";
 import tapPoster from "./assets/mascot/animations/mobao-clean-tap-result.poster.png";
 import tapVideo from "./assets/mascot/animations/mobao-clean-tap-result.webm";
+import alphaAtlases from "./assets/mascot/animations/mobao-alpha-atlases.json";
+const atlasUrls = import.meta.glob("./assets/mascot/animations/*.atlas.png", { eager: true, query: "?url", import: "default" }) as Record<string, string>;
 import animationManifest from "./assets/mascot/animations/mobao-clean.manifest.json";
 import { useEffect, useRef, useState } from "react";
-import type { RefObject } from "react";
+import type { PointerEvent, RefObject } from "react";
 import { createPortal } from "react-dom";
+const avatarUrls = import.meta.glob("./assets/mascot/avatars/*.png", { eager: true, query: "?url", import: "default" }) as Record<string, string>;
+export function MobaoAvatar({ mood }: { mood: "calm" | "thinking" | "frustrated" | "angry" | "complete" | "rest" }) {
+  return <img src={avatarUrls[`./assets/mascot/avatars/mobao-${mood}.png`]} alt={({ calm: "墨宝在听", thinking: "墨宝在思考", frustrated: "墨宝遇到问题", angry: "墨宝认真排查问题", complete: "墨宝完成了这一步", rest: "墨宝暂时休息" })[mood]} />;
+}
 
 export type MascotMood = "idle" | "thinking" | "waiting" | "success" | "rest" | "welcome" | "reading" | "writing" | "reviewing"
   | "move_right" | "move_left" | "point_result" | "tap_result" | "show_summary" | "waiting_user" | "pause_exhausted";
@@ -77,6 +83,9 @@ for (const [mood, clip] of Object.entries(clips)) {
   clip.playbackRate = Math.min(1, mascotFramesPerSecond / (source?.fps || 20));
   clip.duration /= clip.playbackRate;
   if (clip.fps) clip.fps = Math.min(clip.fps, mascotFramesPerSecond);
+  const atlas = (alphaAtlases as Record<string, { file: string; frames: number; columns: number; rows: number; fps: number; duration: number }>)[source?.action || ""];
+  if (atlas) { Object.assign(clip, atlas); clip.sheet = atlasUrls[`./assets/mascot/animations/${atlas.file}`]; }
+
 }
 const guideTravelMs = Math.ceil(clips.move_right.duration * 1000);
 
@@ -138,7 +147,7 @@ export function Mascot({
   const visible = pageVisible && inViewport;
   const videoFailed = mediaState.source === clip.video && mediaState.failed;
   const videoReady = mediaState.source === clip.video && mediaState.ready;
-  const useSheet = !!clip.sheet && sheetReady === clip.sheet && !reducedMotion && !videoReady;
+  const useSheet = !!clip.sheet && sheetReady === clip.sheet && !reducedMotion;
   const finish = () => {
     if (settled.current) return;
     settled.current = true;
@@ -185,7 +194,7 @@ export function Mascot({
     video.defaultPlaybackRate = clip.playbackRate || 1;
     video.playbackRate = clip.playbackRate || 1;
     let cancelled = false;
-    if (!visible || reducedMotion) video.pause();
+    if (!visible || reducedMotion || useSheet) video.pause();
     else void video.play().catch(error => {
       // A rapid mood switch cancels the old play() promise. It is not a decode
       // failure for the new clip and must not freeze the next action forever.
@@ -193,14 +202,14 @@ export function Mascot({
         setMediaState({ source: clip.video, ready: false, failed: true });
     });
     return () => { cancelled = true; };
-  }, [visible, mood, clip.video, clip.playbackRate, reducedMotion, videoFailed]);
+  }, [visible, mood, clip.video, clip.playbackRate, reducedMotion, videoFailed, useSheet]);
   useEffect(() => {
     if (videoReady || videoFailed || reducedMotion || !visible) return;
     const timer = window.setTimeout(() => setMediaState({ source: clip.video, ready: false, failed: true }), 4000);
     return () => window.clearTimeout(timer);
   }, [clip.video, videoReady, videoFailed, reducedMotion, visible]);
   useEffect(() => {
-    if (!clip.sheet || reducedMotion || !visible || videoReady || sheetReady === clip.sheet) return;
+    if (!clip.sheet || reducedMotion || !visible || sheetReady === clip.sheet) return;
     const source = clip.sheet;
     let cancelled = false;
     const image = new Image();
@@ -208,7 +217,7 @@ export function Mascot({
     const timer = window.setTimeout(() => {
       image.onload = () => { if (!cancelled) setSheetReady(source); };
       image.src = source;
-    }, videoFailed ? 0 : 750);
+    }, 0);
     return () => { cancelled = true; window.clearTimeout(timer); image.onload = null; };
   }, [clip.sheet, reducedMotion, visible, videoReady, videoFailed, sheetReady]);
   useEffect(() => {
@@ -220,6 +229,7 @@ export function Mascot({
       const value = Math.floor((now - started) * (clip.fps || mascotFramesPerSecond) / 1000);
       setFrame(clip.loop ? value % frameCount : Math.min(value, frameCount - 1));
       if (clip.loop || value < frameCount - 1) callback = window.requestAnimationFrame(tick);
+      else finish();
     };
     callback = window.requestAnimationFrame(tick);
     return () => window.cancelAnimationFrame(callback);
@@ -235,7 +245,7 @@ export function Mascot({
         {useSheet ?
           <span role="img" aria-label={clip.label} style={{ display: "block", width: "100%", height: "100%", aspectRatio: "1 / 1", backgroundImage: `url(${clip.sheet})`, backgroundRepeat: "no-repeat", backgroundSize: `${(clip.columns || 4) * 100}% ${(clip.rows || 3) * 100}%`, backgroundPosition: spritePosition(frame, clip.columns, clip.rows) }} />
           : <img className="mobao-video" src={clip.poster} alt={clip.label} decoding="async" style={{ opacity: videoReady && !videoFailed && !reducedMotion ? 0 : 1, transition: "opacity 150ms ease" }} />}
-        {!reducedMotion && !videoFailed && <video
+        {!reducedMotion && !videoFailed && !useSheet && <video
           ref={videoRef}
           key={clip.video}
           className="mobao-video"
@@ -262,6 +272,57 @@ export function Mascot({
 }
 
 export type MobaoGuideCue = { id: string; summary: string };
+
+export function MobaoCompanion({ workAreaRef, dockRef, disabled }: { workAreaRef: RefObject<HTMLElement | null>; dockRef: RefObject<HTMLElement | null>; disabled: boolean }) {
+  const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
+  const [action, setAction] = useState<MascotMood>("welcome");
+  const [dragging, setDragging] = useState(false);
+  const drag = useRef<{ x: number; y: number; pointer: number } | null>(null);
+  const manuallyPlaced = useRef(false);
+  const park = () => { manuallyPlaced.current = false; drag.current = null; setDragging(false); setPosition(null); };
+  useEffect(() => {
+    const dock = dockRef.current;
+    if (!dock || disabled) { setPosition(null); return; }
+    const greet = () => {
+      const area = workAreaRef.current?.getBoundingClientRect();
+      if (!area) return;
+      manuallyPlaced.current = true; setAction("welcome");
+      const box = dock.getBoundingClientRect();
+      setPosition(boundedGuidePoint(box.left - 88, box.top + 20, area, 76, 76));
+    };
+    const key = (event: KeyboardEvent) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); greet(); } };
+    dock.setAttribute("role", "button"); dock.setAttribute("tabindex", "0"); dock.setAttribute("aria-label", "和墨宝互动，拖动它在工作区移动");
+    dock.addEventListener("click", greet); dock.addEventListener("keydown", key);
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    let returnTimer = 0, moveTimer = 0;
+    const timer = window.setTimeout(() => {
+      if (reduced || manuallyPlaced.current || document.hidden || document.querySelector('.mobao-result-guide, [aria-modal="true"]')) return;
+      const area = workAreaRef.current?.getBoundingClientRect();
+      if (!area || area.width < 500) return;
+      const box = dock.getBoundingClientRect();
+      setAction(box.left > area.left + area.width / 2 ? "move_left" : "move_right");
+      setPosition(boundedGuidePoint(box.left, box.top, area, 76, 76));
+      moveTimer = window.setTimeout(() => { if (!manuallyPlaced.current) setPosition(boundedGuidePoint(box.left + (box.left > area.left + area.width / 2 ? -95 : 95), box.top, area, 76, 76)); }, 40);
+      returnTimer = window.setTimeout(() => { if (!manuallyPlaced.current) setPosition(null); }, 7000);
+    }, 18000);
+    return () => { window.clearTimeout(timer); window.clearTimeout(moveTimer); window.clearTimeout(returnTimer); dock.removeEventListener("click", greet); dock.removeEventListener("keydown", key); dock.removeAttribute("role"); dock.removeAttribute("tabindex"); dock.removeAttribute("aria-label"); };
+  }, [disabled, workAreaRef, dockRef]);
+  useEffect(() => {
+    const fit = () => { const area = workAreaRef.current?.getBoundingClientRect(); if (area) setPosition(point => point && boundedGuidePoint(point.x, point.y, area, 76, 76)); };
+    window.addEventListener("resize", fit);
+    return () => window.removeEventListener("resize", fit);
+  }, [workAreaRef]);
+  const move = (event: PointerEvent<HTMLButtonElement>) => {
+    if (!drag.current || drag.current.pointer !== event.pointerId) return;
+    const bounds = workAreaRef.current?.getBoundingClientRect();
+    if (bounds) setPosition(boundedGuidePoint(event.clientX - drag.current.x, event.clientY - drag.current.y, bounds, 76, 76));
+  };
+  if (disabled || !position) return null;
+  return createPortal(<div className="mobao-companion" style={{ left: position.x, top: position.y }} data-dragging={dragging}>
+    <button className="mobao-companion-body" title="拖动我换位置，轻点看动作，双击返回" aria-label="拖动墨宝移动，双击返回对话区" onPointerDown={event => { if (event.button !== 0) return; manuallyPlaced.current = true; setDragging(true); drag.current = { x: event.clientX - position.x, y: event.clientY - position.y, pointer: event.pointerId }; event.currentTarget.setPointerCapture(event.pointerId); }} onPointerMove={move} onPointerUp={() => { drag.current = null; setDragging(false); setAction("tap_result"); }} onPointerCancel={() => { drag.current = null; setDragging(false); }} onDoubleClick={park} onKeyDown={event => { if (event.key === "Escape") park(); else if (event.key === "Enter") setAction("success"); }}><Mascot mood={action} /></button>
+    <button className="mobao-companion-return" onClick={park} aria-label="墨宝回到对话区" title="回到对话区">↙</button>
+  </div>, document.body);
+}
 
 export function boundedGuidePoint(x: number, y: number, bounds: DOMRect, width: number, height: number) {
   return {

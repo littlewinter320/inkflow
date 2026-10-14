@@ -310,6 +310,8 @@ class InkFlowAppService:
         emit: EventSink,
         consume_steering: Callable[[], Awaitable[list[str]]] | None = None,
     ) -> Any:
+        if method.startswith("voice.") and self.voice.migrating and method != "voice.status":
+            raise ValueError("语音资料正在迁移，请完成后再录音或朗读。小说写作可以继续。")
         if method in _TASK_SETTINGS_METHODS and active_task_settings.get() is None:
             if method in {"project.ideate", "prompt.optimize", "provider.test"}:
                 root = Path(str(params.get("project_root") or params.get("workspace_root") or Path.cwd())).resolve()
@@ -554,11 +556,15 @@ class InkFlowAppService:
                 "public_reasoning_summary": result.data.public_reasoning_summary,
             }
         if method == "voice.status":
+            if params.get("input_only") is True:
+                self.voice.prepare_input()
+            if params.get("input_only") is not True and not self.voice.migrating:
+                self.voice.schedule_edge_update_check()
             # Directory-size checks and optional package discovery can touch a
             # large local model tree. Keep them off the asyncio event loop so
             # a settings click cannot freeze the desktop while status refreshes.
             return await asyncio.to_thread(
-                self.voice.status,
+                self.voice.input_status if params.get("input_only") is True else self.voice.status,
                 params.get("workspace_root") or params.get("project_root"),
             )
         if method == "voice.settings.get":
@@ -566,6 +572,20 @@ class InkFlowAppService:
                 self.voice.settings,
                 params.get("workspace_root") or params.get("project_root"),
             )
+        if method == "voice.storage.move":
+            if params.get("confirmation") != "move_voice_storage":
+                raise ValueError("更改语音位置前需要确认目标文件夹。")
+            voice = self.voice
+            tasks = list(voice._jobs.values()) + [voice._edge_install_task, voice._moss_install_task, voice._sherpa_install_task, voice._edge_update_task, voice._asr_prepare_task]
+            locks = [voice._short_lock, voice._long_lock, voice._inference_lock, voice._asr_lock]
+            if any(task and not task.done() for task in tasks) or any(lock and lock.locked() for lock in locks):
+                raise ValueError("请等正在进行的录音识别、朗读或组件更新结束，再更改保存位置。")
+            voice.migrating = True
+            try:
+                self.voice = await asyncio.to_thread(voice.copy_storage, str(params.get("destination") or ""))
+                return {"status": self.voice.status(), "settings": self.voice.settings(), "message": "语音资料已复制、核对并切换到新位置；原目录保留，可检查后自行清理。"}
+            finally:
+                voice.migrating = False
         if method == "voice.settings.configure":
             updates = {name: params[name] for name in VOICE_SETTING_NAMES if name in params}
             return await asyncio.to_thread(

@@ -586,6 +586,7 @@ type WorkspacePanelId = "navigation" | "assistant" | "inspector";
 const conversationWindows = new Map<number, { projectRoot: string; conversationId: string; panel?: WorkspacePanelId; ownerId?: number; relativePath?: string; shared?: boolean; returnHidden?: boolean }>();
 const workspaceStates = new Map<number, Record<string, unknown>>();
 let bridge: EngineBridge | null = null;
+let voiceDataDirectory = "";
 let updates: UpdateManager | null = null;
 let confirmationPending = false;
 let closeConfirmationPending = false;
@@ -932,6 +933,10 @@ function createWindow(): void {
     if (!source || (source !== mainWindow && !conversationWindows.has(source.id))) throw new Error("这个窗口没有本地引擎访问权限。");
     const conversationId = conversationWindows.get(source.id)?.conversationId || "main";
     const result = await bridge?.request(method, { ...params, conversation_id: conversationId });
+    if (method === "voice.settings.get" || method === "voice.settings.configure" || method === "voice.storage.move") {
+      const settings = (method === "voice.storage.move" ? (result as { settings?: unknown })?.settings : result) as { voice_data_dir?: string } | undefined;
+      voiceDataDirectory = settings?.voice_data_dir || "";
+    }
     const context = conversationWindows.get(source.id);
     if (context && method === "project.open" && typeof params.project_root === "string" && context.projectRoot !== params.project_root) {
       context.projectRoot = params.project_root;
@@ -1076,21 +1081,26 @@ function createWindow(): void {
     });
     return result.canceled ? null : result.filePaths[0];
   });
-  ipcMain.handle("voice:save-recording", (_event, bytes: Uint8Array, extension = "webm") => {
+  ipcMain.handle("voice:save-recording", (_event, bytes: Uint8Array, extension = "webm", snapshotId?: string) => {
+    if (!bytes?.byteLength || bytes.byteLength > 50 * 1024 * 1024) throw new Error("录音为空或过长，请分段录制。");
+    if (snapshotId !== undefined && !/^[a-f0-9-]{36}$/.test(snapshotId)) throw new Error("本次录音的身份无效，请重新开始录音。");
     const safeExtension = ["wav", "webm", "ogg", "mp3", "m4a"].includes(extension) ? extension : "webm";
-    const folder = path.join(app.getPath("userData"), "voice-input");
+    const folder = voiceDataDirectory ? path.join(voiceDataDirectory, "cache", "voice-input") : process.platform === "win32" && existsSync("D:/") ? "D:/墨流/cache/voice-input" : path.join(app.getPath("userData"), "voice-input");
     mkdirSync(folder, { recursive: true });
-    const target = path.join(folder, `recording-${randomUUID()}.${safeExtension}`);
+    const target = path.join(folder, `${snapshotId ? "snapshot" : "recording"}-${snapshotId || randomUUID()}.${safeExtension}`);
     writeFileSync(target, Buffer.from(bytes));
     return target;
   });
-  ipcMain.handle("voice:audio-url", (_event, target: string) => {
+  ipcMain.handle("voice:audio-url", async (_event, target: string) => {
     const resolved = path.resolve(target);
+    const voiceSettings = await bridge?.request("voice.settings.get") as { voice_data_dir?: string } | undefined;
     const allowedRoots = [
       app.getPath("userData"),
       app.getPath("temp"),
       path.join(process.env.LOCALAPPDATA || app.getPath("userData"), "InkFlow"),
       path.join(process.env.APPDATA || app.getPath("userData"), "InkFlow"),
+      "D:/墨流/cache/voice-input",
+      ...(voiceSettings?.voice_data_dir ? [voiceSettings.voice_data_dir] : []),
     ].map((item) => path.resolve(item));
     const allowed = allowedRoots.some((root) => {
       const relative = path.relative(root, resolved);

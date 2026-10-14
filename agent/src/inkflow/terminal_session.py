@@ -76,6 +76,7 @@ TERMINAL_ROUTER_SYSTEM = """
 - 项目已有正式三层规划时，改其大纲或卷细纲应选择 redesign_story，以上一章已接受正文为锚点，并审核受影响的三层后发布；独立旧入口不能直接覆盖生效的一层。只改近期窗口时仍通过正式链修订，不绕回旧数据库重排入口。
 - scene_draft：用户明确要试写一个场景、片段或短草稿时使用。只由 Writer 产出隔离候选，narrative_scope=scene，不覆盖章节正文，不审查、验收或入正史。
 - story_settings_manage：设定是持续维护的合集，可记录人物、场景、道具、世界等及自定义字段，不仅开书资料。由语义理解用户请求，不靠固定关键词。用户要求检查设定与规划、正文一致性，或维护现有设定、补齐已有资料中的基础记录与失败引用时，使用operation=audit，不需要先选合集或提供替换原文。只有明确创作新的设想才用record_generate；record_supplement只处理已指定的单条记录，不能拿它代替跨合集维护。setting_change.apply_corrections仅在用户明确要求处理或整改时为true；只查看时为false。由实际审查角色读取资料、提出有据修正，Coordinator不能凭自己的概括代替审查。范围已说明时直接执行，不再把原话改写成确认题。其余setting_change.operation 选择 collection_create/collection_update/collection_archive/record_generate/record_supplement/record_save/record_archive/list；可用collection_id或collection_name唯一定位，更新删除须读取当前revision作为expected_revision。用户定义name/category/template_id/instructions/fields。生成新的设定交Writer，补证纠正交当前审查或记忆所有者；你只提取目标与参数，不编写设定正文，不更改正史、不永久删除。若回答后台手动核对疑问，可用manual_decide，必须绑定上下文中的job_id与current_hash作为expected_hash，decision为keep_pending/request_revision/confirm_exception/discard_candidate，reason保留用户解释；只有具体解释可请求一次限次复核，简单同意不覆盖硬正史。不明确合集或取舍时只问必要问题；有据记录、创作假设、人物信念分别标注。
+- 用户明确要求自行分析并新增一至三类分层设定时，可使用story_settings_manage，setting_change.operation=collection_create_many、collections数组。用户要具体设定时populate_records=true，引擎在同任务内接续当前责任角色核对已有正文并保存记录；只要空模板时为false。用户已授权纠正当前书籍要求时apply_corrections=true，否则不自动改书籍约束。每项只定义name/template_id/category/instructions/fields/auto_record，分类用“上层 / 子层”表达，写清记录目标、更新时机与不要混入的内容；角色读取/写入沿现有默认权限，不自行更改权限。不能把只建空合集说成具体设定已完成。已有同名合集先读取并复用，后续用operation=audit、collection_names点名这些合集、new_record_limit限定一至三条具体记录、apply_corrections按用户授权填写，从正史提取并核对来源后保存。Coordinator负责组织结构，不能代写具体设定或自行批准。不要因用户未指定分类名称重复询问已经授权你判断的常规分类。
 - story_setting_edit：用户明确要求修改书籍设定、大纲或剧情细纲时使用。document_kind 为 book、outline 或 story_detail；book 的 setting_change 只填明确要改的 BookBrief 字段；用户明确更改总字数、卷数或章节规模时，同时检查 user_rules 是否仍含旧要求，仅替换已明确被取代的部分并保留其余题材、人物与文风要求，不能只改 estimated_chapters 后继续把旧字数当硬规则；历史原话由版本记录保留，不冠以“不可改写”继续作为生效要求，大纲和细纲只填唯一原文 old_text 与替换文字 new_text。不要把“讨论怎么改”解释为执行，也不要修改已接受正文。
 - plan：近期章节安排，参考设定、独立大纲、剧情细纲与已写正文，再切分章节和字数；用户未指定范围时只展开接下来约三章。逐章场景安排属于计划，不是细纲。
 - 用户要求“理顺/修改几章的安排、别重复已发生的事”属于 plan。若随后要求“按新安排修好这些章节，检查后接收”，用 batch_draft_accept，并采用 latest_pending_plan_revision 给出的明确窗口；不得扩回旧批次更大的范围。计划任务本身不写正文。
@@ -3435,7 +3436,7 @@ class TerminalSession:
                         question=str(result["reason"]), options=options,
                         why_it_matters="明确本次处理对象后继续原任务；已有资料不变。") ]})
                     response.update(needs_clarification=True, status="waiting_user", questions=self._question_cards(choices))
-            if intent.setting_change.get("operation") == "audit":
+            if intent.setting_change.get("operation") == "audit" or result.get("adopted_settings") is not None:
                 lines = [result["summary"], *result.get("findings", [])]
                 coverage = result.get("coverage", {})
                 chapters = coverage.get("canonical_chapters", [])

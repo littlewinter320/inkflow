@@ -21,7 +21,7 @@ interface Window {
     moveProject(root: string, targetParent: string): Promise<{ source: string; destination: string }>;
     chooseFile(title: string): Promise<string | null>;
     chooseAudio(title: string): Promise<string | null>;
-    saveVoiceRecording(bytes: Uint8Array, extension?: string): Promise<string>;
+    saveVoiceRecording(bytes: Uint8Array, extension?: string, snapshotId?: string): Promise<string>;
     audioUrl(target: string): Promise<string>;
     openPath(target: string): Promise<string>;
     showItem(target: string): Promise<void>;

@@ -1,15 +1,16 @@
+import { VersionRepair } from "./VersionRepair";
 import { AuthorPreferences } from "./AuthorPreferences";
-import { ManualEditMonitor, StorySettings } from "./StorySettings";
+import { BookSettingsBrowser, ManualEditMonitor, StorySettings } from "./StorySettings";
 import type { ManualEditJob } from "./StorySettings";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { FormEvent, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MutableRefObject, ReactNode } from "react";
-import { Mascot, MascotShowcase, MobaoGuide, mobaoIdlePoster } from "./Mascot";
+import { Mascot, MascotShowcase, MobaoGuide, MobaoCompanion, MobaoAvatar, mobaoIdlePoster } from "./Mascot";
 import type { MascotMood } from "./Mascot";
 import { ProjectCenter } from "./ProjectCenter";
 import { VoiceCenter } from "./VoiceCenter";
 import type { VoiceSettings, VoiceSource, VoiceStatus } from "./VoiceCenter";
-import { LocalWavRecorder } from "./voiceRecording";
+import { LocalWavRecorder, voiceInputFailure } from "./voiceRecording";
 import { detachedPanel, useWorkspaceLayout, WorkspaceDropPreview, WorkspaceMenu, WorkspacePanel } from "./Workspace";
 import type { PanelId } from "./workspaceLayout";
 import { documentLabel, readableSourceText } from "./readableNames";
@@ -273,6 +274,7 @@ type SpeechRecognitionLike = {
   continuous: boolean;
   interimResults: boolean;
   lang: string;
+  onstart: (() => void) | null;
   onresult: ((event: SpeechRecognitionEventLike) => void) | null;
   onerror: ((event: { error?: string }) => void) | null;
   onend: (() => void) | null;
@@ -344,6 +346,8 @@ function App() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [tree, setTree] = useState<ProjectTree | null>(null);
   const [document, setDocument] = useState<DocumentData | null>(null);
+  const [bookRawEditing, setBookRawEditing] = useState(false);
+  useEffect(() => { setBookRawEditing(false); }, [document?.relative_path, projectRoot]);
   const [reviewDocument, setReviewDocument] = useState<DocumentData | null>(null);
   const [referenceDocument, setReferenceDocument] = useState<DocumentData | null>(null);
   const [text, setText] = useState("");
@@ -387,6 +391,8 @@ function App() {
   const [projectOpenFailure, setProjectOpenFailure] = useState<{ root: string; message: string } | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsInitialSection, setSettingsInitialSection] = useState<SettingsSection>("appearance");
+  const openSettings = (section: SettingsSection = "appearance") => { setSettingsInitialSection(section); setShowSettings(true); };
   const [showManualMonitor, setShowManualMonitor] = useState(false);
   const [manualJobs, setManualJobs] = useState<ManualEditJob[]>([]);
   const [manualMonitorError, setManualMonitorError] = useState("");
@@ -419,6 +425,12 @@ function App() {
   const [voiceSource, setVoiceSource] = useState<VoiceSource | null>(null);
   const [voiceRevision, setVoiceRevision] = useState(0);
   const [voiceRecording, setVoiceRecording] = useState(false);
+  const [voiceStarting, setVoiceStarting] = useState(false);
+  const [voiceLiveProblem, setVoiceLiveProblem] = useState("");
+  const [voiceInputPhase, setVoiceInputPhase] = useState("");
+  const voiceInputBusyRef = useRef(false);
+  const voiceSessionRef = useRef("");
+  const voiceBrowserTimerRef = useRef<number | null>(null);
   const [voiceTranscribing, setVoiceTranscribing] = useState(false);
   const [voiceTranscript, setVoiceTranscript] = useState("");
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
@@ -428,10 +440,12 @@ function App() {
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
   const voiceLiveTimerRef = useRef<number | null>(null);
   const voiceLiveBusyRef = useRef(false);
+  const voiceDecodeRef = useRef<{ recorder: LocalWavRecorder; byteLength: number; result: Promise<{ text: string }> } | null>(null);
   const voiceRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const voiceTranscriptRef = useRef("");
   const voiceFinalTranscriptRef = useRef("");
   const voiceBaseInputRef = useRef("");
+  const voiceProjectRef = useRef("");
   const startupStartedRef = useRef(false);
   const voiceRecorderRef = useRef<LocalWavRecorder | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -517,7 +531,10 @@ function App() {
     audioPlaybackSequenceRef.current += 1;
     audioRef.current?.pause();
     if (voiceLiveTimerRef.current !== null) window.clearInterval(voiceLiveTimerRef.current);
-    voiceRecognitionRef.current?.abort();
+    if (voiceBrowserTimerRef.current !== null) window.clearTimeout(voiceBrowserTimerRef.current);
+    const recognition = voiceRecognitionRef.current;
+    voiceRecognitionRef.current = null;
+    recognition?.abort();
     if (voiceRecorderRef.current) void voiceRecorderRef.current.stop();
   }, []);
 
@@ -1352,28 +1369,40 @@ function App() {
     finally { if (suggestionRefreshRef.current?.promise === promise) suggestionRefreshRef.current = null; }
   };
 
-  // 边听边出字：录音中每 2.5 秒对当前累计音频做一次快照转写，结果实时填入输入框。
+  // One in-flight local decode per recording; late results never change a new session.
   const transcribeLiveSnapshot = async () => {
     const recorder = voiceRecorderRef.current;
     if (!recorder || voiceLiveBusyRef.current) return;
+    if (!recorder.seconds || !recorder.hasSignal) {
+      setVoiceInputPhase(recorder.seconds ? "已连接麦克风，但还没收到明显声音，请检查静音或输入设备。" : "麦克风已连接，等待录音数据…");
+      return;
+    }
     voiceLiveBusyRef.current = true;
+    setVoiceInputPhase("正在本地识别，第一次使用需要加载模型…");
     try {
       const bytes = recorder.snapshot();
-      if (bytes.length <= 44) return;
-      const path = await window.inkflow.saveVoiceRecording(bytes, "wav");
-      const result = await request<{ text: string }>("voice.transcribe", { audio_path: path });
+      const path = await window.inkflow.saveVoiceRecording(bytes, "wav", voiceSessionRef.current);
+      const decoding = request<{ text: string }>("voice.transcribe", { audio_path: path });
+      voiceDecodeRef.current = { recorder, byteLength: bytes.length, result: decoding };
+      const result = await decoding;
+      if (voiceRecorderRef.current !== recorder) return;
+      setVoiceLiveProblem("");
+      setVoiceInputPhase(result.text.trim() ? "正在听写，停止后回填输入框。" : "已收到声音，暂未识别出清晰说话内容。继续说话后会再核对。");
       if (result.text.trim()) {
         voiceTranscriptRef.current = result.text.trim();
         setVoiceTranscript(result.text.trim());
       }
-    } catch {
-      // The browser speech recognizer is the primary path; this is an optional offline fallback.
-    } finally {
-      voiceLiveBusyRef.current = false;
-    }
+    } catch (cause) {
+      if (voiceRecorderRef.current !== recorder) return;
+      setVoiceLiveProblem(voiceInputFailure(cause));
+      setVoiceInputPhase("实时识别遇到问题。停止录音时仍会保留完整录音并核对一次。");
+      if (voiceLiveTimerRef.current !== null) window.clearInterval(voiceLiveTimerRef.current);
+      voiceLiveTimerRef.current = null;
+    } finally { voiceLiveBusyRef.current = false; }
   };
 
   const commitVoiceTranscript = (transcript: string) => {
+    if (voiceProjectRef.current !== projectRootRef.current) { setNotice("录音期间已切换小说，识别结果没有放入另一部小说的输入框。请回到原小说核对录音。"); return; }
     const clean = transcript.trim();
     const base = voiceBaseInputRef.current.trim();
     voiceBaseInputRef.current = "";
@@ -1392,15 +1421,16 @@ function App() {
     const recognition = voiceRecognitionRef.current;
     if (!recognition) return false;
     setVoiceTranscribing(true);
-    try {
-      recognition.stop();
-    } catch {
-      // The browser may already have ended recognition; commit the latest text.
+    setVoiceRecording(false);
+    const finish = () => {
+      if (voiceRecognitionRef.current !== recognition) return;
       voiceRecognitionRef.current = null;
       setVoiceTranscribing(false);
       commitVoiceTranscript(voiceFinalTranscriptRef.current || voiceTranscriptRef.current);
-    }
-    setVoiceRecording(false);
+    };
+    if (voiceBrowserTimerRef.current !== null) window.clearTimeout(voiceBrowserTimerRef.current);
+    voiceBrowserTimerRef.current = window.setTimeout(() => { finish(); recognition.abort(); }, 8000);
+    try { recognition.stop(); } catch { finish(); }
     return true;
   };
 
@@ -1535,110 +1565,117 @@ function App() {
   };
 
   const toggleVoiceInput = async () => {
-    if (voiceRecording) {
-      if (stopBrowserVoiceInput()) return;
-      if (voiceLiveTimerRef.current !== null) {
-        window.clearInterval(voiceLiveTimerRef.current);
+    if (voiceInputBusyRef.current || voiceTranscribing) return;
+    voiceInputBusyRef.current = true;
+    try {
+      if (voiceRecording) {
+        if (stopBrowserVoiceInput()) return;
+        if (voiceLiveTimerRef.current !== null) window.clearInterval(voiceLiveTimerRef.current);
         voiceLiveTimerRef.current = null;
-      }
-      setVoiceRecording(false);
-      setVoiceTranscribing(true);
-      try {
-        const bytes = await voiceRecorderRef.current?.stop();
+        const recorder = voiceRecorderRef.current;
         voiceRecorderRef.current = null;
-        if (!bytes?.length) throw new Error("\u5f55\u97f3\u5185\u5bb9\u4e3a\u7a7a\uff0c\u8bf7\u91cd\u65b0\u5f55\u5236\u3002");
-        const path = await window.inkflow.saveVoiceRecording(bytes, "wav");
-        const result = await request<{ text: string }>("voice.transcribe", { audio_path: path });
-        commitVoiceTranscript(result.text);
-      } catch (cause) {
-        setError(errorMessage(cause));
-      } finally {
-        setVoiceTranscribing(false);
-      }
-      return;
-    }
-    if (!voiceSettings?.voice_enabled || !voiceSettings.voice_input_enabled) {
-      setNotice("\u8bf7\u5148\u5728\u8bbe\u7f6e\u7684\u201c\u8bed\u97f3\u201d\u5206\u7c7b\u4e2d\u5f00\u542f\u672c\u5730\u8bed\u97f3\u8f93\u5165\u3002");
-      setShowSettings(true);
-      return;
-    }
-    const recognition = createSpeechRecognition();
-    if (voiceSettings.voice_input_engine === "browser" && recognition) {
-      voiceBaseInputRef.current = chatInput;
-      voiceTranscriptRef.current = "";
-      voiceFinalTranscriptRef.current = "";
-      setVoiceTranscript("");
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = "zh-CN";
-      recognition.onresult = (event) => {
-        let finalText = "";
-        let interimText = "";
-        for (let index = event.resultIndex; index < event.results.length; index += 1) {
-          const result = event.results[index];
-          const transcript = String(result?.[0]?.transcript || "").trim();
-          if (!transcript) continue;
-          if (result.isFinal) finalText += transcript;
-          else interimText += transcript;
-        }
-        if (finalText) voiceFinalTranscriptRef.current = `${voiceFinalTranscriptRef.current} ${finalText}`.trim();
-        const visible = `${voiceFinalTranscriptRef.current} ${interimText}`.trim();
-        voiceTranscriptRef.current = visible;
-        setVoiceTranscript(visible);
-      };
-      recognition.onerror = (event) => {
-        if (event.error && event.error !== "aborted") setNotice(`\u5b9e\u65f6\u542c\u5199\u6682\u65f6\u4e0d\u53ef\u7528\uff08${event.error}\uff09\uff0c\u8bf7\u7ee7\u7eed\u8bf4\u8bdd\u6216\u505c\u6b62\u540e\u68c0\u67e5\u8f93\u5165\u3002`);
-      };
-      recognition.onend = () => {
-        if (voiceRecognitionRef.current !== recognition) return;
-        voiceRecognitionRef.current = null;
         setVoiceRecording(false);
-        setVoiceTranscribing(false);
-        commitVoiceTranscript(voiceFinalTranscriptRef.current || voiceTranscriptRef.current);
-      };
-      voiceRecognitionRef.current = recognition;
-      try {
-        recognition.start();
+        setVoiceTranscribing(true);
+        setVoiceInputPhase("正在核对完整录音，完成后回填输入框…");
+        try {
+          const bytes = await recorder?.stop();
+          if (!recorder?.hasSignal || !bytes || bytes.length <= 44) throw new Error("这次录音没有收到明显声音。请确认麦克风没有静音，并检查语音设置中的输入设备。");
+          const path = await window.inkflow.saveVoiceRecording(bytes, "wav");
+          const decoded = voiceDecodeRef.current;
+          const result = await withDeadline(decoded?.recorder === recorder && decoded.byteLength === bytes.length ? decoded.result : request<{ text: string }>("voice.transcribe", { audio_path: path }), 120000,
+            "这次录音已保存，但识别还没有及时完成。请稍后再试；可以在语音设置检查本地识别组件。");
+          setVoiceLiveProblem("");
+          commitVoiceTranscript(result.text);
+        } catch (cause) { setError(voiceInputFailure(cause)); }
+        finally { setVoiceTranscribing(false); setVoiceInputPhase(""); }
+        return;
+      }
+      setVoiceStarting(true);
+      voiceProjectRef.current = projectRootRef.current;
+      voiceDecodeRef.current = null;
+      setVoiceInputPhase("正在准备麦克风…");
+      setError(""); setNotice(""); setVoiceLiveProblem("");
+      const settings = await withDeadline(request<VoiceSettings>("voice.settings.get"), 10000, "没能及时读取语音设置，请重新打开墨流后再试。");
+      setVoiceSettings(settings);
+      if (!settings.voice_enabled || !settings.voice_input_enabled) {
+        setNotice("语音输入尚未开启，请在语音设置中开启后再试。"); openSettings("voice"); return;
+      }
+      const recognition = settings.voice_input_engine === "browser" ? createSpeechRecognition() : null;
+      if (recognition) {
+        voiceBaseInputRef.current = chatInput;
+        voiceTranscriptRef.current = ""; voiceFinalTranscriptRef.current = ""; setVoiceTranscript("");
+        recognition.continuous = true; recognition.interimResults = true; recognition.lang = "zh-CN";
+        recognition.onstart = () => {
+          if (voiceRecognitionRef.current !== recognition) return;
+          if (voiceBrowserTimerRef.current !== null) window.clearTimeout(voiceBrowserTimerRef.current);
+          voiceBrowserTimerRef.current = null;
+          setVoiceInputPhase("正在浏览器听写，停止后回填输入框。");
+        };
+        recognition.onresult = event => {
+          if (voiceRecognitionRef.current !== recognition) return;
+          let finalText = "", interimText = "";
+          for (let index = event.resultIndex; index < event.results.length; index += 1) {
+            const result = event.results[index], text = String(result?.[0]?.transcript || "").trim();
+            if (result.isFinal) finalText += text; else interimText += text;
+          }
+          if (finalText) voiceFinalTranscriptRef.current = `${voiceFinalTranscriptRef.current} ${finalText}`.trim();
+          const visible = `${voiceFinalTranscriptRef.current} ${interimText}`.trim();
+          voiceTranscriptRef.current = visible; setVoiceTranscript(visible);
+        };
+        recognition.onerror = event => {
+          if (event.error === "aborted" || voiceRecognitionRef.current !== recognition) return;
+          const partial = voiceFinalTranscriptRef.current || voiceTranscriptRef.current;
+          voiceRecognitionRef.current = null;
+          if (voiceBrowserTimerRef.current !== null) window.clearTimeout(voiceBrowserTimerRef.current);
+          voiceBrowserTimerRef.current = null;
+          recognition.abort(); setVoiceRecording(false); setVoiceTranscribing(false);
+          if (partial.trim()) commitVoiceTranscript(partial);
+          setError(voiceInputFailure(event.error));
+        };
+        recognition.onend = () => {
+          if (voiceRecognitionRef.current !== recognition) return;
+          voiceRecognitionRef.current = null;
+          if (voiceBrowserTimerRef.current !== null) window.clearTimeout(voiceBrowserTimerRef.current);
+          voiceBrowserTimerRef.current = null;
+          setVoiceRecording(false); setVoiceTranscribing(false);
+          commitVoiceTranscript(voiceFinalTranscriptRef.current || voiceTranscriptRef.current);
+        };
+        voiceRecognitionRef.current = recognition;
+        try { recognition.start(); } catch (cause) { voiceRecognitionRef.current = null; throw cause; }
         setVoiceRecording(true);
-        setNotice("\u6b63\u5728\u5b9e\u65f6\u542c\u5199\uff0c\u7070\u8272\u6587\u5b57\u4f1a\u968f\u7740\u8bf4\u8bdd\u66f4\u65b0\uff1b\u518d\u6b21\u70b9\u51fb\u9ea6\u514b\u98ce\u505c\u6b62\u5e76\u56de\u586b\u8f93\u5165\u6846\u3002");
-      } catch (cause) {
-        voiceRecognitionRef.current = null;
-        setError(errorMessage(cause));
+        voiceBrowserTimerRef.current = window.setTimeout(() => {
+          if (voiceRecognitionRef.current !== recognition) return;
+          voiceRecognitionRef.current = null; recognition.abort(); setVoiceRecording(false);
+          setError("浏览器听写服务没有启动。可在语音设置中选择已安装的本地识别后重试。");
+        }, 12000);
+        return;
       }
-      return;
-    }
-    let currentVoiceStatus: VoiceStatus;
-    try {
-      currentVoiceStatus = await request<VoiceStatus>("voice.status");
-      setVoiceStatus(currentVoiceStatus);
-    } catch (cause) {
-      setError(`暂时没能读取本地语音状态：${errorMessage(cause)}。稍后再点麦克风即可。`);
-      return;
-    }
-    if (!currentVoiceStatus.asr?.asr_ready) {
-      const asr = currentVoiceStatus.asr;
-      setNotice(asr?.installing ? `语音组件还在准备中：${asr.install_summary || "正在安装依赖和模型"}。完成后再点麦克风即可。`
-        : asr?.last_error ? `语音组件已有文件，但准备时遇到问题：${readableSourceText(asr.last_error)}。请在语音设置查看具体步骤。`
-        : asr?.package_installed ? "识别组件已安装，但语音模型或录音文件依赖还未就绪。请在语音设置查看缺少的部分。"
-        : asr?.has_local_files ? "检测到了语音文件，但当前墨流环境还不能使用识别组件。请在语音设置查看组件状态。"
-        : "当前墨流没有找到可用的本地识别组件。请在语音设置安装或检查组件位置。");
-      setShowSettings(true);
-      return;
-    }
-    try {
-      if (voiceSettings.voice_input_engine !== "local") {
-        const settings = await request<VoiceSettings>("voice.settings.configure", { voice_input_engine: "local" });
-        setVoiceSettings(settings);
+      const status = await withDeadline(request<Pick<VoiceStatus, "asr" | "ready_for_input">>("voice.status", { input_only: true }), 10000,
+        "本地识别组件没有及时返回状态。请重新打开墨流或查看语音设置后再试。");
+      if (!status.asr?.asr_ready) {
+        const asr = status.asr;
+        setNotice(asr?.installing ? `识别组件正在准备：${asr.install_summary || "依赖与模型尚未齐全"}。完成后再点语音即可。`
+          : asr?.last_error ? `识别组件准备失败：${readableSourceText(asr.last_error)}。请在语音设置检查对应步骤。`
+          : asr?.package_installed ? "识别程序已安装，但模型或录音读取组件不完整。请在语音设置查看缺少的部分。"
+          : asr?.has_local_files ? "找到了本地识别模型，但当前程序缺少运行它的组件。请在语音设置补齐组件，已有模型会继续使用。"
+          : "没有找到可用的本地识别组件，请在语音设置中安装或检查位置。");
+        openSettings("voice"); return;
       }
-      voiceBaseInputRef.current = chatInput;
-      voiceTranscriptRef.current = "";
-      setVoiceTranscript("");
-      voiceRecorderRef.current = await LocalWavRecorder.start(voiceSettings.voice_input_device);
-      setVoiceRecording(true);
-      setNotice("\u6b63\u5728\u542c\u5199\uff1b\u8bc6\u522b\u7ed3\u679c\u4f1a\u5b9e\u65f6\u51fa\u73b0\uff0c\u518d\u70b9\u4e00\u6b21\u9ea6\u514b\u98ce\u505c\u6b62\u3002");
-      voiceLiveTimerRef.current = window.setInterval(() => { void transcribeLiveSnapshot(); }, 2500);
+      if (settings.voice_input_engine !== "local") {
+        const selected = await request<VoiceSettings>("voice.settings.configure", { voice_input_engine: "local" });
+        setVoiceSettings(selected);
+      }
+      voiceBaseInputRef.current = chatInput; voiceTranscriptRef.current = ""; setVoiceTranscript("");
+      voiceSessionRef.current = crypto.randomUUID();
+      voiceRecorderRef.current = await LocalWavRecorder.start(settings.voice_input_device);
+      setVoiceRecording(true); setVoiceInputPhase("正在本地听写，请开始说话…");
+      if (voiceRecorderRef.current.deviceFallback) setNotice("原来选择的麦克风不可用，这次已使用系统默认输入设备。");
+      voiceLiveTimerRef.current = window.setInterval(() => { void transcribeLiveSnapshot(); }, 1200);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "\u65e0\u6cd5\u4f7f\u7528\u9ea6\u514b\u98ce\uff0c\u8bf7\u68c0\u67e5 Windows \u6743\u9650\u3002");
+      setError(voiceInputFailure(cause));
+      setVoiceRecording(false);
+    } finally {
+      setVoiceStarting(false); voiceInputBusyRef.current = false;
     }
   };
 
@@ -1909,7 +1946,7 @@ function App() {
         } />}
         {showCreate && <CreateProject onClose={() => setShowCreate(false)} onCreated={openProject} />}
         {showManualMonitor && <Modal title="手动修改核对" subtitle="后台检测、依据和你的决定" onClose={() => setShowManualMonitor(false)} className="manual-monitor-modal"><ManualEditMonitor jobs={manualJobs} error={manualMonitorError} onRefresh={() => void refreshManualEdits()} onDecision={decideManualEdit} /></Modal>}
-      {showSettings && <SettingsDialog projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} preferences={uiPreferences} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
+      {showSettings && <SettingsDialog initialSection={settingsInitialSection} projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} preferences={uiPreferences} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
         {showUpdate && <UpdateDialog info={updateInfo} onClose={() => setShowUpdate(false)} />}
       </div>
     );
@@ -1940,10 +1977,8 @@ function App() {
         <WorkspaceDropPreview workspace={workspace} />
         <WorkspacePanel id="navigation" workspace={workspace} className="left-rail" onDetach={detachWorkspacePanel} actions={<button className="panel-icon" title="新建小说" aria-label="新建小说" onClick={() => setShowCreate(true)}>＋</button>}>
           {Boolean(dashboard?.recovery_warnings?.length) && <details className="rail-recovery"><summary>有 {dashboard?.recovery_warnings?.length} 项文件待核对</summary>{dashboard?.recovery_warnings?.map((warning, index) => <p key={`${index}-${warning}`}>{warning}</p>)}</details>}
-          <TreeSection label="故事依据" items={(tree?.items || []).filter(item => ["BOOK.md", "OUTLINE.md", "STORY_DETAIL.md"].includes(item.relative_path))} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
-          <TreeSection label="近期章节规划" items={(tree?.items || []).filter(item => item.relative_path === "RECENT_PLAN.md")} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
-          {(tree?.items || []).some(item => item.relative_path === "PLAN.md") && <TreeSection label="旧版近期计划" items={(tree?.items || []).filter(item => item.relative_path === "PLAN.md")} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />}
-          <TreeSection label="正史与记录" items={(tree?.items || []).filter(item => ["STATE.md", "DIALOGUE.md"].includes(item.relative_path))} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
+          <button className="tree-label tree-setting-entry" type="button" title="本书设定 · 分层管理" onClick={() => openSettings("story_settings")}>本书设定 · 分层管理</button>
+          <TreeSection label="当前资料" items={(tree?.items || []).filter(item => ["BOOK.md", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md"].includes(item.relative_path))} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
           {(tree?.groups || []).filter(group => group.items.length > 0).map((group) => (
             group.id === "chapters" ? <ChapterTree key={`${dashboard?.root}:chapters`} items={group.items} outline={dashboard?.chapter_outline} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} /> : <TreeSection key={group.id} label={group.label} items={group.items} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
           ))}
@@ -1980,7 +2015,7 @@ function App() {
           <div className="messages" ref={messagesRef}>
             {messages.map((message) => (
               <article key={message.id} className={`message ${message.role}`} ref={message.id === mobaoCompletion?.messageId ? mobaoTargetRef : undefined}>
-                <span className="avatar">{message.role === "user" ? "你" : message.role === "system" ? "记" : "墨"}</span>
+                <span className={`avatar ${message.role === "user" ? "" : "mobao-message-avatar"}`}>{message.role === "user" ? "你" : <MobaoAvatar mood={message.process?.status === "failed" || /尚未完成|没有完成|失败|异常/.test(message.text) ? "frustrated" : /硬冲突|严重问题/.test(message.text) ? "angry" : message.process?.status?.startsWith("waiting") || /等待|需要你|正在思考/.test(message.text) ? "thinking" : message.process?.status === "completed" || /已完成|已核对|已接受|已保存/.test(message.text) ? "complete" : /休息|暂停/.test(message.text) ? "rest" : "calm"} />}</span>
                 <div>
                   <p>{message.role === "assistant" && message.text.startsWith("这次没有完成：") ? errorMessage(readableWorkMessage(message.text.replace(/^这次没有完成：\s*/, ""), collaborationPending(collaboration).work, manualJobs)) : readableWorkMessage(message.text, collaborationPending(collaboration).work, manualJobs)}</p>
                   {message.indices?.length ? <div className="message-indices">{message.indices.map(item => <button key={item.id} onClick={() => void openDocument(item)}>{item.label}</button>)}</div> : null}
@@ -2015,11 +2050,11 @@ function App() {
                   void sendChat();
                 }
               }}
-              placeholder="比如：接着写到第6章，哪里不顺就帮我改好。"
+              placeholder={pendingQuestions.length ? "补充你的选择，或说说希望怎么调整…" : busy ? "可以补充这次任务的要求，墨宝会接着当前进度处理…" : uiPreferences.suggestedPromptsEnabled && suggestedPrompts[0]?.prompt ? readableSourceText(suggestedPrompts[0].prompt) : initialSuggestedPrompts(dashboard, false, false)[0]?.prompt || "说说你想写的故事，或想先完善哪些设定…"}
             />
-            {voiceRecording && <div className="voice-live-transcript" role="status" aria-live="polite">
+            {(voiceStarting || voiceRecording || voiceTranscribing) && <div className="voice-live-transcript" role="status" aria-live="polite">
               <div><strong>实时听写</strong><span>只是预览，停止后才回填输入框</span></div>
-              <p>{voiceTranscript || "请开始说话…"}</p>
+              <p>{voiceTranscript || voiceInputPhase || "请开始说话…"}</p>{voiceTranscript && <small>{voiceInputPhase}</small>}{voiceLiveProblem && <p className="form-error">{voiceLiveProblem}</p>}
             </div>}
             {promptOptimization && <div className="prompt-optimization-preview">
               <div><strong>提示词已优化</strong><span>{promptOptimization.change_summary.join(" · ")}</span><button type="button" onClick={() => { setPromptUndo(chatInput); setChatInput(promptOptimization.optimized_prompt); }}>采用优化版</button></div>
@@ -2028,7 +2063,7 @@ function App() {
             <div className="composer-foot">
               <span>Enter 发送 · Shift+Enter 换行</span>
               <div>
-                <button className={`voice-input-action ${voiceRecording ? "recording" : ""}`} type="button" disabled={voiceTranscribing} onClick={() => void toggleVoiceInput()} title="普通话语音输入">{voiceTranscribing ? "识别中…" : voiceRecording ? "■ 停止" : "● 语音"}</button>
+                <button className={`voice-input-action ${voiceRecording ? "recording" : ""}`} type="button" disabled={voiceStarting || voiceTranscribing} onClick={() => void toggleVoiceInput()} title="普通话语音输入">{voiceStarting ? "准备中…" : voiceTranscribing ? "识别中…" : voiceRecording ? "■ 停止" : "● 语音"}</button>
                 {busy && <button className="stop-action" type="button" disabled={!cancelReady} onClick={() => void cancelActiveRun()} title={cancelReady ? "停止当前任务" : "任务刚启动，稍后可停止"}>{cancelReady ? "停止任务" : "任务启动中…"}</button>}
                 {promptUndo !== null && <button type="button" onClick={undoPromptOptimization}>撤回优化</button>}
                 <button className="optimize-action" type="button" disabled={promptOptimizing || !chatInput.trim()} onClick={() => void optimizeChatPrompt()}>{promptOptimizing ? "优化中…" : "优化提示词"}</button>
@@ -2062,7 +2097,8 @@ function App() {
               onError={setError}
             />
           )}
-          {activeTab === "editor" && (
+          {activeTab === "editor" && document?.relative_path === "BOOK.md" && !bookRawEditing && <BookSettingsBrowser projectRoot={projectRoot} brief={dashboard?.brief || {}} refreshKey={messages.filter(message => message.role === "assistant").at(-1)?.id || ""} onManage={() => openSettings("story_settings")} onEdit={() => setBookRawEditing(true)} onAudit={() => { setChatInput("检查本书设定与当前规划，有依据的缺项请补齐，具体冲突请解释；不要改已经接受的正文。"); chatInputRef.current?.focus(); }} />}
+          {activeTab === "editor" && (document?.relative_path !== "BOOK.md" || bookRawEditing) && (
             <EditorPanel
               projectRoot={projectRoot}
               document={document}
@@ -2096,10 +2132,11 @@ function App() {
       </main>
       <footer className="status-strip project-body-total" aria-label="正文总字数" title="累计本书当前已保存的正文，草稿与已接受章节各计一次；规划、报告和历史版本不计入。"><span>{typeof dashboard?.written_characters === "number" ? `正文总字 ${dashboard.written_characters.toLocaleString()}` : "正文总字 待读取"}</span></footer>
 
+      <MobaoCompanion workAreaRef={mobaoWorkAreaRef} dockRef={mobaoDockRef} disabled={projectLoading || Boolean(chatInput.trim()) || voiceStarting || voiceRecording || voiceTranscribing || showSettings || showCreate || showManualMonitor || showHistory || showSearch || showUpdate || showMigration || Boolean(selectionDraft || compareContent) || !projectRoot} />
       <MobaoGuide cue={mobaoCompletion?.root === projectRoot ? mobaoCompletion : null}
         workAreaRef={mobaoWorkAreaRef} targetRef={mobaoTargetRef} dockRef={mobaoDockRef}
         autoPreview={Boolean(completionReference(events, mobaoCompletion?.runId))}
-        disabled={busy || projectLoading || Boolean(chatInput.trim()) || text !== savedText || voiceRecording || voiceTranscribing || pendingQuestions.length > 0 || pendingComputerActions.length > 0 || showSettings || showCreate || showManualMonitor || showHistory || showSearch || showUpdate || showMigration || Boolean(pendingRejection) || Boolean(selectionDraft || compareContent)}
+        disabled={busy || projectLoading || Boolean(chatInput.trim()) || text !== savedText || voiceStarting || voiceRecording || voiceTranscribing || pendingQuestions.length > 0 || pendingComputerActions.length > 0 || showSettings || showCreate || showManualMonitor || showHistory || showSearch || showUpdate || showMigration || Boolean(pendingRejection) || Boolean(selectionDraft || compareContent)}
         onPreview={() => {
           const reference = completionReference(events, mobaoCompletion?.runId);
           if (!reference) { mobaoTargetRef.current?.scrollIntoView({ block: "nearest" }); return; }
@@ -2114,10 +2151,10 @@ function App() {
             setReferenceDocument(loaded); setActiveTab("process");
           }).catch(cause => setError(errorMessage(cause)));
         }} />
-      {(notice || error) && <Toast kind={error ? "error" : "info"} text={error || notice} onClose={() => { setError(""); setNotice(""); setMascotMood("idle"); }} action={error ? (/任务记录|原任务状态/.test(error) ? { label: "查看可恢复任务", onClick: () => setActiveTab("project") } : /API Key|密钥|模型接口|服务商|模型配置需要处理/.test(error) ? { label: "打开设置", onClick: () => setShowSettings(true) } : /音频|播放|语音|朗读|解码/.test(error) ? { label: "查看音频", onClick: () => setActiveTab("listen") } : /重新审查/.test(error) ? { label: "打开审查", onClick: () => setActiveTab("review") } : /上下文容量|上下文占用/.test(error) ? { label: "查看上下文", onClick: () => setActiveTab("process") } : { label: "查看协作台", onClick: () => setActiveTab("process") }) : undefined} />}
+      {(notice || error) && <Toast kind={error ? "error" : "info"} text={error || notice} onClose={() => { setError(""); setNotice(""); setMascotMood("idle"); }} action={error ? (/任务记录|原任务状态/.test(error) ? { label: "查看可恢复任务", onClick: () => setActiveTab("project") } : /API Key|密钥|模型接口|服务商|模型配置需要处理/.test(error) ? { label: "打开设置", onClick: () => setShowSettings(true) } : /麦克风|听写|识别|连接组件|语音输入/.test(error) ? { label: "打开语音设置", onClick: () => openSettings("voice") } : /音频|播放|语音|朗读|解码/.test(error) ? { label: "查看音频", onClick: () => setActiveTab("listen") } : /重新审查/.test(error) ? { label: "打开审查", onClick: () => setActiveTab("review") } : /上下文容量|上下文占用/.test(error) ? { label: "查看上下文", onClick: () => setActiveTab("process") } : { label: "查看协作台", onClick: () => setActiveTab("process") }) : undefined} />}
       {showCreate && <CreateProject onClose={() => setShowCreate(false)} onCreated={openProject} />}
       {showManualMonitor && <Modal title="手动修改核对" subtitle="后台检测、依据和你的决定" onClose={() => setShowManualMonitor(false)} className="manual-monitor-modal"><ManualEditMonitor jobs={manualJobs} error={manualMonitorError} onRefresh={() => void refreshManualEdits()} onDecision={decideManualEdit} /></Modal>}
-      {showSettings && <SettingsDialog projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} preferences={uiPreferences} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
+      {showSettings && <SettingsDialog initialSection={settingsInitialSection} projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} preferences={uiPreferences} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
       {showUpdate && <UpdateDialog info={updateInfo} onClose={() => setShowUpdate(false)} />}
       {showSearch && <SearchDialog request={request} result={searchResult} setResult={setSearchResult} onClose={() => setShowSearch(false)} onOpen={async (relativePath) => {
         const item = [...(tree?.items || []), ...(tree?.groups.flatMap((group) => group.items) || [])].find((entry) => entry.relative_path === relativePath);
@@ -2336,7 +2373,7 @@ function canPollWorkspace(visibility: string, focused: boolean): boolean {
 function audioPlaybackFailure(cause?: unknown, mediaCode?: number): string {
   const message = cause instanceof Error ? cause.message : String(cause || "");
   const name = cause && typeof cause === "object" && "name" in cause ? String(cause.name) : "";
-  if (/403|在线朗读服务拒绝/.test(message)) return "在线朗读服务拒绝连接（403），这次没有生成音频。正文和对话文字已保留，请稍后手动重试，或在语音设置中选择已就绪的本地朗读组件。";
+  if (/403|在线朗读服务拒绝/.test(message)) return "在线朗读服务拒绝连接（403），这次没有生成音频。请在语音设置中检查连接组件更新；已经更新仍被拒绝时，稍后再试或选用已就绪的本地朗读组件。";
   if (mediaCode === 4 || name === "NotSupportedError" || /no supported source|unsupported source|not supported|播放器无法打开/i.test(message)) return "音频已经生成，但本地文件格式或播放地址当前不可用。已有文件保留，请在听读页查看或导出音频，核对格式后再播放。";
   if (mediaCode === 3) return "音频文件无法解码。已有文件保留，请在听读页导出并核对格式，不必重新生成正文。";
   if (mediaCode === 2) return "本地音频暂时无法读取。请确认文件仍存在，并从听读页重新打开。";
@@ -2459,13 +2496,16 @@ function CanonMigrationDialog({ migration, busy, onClose, onApply }: { migration
 }
 
 function ChapterTree({ items, outline, ...props }: { items: TreeItem[]; outline?: Dashboard["chapter_outline"]; onOpen: (item: TreeItem) => void; active?: string; opening?: string | null }) {
+  const [expanded, setExpanded] = useState(false);
+  const containsActive = Boolean(props.active && items.some(item => item.relative_path === props.active));
+  useEffect(() => { if (containsActive) setExpanded(true); }, [props.active, containsActive]);
   const volumes = outline?.state === "active" ? outline.volumes : [];
   const groups = volumes.map(volume => ({ label: `第 ${volume.volume_no} 篇 · ${volume.chapter_start}～${volume.chapter_end} 章`,
     items: items.filter(item => item.chapter_no && item.chapter_no >= volume.chapter_start && item.chapter_no <= volume.chapter_end) }));
   const remaining = items.filter(item => !groups.some(group => group.items.includes(item)));
   const starts = [...new Set(remaining.map(item => Math.floor(((item.chapter_no || 1) - 1) / 10) * 10 + 1))].sort((a, b) => a - b);
   for (const first of starts) groups.push({ label: `第 ${first}～${first + 9} 章`, items: remaining.filter(item => (item.chapter_no || 1) >= first && (item.chapter_no || 1) <= first + 9) });
-  return <div aria-label="按篇章查看正文">{groups.map(group => <TreeSection key={group.label} {...group} {...props} />)}</div>;
+  return <section className="tree-section" aria-label="按篇章查看正文"><button className="tree-label" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}><span>{expanded ? "⌄" : "›"}</span>章节<small>{items.length}</small></button>{expanded && <div className="chapter-tree-groups">{groups.map(group => <TreeSection key={group.label} {...group} {...props} />)}</div>}</section>;
 }
 
 function TreeSection({ label, items, onOpen, active, opening }: { label: string; items: TreeItem[]; onOpen: (item: TreeItem) => void; active?: string; opening?: string | null }) {
@@ -2481,7 +2521,6 @@ function TreeSection({ label, items, onOpen, active, opening }: { label: string;
           <button key={item.id} className={active === item.relative_path ? "active" : ""} onClick={() => void onOpen(item)} title={item.label || documentLabel(item.relative_path)} aria-busy={opening === item.relative_path} disabled={opening === item.relative_path}>
             <span>{item.kind === "chapter" ? "§" : item.kind === "review" ? "✓" : "◇"}</span>
             <em>{item.label}</em>
-            {opening === item.relative_path && <small>打开中…</small>}
           </button>
         ))}
       </div>}
@@ -3330,7 +3369,7 @@ const PROVIDER_OPTIONS = [
   { id: "custom", name: "自定义", note: "其他 OpenAI 兼容服务", baseUrl: "", models: [] },
 ] as const;
 
-type SettingsSection = "story_settings" | "author" | "appearance" | "models" | "creation" | "voice" | "context" | "review" | "advanced";
+type SettingsSection = "story_settings" | "author" | "appearance" | "models" | "creation" | "voice" | "context" | "review" | "repair" | "advanced";
 const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string; note: string }> = [
   { id: "story_settings", label: "本书设定", note: "人物、场景、道具与自定义资料模块" },
   { id: "author", label: "作者习惯与记忆", note: "跨书习惯、本书偏好和来源历史" },
@@ -3340,6 +3379,7 @@ const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string; note: strin
   { id: "voice", label: "语音", note: "输入、朗读与设备" },
   { id: "context", label: "上下文", note: "预算与记忆检索" },
   { id: "review", label: "审查", note: "证据与核验方式" },
+  { id: "repair", label: "版本修复", note: "版本、连接与组件状态" },
   { id: "advanced", label: "高级", note: "本机开发能力" },
 ];
 
@@ -3380,7 +3420,8 @@ function agentContextBudgetsFromProvider(value: unknown): AgentContextBudgets {
   })) as AgentContextBudgets;
 }
 
-function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, preferences, onPreferencesChange, onClose, onSaved, onVoiceSaved }: {
+function SettingsDialog({ initialSection = "appearance", projectRoot, provider, voiceSettings, voiceStatus, preferences, onPreferencesChange, onClose, onSaved, onVoiceSaved }: {
+  initialSection?: SettingsSection;
   projectRoot: string;
   provider: Record<string, unknown> | null;
   voiceSettings: VoiceSettings | null;
@@ -3401,7 +3442,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, pre
   const [error, setError] = useState("");
   const [working, setWorking] = useState(false);
   const [result, setResult] = useState("");
-  const [section, setSection] = useState<SettingsSection>("appearance");
+  const [section, setSection] = useState<SettingsSection>(initialSection);
   const [search, setSearch] = useState("");
   const [remoteModels, setRemoteModels] = useState<string[]>([]);
   const [voiceDevices, setVoiceDevices] = useState<MediaDeviceInfo[]>([]);
@@ -3409,6 +3450,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, pre
   const [edgeInstalling, setEdgeInstalling] = useState(false);
   const [asrInstalling, setAsrInstalling] = useState(false);
   const [voiceDeleting, setVoiceDeleting] = useState(false);
+  const [voiceMoving, setVoiceMoving] = useState(false);
   const [usageSummary, setUsageSummary] = useState<CollaborationOverview["usage"] | null>(null);
   const [limitPreview, setLimitPreview] = useState<{ model_limits?: { context_tokens?: number; max_output_tokens?: number }; role_output_limits?: Partial<Record<AgentRole, { model_limits: { context_tokens?: number; max_output_tokens?: number } }>>; capabilities?: { reasoning_effort?: boolean; top_k?: boolean; sampling_constraints?: { temperature?: number[]; top_p?: number[]; thinking_temperature?: number; thinking_top_p?: number } } } | null>(null);
   const [limitPreviewError, setLimitPreviewError] = useState("");
@@ -3582,7 +3624,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, pre
   };
   const activePreset = SETTINGS_PRESETS.find((preset) => preset.reasoning_effort === form.reasoning_effort && preset.inquiry_frequency === form.inquiry_frequency && preset.context_soft_tokens === form.context_soft_tokens && preset.context_hard_tokens === form.context_hard_tokens)?.id;
   const inferredProvider = form.provider_kind;
-  const settingKeywords: Record<SettingsSection, string> = { story_settings: "本书 设定 人物 场景 道具 世界 模板 资料 记录 证据 分类", author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", advanced: "高级 temperature top p top k PowerShell" };
+  const settingKeywords: Record<SettingsSection, string> = { story_settings: "本书 设定 人物 场景 道具 世界 模板 资料 记录 证据 分类", author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", repair: "版本 修复 引擎 连接 组件 更新", advanced: "高级 temperature top p top k PowerShell" };
   const visibleSections = SETTINGS_SECTIONS.filter((item) => `${item.label}${item.note}${settingKeywords[item.id]}`.toLowerCase().includes(search.trim().toLowerCase()));
   const chooseProvider = (id: string) => {
     const choice = PROVIDER_OPTIONS.find((item) => item.id === id);
@@ -3618,18 +3660,30 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, pre
     }
   };
   const installEdge = async () => {
-    const confirmed = await window.inkflow.confirm("将安装 Edge 在线语音连接组件及少量依赖，不下载语音模型。朗读时会上传选中的文字，音频返回后保存在本机；安装不会自动把任何功能切换到 Edge。确认安装吗？");
+    const confirmed = await window.inkflow.confirm("更新或安装 Edge 在线朗读连接组件及少量依赖，缓存放在本机专用目录；录音和声音档案保留，不下载语音模型。朗读时会上传选中的文字，音频返回本机。确认继续吗？");
     if (!confirmed) return;
     setEdgeInstalling(true); setError("");
     try {
       const status = await window.inkflow.request<VoiceStatus>("voice.edge.install", { confirmation: "install_edge_online_voice" });
       onVoiceSaved(voiceSettings || initialVoiceSettingsRef.current || voiceForm, status);
-      setResult(status.edge?.installed ? "Edge 连接组件已安装；请单独选择要由它朗读的功能。" : "Edge 连接组件已在后台安装，可以关闭设置继续使用墨流。完成后会通知你。");
+      setResult(status.edge?.installing ? "Edge 连接组件正在后台更新，完成后会通知你。" : status.edge?.connection_ready ? "Edge 连接组件已准备好。" : "连接组件更新未完成，请查看下面的具体进度。");
       setEdgeInstalling(Boolean(status.edge?.installing));
     } catch (cause) {
       setEdgeInstalling(false);
       setError(errorMessage(cause));
     }
+  };
+  const moveVoiceStorage = async () => {
+    const parent = await window.inkflow.chooseFolder("选择新的语音资料存放磁盘或文件夹");
+    if (!parent) return;
+    const destination = `${parent.replace(/[\\/]+$/, "")}/InkFlow-voice`;
+    if (!await window.inkflow.confirm(`把语音资料、已安装模型和连接组件复制到 ${destination}？核对后切换使用新位置，原目录保留。录音或更新正在进行时暂不迁移。`)) return;
+    setVoiceMoving(true); setError(""); setResult("正在复制并核对语音资料，完成前请暂缓录音与朗读…");
+    try {
+      const value = await window.inkflow.request<{ settings: VoiceSettings; status: VoiceStatus; message: string }>("voice.storage.move", { destination, confirmation: "move_voice_storage" });
+      onVoiceSaved(value.settings, value.status); setVoiceForm(value.settings); setResult(value.message);
+    } catch (cause) { setResult(""); setError(errorMessage(cause)); }
+    finally { setVoiceMoving(false); }
   };
   const installMoss = async () => {
     const moss = voiceStatus?.moss;
@@ -3721,6 +3775,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, pre
           <SettingGroup title="配色"><div className="palette-grid">{(["lime", "jade", "blue", "violet", "amber", "rose"] as AccentPalette[]).map((accent) => <button type="button" key={accent} data-palette={accent} className={preferences.accent === accent ? "active" : ""} onClick={() => updatePreferences({ accent })}><i />{({ lime: "青柠", jade: "青玉", blue: "湖蓝", violet: "紫罗兰", amber: "琥珀", rose: "胭脂" } as Record<AccentPalette, string>)[accent]}</button>)}</div></SettingGroup>
           <SettingGroup title="界面密度"><div className="choice-row"><button type="button" className={preferences.density === "comfortable" ? "active" : ""} onClick={() => updatePreferences({ density: "comfortable" })}>舒适</button><button type="button" className={preferences.density === "compact" ? "active" : ""} onClick={() => updatePreferences({ density: "compact" })}>紧凑</button></div></SettingGroup>
         </SettingsPane>}
+        {section === "repair" && <VersionRepair projectRoot={projectRoot} onVoiceSaved={onVoiceSaved} />}
         {section === "models" && <SettingsPane title="模型" note="先选服务商，再填写该服务商当前有效的模型 ID。">
           <div className="provider-grid">{PROVIDER_OPTIONS.map((item) => <button type="button" key={item.id} className={inferredProvider === item.id ? "active" : ""} onClick={() => chooseProvider(item.id)}><strong>{item.name}</strong><span>{item.note}</span></button>)}</div>
           <div className={`provider-status ${provider?.api_key_configured ? "ready" : "missing"}`}><strong>{provider?.api_key_configured ? "模型密钥已保存" : "尚未保存模型密钥"}</strong><span>{provider?.api_key_configured ? `凭据来源：${credentialLabel(String(provider?.api_key_storage || ""))}` : "密钥只交给本机引擎，并保存在系统凭据库。"}</span></div>
@@ -3757,7 +3812,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, pre
               <label>对话回复朗读<select value={voiceForm.voice_dialogue_engine} onChange={(event) => updateVoiceForm({ voice_dialogue_engine: event.target.value as VoiceSettings["voice_dialogue_engine"] })}><option value="off">未选用</option><option value="edge">Edge 在线自然语音</option><option value="moss">本地 MOSS</option></select></label>
               <label>普通文本转语音<select value={voiceForm.voice_text_engine} onChange={(event) => updateVoiceForm({ voice_text_engine: event.target.value as VoiceSettings["voice_text_engine"] })}><option value="off">未选用</option><option value="edge">Edge 在线自然语音</option><option value="moss">本地 MOSS</option></select></label>
               <label>正文与草稿听读<select value={voiceForm.voice_novel_engine} onChange={(event) => updateVoiceForm({ voice_novel_engine: event.target.value as VoiceSettings["voice_novel_engine"] })}><option value="off">未选用</option><option value="edge">Edge 在线自然语音</option><option value="moss">本地 MOSS</option></select></label>
-            </div><p className="form-hint">Edge：{voiceStatus?.packages?.edge_tts ? "已就绪" : "当前程序尚未安装"}；MOSS：{voiceStatus?.moss?.tts_ready ? "已就绪" : "未就绪"}；SenseVoice：{voiceStatus?.asr?.asr_ready ? "已就绪" : "未就绪"}。语音对话的文字回复仍使用模型设置中的对话模型。</p>
+            </div><p className="form-hint">Edge：{voiceStatus?.edge?.connection_ready ? "已就绪" : voiceStatus?.edge?.needs_update ? "需要更新连接组件" : "当前程序尚未安装"}；MOSS：{voiceStatus?.moss?.tts_ready ? "已就绪" : "未就绪"}；SenseVoice：{voiceStatus?.asr?.asr_ready ? "已就绪" : "未就绪"}。语音对话的文字回复仍使用模型设置中的对话模型。</p>
           </SettingGroup>
           <SettingGroup title="总开关"><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_enabled} onChange={(event) => updateVoiceForm({ voice_enabled: event.target.checked })} />启用语音功能</label><div className="settings-fields two"><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_input_enabled} disabled={!voiceStatus?.ready_for_input} onChange={(event) => updateVoiceForm({ voice_input_enabled: event.target.checked })} />语音下达命令与聊天</label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_output_enabled} onChange={(event) => updateVoiceForm({ voice_output_enabled: event.target.checked })} />对话与正文朗读</label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_auto_send} disabled={!voiceStatus?.ready_for_input} onChange={(event) => updateVoiceForm({ voice_auto_send: event.target.checked })} />识别后直接发送 <small>关闭时只填入输入框</small></label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_auto_read} onChange={(event) => updateVoiceForm({ voice_auto_read: event.target.checked })} />自动朗读 AI 回答</label></div></SettingGroup>
           <SettingGroup title="默认声音与听感"><div className="settings-fields two"><label>默认声音<select value={voiceForm.voice_default_profile} onChange={(event) => updateVoiceForm({ voice_default_profile: event.target.value })}><option value="narrator_female">女声旁白</option><option value="female_bright">明快女声</option><option value="female_warm">温柔女声</option><option value="narrator_male">男声旁白</option><option value="male_calm">沉静男声</option><option value="male_firm">坚定男声</option></select></label><label>计算设备<select value={voiceForm.voice_compute_device} onChange={(event) => updateVoiceForm({ voice_compute_device: event.target.value as VoiceSettings["voice_compute_device"] })}><option value="auto">自动（MOSS 优先使用可用 CUDA，失败时显示原因）</option><option value="cpu">只用 CPU（较慢）</option><option value="cuda">NVIDIA CUDA</option></select></label><label>语速 <output>{voiceForm.voice_speed.toFixed(2)}</output><input type="range" min="0.75" max="1.35" step="0.05" value={voiceForm.voice_speed} onChange={(event) => updateVoiceForm({ voice_speed: Number(event.target.value) })} /></label><label>音量 <output>{voiceForm.voice_volume.toFixed(2)}</output><input type="range" min="0.25" max="1.5" step="0.05" value={voiceForm.voice_volume} onChange={(event) => updateVoiceForm({ voice_volume: Number(event.target.value) })} /></label><label>自然停顿 <output>{voiceForm.voice_pause_scale.toFixed(2)}</output><input type="range" min="0.6" max="1.8" step="0.1" value={voiceForm.voice_pause_scale} onChange={(event) => updateVoiceForm({ voice_pause_scale: Number(event.target.value) })} /><small>按逗号、句号、问号、换段自动留白；1.0 为自然节奏</small></label></div></SettingGroup>
@@ -3766,14 +3821,15 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, pre
           <SettingGroup title="普通话语音输入" note="用于麦克风命令与聊天；浏览器实时听写不可用时自动使用本地识别。"><div className="settings-inline-actions"><button type="button" disabled={asrInstalling || voiceDeleting || Boolean(voiceStatus?.asr?.asr_ready)} onClick={() => void installAsr()}>{asrInstalling ? "安装中…" : voiceStatus?.asr?.asr_ready ? "语音输入已就绪" : voiceInstallProgress.asr?.retryable ? "重新安装语音输入" : "安装语音输入"}</button><button type="button" className="danger" disabled={voiceDeleting} onClick={() => void deleteVoiceComponent("sherpa")}>删除语音输入</button><span>{voiceStatus?.asr?.storage_size_mb ? `已占用 ${voiceStatus.asr.storage_size_mb.toFixed(1)}MB` : "预计下载约 470MB"}</span></div><VoiceInstallProgressCard value={voiceInstallProgress.asr} />{voiceStatus?.asr?.last_error && !voiceInstallProgress.asr?.summary && <p className="form-error">{voiceStatus.asr.last_error}</p>}</SettingGroup>
           <SettingGroup title="Edge 在线语音" note="安装包已包含连接组件；语音生成在网上进行，不下载或运行本地语音模型。">
             <div className="settings-inline-actions">
-              <button type="button" disabled={edgeInstalling || voiceDeleting || Boolean(voiceStatus?.edge?.installed)} onClick={() => void installEdge()}>{edgeInstalling ? "安装中…" : voiceStatus?.edge?.installed ? "Edge 组件已就绪" : voiceInstallProgress.edge?.retryable ? "重新安装 Edge 组件" : "安装 Edge 连接组件"}</button>
+              <button type="button" disabled={edgeInstalling || voiceDeleting} onClick={() => void installEdge()}>{edgeInstalling ? "安装中…" : voiceStatus?.edge?.needs_update ? "更新 Edge 连接组件" : voiceStatus?.edge?.connection_ready ? "检查并更新 Edge 连接组件" : voiceInstallProgress.edge?.retryable ? "重新安装 Edge 组件" : "安装 Edge 连接组件"}</button>
               <button type="button" className="danger" disabled={voiceDeleting || !voiceStatus?.edge?.has_local_files} onClick={() => void deleteVoiceComponent("edge")}>删除 Edge 组件</button>
               <span>{voiceStatus?.edge?.storage_size_mb ? `已占用 ${voiceStatus.edge.storage_size_mb.toFixed(1)}MB` : "只下载连接组件，不下载模型"}</span>
-            </div><VoiceInstallProgressCard value={voiceInstallProgress.edge} />{voiceStatus?.edge?.last_error && !voiceInstallProgress.edge?.summary && <p className="form-error">{voiceStatus.edge.last_error}</p>}
+            </div><VoiceInstallProgressCard value={voiceInstallProgress.edge} />{voiceStatus?.edge?.needs_update && <p className="form-hint">{voiceStatus.edge.compatibility_message}</p>}{voiceStatus?.edge?.last_error && !voiceInstallProgress.edge?.summary && <p className="form-error">{voiceStatus.edge.last_error}</p>}
           </SettingGroup>
           <SettingGroup title="MOSS 标准组件（默认）" note="点击安装后在这里显示依赖、模型、完成或失败四种状态。"><div className="settings-inline-actions"><button type="button" disabled={mossInstalling || voiceDeleting || Boolean(voiceStatus?.moss?.tts_ready)} onClick={() => void installMoss()}>{mossInstalling ? "安装中…" : voiceStatus?.moss?.tts_ready ? "MOSS 已就绪" : voiceInstallProgress.moss?.retryable ? "重新安装 MOSS" : "安装 MOSS"}</button><button type="button" className="danger" disabled={voiceDeleting} onClick={() => void deleteVoiceComponent("moss")}>删除 MOSS</button><span>{voiceStatus?.moss?.storage_size_mb ? `已占用 ${voiceStatus.moss.storage_size_mb.toFixed(1)}MB` : "预计下载约 2.7GB"}</span></div><VoiceInstallProgressCard value={voiceInstallProgress.moss} />{voiceStatus?.moss?.last_error && !voiceInstallProgress.moss?.summary && <p className="form-error">{voiceStatus.moss.last_error}</p>}</SettingGroup>
           <SettingGroup title="声音调试与资源" note="这些参数只影响本机音频生成，不修改正文或正史。"><div className="settings-fields two"><label>输出采样率<select value={voiceForm.voice_sample_rate} onChange={(event) => updateVoiceForm({ voice_sample_rate: Number(event.target.value) })}><option value={16000}>16 kHz（省空间）</option><option value={22050}>22.05 kHz</option><option value={24000}>24 kHz（推荐）</option><option value={44100}>44.1 kHz（更大文件）</option><option value={48000}>48 kHz（更大文件）</option></select></label><label>每段最多字数 <small>{voiceForm.voice_segment_chars} 字</small><input type="range" min="120" max="800" step="20" value={voiceForm.voice_segment_chars} onChange={(event) => updateVoiceForm({ voice_segment_chars: Number(event.target.value) })} /></label><label>短音频缓存 <small>{voiceForm.voice_cache_limit_mb} MB</small><input type="range" min="128" max="4096" step="128" value={voiceForm.voice_cache_limit_mb} onChange={(event) => updateVoiceForm({ voice_cache_limit_mb: Number(event.target.value) })} /></label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_debug} onChange={(event) => updateVoiceForm({ voice_debug: event.target.checked })} />开启语音调试日志 <small>只记录运行状态，不记录录音内容</small></label></div><p className="form-hint">分段越短越容易暂停和恢复，但文件数量会增加；缓存达到上限时会自动清理最早的短音频。</p></SettingGroup>
-          <details className="voice-technical"><summary>组件与模型信息</summary><p>语音输入：{voiceForm.voice_input_engine}</p><p>对话朗读：{voiceForm.voice_dialogue_engine}</p><p>文本朗读：{voiceForm.voice_text_engine}</p><p>正文听读：{voiceForm.voice_novel_engine}</p><p>本地目录：{voiceStatus?.data_root || "尚未读取"}</p></details>
+          <SettingGroup title="语音资料保存位置" note="录音、声音档案、听读结果与已安装组件一起复制，核对后再切换。"><p>{voiceStatus?.data_root || "正在读取当前保存位置…"}</p><button type="button" disabled={voiceMoving || voiceDeleting || edgeInstalling || asrInstalling || mossInstalling} onClick={() => void moveVoiceStorage()}>{voiceMoving ? "正在迁移与核对…" : "更改保存位置"}</button><p className="form-hint">选择磁盘或父文件夹后，会新建专用语音文件夹；原目录保留，目标已有内容时不会覆盖。以后下载和安装使用新位置。</p></SettingGroup>
+          <details className="voice-technical"><summary>组件与模型信息</summary><p>本地听写：{voiceForm.voice_input_engine === "local" ? "SenseVoice" : voiceForm.voice_input_engine === "browser" ? "浏览器听写" : "未启用"}</p><p>在线朗读连接：{voiceStatus?.edge?.version ? `Edge ${voiceStatus.edge.version}` : "尚未读取"}</p><p>组件状态：{voiceStatus?.edge?.connection_ready ? "当前协议可用" : "需要检查连接组件"}</p></details>
         </SettingsPane>}
         {section === "context" && <SettingsPane title="上下文与检索" note="参与角色可共用一套预算，也可按职责分别设置；硬事实固定保留，普通资料按相关度压缩。">
           {limitPreviewWarning}
@@ -3978,7 +4034,7 @@ function LiveRunCard({ summary, steps = [], startedAt }: { summary?: string; ste
     : role === "writer" ? "正在处理当前创作任务…"
     : "正在理解你的想法…";
   return <article className="message assistant pending live-run-card" aria-live="polite">
-    <span className="avatar" aria-hidden="true">墨</span>
+    <span className="avatar mobao-message-avatar"><MobaoAvatar mood={current?.status === "failed" ? "frustrated" : "thinking"} /></span>
     <div>
       <p>{current?.status === "failed" ? summary || "遇到问题，正在检查能否继续。" : focus}</p>
       <ProcessDisclosure startedAt={startedAt} steps={steps} />
@@ -4080,6 +4136,7 @@ function errorMessage(cause: unknown): string {
     .replace(/^Error:\s*/i, "")
     .trim();
   if (/墨流本地引擎已退出/.test(message)) return "本地写作引擎意外中断。下一次操作会自动重启引擎；请先在任务记录确认最后完成的步骤，再续接未完成部分。";
+  if (/\bConnectError\b/.test(message)) return message.replace(/\bConnectError\b/g, "未能连接到模型服务，本步尚未取得结果。请检查网络或服务状态，恢复后从这一步继续。");
   if (/^(?:本次操作未完成\s*)?['"]stop_reason['"](?:\s|$)/.test(message)) return "审查结果已经返回，但墨流读取暂停原因时出错了。这是任务衔接的程序问题，需要修复结果读取后从本章审查继续。";
   if (/pip-unpack|No such file or directory.*\.whl|临时目录中的下载文件/.test(message)) return "语音组件安装时，Windows 临时下载文件失效。墨流已清理本次暂存目录；请回到语音设置点击重新安装，稳定缓存会复用已下载文件。";
   return message.replace(/\n(?:已保留|已保存)：[^\n]*/g, "").replace(/\n影响：(?:本次操作已停止[；。]?|当前模型任务未完成[，。]?)[^\n]*/g, "");

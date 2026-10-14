@@ -570,11 +570,46 @@ class InkFlowEngine:
         project = InkFlowProject(root)
         service = StorySettingsService(project)
         operation = change.get("operation", "list")
+        if operation == "collection_create_many":
+            definitions = change.get("collections")
+            if not isinstance(definitions, list) or not 1 <= len(definitions) <= 3 or any(not isinstance(item, dict) for item in definitions):
+                raise ValidationGateError("一次请定义一至三份设定，分别给出名称、分类和记录目标。")
+            names = [str(item.get("name") or "").strip() for item in definitions]
+            if not all(names) or len(set(names)) != len(names):
+                raise ValidationGateError("设定名称不能为空或重复。")
+            saved, failures = [], []
+            for definition, name in zip(definitions, names):
+                matches = [item for item in service.list_collections() if item["name"] == name]
+                if len(matches) == 1:
+                    saved.append(matches[0])
+                    continue
+                if matches:
+                    failures.append(f"《{name}》已有多个同名合集，请先选择具体目标。")
+                    continue
+                try:
+                    args = {key: definition[key] for key in ("name", "template_id", "category", "instructions", "fields", "auto_record") if key in definition}
+                    saved.append(service.save_collection(**args))
+                except (ProjectError, ValueError) as exc:
+                    failures.append(f"《{name}》尚未创建：{exc}")
+            if saved and change.get("populate_records") is True:
+                from .setting_audit import audit_story_settings
+                audit = await audit_story_settings(self, project, instruction=instruction,
+                    apply_corrections=True, conversation_context=conversation_context,
+                    allow_evidence_repair=allow_evidence_repair,
+                    collection_names=[item["name"] for item in saved], new_record_limit=len(saved),
+                    apply_rule_corrections=change.get("apply_corrections") is True)
+                if failures:
+                    audit["summary"] += "\n" + "；".join(failures)
+                    audit["status"] = "needs_evidence"
+                return {**audit, "collections": saved, "collection_failures": failures}
+            return {"collections": saved, "failures": failures, "canon_changed": False,
+                    "summary": f"已准备 {len(saved)} 份分层设定。接下来核对已有正文，为各份设定保存有依据的具体记录。"}
         if operation == "audit":
             from .setting_audit import audit_story_settings
             return await audit_story_settings(self, project, instruction=instruction,
                 apply_corrections=change.get("apply_corrections") is True, conversation_context=conversation_context,
-                allow_evidence_repair=allow_evidence_repair)
+                allow_evidence_repair=allow_evidence_repair,
+                collection_names=change.get("collection_names"), new_record_limit=change.get("new_record_limit"))
         if operation == "manual_decide":
             job_id = str(change.get("job_id") or "")
             job = ManualEditsService(project).jobs().get(job_id)

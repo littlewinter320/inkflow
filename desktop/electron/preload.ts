@@ -25,8 +25,8 @@ contextBridge.exposeInMainWorld("inkflow", {
   moveProject: (root: string, targetParent: string) => ipcRenderer.invoke("project:move", root, targetParent),
   chooseFile: (title: string) => ipcRenderer.invoke("dialog:choose-file", title),
   chooseAudio: (title: string) => ipcRenderer.invoke("dialog:choose-audio", title),
-  saveVoiceRecording: (bytes: Uint8Array, extension = "webm") =>
-    ipcRenderer.invoke("voice:save-recording", bytes, extension),
+  saveVoiceRecording: (bytes: Uint8Array, extension = "webm", snapshotId?: string) =>
+    ipcRenderer.invoke("voice:save-recording", bytes, extension, snapshotId),
   audioUrl: (target: string) => ipcRenderer.invoke("voice:audio-url", target),
   openPath: (target: string) => ipcRenderer.invoke("shell:open-path", target),
   showItem: (target: string) => ipcRenderer.invoke("shell:show-item", target),

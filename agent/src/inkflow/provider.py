@@ -471,7 +471,9 @@ class DeepSeekProvider:
             finally:
                 accounting.finish()
         if isinstance(last_error, (httpx.TimeoutException, asyncio.TimeoutError)):
-            reason = f"连接或等待模型响应超时（{type(last_error).__name__}）；请检查网络和模型服务后继续，已有内容已保留。"
+            reason = "连接或等待模型响应超时；请检查网络和模型服务后续接当前步骤。"
+        elif isinstance(last_error, httpx.ConnectError):
+            reason = "未能建立到模型服务的连接，本步还没有收到模型结果。请检查网络、代理或服务可用性；连接恢复后续接当前步骤。"
         else:
             reason = str(last_error).strip() or type(last_error).__name__
         exhausted = ProviderError(f"模型请求经过 3 次限次自恢复仍未完成：{reason}")

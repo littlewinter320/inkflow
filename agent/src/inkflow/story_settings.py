@@ -620,6 +620,7 @@ class StorySettingsService:
             coverage.append(audit)
             payload = {key: value for key, value in collection.items()
                        if key not in {"history", "records", "updated_at", "entry_status"}}
+            payload["classification_path"] = [part.strip() for part in collection["category"].split("/") if part.strip()]
             payload["records"] = []
             payload["recording_allowed"] = collection.get("auto_record", True) and actor in collection["write_roles"]
             eligible = []

@@ -26,7 +26,7 @@ def corrected_rules(rules, corrections, sources):
     return result
 
 
-async def audit_story_settings(engine, project, *, instruction, apply_corrections=False, conversation_context="", allow_evidence_repair=True):
+async def audit_story_settings(engine, project, *, instruction, apply_corrections=False, conversation_context="", allow_evidence_repair=True, collection_names=None, new_record_limit=None, apply_rule_corrections=None):
     from .manual_edits import ManualEditsService
     from .trace import TraceRecorder
     scope = active_task_settings.get()
@@ -60,12 +60,24 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
         canon.append(chapter["chapter_no"])
     payload = service.context_payload(chapter_no=latest + 1, actor=role,
         max_chars=min(64000, max(1000, engine.settings.context_budget_for(role)[1] // 8)))
+    if collection_names is not None:
+        if not isinstance(collection_names, list) or not 1 <= len(collection_names) <= 3 or any(not isinstance(name, str) for name in collection_names):
+            raise ValidationGateError("请点名一至三份需要建立记录的设定。")
+        targets = [item for item in payload["collections"] if item["name"] in collection_names]
+        if len(targets) != len(set(collection_names)):
+            raise ValidationGateError("指定设定没有全部装入本次核对，未把未读取的合集当作空设定。")
+        payload["collections"] = targets
+        target_ids = {item["collection_id"] for item in targets}
+        payload["coverage"] = [item for item in payload["coverage"] if item["collection_id"] in target_ids]
+    if new_record_limit is not None and (type(new_record_limit) is not int or not 1 <= new_record_limit <= 3):
+        raise ValidationGateError("新增记录上限须为一至三条。")
     prompt = json_dumps({"当前书籍资料": brief.model_dump(mode="json"),
         "来源": {key: value for key, value in sources.items() if key != "近期对话·用户"}, "设定读取范围": payload,
         "正史事实": project.db.current_facts()[:128], "未结线索": project.db.open_threads()[:64],
         "范围说明": "正文只读取所列章节和有界正史记录；不可声称逐章审完全部小说。",
         "补充来源": {"近期对话·用户": sources["近期对话·用户"]},
-        "用户目标": instruction})
+        "用户目标": instruction, "新增具体记录上限": new_record_limit,
+        "新增说明": "只为本次点名的设定建立有明确追踪目标和当前来源的记录；每份最多一条，不把空模板算作完成。" if collection_names else "按实际问题提出必要记录。"})
     record_capacity = min(8, 2 * sum(bool(item.get("recording_allowed")) for item in payload["collections"]))
     requested_output = 4096 + record_capacity * 1000 + min(4000, 2 * estimate_tokens(json_dumps(brief.user_rules)))
     output_budget = engine.settings.effective_output_tokens(requested_output, role)
@@ -101,7 +113,7 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
         changes = None
         rules_unchanged = False
         rule_pending = []
-        if apply_corrections and report.rule_corrections:
+        if apply_corrections and apply_rule_corrections is not False and report.rule_corrections:
             try:
                 rules = corrected_rules(brief.user_rules, report.rule_corrections, sources)
                 changes = await engine.edit_story_setting(project.root, document_kind="book",
@@ -116,9 +128,25 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
             except ValidationGateError as exc:
                 rule_pending.append(str(exc))
         candidates = list(report.setting_updates)
+        if collection_names or new_record_limit:
+            allowed = {item["collection_id"] for item in payload["collections"]}
+            selected, seen_collections = [], set()
+            for candidate in candidates:
+                if candidate.collection_id not in allowed:
+                    continue
+                if collection_names and candidate.collection_id in seen_collections:
+                    continue
+                if new_record_limit and len(selected) >= new_record_limit:
+                    continue
+                selected.append(candidate); seen_collections.add(candidate.collection_id)
+            if len(selected) != len(candidates):
+                trace.record("settings.scope", "completed", "仅采用本次指定分类与数量内的候选，其他输出留在原报告，不扩大记录范围。",
+                             metadata={"returned": len(candidates), "selected": len(selected)})
+            candidates = selected
+
         if changes and changes.get("after"):
             sources["BOOK.md"] = changes["after"]
-        if apply_corrections and not changes and allow_evidence_repair:
+        if apply_corrections and apply_rule_corrections is not False and not changes and allow_evidence_repair:
             manual = ManualEditsService(project)
             for job in manual.jobs().values():
                 if (job.get("relative_path") == "BOOK.md" and job.get("status") in {"pending", "failed"}
@@ -198,6 +226,15 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
                     adopted.append({"title": record["title"], "record_id": record["record_id"], "collection_id": record["collection_id"], "changed": bool(record.get("changed")), "evidence_refs": record["evidence_refs"]})
                 except Exception as exc:
                     pending.append(f"《{candidate.title}》尚未保存通过：{exc}")
+        if apply_corrections and collection_names:
+            from .story_settings import has_setting_content
+            current = service.context_payload(chapter_no=latest + 1, actor=role, max_chars=64000)
+            for collection in current["collections"]:
+                if collection["name"] in collection_names and not any(
+                    has_setting_content(record.get("values")) and record.get("status") == "verified_reference"
+                    for record in collection["records"]
+                ):
+                    pending.append(f"《{collection['name']}》仍缺可核对的具体记录，分类已保留，但内容补齐尚未完成")
         status = "needs_input" if report.needs_choice else "needs_evidence" if pending else "reviewed"
         if changes:
             status = "corrected" if (changes.get("verification") or {}).get("status") == "passed" else "needs_evidence"

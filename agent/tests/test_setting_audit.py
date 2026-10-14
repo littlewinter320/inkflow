@@ -227,3 +227,36 @@ def test_unchanged_book_does_not_block_world_record(tmp_path):
     assert result["status"] == "reviewed" and result["changes"] is None
     assert len(provider.calls) == 1 and not result["pending_settings"]
     assert StorySettingsService(project).records("setting-base-world")[0]["status"] == "verified_reference"
+
+
+def test_new_collections_populate_only_when_requested_with_same_audit_owner(tmp_path, monkeypatch):
+    import inkflow.setting_audit as audit
+    from inkflow.story_settings import StorySettingsService
+    project = project_fixture(tmp_path)
+    engine = InkFlowEngine(ScriptedProvider([]), Settings())
+    calls = []
+    async def review(engine_arg, project_arg, **kwargs):
+        calls.append(kwargs)
+        return {"summary": "已核对具体记录", "adopted_settings": []}
+    monkeypatch.setattr(audit, "audit_story_settings", review)
+    definitions = [{"name": "证据物件", "category": "高级 / 物件", "instructions": "记录原件状态", "fields": [{"key": "state", "label": "状态"}]}]
+    asyncio.run(engine.manage_story_settings(project.root, change={"operation": "collection_create_many", "collections": definitions}))
+    assert calls == []
+    result = asyncio.run(engine.manage_story_settings(project.root, change={"operation": "collection_create_many", "collections": definitions, "populate_records": True}, instruction="新增具体设定"))
+    assert len(calls) == 1 and calls[0]["collection_names"] == ["证据物件"]
+    assert calls[0]["new_record_limit"] == 1 and calls[0]["apply_rule_corrections"] is False
+    assert len([item for item in StorySettingsService(project).list_collections() if item["name"] == "证据物件"]) == 1
+    assert result["summary"] == "已核对具体记录"
+
+
+def test_requested_specific_setting_is_not_complete_when_model_returns_only_template(tmp_path):
+    from inkflow.story_settings import StorySettingsService
+    project = project_fixture(tmp_path)
+    service = StorySettingsService(project)
+    service.save_collection(name="新证据", category="证据 / 物件", instructions="只记已有正文证据", fields=[{"key": "state", "label": "状态"}])
+    provider = ScriptedProvider([StorySettingsAudit(summary="分类可以使用", findings=[], setting_updates=[])])
+    engine = InkFlowEngine(provider, Settings())
+    result = asyncio.run(engine.manage_story_settings(project.root, change={"operation": "audit", "collection_names": ["新证据"], "new_record_limit": 1, "apply_corrections": True}))
+    assert result["status"] == "needs_evidence"
+    assert any("新证据" in line for line in result["pending_settings"])
+    assert result["adopted_settings"] == []

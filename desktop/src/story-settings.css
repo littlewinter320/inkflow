@@ -36,3 +36,29 @@
 .setting-collection-card { border: 1px solid var(--line); border-radius: 10px; padding: 10px; display: grid; gap: 10px; }
 .setting-collection-card > button { display: grid; gap: 6px; text-align: left; border: 0; background: transparent; padding: 0; height: auto; }
 .setting-collection-card > label { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.setting-category-branch { padding: 6px 0 6px 8px; }
+.setting-category-branch > summary { display: flex; gap: 8px; align-items: center; cursor: pointer; padding: 7px 0; }
+.setting-category-branch > summary small { margin-left: auto; color: var(--muted); }
+.setting-category-branch .setting-category-branch { border-left: 1px solid var(--line-soft); margin-left: 5px; }
+.setting-record-index { font-size: 12px; color: var(--muted); margin-top: 8px; }
+.setting-record-index > p { white-space: pre-wrap; line-height: 1.65; }
+.setting-record-index > button { display: block; text-align: left; width: 100%; margin-top: 6px; font-size: 12px; }
+
+.book-settings-browser { height: 100%; overflow-y: auto; padding: clamp(16px, 3vw, 32px); }
+.book-settings-browser > header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 20px; }
+.book-settings-browser h2, .book-settings-browser h3 { margin: 0 0 8px; }
+.book-settings-browser > header p { color: var(--muted); margin: 0; }
+.book-settings-browser > header button { margin: 4px; }
+.book-setting-section { border-bottom: 1px solid color-mix(in srgb, var(--muted) 16%, transparent); padding: 16px 0; }
+.book-setting-section summary { display: flex; flex-wrap: wrap; gap: 8px; cursor: pointer; font-weight: 600; }
+.book-setting-section summary::before { content: "›"; color: var(--muted); }
+.book-setting-section[open] > summary::before, .book-setting-collection[open] > summary::before, .book-setting-record[open] > summary::before { content: "⌄"; }
+.book-setting-section summary small { color: var(--muted); font-weight: 400; margin-left: auto; }
+.book-setting-collection, .book-setting-record { margin: 14px 0 0 12px; padding: 12px; background: color-mix(in srgb, var(--muted) 4%, transparent); border-radius: 10px; }
+.book-settings-browser dl > div { display: grid; grid-template-columns: minmax(85px, .2fr) minmax(0, 1fr); gap: 16px; padding: 8px 0; }
+.book-settings-browser dt { color: var(--muted); }
+.book-settings-browser dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.book-setting-rules p { line-height: 1.8; overflow-wrap: anywhere; }
+.book-setting-evidence { margin-top: 12px; }
+.book-setting-evidence blockquote { margin: 12px 0; padding-left: 12px; border-left: 2px solid var(--accent); }
+@media(max-width: 600px) { .book-settings-browser dl > div { grid-template-columns: 1fr; gap: 4px; } }

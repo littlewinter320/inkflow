@@ -3650,3 +3650,8 @@ flowchart TD
 | <a id="term-isolated-recovery"></a>**isolated_acceptance / safety checkpoint / journal** | 只撤销一个能证明可隔离的误接受；恢复前留安全点并记步骤 | 不满足严格条件就不能保证保留其他所有数据。journal像恢复施工记录，失败后先按它恢复中断前状态。 | [第33节](#inkflow-33) |
 
 [返回词库分类](#glossary) · [返回章节目录](#contents)
+
+
+### 语音与可见设定补充入口（2026-10-14）
+
+当前源码增加BookSettingsBrowser可见资料页、collection_create_many的条件式有据建档、12帧透明PNG播放与六种墨宝状态头像、同任务建议驱动的输入占位语。VoiceRuntime区分包安装与协议可用，后台有界检查官方新版，显式更新既有组件；input_only状态入口用于启动麦克风时的快速核对和异步识别器准备。voice.storage.move复制核验后保存全局voice_data_dir，并同步播放与新录音路径，保留原目录。此路径不更改小说与源码位置。开发启动器按真实更名进程确认主窗口、等待30秒。实际验证和未完成范围统一记录在docs/INTERFACE_AND_LEARNING_AUDIT_2026-10-14.md末节；没有创建新版安装包或宣称第51章已通过。
