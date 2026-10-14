@@ -80,6 +80,7 @@ type Dashboard = {
   brief: Record<string, unknown>;
   status: { chapters?: Record<string, number>; active_facts?: number; open_threads?: number };
   current_plan: Record<string, unknown> | null;
+  chapter_outline?: { state: string; revision_no?: number; volumes: Array<{ volume_no: number; title: string; chapter_start: number; chapter_end: number }>; cards: Array<Record<string, unknown>> };
   facts: Array<Record<string, unknown>>;
   threads: Array<Record<string, unknown>>;
   bible_entries: Array<Record<string, unknown>>;
@@ -1944,9 +1945,9 @@ function App() {
           {(tree?.items || []).some(item => item.relative_path === "PLAN.md") && <TreeSection label="旧版近期计划" items={(tree?.items || []).filter(item => item.relative_path === "PLAN.md")} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />}
           <TreeSection label="正史与记录" items={(tree?.items || []).filter(item => ["STATE.md", "DIALOGUE.md"].includes(item.relative_path))} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
           {(tree?.groups || []).filter(group => group.items.length > 0).map((group) => (
-            <TreeSection key={group.id} label={group.label} items={group.items} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
+            group.id === "chapters" ? <ChapterTree key={`${dashboard?.root}:chapters`} items={group.items} outline={dashboard?.chapter_outline} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} /> : <TreeSection key={group.id} label={group.label} items={group.items} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
           ))}
-          <section className="rail-pending" aria-label="待办摘要"><div><strong>待办与收尾</strong><span>{pendingSummary.count}</span></div><p>{pendingSummary.count ? "按章节查看下一步" : "当前没有待办"}{pendingSummary.messages.length ? ` · ${pendingSummary.messages.length} 条待回应消息` : ""}</p><button type="button" onClick={() => setActiveTab("process")}>打开待办看板</button></section>
+          <section className="rail-pending" aria-label="待办摘要"><div><strong>待办与收尾</strong><span>{pendingSummary.count}</span></div><p>{pendingSummary.count ? "按章节查看下一步" : "当前没有待办"}{pendingSummary.messages.length ? ` · ${pendingSummary.messages.length} 条协作记录` : ""}</p><button type="button" onClick={() => setActiveTab("process")}>打开待办看板</button></section>
           <details className="rail-tools"><summary>资料与容量详情</summary><ContextBudgetPanel value={contextStatus} onPin={setContextPin} /></details>
           <div className="rail-summary">
             <div><span>草稿</span><strong>{dashboard?.status.chapters?.draft || 0}</strong></div>
@@ -2431,9 +2432,9 @@ function CollaborationBoard({ value, busy, onProcessAll, onWork, onReject, onReo
     {pending.resumableBatches.length + pending.readyBatches.length + pending.pendingBatches.length > 0 && <details className="pending-board-disclosure"><summary>批次来源与保存断点 <span>{pending.resumableBatches.length + pending.readyBatches.length + pending.pendingBatches.length}</span></summary><p>每个批次保留自己的产物与审核来源；不会叠加成当前工作数量，也不代表全书正史进度。</p>{pending.resumableBatches.map(batch => renderBatch(batch, "resume"))}{pending.readyBatches.map(batch => renderBatch(batch, "accept"))}{pending.pendingBatches.map(batch => renderBatch(batch, "inspect"))}</details>}
     {deferred.length > 0 && <details className="pending-board-disclosure"><summary>留到下次的事项 <span>{deferred.length}</span></summary>{deferred.map(renderWork)}</details>}
     {pending.suggestions.length > 0 && <details className="pending-board-disclosure"><summary>可选建议与恢复记录 <span>{pending.suggestions.length}</span></summary><p>这些建议不单独阻断写作，也不计入待审核数量。相关审核读到完整来源时可同次整理；你也可以选择不采用并留档。</p>{pending.suggestions.map(renderWork)}</details>}
-    {pending.messages.length > 0 && <details className="pending-board-disclosure"><summary>Agent 协作讨论 <span>{pending.messages.length}</span></summary><p>这里保留角色交接和待回应问题，具体处理与运行记录见下方「Agent」。</p>{pending.messages.map(item => <article className="pending-discussion" key={item.message_id}><header><strong>{item.chapter_no ? `第 ${item.chapter_no} 章 · ` : ""}{messageTypeLabel(item.message_type)}</strong><span>{roleLabel(item.sender_role)} → {roleLabel(item.recipient_role)}</span></header><p>{item.claim}</p></article>)}</details>}
+    {pending.messages.length > 0 && <details className="pending-board-disclosure"><summary>Agent 协作讨论 <span>{pending.messages.length}</span></summary><p>这里是尚未收尾的角色交接记录；需要你作决定的事项会在待办中单独列出。</p>{pending.messages.map(item => <article className="pending-discussion" key={item.message_id}><header><strong>{item.chapter_no ? `第 ${item.chapter_no} 章 · ` : ""}{messageTypeLabel(item.message_type)}</strong><span>{roleLabel(item.sender_role)} → {roleLabel(item.recipient_role)}</span></header><p>{readableSourceText(item.claim)}</p></article>)}</details>}
     {pending.historicalBatches.length > 0 && <details className="pending-board-disclosure"><summary>已被当前成果接管的批次历史 <span>{pending.historicalBatches.length}</span></summary>{pending.historicalBatches.map(batch => <article className="pending-discussion" key={batch.batch_id}><header><strong>第 {batch.start_chapter_no}—{batch.end_chapter_no} 章</strong><span>仅历史记录</span></header><p>{batch.history_reason}</p><BatchStateDetails batch={batch} /></article>)}</details>}
-    {pending.rejected.length > 0 && <details className="pending-board-disclosure"><summary>已拒绝的建议与工作 <span>{pending.rejected.length}</span></summary><p>拒绝记录保留；恢复安排保留原任务处理次数，不立即执行，也不表示问题已经解决。</p>{pending.rejected.map(item => <article className="pending-discussion" key={item.id}><header><strong>{item.chapter_no ? `第 ${item.chapter_no} 章 · ` : ""}{pendingWorkLabel(item)}</strong><span>已拒绝，保留记录</span></header><p>{item.rejection?.reason || item.reason}</p>{item.reject_impact && <p>{item.reject_impact}</p>}<div className="pending-work-actions"><button type="button" disabled={busy} onClick={() => onReopen(item)}>恢复安排</button></div><small>{item.id}</small></article>)}</details>}
+    {pending.rejected.length > 0 && <details className="pending-board-disclosure"><summary>已拒绝的建议与工作 <span>{pending.rejected.length}</span></summary><p>拒绝记录保留；恢复安排保留原任务处理次数，不立即执行，也不表示问题已经解决。</p>{pending.rejected.map(item => <article className="pending-discussion" key={item.id}><header><strong>{item.chapter_no ? `第 ${item.chapter_no} 章 · ` : ""}{pendingWorkLabel(item)}</strong><span>已拒绝，保留记录</span></header><p>{item.rejection?.reason || item.reason}</p>{item.reject_impact && <p>{item.reject_impact}</p>}<div className="pending-work-actions"><button type="button" disabled={busy} onClick={() => onReopen(item)}>恢复安排</button></div></article>)}</details>}
   </section>;
 }
 
@@ -2457,11 +2458,23 @@ function CanonMigrationDialog({ migration, busy, onClose, onApply }: { migration
   </Modal>;
 }
 
+function ChapterTree({ items, outline, ...props }: { items: TreeItem[]; outline?: Dashboard["chapter_outline"]; onOpen: (item: TreeItem) => void; active?: string; opening?: string | null }) {
+  const volumes = outline?.state === "active" ? outline.volumes : [];
+  const groups = volumes.map(volume => ({ label: `第 ${volume.volume_no} 篇 · ${volume.chapter_start}～${volume.chapter_end} 章`,
+    items: items.filter(item => item.chapter_no && item.chapter_no >= volume.chapter_start && item.chapter_no <= volume.chapter_end) }));
+  const remaining = items.filter(item => !groups.some(group => group.items.includes(item)));
+  const starts = [...new Set(remaining.map(item => Math.floor(((item.chapter_no || 1) - 1) / 10) * 10 + 1))].sort((a, b) => a - b);
+  for (const first of starts) groups.push({ label: `第 ${first}～${first + 9} 章`, items: remaining.filter(item => (item.chapter_no || 1) >= first && (item.chapter_no || 1) <= first + 9) });
+  return <div aria-label="按篇章查看正文">{groups.map(group => <TreeSection key={group.label} {...group} {...props} />)}</div>;
+}
+
 function TreeSection({ label, items, onOpen, active, opening }: { label: string; items: TreeItem[]; onOpen: (item: TreeItem) => void; active?: string; opening?: string | null }) {
   const [expanded, setExpanded] = useState(label === "章节" || label === "核心文档");
+  const containsActive = Boolean(active && items.some(item => item.relative_path === active));
+  useEffect(() => { if (containsActive) setExpanded(true); }, [active, containsActive]);
   return (
     <section className="tree-section">
-      <button className="tree-label" onClick={() => setExpanded(!expanded)}><span>{expanded ? "⌄" : "›"}</span>{label}<small>{items.length}</small></button>
+      <button className="tree-label" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}><span>{expanded ? "⌄" : "›"}</span>{label}<small>{items.length}</small></button>
       {expanded && <div className="tree-items">
         {items.length === 0 && <p className="empty-mini">暂无内容</p>}
         {items.map((item) => (
@@ -2733,7 +2746,7 @@ function ReviewPanel({ document, reviewDocument, tree, workspace, request, onOpe
   return <div className="scroll-panel review-panel">
     <div className="section-heading"><p className="eyebrow">审查</p><h2>本章检查</h2><p>先看本章实际问题；需要时展开对应依据或完整报告。</p></div>
     {workspace && <ChapterStatusStrip workspace={workspace} />}
-    {reviewDocument && <details className="markdown-preview review-document"><summary>已选择的章节报告 · 展开完整内容</summary><pre>{reviewDocument.content}</pre></details>}
+    {reviewDocument && <details className="markdown-preview review-document"><summary>已选择的章节报告 · 展开完整内容</summary><pre>{readableRecordText(reviewDocument.content)}</pre></details>}
     {reviewChapterMatch && chapterMatch && Number(reviewChapterMatch[1]) !== chapterNo && <p className="form-hint">已打开第 {Number(reviewChapterMatch[1])} 章报告；本次预审和精修目标为编辑器中的第 {chapterNo} 章。</p>}
     {chapterNo > 0 && <section className="stack-section"><h3>Editor 多维预审 · 第 {chapterNo} 章</h3><p className="form-hint">Editor 分别检查连续性、人物、叙事和表达，再按证据去重；不会直接修改正文。</p><button disabled={panelWorking} onClick={() => void runPanel()}>{panelWorking ? "正在审查本章…" : "运行多维预审"}</button>{panelResult && <div>{panelFindings.length === 0 && <p className="empty-mini">没有发现可引用的问题。</p>}{panelFindings.map((finding, index) => <article className="thread-card" key={index}><strong>[{String(finding.severity || "info")}] {String(finding.category || "阅读体验")}</strong><p>原文：{String(finding.evidence || "未提供")}</p><p>影响：{String(finding.explanation || "未单独说明")}</p><small>修订方向：{String(finding.repair_instruction || "由作者决定是否调整")}</small></article>)}</div>}</section>}
     {chapterNo > 0 && <button className="wide-action" onClick={() => onPrompt(`请根据第 ${chapterNo} 章当前版本的 Editor 审查证据进入精修模式：先输出可审计的场景蓝图，再由 Writer 定点修订并让 Editor 重审新版本；不要验收。`)}>把审查意见交给 Writer 精修</button>}

@@ -2746,6 +2746,7 @@ class InkFlowEngine:
             result = await self.provider.generate_json(
                 system_prompt=WRITER_SYSTEM,
                 user_prompt=writer_prompt,
+                cache_prefix=packet.model_prompt_parts()[0] or None,
                 output_model=DraftOutput,
                 effort=self.settings.reasoning_effort,
                 max_tokens=self.settings.max_output_tokens,

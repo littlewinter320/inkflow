@@ -76,5 +76,7 @@ export function readableRecordText(text: string): string {
   if (/^[\[{]/.test(clean)) {
     try { return readableRecord(JSON.parse(clean)); } catch { /* Ordinary prose keeps its original punctuation. */ }
   }
-  return readableSourceText(text);
+  return readableSourceText(text.replace(/```(?:json)?\s*\n([\s\S]*?)\n```/g, (block, body: string) => {
+    try { return readableRecord(JSON.parse(body)); } catch { return block; }
+  }));
 }

@@ -1,7 +1,7 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, PointerEvent, ReactNode, RefObject } from "react";
-import { closeDropRect, defaultWorkspaceLayout, dockedWidth, dropLayout, fitFloatingRect, layoutStorageKey, panelIds, panelLabels, readWorkspaceLayout, workspaceDropTarget, workspaceGeometry } from "./workspaceLayout";
-import type { DockPosition, DropPreview, PanelId, Rect, WorkspaceLayout, WorkspaceSize } from "./workspaceLayout";
+import { closeDropRect, layoutPresets, presetLayout, shouldCollapse, swapPanels, defaultWorkspaceLayout, dockedWidth, dropLayout, fitFloatingRect, layoutStorageKey, panelIds, panelLabels, readWorkspaceLayout, workspaceDropTarget, workspaceGeometry } from "./workspaceLayout";
+import type { DockPosition, DropPreview, LayoutPreset, PanelId, Rect, WorkspaceLayout, WorkspaceSize } from "./workspaceLayout";
 import "./workspace.css";
 
 const rectStyle = (rect: Rect): CSSProperties => ({ left: rect.x, top: rect.y, width: rect.width, height: rect.height });
@@ -39,7 +39,7 @@ export function useWorkspaceLayout(area: RefObject<HTMLElement | null>, projectR
   const update = (next: WorkspaceLayout) => { layoutRef.current = next; setLayout(next); };
   const remember = (value = layoutRef.current) => setPrevious({ layout: value, native: [...nativePanelsRef.current] });
   const change = (next: WorkspaceLayout) => { remember(); update(next); };
-  const updatePreview = (next: DropPreview | null) => setPreview(old => old?.action === next?.action && old?.position === next?.position
+  const updatePreview = (next: DropPreview | null) => setPreview(old => old?.action === next?.action && old?.position === next?.position && old?.target === next?.target
     && old?.rect.x === next?.rect.x && old?.rect.y === next?.rect.y && old?.rect.width === next?.rect.width && old?.rect.height === next?.rect.height ? old : next);
   const previewLayout = (value: WorkspaceLayout) => ({ ...value, panels: Object.fromEntries(panelIds.map(id => [id,
     { ...value.panels[id], visible: value.panels[id].visible && !nativePanelsRef.current.includes(id) }])) as WorkspaceLayout["panels"] });
@@ -123,6 +123,13 @@ export function useWorkspaceLayout(area: RefObject<HTMLElement | null>, projectR
           next.panels[current.id] = { ...panel, width: dockedWidth(current.id, current.rect.width + (panel.position === "left" ? dx : -dx), current.rect, editor, sizeRef.current) };
         }
       }
+      if (current.edge) {
+        const isFloating = geometryFor(current.original, sizeRef.current).panels[current.id]?.floating;
+        const width = current.rect.width + (isFloating ? (current.edge.includes("w") ? -dx : current.edge.includes("e") ? dx : 0) : panel.position === "bottom" ? 0 : panel.position === "left" ? dx : -dx);
+        const height = current.rect.height + (current.edge.includes("n") ? -dy : current.edge.includes("s") ? dy : 0);
+        current.drop = shouldCollapse(current.id, width, height) ? { action: "close", rect: current.rect } : null;
+        updatePreview(current.drop);
+      }
       layoutRef.current = next;
       if (pendingFrame.current === null) pendingFrame.current = window.requestAnimationFrame(() => { pendingFrame.current = null; draw(layoutRef.current); });
     };
@@ -133,7 +140,8 @@ export function useWorkspaceLayout(area: RefObject<HTMLElement | null>, projectR
       if (current.moved && event.type === "pointerup") {
         const next = layoutRef.current;
         remember(current.original);
-        const finished = current.drop?.action === "dock" ? dropLayout(next, current.id, current.drop.position!)
+        const finished = current.drop?.action === "swap" ? swapPanels(current.original, current.id, current.drop.target!)
+          : current.drop?.action === "dock" ? dropLayout(next, current.id, current.drop.position!)
           : current.drop?.action === "close" ? { ...current.original, panels: { ...current.original.panels, [current.id]: { ...current.original.panels[current.id], visible: false } } } : next;
         if (area.current) area.current.dataset.moving = "false";
         draw(finished);
@@ -186,7 +194,8 @@ export function useWorkspaceLayout(area: RefObject<HTMLElement | null>, projectR
     nativeDragRef.current = null; setMoving(null); setPreview(null);
     if (value.phase === "drop" && drop) {
       remember();
-      if (drop.action === "dock") update(dropLayout(incoming, id, drop.position!));
+      if (drop.action === "swap") update(swapPanels(incoming, id, drop.target!));
+      else if (drop.action === "dock") update(dropLayout(incoming, id, drop.position!));
       else if (drop.action === "close") update({ ...layoutRef.current, panels: { ...layoutRef.current.panels, [id]: { ...layoutRef.current.panels[id], visible: false } } });
       void returnRef.current(id, drop.action === "close");
     }
@@ -206,7 +215,7 @@ export function useWorkspaceLayout(area: RefObject<HTMLElement | null>, projectR
     const fitted = fitFloatingRect(id, event.shiftKey ? { ...rect, width: rect.width + direction[0], height: rect.height + direction[1] } : { ...rect, x: rect.x + direction[0], y: rect.y + direction[1] }, size);
     change({ ...current, panels: { ...current.panels, [id]: { ...current.panels[id], ...fitted, position: "floating" } } });
   };
-  return { layout, geometry, size, moving, preview, active, nativePanels, markNative, nativeDrag, remember, start, setActive, keyMove, setPosition, toggle, undo, reset: () => change(readWorkspaceLayout(defaultWorkspaceLayout, null)) };
+  return { applyPreset: (preset: LayoutPreset) => change(presetLayout(layoutRef.current, preset, size)), layout, geometry, size, moving, preview, active, nativePanels, markNative, nativeDrag, remember, start, setActive, keyMove, setPosition, toggle, undo, reset: () => change(readWorkspaceLayout(defaultWorkspaceLayout, null)) };
 }
 type WorkspaceController = ReturnType<typeof useWorkspaceLayout>;
 
@@ -220,13 +229,13 @@ function WorkspacePopover({ label, className, icon, children }: { label: string;
 }
 
 export function WorkspaceMenu({ workspace, onReturn }: { workspace: WorkspaceController; onReturn: (id: PanelId) => void }) {
-  return <WorkspacePopover label="显示面板和恢复布局" className="workspace-layout-button" icon={<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><rect x="2" y="3" width="16" height="14" rx="2" /><path d="M7 3v14M13 3v14" /></svg>}><small>工作区面板</small>{panelIds.map(id => <button key={id} type="button" aria-pressed={workspace.layout.panels[id].visible} onClick={() => workspace.nativePanels.includes(id) ? onReturn(id) : workspace.toggle(id)}><span>{panelLabels[id]}</span><span aria-hidden="true">{workspace.nativePanels.includes(id) ? "返回工作台" : workspace.layout.panels[id].visible ? "✓" : "打开"}</span></button>)}<hr /><button disabled={!workspace.undo} onClick={() => workspace.undo?.()}>回到上一步布局</button><button onClick={() => { workspace.nativePanels.forEach(onReturn); workspace.reset(); }}>恢复初始布局</button><p>拖标题移动，拖边缘调整大小。</p></WorkspacePopover>;
+  return <WorkspacePopover label="显示面板和恢复布局" className="workspace-layout-button" icon={<svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><rect x="2" y="3" width="16" height="14" rx="2" /><path d="M7 3v14M13 3v14" /></svg>}><small>布局预选</small><div className="workspace-presets">{layoutPresets.map(preset => <button key={preset.id} type="button" onClick={() => workspace.applyPreset(preset.id)}><span className={`layout-mini layout-${preset.id}`} aria-hidden="true"><i /><i /><i /></span>{preset.label}</button>)}</div><hr /><small>工作区面板</small>{panelIds.map(id => <button key={id} type="button" aria-pressed={workspace.layout.panels[id].visible} onClick={() => workspace.nativePanels.includes(id) ? onReturn(id) : workspace.geometry.collapsed.includes(id) ? workspace.setPosition(id, "floating") : workspace.toggle(id)}><span>{panelLabels[id]}</span><span aria-hidden="true">{workspace.nativePanels.includes(id) ? "返回工作台" : workspace.geometry.collapsed.includes(id) ? "展开" : workspace.layout.panels[id].visible ? "✓" : "打开"}</span></button>)}<hr /><button disabled={!workspace.undo} onClick={() => workspace.undo?.()}>回到上一步布局</button><button onClick={() => { workspace.nativePanels.forEach(onReturn); workspace.reset(); }}>恢复初始布局</button><p>拖标题移动或交换位置；缩得很小时松开即可收起。</p></WorkspacePopover>;
 }
 
 export function WorkspacePanel({ id, workspace, className, actions, onDetach, children }: { id: PanelId; workspace: WorkspaceController; className: string; actions?: ReactNode; onDetach: (id: PanelId) => void; children: ReactNode }) {
   const panel = workspace.layout.panels[id], detachedHere = detachedPanel === id;
   const rect = detachedHere ? { x: 0, y: 0, ...workspace.size, floating: false } : workspace.geometry.panels[id];
-  const hidden = detachedPanel ? !detachedHere : !panel.visible || workspace.nativePanels.includes(id);
+  const hidden = detachedPanel ? !detachedHere : !panel.visible || workspace.nativePanels.includes(id) || !rect;
   const bottom = panelIds.filter(item => workspace.geometry.panels[item] && !workspace.geometry.panels[item]?.floating && workspace.layout.panels[item].position === "bottom").sort((a, b) => workspace.geometry.panels[a]!.x - workspace.geometry.panels[b]!.x);
   const edges = rect?.floating ? ["n", "e", "s", "w", "ne", "se", "sw", "nw"] : panel.position === "bottom" ? ["n", ...(bottom.indexOf(id) < bottom.length - 1 ? ["e"] : []), ...(bottom.indexOf(id) > 0 ? ["w"] : [])] : [panel.position === "left" ? "e" : "w"];
   return <section className={`workspace-panel ${className}`} hidden={hidden} style={rect ? { ...rectStyle(rect), zIndex: workspace.moving === id || (rect.floating && workspace.active === id) ? 24 : rect.floating ? 22 : 1 } : undefined} data-floating={rect?.floating} data-panel={id} onPointerDown={() => workspace.setActive(id)}>
@@ -242,7 +251,7 @@ export function WorkspaceDropPreview({ workspace }: { workspace: WorkspaceContro
   return <>
     <div className={`workspace-close-drop${preview?.action === "close" ? " active" : ""}`} style={rectStyle(closeDropRect(workspace.size))} aria-hidden="true">拖到这里收起面板</div>
     {preview && <div className={`workspace-drop-preview action-${preview.action}`} style={rectStyle(preview.rect)} role="status">
-      <span>{preview.action === "close" ? `松开后收起${label}` : preview.action === "detach" ? "松开后移到独立窗口" : `松开后放到${preview.position === "left" ? "左侧" : preview.position === "right" ? "右侧" : "下方"}`}</span>
+      <span>{preview.action === "close" ? `松开后收起${label}` : preview.action === "swap" ? `松开后与${panelLabels[preview.target!]}交换位置` : preview.action === "detach" ? "松开后移到独立窗口" : `松开后放到${preview.position === "left" ? "左侧" : preview.position === "right" ? "右侧" : "下方"}`}</span>
       <small>{preview.action === "close" ? "可从顶端布局重新打开" : "移出预览区域可继续自由摆放"}</small>
     </div>}
   </>;

@@ -1329,9 +1329,10 @@ class ContextBuilder:
         ordered = sorted(enumerate(packet.sections), key=lambda pair: (
             {"global": 0, "book": 1, "canon": 2, "chapter": 3, "request": 4}[pair[1].cache_scope],
             {"J": 0, "B": 1, "O0": 2, "O1": 3, "O2": 4, "C0": 5}.get(pair[1].key, 10 + pair[0]) if pair[1].cache_scope == "book"
+            else {"B": 0, "D": 1, "CSET": 2, "G": 3}.get(pair[1].key, 10 + pair[0]) if pair[1].cache_scope == "canon"
             else -1 if pair[1].cache_scope == "chapter" and pair[1].key == "E0" else pair[0],
         ))
-        prefix_sections = [item for _, item in ordered if item.cache_scope in {"global", "book"}]
+        prefix_sections = [item for _, item in ordered if item.cache_scope in {"global", "book", "canon"}]
         prefix_hashes = {
             item.key: hashlib.sha256((
                 f"## {item.key}. {item.title}\n\n{item.model_content()}\n\n"
@@ -1413,8 +1414,9 @@ class ContextBuilder:
                 "role": role,
                 "changed_sections": changed_keys,
                 "first_changed_section": changed_keys[0] if changed_keys else None,
-                "reason": "首次记录该角色书籍段" if not old_hashes else ("书籍段内容、标题或来源已变化" if changed_keys else "书籍段未变化；还须对照调用记录中的模型、系统契约与前段输入指纹"),
-                "estimated_prefix_tokens": estimate_tokens("\n".join(item.model_content() for item in prefix_sections)),
+                "reason": "首次记录该角色参考资料" if not old_hashes else ("参考资料内容、标题或来源已变化" if changed_keys else "参考资料未变化；仍须核对模型、系统契约及供应商缓存是否可用"),
+                "estimated_prefix_tokens": estimate_tokens(packet.model_prompt_parts()[0]),
+                "reference_prefix_hash": content_hash(packet.model_prompt_parts()[0]),
             },
             "prefix_history_by_role": prefix_history,
             "warnings": packet.warnings,

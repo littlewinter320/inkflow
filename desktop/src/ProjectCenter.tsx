@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { readableSourceText } from "./readableNames";
+import { documentLabel, readableSourceText } from "./readableNames";
 
 type Request = <T>(method: string, params?: Record<string, unknown>) => Promise<T>;
 
@@ -12,6 +12,7 @@ type DashboardLike = {
     open_threads?: number;
   };
   accepted_characters: number;
+  chapter_outline?: { state: string; revision_no?: number; volumes: Array<{ volume_no: number; title: string; chapter_start: number; chapter_end: number }>; cards: Array<Record<string, unknown>> };
   planning_impact?: { changed_sources: string[]; affected: string[]; accepted_chapters_preserved: number; next_step: string };
   pending_planning_publication?: { run_id: string; anchor: number; end: number } | null;
   quality_hold?: { chapter_no: number; source_hash: string; stage?: "legacy_review" | "repair_confirmation"; reason: string; detail?: string; first_evidence: string; second_evidence: string } | null;
@@ -116,8 +117,6 @@ export function ProjectCenter({
   const [tasks, setTasks] = useState<TaskRun[]>([]);
   const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
   const [pendingRecovery, setPendingRecovery] = useState<PendingRecovery | null>(null);
-  const [planningPublication, setPlanningPublication] = useState<"checking" | "active" | "changed" | "unknown">("checking");
-  const [planningRevisionNo, setPlanningRevisionNo] = useState<number | null>(null);
   const [trashItems, setTrashItems] = useState<TrashItem[] | null>(null);
   const [preview, setPreview] = useState<RollbackPreview | null>(null);
   const [working, setWorking] = useState(false);
@@ -298,7 +297,7 @@ export function ProjectCenter({
       await request("project.trash.restore", { trash_id: item.trash_id, expected_hash: item.content_hash });
       await Promise.all([load(), onRefresh()]);
       setTrashItems((items) => (items || []).filter((candidate) => candidate.trash_id !== item.trash_id));
-      onNotice(`已恢复 ${item.relative_path}。`);
+      onNotice(`已恢复${documentLabel(item.relative_path)}。`);
     } catch (cause) {
       onError(errorMessage(cause));
     } finally {
@@ -352,26 +351,9 @@ export function ProjectCenter({
   const currentWorkspace = workspace as ChapterWorkspaceLike | null;
   const documentItems = tree?.items || [];
   const hasRecentPlan = documentItems.some((item) => item.relative_path === "RECENT_PLAN.md");
-  useEffect(() => {
-    if (!hasRecentPlan || !dashboard?.root) return;
-    let cancelled = false;
-    setPlanningPublication("checking");
-    void Promise.all([
-      request<{ content: string }>("document.read", { project_root: dashboard.root, relative_path: "planning/active-v2.json" }),
-      request<{ content_hash: string }>("document.read", { project_root: dashboard.root, relative_path: "OUTLINE.md" }),
-      request<{ content_hash: string }>("document.read", { project_root: dashboard.root, relative_path: "STORY_DETAIL.md" }),
-      request<{ content_hash: string }>("document.read", { project_root: dashboard.root, relative_path: "RECENT_PLAN.md" }),
-    ]).then(([manifestDocument, outline, detail, recent]) => {
-      if (cancelled) return;
-      const manifest = JSON.parse(manifestDocument.content) as Record<string, unknown>;
-      setPlanningRevisionNo(typeof manifest.revision_no === "number" ? manifest.revision_no : 1);
-      setPlanningPublication(manifest.protocol_version === 2 && manifest.status === "active"
-        && manifest.outline_hash === outline.content_hash
-        && manifest.volume_detail_hash === detail.content_hash
-        && manifest.recent_plan_hash === recent.content_hash ? "active" : "changed");
-    }).catch(() => { if (!cancelled) setPlanningPublication("unknown"); });
-    return () => { cancelled = true; };
-  }, [hasRecentPlan, dashboard?.root, tree, request]);
+  const planningPublication = dashboard?.chapter_outline?.state === "active" ? "active"
+    : dashboard?.chapter_outline?.state === "needs_attention" ? "changed" : "unknown";
+  const planningRevisionNo = dashboard?.chapter_outline?.revision_no;
   const suggestions = projectSuggestions(dashboard, documentItems.map(item => item.relative_path));
   const legacyPlan = dashboard?.current_plan || null;
   const currentPlan = hasRecentPlan ? null : legacyPlan;
@@ -406,7 +388,7 @@ export function ProjectCenter({
         <div className="project-heading-actions"><button disabled={working} onClick={() => { void Promise.all([load(), onRefresh()]).catch((cause) => onError(errorMessage(cause))); }}>刷新</button><button disabled={working} onClick={() => void loadTrash()}>回收站</button></div>
       </header>
 
-      {trashItems !== null && <section className="project-section trash-section" aria-label="项目回收站"><div className="project-section-title"><div><h3>项目回收站</h3><p>普通删除会保留在项目回收区；正史正文不能从这里绕过验收流程删除。</p></div><button disabled={working} onClick={() => setTrashItems(null)}>收起</button></div>{trashItems.length === 0 ? <p className="empty-mini">暂无可恢复文件。</p> : trashItems.map((item) => <article className="trash-item" key={item.trash_id}><div><strong>{item.relative_path}</strong><small>{item.deleted_at}</small>{item.restore_blocked && <small>原位置已有同名文件，需先处理冲突</small>}</div><button disabled={working || item.restore_blocked} onClick={() => void restoreTrashItem(item)}>恢复文件</button></article>)}</section>}
+      {trashItems !== null && <section className="project-section trash-section" aria-label="项目回收站"><div className="project-section-title"><div><h3>项目回收站</h3><p>普通删除会保留在项目回收区；正史正文不能从这里绕过验收流程删除。</p></div><button disabled={working} onClick={() => setTrashItems(null)}>收起</button></div>{trashItems.length === 0 ? <p className="empty-mini">暂无可恢复文件。</p> : trashItems.map((item) => <article className="trash-item" key={item.trash_id}><div><strong>{documentLabel(item.relative_path)}</strong><small>{item.deleted_at}</small>{item.restore_blocked && <small>原位置已有同名文件，需先处理冲突</small>}</div><button disabled={working || item.restore_blocked} onClick={() => void restoreTrashItem(item)}>恢复文件</button></article>)}</section>}
 
       {dashboard?.quality_hold && (
         <section className="project-section quality-hold" aria-label="正史待复核">
@@ -452,7 +434,7 @@ export function ProjectCenter({
           return <button key={item.path} type="button" disabled={!documentItem} className={documentItem ? "ready" : "missing"} onClick={() => documentItem && onOpen(documentItem)}><strong>{item.label}</strong><small>{documentItem ? item.note : "待建立"}</small></button>;
         })}</div>
         {!hasRecentPlan && !!dashboard?.planning_impact?.affected.length && <div className="planning-impact"><strong>依据已有变化</strong><p>{dashboard.planning_impact.affected.join("；")}。{dashboard.planning_impact.next_step}</p><button onClick={() => onPrompt("大纲或设定改过了，请先核对细纲与还没写的章节安排，指出影响范围；保留已接受的正文。")}>让墨流核对未来安排</button></div>}
-        {hasRecentPlan && <div className={`current-planning-note ${planningPublication}`}><strong title="正式版号累计记录本书已采用的规划更新，不是自动重试次数。审核未过、中断和等待确认不会增加版号；补救次数见本次任务记录。">{planningPublication === "active" ? `当前规划已生效 · 正式第 ${planningRevisionNo || 1} 版` : planningPublication === "changed" ? "规划文档与生效记录不一致" : planningPublication === "unknown" ? "规划文档已存在，生效状态待核对" : "正在核对规划状态"}</strong><p>点击上方卡片查看当前大纲、卷细纲与近期章节规划。已接受正文仍以正史为准；旧版未来章节卡已退出当前数据库规划。</p></div>}
+        {hasRecentPlan && <div className={`current-planning-note ${planningPublication}`}><strong title="正式版号累计记录本书已采用的规划更新，不是自动重试次数。审核未过、中断和等待确认不会增加版号；补救次数见本次任务记录。">{planningPublication === "active" ? `当前规划已生效 · 正式第 ${planningRevisionNo || 1} 版` : planningPublication === "changed" ? "规划文档与生效记录不一致" : planningPublication === "unknown" ? "规划文档已存在，生效状态待核对" : "正在核对规划状态"}</strong><details><summary>查看规划说明</summary><p>上方卡片可查看当前大纲、卷细纲和近期安排。规划更新只安排后续故事，已经接受的正文仍以正史为准。</p></details></div>}
         {!hasRecentPlan && !currentPlan && <div className="plan-empty"><strong>还没有近期章节规划</strong><p>先确定大纲与细纲，再安排接下来的章节。</p></div>}
         {currentPlan && <>
           <p className="legacy-plan-note">以下卷、篇章及章节卡来自旧版规划记录，仅供核对。当前三层规划完成后，请查看上方文档。</p>
@@ -464,7 +446,7 @@ export function ProjectCenter({
         </>}
       </section>
 
-      <ChapterNavigator cards={chapterCards} files={chapterFiles} volume={volume} acceptedTotal={numberValue(chapterStatus.accepted)} onOpen={onOpen} onPrompt={onPrompt} hasRecentPlan={hasRecentPlan} />
+      <ChapterNavigator key={dashboard?.root} cards={dashboard?.chapter_outline?.state === "active" ? dashboard.chapter_outline.cards : chapterCards} files={chapterFiles} volume={volume} outline={dashboard?.chapter_outline} acceptedTotal={numberValue(chapterStatus.accepted)} onOpen={onOpen} onPrompt={onPrompt} hasRecentPlan={hasRecentPlan} />
 
       <section className="project-section">
         <div className="project-section-title"><div><h3>接下来可以做什么</h3><p>建议来自当前确定性状态，不会自动执行。</p></div></div>
@@ -634,6 +616,7 @@ function ChapterNavigator({
   cards,
   files,
   volume,
+  outline,
   acceptedTotal,
   onOpen,
   onPrompt,
@@ -642,11 +625,13 @@ function ChapterNavigator({
   cards: Array<Record<string, unknown>>;
   files: ProjectTreeItemLike[];
   volume: Record<string, unknown>;
+  outline?: DashboardLike["chapter_outline"];
   acceptedTotal: number;
   onOpen: (item: ProjectTreeItemLike) => void;
   onPrompt: (prompt: string) => void;
   hasRecentPlan: boolean;
 }) {
+  const [expanded, setExpanded] = useState<string[]>([]);
   const accepted = new Set(
     files
       .filter((item) => item.status === "accepted" && item.chapter_no)
@@ -668,37 +653,55 @@ function ChapterNavigator({
     ? end - start + 1
     : null;
   // 当前篇章的章节卡只代表近期计划；整卷目标取卷范围，正史按章号去重统计。
-  const inVolume = (chapterNo: number) => target !== null && chapterNo >= start && chapterNo <= end;
-  const acceptedCount = target === null
-    ? Math.max(acceptedTotal, accepted.size)
-    : [...accepted].filter(inVolume).length;
-  const plannedCount = new Set(cards.map((card) => Number(card.chapter_no)).filter((chapterNo) => (
-    Number.isInteger(chapterNo) && chapterNo > 0 && (target === null || inVolume(chapterNo))
-  ))).size;
   const cardsByChapter = new Map(cards.map((card) => [Number(card.chapter_no), card]));
-  const chapterNumbers = target === null
+  const knownNumbers = target === null
     ? [...new Set([...cardsByChapter.keys(), ...accepted, ...drafts.keys(), ...canon.keys()])]
       .filter((chapterNo) => Number.isInteger(chapterNo) && chapterNo > 0).sort((a, b) => a - b)
     : Array.from({ length: target }, (_, index) => start + index);
-  const progress = target === null ? null : acceptedCount === target ? 100 : Math.min(99, Math.round((acceptedCount / target) * 100));
+  const volumes = outline?.state === "active" ? outline.volumes : [];
+  const covered = (number: number) => volumes.some(item => number >= item.chapter_start && number <= item.chapter_end);
+  const ungrouped = knownNumbers.filter(number => !covered(number));
+  const groups = volumes.map(item => ({ key: `volume-${item.volume_no}`, title: `第 ${item.volume_no} 篇 · ${item.title.replace(/^第[一二三四五六七八九十百零〇两\d]+[卷篇部]\s*[·：:、-]?\s*/, "")}`,
+    numbers: Array.from({ length: item.chapter_end - item.chapter_start + 1 }, (_, index) => item.chapter_start + index), planned: true }));
+  // Without a verified full-book plan, group actual chapters for navigation only.
+  for (const number of ungrouped) {
+    const first = Math.floor((number - 1) / 10) * 10 + 1;
+    const key = `chapters-${first}`;
+    let group = groups.find(item => item.key === key);
+    if (!group) { group = { key, title: `第 ${first}～${first + 9} 章`, numbers: [], planned: false }; groups.push(group); }
+    group.numbers.push(number);
+  }
+  const total = groups.reduce((sum, group) => sum + group.numbers.length, 0);
+  const current = Math.max(0, ...accepted);
   return (
     <section className="project-section chapter-navigator">
       <div className="project-section-title">
-        <div><h3>{target === null ? "章节进度" : "本卷正史进度"}</h3><p>{target === null ? `全书已有 ${acceptedCount} 章正史` : `${acceptedCount} / ${target} 章已进入正史 · 第 ${start}～${end} 章`}</p></div>
-        <span>{progress === null ? "" : `${progress}%`}</span>
+        <div><h3>全书进度</h3><p>已完成 {Math.max(acceptedTotal, accepted.size)} 章{volumes.length ? ` · 全书规划 ${total} 章` : ""}{current ? ` · 最近完成第 ${current} 章` : ""}</p></div>
+        {!!expanded.length && <button className="text-button" onClick={() => setExpanded([])}>全部收起</button>}
       </div>
-      {progress !== null && <div className="chapter-progress-track" aria-label={`本卷正史已完成 ${acceptedCount} / ${target} 章`}><i style={{ width: `${progress}%` }} /></div>}
-      <p className="chapter-plan-note">{hasRecentPlan ? "下方显示已有正文与草稿；未来章节安排请查看近期规划文档。" : `旧版计划卡 ${plannedCount} 张；下方按章节显示实际正文与草稿。`}</p>
-      <div className="chapter-navigator-grid">
-        {chapterNumbers.map((chapterNo) => {
+      {outline?.state === "needs_attention" && <p className="chapter-plan-note">规划有改动尚未核对，暂按已有章节分组；正文进度照常显示。</p>}
+      {!groups.length && <p className="chapter-plan-note">还没有章节。规划完成后，这里会显示各篇的安排与写作进度。</p>}
+      <div className="chapter-volume-list">{groups.map(group => {
+        const done = group.numbers.filter(number => accepted.has(number)).length;
+        const drafting = group.numbers.filter(number => !accepted.has(number) && drafts.has(number)).length;
+        const planned = group.numbers.filter(number => !accepted.has(number) && !drafts.has(number) && cardsByChapter.has(number)).length;
+        const state = done === group.numbers.length ? "已完成" : done || drafting ? "写作中" : group.planned ? "已规划 · 尚未开写" : "待安排";
+        const opened = expanded.includes(group.key);
+        return <section className="chapter-volume" key={group.key}>
+          <button type="button" className="chapter-volume-toggle" aria-expanded={opened} onClick={() => setExpanded(values => opened ? values.filter(key => key !== group.key) : [...values, group.key])}>
+            <span className="chapter-volume-arrow" aria-hidden="true">{opened ? "▾" : "▸"}</span><span className="chapter-volume-title"><strong>{group.title}</strong><small>第 {group.numbers[0]}～{group.numbers[group.numbers.length - 1]} 章 · 已完成 {done}/{group.numbers.length}{drafting ? ` · ${drafting} 章草稿` : ""}{planned ? ` · ${planned} 章已细化` : ""}</small></span><span>{state}</span>
+          </button>
+          <div className="chapter-progress-track" aria-label={`${group.title}，已完成 ${done} 章，共 ${group.numbers.length} 章`}><i style={{ width: `${done / group.numbers.length * 100}%` }} /></div>
+          {opened && <><div className="chapter-navigator-grid">
+        {group.numbers.map((chapterNo) => {
           const card = cardsByChapter.get(chapterNo);
           const draft = drafts.get(chapterNo);
           const final = canon.get(chapterNo);
-          const status = accepted.has(chapterNo) ? "正史" : draft ? "草稿" : card ? "已规划" : "待规划";
+          const status = accepted.has(chapterNo) ? "正史" : draft ? "草稿" : card ? "已细化" : group.planned ? "篇章已规划" : "待规划";
           return (
             <article className={`chapter-nav-card ${status === "正史" ? "accepted" : status === "草稿" ? "draft" : "planned"}`} key={chapterNo}>
               <header><strong>第 {chapterNo} 章</strong><span>{status}</span></header>
-              <p>{card ? String(card.title_working || "未命名章节") : hasRecentPlan ? "近期安排见规划文档" : "尚无旧版计划卡"}</p>
+              <p>{card ? String(card.title_working || "章节安排") : final?.label || draft?.label || (group.planned ? "已有篇章方向，具体情节待展开" : "还没有安排具体情节")}</p>
               <div className="chapter-nav-actions">
                 {final && <button type="button" onClick={() => onOpen(final)}>打开正文</button>}
                 {draft && <button type="button" onClick={() => onOpen(draft)}>打开草稿</button>}
@@ -709,7 +712,9 @@ function ChapterNavigator({
             </article>
           );
         })}
-      </div>
+      </div><button className="text-button" onClick={() => setExpanded(values => values.filter(key => key !== group.key))}>收起本篇章节</button></>}
+        </section>;
+      })}</div>
     </section>
   );
 }

@@ -384,6 +384,15 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .chapter-navigator { margin-top: 22px; }
 .chapter-progress-track { height: 5px; overflow: hidden; border-radius: 999px; background: var(--line-soft); }
 .chapter-progress-track i { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .25s ease; }
+.chapter-volume-list { display: grid; gap: 10px; margin-top: 14px; }
+.chapter-volume { min-width: 0; padding: 10px 12px; border-radius: 12px; background: color-mix(in srgb, var(--text) 2%, transparent); }
+.chapter-volume-toggle { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; border: 0; background: transparent; padding: 8px 0 12px; }
+.chapter-volume-title { display: grid; gap: 5px; flex: 1; min-width: 0; }
+.chapter-volume-title strong { overflow-wrap: anywhere; }
+.chapter-volume-title small, .chapter-volume-toggle > span:last-child { font-size: 12px; color: var(--muted); }
+.chapter-volume-arrow { color: var(--muted); }
+.chapter-volume .chapter-progress-track { height: 3px; opacity: .65; }
+@media (max-width: 650px) { .chapter-volume-toggle { flex-wrap: wrap; } .chapter-volume-toggle > span:last-child { margin-left: 22px; } }
 .chapter-plan-note { margin: 10px 0 0; color: var(--muted); font-size: 11px; }
 .chapter-navigator-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(225px, 1fr)); gap: 8px; margin-top: 11px; }
 .chapter-nav-card { min-width: 0; padding: 11px; border: 1px solid var(--line); background: #161613; }

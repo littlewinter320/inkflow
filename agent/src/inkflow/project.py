@@ -250,6 +250,7 @@ class InkFlowProject:
         with self.db.connect() as connection:
             rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
         self._reconcile_workflow_outputs([json.loads(row["value_json"]) for row in rows], current_pass=current_pass)
+        self._reconcile_completed_discussions()
         with self.db.connect() as connection:
             rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
         finished_tasks = {item["source"].get("task_id"): item for row in rows
@@ -363,6 +364,65 @@ class InkFlowProject:
                 if active:
                     self.update_pending_work(item["id"], status="completed",
                         resolution={"run_id": active[0]["trace_id"], "revision_no": active[0].get("revision_no", 1)})
+
+    def _reconcile_completed_discussions(self) -> None:
+        """Retire old handoffs only against complete, current acceptance receipts."""
+        from datetime import datetime
+        active = self.db.list_collaboration_messages(active_only=True, limit=500)
+        receipts: dict[int, dict[str, Any] | None] = {}
+        def accepted(number: int, created: str, version: int | None = None, *, repeated_accept: bool = False) -> bool:
+            chapter = self.db.get_chapter(number)
+            if not chapter or (version is not None and chapter["version"] != version):
+                return False
+            if number not in receipts:
+                receipts[number] = self.completed_acceptance_receipt(number)
+            if not receipts[number]:
+                return False
+            try:
+                return repeated_accept or datetime.fromisoformat(chapter["accepted_at"]) >= datetime.fromisoformat(created)
+            except (ValueError, TypeError, KeyError):
+                return False
+        completed: set[str] = set()
+        for item in active:
+            if item.get("message_type") not in {"risk", "task_assignment"}:
+                continue
+            number, created = item.get("chapter_no"), item["created_at"]
+            if number and accepted(int(number), created, item.get("chapter_version")):
+                completed.add(item["message_id"])
+                continue
+            # An accept-only duplicate may have been reported after acceptance.
+            # Read its actual local route, never infer intent from error wording.
+            run_id = str(item.get("run_id") or "")
+            if number and item.get("sender_role") == "coordinator" and re.fullmatch(r"[\w+-]+", run_id):
+                try:
+                    events = (self.internal / "runs" / run_id / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                    routes = [event.get("metadata", {}) for line in events if (event := json.loads(line)).get("stage") == "session.route"]
+                    if len(routes) == 1 and routes[0].get("action") == "accept" and routes[0].get("chapter_no") == number and accepted(int(number), created, item.get("chapter_version"), repeated_accept=True):
+                        completed.add(item["message_id"])
+                        continue
+                except (OSError, ValueError, TypeError, AttributeError):
+                    pass
+            if number is not None:
+                continue
+            batch_ids = [ref[6:] for ref in item.get("evidence_refs", []) if isinstance(ref, str) and re.fullmatch(r"batch:batch-[\w-]+", ref)]
+            if len(batch_ids) != 1:
+                continue
+            try:
+                batch = json.loads((self.internal / "batches" / f"{batch_ids[0]}.json").read_text(encoding="utf-8"))
+                first, last = batch["start_chapter_no"], batch["end_chapter_no"]
+                versions = {entry["chapter_no"]: entry["version"] for entry in batch["chapters"]}
+                if (batch["batch_id"] == batch_ids[0] and batch["status"] == "accepted" and 0 < first <= last
+                        and all(number in versions and accepted(number, created, versions[number]) for number in range(first, last + 1))):
+                    completed.add(item["message_id"])
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        if completed:
+            # Resolve individual old messages, preserving newer questions in the same thread.
+            with self.db.connect() as connection:
+                connection.executemany("UPDATE collaboration_messages SET status='resolved',resolved_at=? WHERE message_id=? AND status IN ('pending','responded','escalated')",
+                    [(utc_now(), message_id) for message_id in completed])
+                connection.commit()
+            self.db.reconcile_collaboration_queue()
 
     def completed_acceptance_receipt(self, chapter_no: int) -> dict[str, Any] | None:
         """A prior complete commit can satisfy a repeated accept-only request."""

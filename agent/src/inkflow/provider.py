@@ -128,6 +128,7 @@ class JsonModelProvider(Protocol):
         *,
         system_prompt: str,
         user_prompt: str,
+        cache_prefix: str | None = None,
         output_model: type[T],
         effort: str | None = None,
         max_tokens: int = 32_000,
@@ -218,6 +219,7 @@ class DeepSeekProvider:
         *,
         system_prompt: str,
         user_prompt: str,
+        cache_prefix: str | None = None,
         output_model: type[T],
         effort: str | None = None,
         max_tokens: int = 32_000,
@@ -255,6 +257,19 @@ class DeepSeekProvider:
             token_parameter: requested_max_tokens,
             "stream": False,
         }
+        # A separate user-message endpoint lets DeepSeek persist the stable
+        # reference prefix before the chapter-specific task on the first call.
+        # Other adapters keep their existing wire format; no beta endpoint or warm-up.
+        dynamic_prompt = user_prompt
+        if cache_prefix and self.settings.is_deepseek:
+            if not user_prompt.startswith(cache_prefix) or len(cache_prefix) == len(user_prompt):
+                raise ProviderError("缓存参考段与本次输入不一致，请重新构建章节资料。")
+            dynamic_prompt = user_prompt[len(cache_prefix):]
+            payload["messages"] = [{"role": "system", "content": system},
+                                   {"role": "user", "content": cache_prefix},
+                                   {"role": "user", "content": dynamic_prompt}]
+            prefix_diagnostic["reference_prefix_hash"] = content_hash(cache_prefix)
+            prefix_diagnostic["reference_prefix_tokens"] = estimate_tokens(cache_prefix)
         if self.settings.provider_kind == "openai" and not self.settings.is_mimo:
             payload["prompt_cache_key"] = (
                 f"inkflow:{agent_role or 'unknown'}:{model_override or self.settings.model}:"
@@ -442,8 +457,8 @@ class DeepSeekProvider:
                         payload.update(temperature=generation.get("temperature", 1.0),
                                        top_p=generation.get("top_p", 0.95))
                     payload[token_parameter] = requested_max_tokens
-                    payload["messages"][1]["content"] = (
-                        user_prompt
+                    payload["messages"][-1]["content"] = (
+                        dynamic_prompt
                         + "\n\n上一次输出为空、截断或不符合 Schema。此轮不展开推理，"
                         + "保持原任务的字数、内容和证据要求，只修复输出结构；所有必填字段都必须存在，只返回一个 JSON 对象。"
                         + ("校验缺口：" + "; ".join(
@@ -514,6 +529,7 @@ class AnthropicProvider:
         *,
         system_prompt: str,
         user_prompt: str,
+        cache_prefix: str | None = None,
         output_model: type[T],
         effort: str | None = None,
         max_tokens: int = 32_000,
@@ -818,6 +834,7 @@ class ScriptedProvider:
         *,
         system_prompt: str,
         user_prompt: str,
+        cache_prefix: str | None = None,
         output_model: type[T],
         effort: str | None = None,
         max_tokens: int = 32_000,
@@ -833,6 +850,7 @@ class ScriptedProvider:
             {
                 "system_prompt": system_prompt,
                 "user_prompt": user_prompt,
+                "cache_prefix": cache_prefix,
                 "output_model": output_model.__name__,
                 "effort": effort,
                 "max_tokens": max_tokens,

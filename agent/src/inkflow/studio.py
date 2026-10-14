@@ -1174,6 +1174,21 @@ class StudioService:
         accepted_through = 0
         while accepted_through + 1 in accepted_numbers:
             accepted_through += 1
+        from .planning_pipeline import load_active_planning
+        chapter_outline: dict[str, Any] = {"volumes": [], "cards": [], "state": "unplanned"}
+        try:
+            active = load_active_planning(self.project)
+            if active:
+                chapter_outline = {
+                    "state": "active",
+                    "revision_no": active[0].get("revision_no", 1),
+                    "volumes": [{key: getattr(volume, key) for key in
+                                 ("volume_no", "title", "chapter_start", "chapter_end")} for volume in active[1].volumes],
+                    "cards": [{"chapter_no": card.chapter_no, "title_working": card.title} for card in active[3].chapters],
+                }
+        except (ProjectError, ValidationGateError, OSError, ValueError):
+            # Never show obsolete ranges as a current plan when source verification fails.
+            chapter_outline["state"] = "needs_attention"
         return {
             "project_id": self.project.project_id,
             "root": str(self.project.root),
@@ -1192,6 +1207,7 @@ class StudioService:
             "threads": self.project.db.open_threads(),
             "bible_entries": self.db.list_bible_entries(),
             "accepted_characters": total_characters,
+            "chapter_outline": chapter_outline,
             "written_characters": written_characters,
             "chapter_progress": {
                 "written": len(counted_chapters),

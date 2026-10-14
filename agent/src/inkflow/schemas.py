@@ -1166,6 +1166,9 @@ class ContextPacket(StrictModel):
         return "\n".join(output).rstrip() + "\n"
 
     def to_model_prompt(self) -> str:
+        return "".join(self.model_prompt_parts())
+
+    def model_prompt_parts(self) -> tuple[str, str]:
         """Compile reusable source scopes before current chapter/request material."""
 
         scopes = {"global": 0, "book": 1, "canon": 2, "chapter": 3, "request": 4}
@@ -1186,7 +1189,11 @@ class ContextPacket(StrictModel):
             return (scopes[section.cache_scope], order, index)
 
         output = ["# 墨流编译上下文", ""]
+        prefix = ""
         for _, section in sorted(enumerate(self.sections), key=priority):
+            if not prefix and section.cache_scope in {"chapter", "request"}:
+                prefix = "\n".join(output) + "\n"
+                output = []
             output.extend([f"## {section.key}. {section.title}", "", section.model_content(), ""])
             if section.source_ids:
                 output.extend([f"来源：{', '.join(sorted(section.source_ids))}", ""])
@@ -1198,7 +1205,7 @@ class ContextPacket(StrictModel):
         ])
         if self.warnings:
             output.extend(["", "警告：", *[f"- {item}" for item in self.warnings]])
-        return "\n".join(output).rstrip() + "\n"
+        return prefix, "\n".join(output).rstrip() + "\n"
 
     def gate_material(self) -> str:
         """Return only acceptance-critical context for stale-review detection."""

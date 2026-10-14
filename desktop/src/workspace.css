@@ -51,3 +51,19 @@
 .workspace-detached .workspace-panel-actions { -webkit-app-region: no-drag; }
 @keyframes workspace-drop-in { from { opacity: 0; } to { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { .workspace-free > .workspace-panel, .workspace-free > .workbench, .workspace-drop-preview { transition: none !important; animation: none !important; } }
+.workspace-presets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+.workspace-presets button { display: grid; justify-items: center; gap: 5px; font-size: 11px; padding: 8px 4px; }
+.layout-mini { display: flex; gap: 3px; width: 58px; height: 35px; padding: 3px; border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 5px; }
+.layout-mini i { flex: 1; border-radius: 2px; background: color-mix(in srgb, currentColor 18%, transparent); }
+.layout-mini i:nth-child(2) { flex: 3; opacity: .5; }
+.layout-focus i:first-child, .layout-focus i:last-child { display: none; }
+.layout-left i:first-child, .layout-right i:last-child { flex: 2; }
+.layout-below { flex-wrap: wrap; }
+.layout-below i:last-child { flex-basis: 100%; }
+.layout-review { flex-wrap: wrap; }
+.layout-review i:last-child { flex-basis: 100%; }
+.layout-desk { position: relative; }
+.layout-desk i { position: absolute; width: 21px; height: 22px; left: 5px; top: 4px; border: 1px solid color-mix(in srgb, currentColor 30%, transparent); }
+.layout-desk i:nth-child(2) { left: 18px; top: 7px; }
+.layout-desk i:last-child { left: 30px; top: 10px; }
+.workspace-menu-content { max-height: min(520px, calc(100vh - 24px)); overflow-y: auto; }
