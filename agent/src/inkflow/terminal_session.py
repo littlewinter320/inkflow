@@ -3952,6 +3952,8 @@ class TerminalSession:
             project.reconcile_pending_work(current_pass=lambda number: self.engine.current_pass_review(project, number))
             basis = self._suggestion_basis(project)
             work = project.pending_work()
+            optional_work = [item for item in work if item.get("can_reject") and not item.get("can_process")
+                and item["kind"] in {"memory_summary", "optimization", "coordinator_recovery", "development_repair", "recovery_decision"}]
             steps = []
             for item in response.get("steps", [])[-6:]:
                 result = item.get("result") or {}
@@ -3962,8 +3964,12 @@ class TerminalSession:
                 "已完成与失败": {"status": workflow_result_status(response), "summary": str(response.get("reply") or response.get("summary") or workflow_failure_reason(response))[:1800],
                     "steps": steps},
                 "小说进度": project.db.project_status(),
+                "最近已接受章节": project.db.chapter_numbers_by_status("accepted")[-10:],
+                "尚未接受的草稿": project.db.chapter_numbers_by_status("draft"),
                 "待办": [{key: item.get(key) for key in ("kind", "chapter_no", "status", "reason", "handling", "can_process", "can_reject", "next_action")}
-                         for item in work[:8]],
+                         for item in work if item not in optional_work][:8],
+                "可选历史建议（不阻断写作，不是未验收章节）": [{key: item.get(key) for key in ("kind", "reason", "can_reject")}
+                         for item in optional_work[:4]],
                 "最近用户要求": [item["user"][:400] for item in self.history(project.root, limit=3)]}
             result = await self.engine.provider.generate_json(system_prompt=(
                 "你是墨流Coordinator。依据本次实际结果、当前进度和用户目标，提出2至4个具体且有差异的下一步提示词。"

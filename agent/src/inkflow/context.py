@@ -408,6 +408,10 @@ class ContextBuilder:
         batch_scope = None
         if mode == "draft" and self.actor == "writer":
             canonical_query, batch_scope = _batch_canonical_query(self.project, chapter_no, history_query)
+        batch_binding = active_batch_context.get()
+        stable_batch_order = bool(batch_binding and batch_binding["root"] == self.project.root.resolve()
+            and int(batch_binding["manifest"]["start_chapter_no"]) <= chapter_no
+            <= int(batch_binding["manifest"]["end_chapter_no"]))
         reference_cards = self._load_reference_cards(limit=6)
         chapter = database.get_chapter(chapter_no)
         retrieval_hits = self.retriever.retrieve(
@@ -506,7 +510,7 @@ class ContextBuilder:
         sections = [
             ContextSection(key="A", title="当前任务与用户要求", content=task, hard=True),
             ContextSection(key="CSET", title="用户定制设定：创作假设与证据参考（非正史）",
-                           content=setting_context, hard=True, cache_scope="canon" if batch_scope else "chapter",
+                           content=setting_context, hard=True, cache_scope="canon" if stable_batch_order else "chapter",
                            source_ids=[record["record_id"] for collection in setting_payload["collections"] for record in collection["records"]]),
             *outline_sections(self.project.root, chapter_no, chapter_no),
             ContextSection(
@@ -658,7 +662,7 @@ class ContextBuilder:
                 else "当前无已提交未结线索。",
                 source_ids=[str(item["thread_id"]) for item in threads],
                 hard=True,
-                cache_scope="canon" if batch_scope else "chapter",
+                cache_scope="canon" if stable_batch_order else "chapter",
             ),
             ContextSection(
                 key="H",
