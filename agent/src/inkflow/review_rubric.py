@@ -23,7 +23,7 @@ REVIEW_EVIDENCE_CONTRACT = """
 5. 每项 reason 解释证据如何支持判断；alternative 简述最强的另一种合理解读及采纳/排除理由，只给可公开核验的结论，不输出隐藏推理。chapter_evidence 逐字摘本章；continuity 和 requirements 另给实际来源 ID 与 source_evidence，后者优先当前规划或用户硬要求；首章 continuity 可用设定。不是所有新事实都必须在旧文出现。
 6. 每条 findings.evidence 引正文，canon_refs 仅用实际来源ID；硬问题 rule_id 只能用 canon_conflict、internal_chapter_conflict、impossible_time、impossible_causality、core_function_missing、truncation、severe_repetition。跨来源硬问题 reference_evidence 引对照原文；同章冲突两句都取正文。风格偏好不升级硬问题。先核对指代、原件/副本、人物信念、时间过渡等相容解释；不能凭空补动作消除明确矛盾。
 7. confidence 仅保留模型自评诊断，自动通过由引擎的必需门禁、证据完整性和质量加权分共同决定。数据未检索到是审核待修复，不是小说不存在该事实。没有必要缺口和硬问题时可 pass；有硬问题 patch；资料问题 unknown。
-8. 表达按下方作者样稿文风和本书当前要求核对。长句、口语、合理的括号内心戏和拟声本身不扣分；标点统计只是观察线索，不能凭逗号数量判定机械或命令拆短句。只有原文能定位的指代不清、关系断裂、无意义重复或说话人混淆才提出具体改法，保持作者声音；句子顺畅不能覆盖事实或数值矛盾。
+8. 表达按下方基础写作技能、表达示例和本书当前要求核对，评价实际正文，不凭装入技能就声称已采用。人物是否有符合处境的盘算、对白是否有回应、情绪是否接上选择、句段是否接得住，应按本章适用场景给具体原句和原因，不要求每章凑齐示例。已明确要求样稿风格时，连续清点物件、只有简短应答或旁白概括人物等实际偏差可以形成有据的表达修订建议；保留事件和事实，不能让Writer照抄示例。长句、口语、合理的括号内心戏和拟声本身不扣分，普通文风差异不冒充硬矛盾；标点统计只是观察，不能凭数量拆短句。指代不清、关系断裂、无意义重复和说话人混淆按定位原句定点修正；句子顺畅不能覆盖事实或数值矛盾。
 9. assessments 与 source_comparisons 的 evidence_relation 必须说明证据关系：direct直接支持、state_change有原文的状态变化、perspective人物信念/谎言/传闻与客观层区别、plan_adaptation合理规划调整、new_information不违反旧规则的新增信息、exclusive_conflict同对象同事件时间同事实层级的排他矛盾。reason说明对象、时间、说话人及原文如何支持判断；新概念未在旧章出现不等于矛盾，但关键行动缺必要原因不能靠假想例外消解。无关引用用irrelevant，必要资料不足用insufficient；不得以同名词凑支持或用unchecked宣告通过。
 10. 缺资料时在source_queries填写最多4条短检索线索，写人物/物件、动作、时间或伏笔问题及必要同义词；missing_source_ids只写知道的真实来源ID。不知道哪章时不猜章节号。引擎将搜索已接受章节、事实和线索并补读原文，然后交当前责任角色限次复核。检索未命中不证明不存在；复核只报告可公开核验的依据，不输出隐藏思维过程，不替作者续写。
 """ + "\n" + AUTHOR_VOICE_CONTRACT

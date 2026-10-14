@@ -20,6 +20,7 @@ PREFERENCE_USE_CONTRACT = (
     "确实不能同时满足的要求须按本次职责公开说明双方原句、来源和取舍原因。"
     "不同题材、人物、场景的差异不报冲突；同级硬要求互斥时等待用户选择，不派Writer反复改稿。"
     "取舍只限本任务，不暂停、改写或删除保存的习惯。"
+    "后台反馈只调整同等适用的普通参考顺序，不改变确认状态、硬要求、正史或权限。"
 )
 PREFERENCE_CONFLICT_OUTPUT = (
     "确实冲突才填写preference_conflicts：sources逐项填输入里的preference_id/revision/逐字text引文，"
@@ -275,6 +276,8 @@ def capture_observations(database, observations, message, run_id):
         active = observation.explicit and (author_explicit if level == "author" else project_explicit)
         if observation.level == "task":
             active = False
+        if observation.feedback_kind == "disliked":
+            active = False
         if level == "author" and not author_explicit:
             level = "project"
         values = dict(text=observation.text, scope=observation.scope, topic=observation.topic,
@@ -310,7 +313,8 @@ def capture_observations(database, observations, message, run_id):
                                   strength=existing["strength"], status="active" if active else existing["status"])
                     if not active:
                         values["topic"] = existing.get("topic", "")
-                saved.append(change_item(connection, level=level, **values))
+                item = change_item(connection, level=level, **values)
+                saved.append(item)
         else:
             known = database.list_preferences(active_only=False)
             existing = next((item for item in known
@@ -331,5 +335,32 @@ def capture_observations(database, observations, message, run_id):
                               strength=existing["strength"], status="active" if active else existing["status"])
                 if not active:
                     values["topic"] = existing.get("topic", "")
-            saved.append(database.upsert_preference(**values))
+            item = database.upsert_preference(**values)
+            saved.append(item)
+        _record_preference_feedback(database, observation, item, run_id)
     return saved
+
+
+def preference_identity(item):
+    return content_hash(json_dumps({key: item.get(key, "project" if key == "level" else "")
+                                   for key in ("level", "text", "scope")}, indent=None))
+
+
+def _record_preference_feedback(database, observation, item, run_id):
+    """Reuse explicit, attributable feedback; an instruction is not a rating."""
+    kind = observation.feedback_kind
+    quote = observation.source_quote.strip()
+    negative = bool(re.search(r"不满意|不喜欢|不好|不自然|太差|错误|错了|无效|没做好|没改好|太机械|太生硬|[Aa][Ii]味|重复", quote))
+    positive = bool(re.search(r"满意|喜欢|很好|写得好|就照|就按|沿用|保持|更喜欢|认可", quote))
+    if (kind == "none" or kind == "liked" and (not positive or negative)
+            or kind in {"corrective", "disliked"} and not negative):
+        return
+    if kind == "disliked" and (observation.preference_id != item["preference_id"]
+            or observation.text.strip() != item["text"]):
+        return  # Criticism of an output must not penalize the desired correction.
+    database.record_learning_event("comparison", {
+        "kind": "preference_feedback", "preference_id": item["preference_id"],
+        "preference_identity": preference_identity(item), "feedback_kind": kind,
+        "source_quote": quote, "source_run_id": run_id,
+        "signal_key": content_hash(json_dumps([preference_identity(item), kind, quote], indent=None)),
+    })

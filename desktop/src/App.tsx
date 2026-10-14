@@ -12,6 +12,8 @@ import type { VoiceSettings, VoiceSource, VoiceStatus } from "./VoiceCenter";
 import { LocalWavRecorder } from "./voiceRecording";
 import { detachedPanel, useWorkspaceLayout, WorkspaceDropPreview, WorkspaceMenu, WorkspacePanel } from "./Workspace";
 import type { PanelId } from "./workspaceLayout";
+import { documentLabel, readableSourceText } from "./readableNames";
+import { readableRecord, readableRecordText, readableValue } from "./readableRecords";
 
 const Editor = lazy(() => import("./MonacoEditors").then((module) => ({ default: module.Editor })));
 const DiffEditor = lazy(() => import("./MonacoEditors").then((module) => ({ default: module.DiffEditor })));
@@ -241,7 +243,7 @@ type QualifiedProduction = { accepted_products: number; unknown_cost_calls: numb
 type RecentCacheSummary = { calls: number; reported_calls: number; unknown_calls: number; input_tokens: number; hit_tokens: number; miss_tokens: number; hit_rate: number | null; last_at: string | null; by_role?: Record<string, { calls: number; reported_calls: number; unknown_calls: number; hit_rate: number | null }>; by_family?: Record<string, { calls: number; reported_calls: number; input_tokens: number; hit_tokens: number; miss_tokens: number; hit_rate: number | null }>; performance_diagnostic?: PerformanceDiagnostic; qualified_production?: QualifiedProduction };
 type VoiceInstallProgress = { status: string; stage: string; progress: number; summary: string; downloaded_mb: number; retryable: boolean; error?: string };
 type PersistentUsage = { calls: number; since: string | null; estimated_cost: number; pending_estimated_cost: number; unknown_usage_calls: number; unknown_cost_calls: number; price_note: string };
-type PendingWorkItem = { id: string; kind: string; status: string; reason: string; next_action: string; chapter_no?: number | null; handling?: string; can_process?: boolean; can_reject?: boolean; reject_label?: string; reject_impact?: string; reject_blocked_reason?: string; updated_at?: string; rejection?: { reason?: string; at?: string }; parent_id?: string; processing_attempts?: number; source?: Record<string, unknown>; intent?: { action?: string; batch_id?: string | null; end_chapter_no?: number | null } };
+type PendingWorkItem = { id: string; kind: string; status: string; reason: string; next_action: string; chapter_no?: number | null; remaining_chapter_no?: number; completed_through?: number; handling?: string; can_process?: boolean; can_reject?: boolean; reject_label?: string; reject_impact?: string; reject_blocked_reason?: string; updated_at?: string; rejection?: { reason?: string; at?: string }; parent_id?: string; processing_attempts?: number; source?: Record<string, unknown>; intent?: { action?: string; batch_id?: string | null; end_chapter_no?: number | null } };
 type CollaborationOverview = { messages: CollaborationMessage[]; pending_work?: PendingWorkItem[]; rejected_work?: PendingWorkItem[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; trace_runs?: TraceRun[]; usage?: UsageSummary & { by_agent_role?: Record<string, UsageSummary>; recent_deepseek_cache?: RecentCacheSummary | null; estimated_cost: number; currency: string; pricing_configured: boolean; accounting?: { available: boolean; warning?: string; project?: PersistentUsage; all_projects?: PersistentUsage } } };
 type PrefillResult = { insertion: string; document_hash: string; cursor_offset: number; confidence: string };
 function busyMascotMood(events: EngineEvent[], runId: string | null): MascotMood {
@@ -408,7 +410,8 @@ function App() {
   const [pendingDecisionError, setPendingDecisionError] = useState("");
   const [canonMigration, setCanonMigration] = useState<CanonMigration | null>(null);
   const [showMigration, setShowMigration] = useState(false);
-  const workspace = useWorkspaceLayout(mobaoWorkAreaRef, projectRoot);
+  const workspace = useWorkspaceLayout(mobaoWorkAreaRef, projectRoot,
+    (id, bounds) => detachWorkspacePanel(id, bounds, false), (id, hide) => returnWorkspacePanel(id, hide));
   const [uiPreferences, setUiPreferences] = useState<UiPreferences>(loadUiPreferences);
   const [voiceSettings, setVoiceSettings] = useState<VoiceSettings | null>(null);
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus | null>(null);
@@ -644,13 +647,14 @@ function App() {
                   }
                 }
                 };
-  const detachWorkspacePanel = async (panel: PanelId) => {
-    try { if (!window.inkflow.openWorkspacePanel) throw new Error("重启墨流后即可使用独立面板。当前窗口中的拖动和缩放已经可以使用。"); await window.inkflow.openWorkspacePanel(projectRoot, panel, document?.relative_path); workspace.markNative(panel, true); }
+  const detachWorkspacePanel = async (panel: PanelId, bounds?: { x: number; y: number; width: number; height: number }, remember = true) => {
+    try { if (!window.inkflow.openWorkspacePanel) throw new Error("重启墨流后即可使用独立面板。当前窗口中的拖动和缩放已经可以使用。"); if (remember) workspace.remember(); await window.inkflow.openWorkspacePanel(projectRoot, panel, document?.relative_path, bounds); workspace.markNative(panel, true); }
     catch (cause) { setError(errorMessage(cause)); }
   };
 
-  const returnWorkspacePanel = (panel: PanelId) => {
-    void window.inkflow.returnWorkspacePanel(panel).catch(cause => setError(errorMessage(cause)));
+  const returnWorkspacePanel = async (panel: PanelId, hide = false) => {
+    try { await window.inkflow.returnWorkspacePanel(panel, hide); }
+    catch (cause) { setError(errorMessage(cause)); }
   };
 
   const openConversationWindow = async (conversationId?: string) => {
@@ -790,7 +794,7 @@ function App() {
       setNotice("这份文件还有未保存修改；先保存或保留修改后再删除。");
       return;
     }
-    const confirmed = await window.inkflow.confirm(`将“${source.relative_path}”移入本项目回收站，保留文件供恢复。当前内容未变化；确认删除吗？`);
+    const confirmed = await window.inkflow.confirm(`将“${documentLabel(source.relative_path)}”移入本项目回收站，保留文件供恢复。当前内容未变化；确认删除吗？`);
     if (!confirmed) return;
     try {
       const result = await window.inkflow.request<{ relative_path: string }>("document.delete", {
@@ -802,7 +806,7 @@ function App() {
       setCompareContent(null);
       setActiveTab("project");
       await refresh(snapshot.projectRoot);
-      setNotice(`已将 ${result.relative_path} 移入项目回收站，可在“项目 → 回收站”恢复。`);
+      setNotice(`已将 ${documentLabel(result.relative_path)} 移入项目回收站，可在“项目 → 回收站”恢复。`);
     } catch (cause) {
       setError(`删除没有完成，当前文件未被忽略。${errorMessage(cause)}`);
     }
@@ -1285,7 +1289,7 @@ function App() {
     const model = editorRef.current?.getModel();
     const selected = selection && model && !selection.isEmpty() ? model.getValueInRange(selection) : "";
     setVoiceSource({
-      name: selected ? `${document.relative_path} · 当前选区` : document.relative_path,
+      name: selected ? `${documentLabel(document.relative_path)} · 当前选区` : documentLabel(document.relative_path),
       type: selected ? "selection" : document.relative_path.endsWith(".draft.md") ? "draft" : "document",
       text: selected || text,
     });
@@ -1294,7 +1298,7 @@ function App() {
 
   const copyMessageText = async (message: Message) => {
     try {
-      await navigator.clipboard.writeText(readableWorkMessage(message.text, collaborationPending(collaboration).work));
+      await navigator.clipboard.writeText(readableWorkMessage(message.text, collaborationPending(collaboration).work, manualJobs));
       setNotice("已复制这条消息。");
     } catch {
       setError("复制失败：剪贴板当前不可用。");
@@ -1439,7 +1443,7 @@ function App() {
     setPromptOptimization(null);
     setPromptUndo(null);
     setError("");
-    setMessages((items) => [...items, { id: crypto.randomUUID(), role: "user", text: readableWorkMessage(message, collaborationPending(collaboration).work), createdAt: new Date().toISOString() }]);
+    setMessages((items) => [...items, { id: crypto.randomUUID(), role: "user", text: message, createdAt: new Date().toISOString() }]);
     setBusy(true);
     setMascotMood("thinking");
     const runId = `desktop-${crypto.randomUUID()}`;
@@ -1602,16 +1606,29 @@ function App() {
       }
       return;
     }
-    if (voiceSettings.voice_input_engine === "browser") {
-      setError("当前桌面环境不支持浏览器实时识别；请在语音设置改选本地 SenseVoice。");
+    let currentVoiceStatus: VoiceStatus;
+    try {
+      currentVoiceStatus = await request<VoiceStatus>("voice.status");
+      setVoiceStatus(currentVoiceStatus);
+    } catch (cause) {
+      setError(`暂时没能读取本地语音状态：${errorMessage(cause)}。稍后再点麦克风即可。`);
       return;
     }
-    if (!voiceStatus?.ready_for_input) {
-      setNotice("\u5f53\u524d\u73af\u5883\u6ca1\u6709\u6d4f\u89c8\u5668\u5b9e\u65f6\u542c\u5199\uff0c\u4e14\u672c\u5730 ASR \u7ec4\u4ef6\u672a\u5b89\u88c5\u3002\u53ef\u4ee5\u5728\u8bbe\u7f6e\u4e2d\u67e5\u770b\u8bed\u97f3\u7ec4\u4ef6\u72b6\u6001\uff1b\u4e0d\u4f1a\u81ea\u52a8\u53d1\u9001\u7a7a\u767d\u7ed3\u679c\u3002");
+    if (!currentVoiceStatus.asr?.asr_ready) {
+      const asr = currentVoiceStatus.asr;
+      setNotice(asr?.installing ? `语音组件还在准备中：${asr.install_summary || "正在安装依赖和模型"}。完成后再点麦克风即可。`
+        : asr?.last_error ? `语音组件已有文件，但准备时遇到问题：${readableSourceText(asr.last_error)}。请在语音设置查看具体步骤。`
+        : asr?.package_installed ? "识别组件已安装，但语音模型或录音文件依赖还未就绪。请在语音设置查看缺少的部分。"
+        : asr?.has_local_files ? "检测到了语音文件，但当前墨流环境还不能使用识别组件。请在语音设置查看组件状态。"
+        : "当前墨流没有找到可用的本地识别组件。请在语音设置安装或检查组件位置。");
       setShowSettings(true);
       return;
     }
     try {
+      if (voiceSettings.voice_input_engine !== "local") {
+        const settings = await request<VoiceSettings>("voice.settings.configure", { voice_input_engine: "local" });
+        setVoiceSettings(settings);
+      }
       voiceBaseInputRef.current = chatInput;
       voiceTranscriptRef.current = "";
       setVoiceTranscript("");
@@ -1831,7 +1848,8 @@ function App() {
   workspaceActionsRef.current = { chat: value => sendChat(undefined, value), document: value => openDocument({ id: value, label: value, relative_path: value, kind: value.startsWith("reviews/") ? "review" : "document" }), compare: compareVersion, annotation: resolveAnnotation };
   useEffect(() => window.inkflow.onWorkspaceEvent?.(value => {
     if (value.type === "state" && sharedWorkspaceRef.current && value.state && typeof value.state === "object") { applySharedWorkspace(value.state as Record<string, unknown>); return; }
-    if (value.type === "returned" && ["navigation", "assistant", "inspector"].includes(String(value.panel))) { workspace.markNative(value.panel as PanelId, false); return; }
+    if (value.type === "returned" && ["navigation", "assistant", "inspector"].includes(String(value.panel))) { workspace.markNative(value.panel as PanelId, false, !value.hidden); return; }
+    if (value.type === "native-drag" && value.projectRoot === projectRootRef.current) { workspace.nativeDrag(value); return; }
     if (value.type !== "command" || value.projectRoot !== projectRootRef.current) return;
     const input = String(value.value || "");
     if (["compare", "annotation"].includes(String(value.command)) && value.relativePath !== editorSnapshotRef.current.document?.relative_path) { setError("文档已经切换，请在批注与版本面板中重新选择当前文件的条目。"); return; }
@@ -1937,7 +1955,7 @@ function App() {
           </div>
         </WorkspacePanel>
         <WorkspacePanel id="assistant" workspace={workspace} className="conversation-panel" onDetach={detachWorkspacePanel} actions={<button className="panel-icon" title="新建独立对话" aria-label="新建独立对话" onClick={() => void openConversationWindow()}>＋</button>}>
-          {manualJobs.some(job => ["needs_confirmation", "awaiting_confirmation", "waiting_user", "needs_evidence", "revision_requested", "conflict", "blocked", "failed"].includes(job.status)) && <details className="manual-edit-issues"><summary>手动修改有待处理问题</summary><p>原稿已保留，待核对改动不会自动变成正史。</p><button type="button" onClick={() => setShowManualMonitor(true)}>查看证据并决定</button></details>}
+          {manualJobs.some(job => (job.kind !== "setting_record" || job.issues?.some(issue => issue.hard_conflict)) && ["needs_confirmation", "awaiting_confirmation", "waiting_user", "needs_evidence", "revision_requested", "conflict", "blocked", "failed"].includes(job.status)) && <details className="manual-edit-issues"><summary>有影响当前写作的修改待核对</summary><button type="button" onClick={() => setShowManualMonitor(true)}>查看问题并决定</button></details>}
           <div className="panel-title">
             <div><h2>和墨宝一起写</h2><p className="panel-status" role="status">{busy ? "任务进行中，可以继续补充想法" : "把想法告诉我。"}</p></div>
             <div className="panel-mascot">
@@ -1963,7 +1981,7 @@ function App() {
               <article key={message.id} className={`message ${message.role}`} ref={message.id === mobaoCompletion?.messageId ? mobaoTargetRef : undefined}>
                 <span className="avatar">{message.role === "user" ? "你" : message.role === "system" ? "记" : "墨"}</span>
                 <div>
-                  <p>{message.role === "assistant" && message.text.startsWith("这次没有完成：") ? errorMessage(message.text.replace(/^这次没有完成：\s*/, "")) : readableWorkMessage(message.text, collaborationPending(collaboration).work)}</p>
+                  <p>{message.role === "assistant" && message.text.startsWith("这次没有完成：") ? errorMessage(readableWorkMessage(message.text.replace(/^这次没有完成：\s*/, ""), collaborationPending(collaboration).work, manualJobs)) : readableWorkMessage(message.text, collaborationPending(collaboration).work, manualJobs)}</p>
                   {message.indices?.length ? <div className="message-indices">{message.indices.map(item => <button key={item.id} onClick={() => void openDocument(item)}>{item.label}</button>)}</div> : null}
                   {message.process && <ProcessDisclosure {...message.process} reasoning={message.reasoning} />}
                   {message.createdAt && <time className="message-time" dateTime={message.createdAt}>{formatTime(message.createdAt)}</time>}
@@ -1975,7 +1993,7 @@ function App() {
                         {message.role === "user" && <button type="button" className="message-action" title="清掉这条之后的消息并原样重发" disabled={busy} onClick={() => rerunMessage(message.id)}>重新运行</button>}
                       </>
                     )}
-                    <button className={`message-speak ${speakingMessageId === message.id ? "playing" : ""}`} title="朗读这条对话" aria-label="朗读这条对话" onClick={() => void speakText(message.id, readableWorkMessage(message.text, collaborationPending(collaboration).work))}>{speakingMessageId === message.id ? "■" : "◖))"}</button>
+                    <button className={`message-speak ${speakingMessageId === message.id ? "playing" : ""}`} title="朗读这条对话" aria-label="朗读这条对话" onClick={() => void speakText(message.id, readableWorkMessage(message.text, collaborationPending(collaboration).work, manualJobs))}>{speakingMessageId === message.id ? "■" : "◖))"}</button>
                   </div>
                 </div>
               </article>
@@ -2354,11 +2372,11 @@ function pendingWorkLabel(item: PendingWorkItem, action = false): string {
   return labels[item.kind]?.[action ? 1 : 0] || (action ? "按原任务处理" : "任务条件待核对");
 }
 
-function readableWorkMessage(text: string, items: PendingWorkItem[]): string {
+function readableWorkMessage(text: string, items: PendingWorkItem[], jobs: ManualEditJob[] = []): string {
   const match = text.match(/^(处理待办|查看待办|下次再处理待办)\s+([a-zA-Z0-9-]{1,180})[。！!\s]*$/);
-  if (!match) return text;
+  if (!match) return readableSourceText(text, jobs.map(job => [job.relative_path || "", job.display_name || ""] as [string, string]));
   const item = items.find(value => value.id === match[2]);
-  const start = item?.chapter_no;
+  const start = item?.remaining_chapter_no || item?.chapter_no;
   const end = item?.intent?.end_chapter_no;
   const scope = start ? `第${start}${end && end > start ? `—${end}` : ""}章的` : "";
   const target = item?.kind === "workflow" ? `${scope}${item.intent?.action === "plan" ? "规划任务" : "未完成任务"}` : item ? `${scope}${pendingWorkLabel(item)}` : "刚才选中的待办";
@@ -2369,7 +2387,7 @@ function readableWorkMessage(text: string, items: PendingWorkItem[]): string {
 function readableWorkReason(item: PendingWorkItem): string {
   const quotes = [...new Set(item.reason.match(/@quote:\d+/g) || [])];
   if (quotes.length) return `${item.chapter_no ? `第${item.chapter_no}章有` : "有"}${quotes.length}条记忆引用还没有定位到原文，需要继续核对引用和来源；目前还不能把相关记忆纳入正史。`;
-  return item.reason.replace(/^editor:\s*/i, "编辑检查：");
+  return readableSourceText(item.reason.replace(/^editor:\s*/i, "编辑检查："), item.source?.display_name && item.source?.relative_path ? [[String(item.source.relative_path), String(item.source.display_name)]] : []);
 }
 
 function pendingDecisionPayload(projectRoot: string, item: PendingWorkItem, decision: "reject" | "reopen", reason = "") {
@@ -2382,14 +2400,15 @@ function CollaborationBoard({ value, busy, onProcessAll, onWork, onReject, onReo
   const pending = collaborationPending(value);
   const active = pending.work.filter(item => item.status !== "deferred");
   const deferred = pending.work.filter(item => item.status === "deferred");
-  const chapterNumbers = [...new Set(active.map(item => item.chapter_no || 0))].sort((a, b) => a - b);
+  const chapterOf = (item: PendingWorkItem) => item.remaining_chapter_no || item.chapter_no || 0;
+  const chapterNumbers = [...new Set(active.map(chapterOf))].sort((a, b) => a - b);
   const rank = (item: PendingWorkItem) => item.handling === "running" ? 0 : item.can_process ? 1 : item.handling === "decision" ? 2 : 3;
   const renderWork = (item: PendingWorkItem) => {
     const children = pending.items.filter(child => child.parent_id === item.id);
     const decision = item.handling === "decision" && item.kind === "manual_edit";
     return <article className={`pending-work-card ${item.handling || "blocked"}`} key={item.id}>
       <header><strong>{pendingWorkLabel(item)}</strong><span>{({ deferred: "留待下次", running: "进行中", blocked: "需补充条件", decision: "需要你决定", local: "可本地恢复", manual: "可续核", review: "可复审", resume: "可续接" } as Record<string, string>)[item.handling || ""] || "待核对"}</span></header>
-      <p className="pending-work-reason">{readableWorkReason(item)}</p>
+      <p className="pending-work-reason">{item.remaining_chapter_no ? `已完成到第${item.completed_through}章；还需完成第${item.remaining_chapter_no}${item.intent?.end_chapter_no && item.intent.end_chapter_no !== item.remaining_chapter_no ? `—${item.intent.end_chapter_no}` : ""}章。原任务范围和要求保留在下方详情。` : readableWorkReason(item)}</p>
       <div className="pending-work-actions">
         {item.can_process && item.handling !== "running" && <button type="button" className="primary" disabled={busy} onClick={() => onWork(item, "process")}>{pendingWorkLabel(item, true)}</button>}
         {!item.can_process && item.handling !== "running" && <button type="button" disabled={busy} onClick={() => onWork(item, "inspect")}>{decision ? "核对修改并决定" : "查看恢复条件"}</button>}
@@ -2397,7 +2416,7 @@ function CollaborationBoard({ value, busy, onProcessAll, onWork, onReject, onReo
         {item.can_reject === true && item.handling !== "running" && <button type="button" className="pending-reject-action" disabled={busy} onClick={() => onReject(item)}>{item.reject_label || "拒绝这项建议"}</button>}
       </div>
       {item.reject_blocked_reason && <p className="pending-decision-note">{item.reject_blocked_reason}</p>}
-      <details className="pending-work-diagnostic"><summary>下一步与诊断{children.length ? ` · ${children.length} 条关联记录` : ""}</summary><p>{item.next_action}</p>{item.reject_impact && <p>拒绝影响：{item.reject_impact}</p>}{children.map(child => <div key={child.id}><strong>{pendingWorkLabel(child)}</strong><p>{child.reason}</p><p>{child.next_action}</p></div>)}<small>本项已记录处理尝试 {Math.max(item.processing_attempts || 0, Number(item.source?.attempts || 0))} 次 · {item.id}</small></details>
+      <details className="pending-work-diagnostic"><summary>下一步与诊断{children.length ? ` · ${children.length} 条关联记录` : ""}</summary><p>{readableSourceText(item.next_action)}</p>{item.remaining_chapter_no && <p>原要求：{readableWorkReason(item)}</p>}{item.reject_impact && <p>拒绝影响：{item.reject_impact}</p>}{children.map(child => <div key={child.id}><strong>{pendingWorkLabel(child)}</strong><p>{readableWorkReason(child)}</p><p>{readableSourceText(child.next_action)}</p></div>)}<small>本项已记录处理尝试 {Math.max(item.processing_attempts || 0, Number(item.source?.attempts || 0))} 次</small></details>
     </article>;
   };
   const renderBatch = (batch: BatchSummary, mode: "resume" | "accept" | "inspect") => <article className="pending-work-card" key={batch.batch_id}>
@@ -2408,7 +2427,7 @@ function CollaborationBoard({ value, busy, onProcessAll, onWork, onReject, onReo
   return <section className="pending-board" aria-labelledby="pending-board-title">
     <header className="pending-board-heading"><div><h3 id="pending-board-title">待办与收尾 <span>{pending.count}</span></h3><p>按当前工作来源统计，关联诊断、批次和角色消息分别展示。</p></div><button type="button" className="primary" title="逐项处理可恢复的原任务；需要你决定或尝试耗尽时保留对应条件。" disabled={busy || !active.some(item => item.can_process)} onClick={onProcessAll}>{busy ? "任务处理中…" : "处理当前全部待办"}</button></header>
     {!value ? <p className="pending-empty" role="status">正在读取待办…</p> : !pending.count && <p className="pending-empty" role="status">当前没有需要处理的任务。{deferred.length ? `${deferred.length} 项留待下次，可在下方展开。` : ""}</p>}
-    {chapterNumbers.map(number => <section className="pending-chapter-group" key={number}><h4>{number ? `第 ${number} 章` : "项目收尾"}<span>{active.filter(item => (item.chapter_no || 0) === number).length} 项</span></h4>{active.filter(item => (item.chapter_no || 0) === number).sort((a, b) => rank(a) - rank(b)).map(renderWork)}</section>)}
+    {chapterNumbers.map(number => <section className="pending-chapter-group" key={number}><h4>{number ? `第 ${number} 章` : "项目收尾"}<span>{active.filter(item => chapterOf(item) === number).length} 项</span></h4>{active.filter(item => chapterOf(item) === number).sort((a, b) => rank(a) - rank(b)).map(renderWork)}</section>)}
     {pending.resumableBatches.length + pending.readyBatches.length + pending.pendingBatches.length > 0 && <details className="pending-board-disclosure"><summary>批次来源与保存断点 <span>{pending.resumableBatches.length + pending.readyBatches.length + pending.pendingBatches.length}</span></summary><p>每个批次保留自己的产物与审核来源；不会叠加成当前工作数量，也不代表全书正史进度。</p>{pending.resumableBatches.map(batch => renderBatch(batch, "resume"))}{pending.readyBatches.map(batch => renderBatch(batch, "accept"))}{pending.pendingBatches.map(batch => renderBatch(batch, "inspect"))}</details>}
     {deferred.length > 0 && <details className="pending-board-disclosure"><summary>留到下次的事项 <span>{deferred.length}</span></summary>{deferred.map(renderWork)}</details>}
     {pending.suggestions.length > 0 && <details className="pending-board-disclosure"><summary>可选建议与恢复记录 <span>{pending.suggestions.length}</span></summary><p>这些建议不单独阻断写作，也不计入待审核数量。相关审核读到完整来源时可同次整理；你也可以选择不采用并留档。</p>{pending.suggestions.map(renderWork)}</details>}
@@ -2446,7 +2465,7 @@ function TreeSection({ label, items, onOpen, active, opening }: { label: string;
       {expanded && <div className="tree-items">
         {items.length === 0 && <p className="empty-mini">暂无内容</p>}
         {items.map((item) => (
-          <button key={item.id} className={active === item.relative_path ? "active" : ""} onClick={() => void onOpen(item)} title={item.relative_path} aria-busy={opening === item.relative_path} disabled={opening === item.relative_path}>
+          <button key={item.id} className={active === item.relative_path ? "active" : ""} onClick={() => void onOpen(item)} title={item.label || documentLabel(item.relative_path)} aria-busy={opening === item.relative_path} disabled={opening === item.relative_path}>
             <span>{item.kind === "chapter" ? "§" : item.kind === "review" ? "✓" : "◇"}</span>
             <em>{item.label}</em>
             {opening === item.relative_path && <small>打开中…</small>}
@@ -2523,7 +2542,7 @@ function EditorPanel(props: {
   return (
     <div className={`editor-layout ${props.document.read_only ? "has-canon-banner" : ""} ${showPrefill ? "has-prefill" : ""}`}>
       <div className="document-toolbar">
-        <div><strong>{props.document.relative_path}</strong><span>{props.isDirty ? "尚未保存" : "已同步"}</span>{uploadError && !uploadCandidate && <span className="form-error" role="alert">{uploadError}</span>}</div>
+        <div><strong>{documentLabel(props.document.relative_path)}</strong><span>{props.isDirty ? "尚未保存" : "已同步"}</span>{uploadError && !uploadCandidate && <span className="form-error" role="alert">{uploadError}</span>}</div>
         <div>
           {props.prefillEnabled && props.document.relative_path.endsWith(".draft.md") && <button className={showPrefill ? "active" : ""} onClick={() => setShowPrefill((value) => !value)}>预填续写</button>}
           <button onClick={props.onListen}>听读 / 转语音</button>
@@ -2566,7 +2585,7 @@ function EditorPanel(props: {
                     await new Promise((resolve) => window.setTimeout(resolve, state.delay));
                     if (sequence !== prefillSequence.current || !prefillState.current.enabled) return { items: [] };
                     const content = model.getValue();
-                    const cursorOffset = model.getOffsetAt(position);
+                    const cursorOffset = Array.from(content.slice(0, model.getOffsetAt(position))).length;
                     const result = await state.request(content, cursorOffset, state.length);
                     if (sequence !== prefillSequence.current || model.getValue() !== content || result.cursor_offset !== cursorOffset) return { items: [] };
                     return { items: [{ insertText: result.insertion, range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column) }] };
@@ -2772,7 +2791,7 @@ function MemoryPanel({ dashboard, workspace, request, onRefresh }: { dashboard: 
     {workspace && <ChapterStatusStrip workspace={workspace} />}
     {showAdd && <div className="inline-form"><select value={kind} onChange={(event) => setKind(event.target.value)}><option value="character">人物</option><option value="location">地点</option><option value="organization">组织</option><option value="item">物品</option><option value="lore">世界观</option><option value="style">文风</option></select><input value={name} onChange={(event) => setName(event.target.value)} placeholder="名称" /><textarea value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="稳定设定、声线、禁忌或说明" /><button className="primary" onClick={() => void save()}>保存</button></div>}
     <section className="stack-section"><h3>写作偏好与强制记忆</h3><p className="form-hint">“普通偏好”会按人物、场景和篇章相关度取用；“强制记忆”每次都交给 Writer，并由 Reviewer 核对。它们用于写作方式和长期要求，不会冒充小说正史。</p><div className="inline-form"><select value={voiceScope} onChange={(event) => setVoiceScope(event.target.value)}><option value="project">全书</option><option value="character">人物</option><option value="scene">场景</option><option value="arc">篇章</option></select>{voiceScope !== "project" && <input value={voiceTarget} onChange={(event) => setVoiceTarget(event.target.value)} placeholder={voiceScope === "character" ? "人物名" : voiceScope === "arc" ? "篇章名或编号" : "场景类型"} />}<select value={voiceStrength} onChange={(event) => setVoiceStrength(event.target.value)}><option value="weak">普通偏好：相关时使用</option><option value="hard">强制记忆：始终使用</option></select><textarea value={voiceText} onChange={(event) => setVoiceText(event.target.value)} placeholder="例如：女主紧张时会缩短句子，但不会直说害怕；认可片段……适用于女主视角。" /><button className="primary" onClick={() => void saveVoicePreference()}>保存</button></div><p className="form-hint">强制记忆过多时，墨流只会去除完全重复的副本，不会偷偷删改规则；容量接近上限时会在协作台提醒你暂停过期项或合并同义项。</p>{voicePreferences.map((item) => <article className="memory-card" key={String(item.preference_id)}><span>{String(item.scope)} · {String(item.strength) === "hard" ? "强制记忆" : "普通偏好"}</span><strong>{String(item.status) === "active" ? "正在使用" : "已暂停"}</strong><p>{String(item.text)}</p><div className="settings-inline-actions"><button onClick={async () => { await request("preference.set_status", { preference_id: item.preference_id, status: item.status === "active" ? "paused" : "active" }); await loadVoicePreferences(); }}>{item.status === "active" ? "暂停使用" : "恢复使用"}</button><button onClick={async () => { if (!(await window.inkflow.confirm("删除这条写作记忆吗？删除后，后续章节不会再使用它。"))) return; await request("preference.delete", { preference_id: item.preference_id }); await loadVoicePreferences(); await onRefresh(); }}>删除</button></div></article>)}</section>
-    <section className="stack-section canon-preview"><h3>正史变更预览</h3><p className="form-hint">只针对你已经接受且 Editor 审查已放行的当前草稿。先看事实与伏笔补丁，再决定是否提交 SQLite。</p><div className="settings-inline-actions"><input type="number" min={1} value={previewChapter} disabled={memoryWorking} onChange={(event) => setPreviewChapter(Number(event.target.value))} /><button disabled={memoryWorking} onClick={() => void generateMemoryPreview()}>生成预览</button></div>{memoryPreview && <article className="memory-card"><strong>第 {String((memoryPreview.preview as Record<string, unknown>).chapter_no)} 章 · 尚未提交</strong><p>新增或更新事实 {Array.isArray(previewData.facts) ? previewData.facts.length : 0} 条，线索变化 {Array.isArray(previewData.threads) ? previewData.threads.length : 0} 条，冲突 {Array.isArray(previewData.unresolved_conflicts) ? previewData.unresolved_conflicts.length : 0} 条。</p><details><summary>查看完整补丁</summary><pre>{JSON.stringify(previewData, null, 2)}</pre></details><button className="primary" disabled={memoryWorking} onClick={async () => { const preview = memoryPreview.preview as Record<string, unknown>; setMemoryWorking(true); try { await request("memory.commit_preview", { chapter_no: Number(preview.chapter_no), artifact_id: preview.artifact_id }); setMemoryPreview(null); await onRefresh(); } finally { setMemoryWorking(false); } }}>确认提交正史</button></article>}</section>
+    <section className="stack-section canon-preview"><h3>正史变更预览</h3><p className="form-hint">只针对你已经接受且 Editor 审查已放行的当前草稿。先看事实与伏笔补丁，再决定是否提交 SQLite。</p><div className="settings-inline-actions"><input type="number" min={1} value={previewChapter} disabled={memoryWorking} onChange={(event) => setPreviewChapter(Number(event.target.value))} /><button disabled={memoryWorking} onClick={() => void generateMemoryPreview()}>生成预览</button></div>{memoryPreview && <article className="memory-card"><strong>第 {String((memoryPreview.preview as Record<string, unknown>).chapter_no)} 章 · 尚未提交</strong><p>新增或更新事实 {Array.isArray(previewData.facts) ? previewData.facts.length : 0} 条，线索变化 {Array.isArray(previewData.threads) ? previewData.threads.length : 0} 条，冲突 {Array.isArray(previewData.unresolved_conflicts) ? previewData.unresolved_conflicts.length : 0} 条。</p><details><summary>查看将记录的内容</summary><p className="record-summary">{readableRecord(displaySafeValue(previewData))}</p></details><button className="primary" disabled={memoryWorking} onClick={async () => { const preview = memoryPreview.preview as Record<string, unknown>; setMemoryWorking(true); try { await request("memory.commit_preview", { chapter_no: Number(preview.chapter_no), artifact_id: preview.artifact_id }); setMemoryPreview(null); await onRefresh(); } finally { setMemoryWorking(false); } }}>确认提交正史</button></article>}</section>
     <section className="stack-section"><h3>人工故事圣经 <small>{dashboard?.bible_entries.length || 0}</small></h3>{dashboard?.bible_entries.map((entry) => <article className="memory-card" key={String(entry.entry_id)}><span>{kindLabel(String(entry.kind))}</span><strong>{String(entry.name)}</strong><p>{String(((entry.data || {}) as Record<string, unknown>).notes || "")}</p></article>)}</section>
     <section className="stack-section"><h3>当前正史事实 <small>{dashboard?.facts.length || 0}</small></h3>{dashboard?.facts.slice(0, 30).map((fact) => <article className="fact-row" key={String(fact.fact_id)}><strong>{String(fact.subject)} · {String(fact.predicate)}</strong><p>{stringifyShort(fact.value)}</p><small>来源第 {String(fact.source_chapter)} 章</small></article>)}</section>
     <section className="stack-section"><h3>开放线索 <small>{dashboard?.threads.length || 0}</small></h3>{dashboard?.threads.map((thread) => <article className="thread-card" key={String(thread.thread_id)}><strong>{String(thread.title)}</strong><p>{String(thread.description)}</p><small>{String(thread.status)} · 预计第 {String(thread.due_chapter || "—")} 章</small></article>)}</section>
@@ -2825,11 +2844,11 @@ type LiveRun = { id: string; steps: EngineEvent[]; method?: string; status: stri
 
 function LiveRunTimeline({ runs, onOpenReference }: { runs: LiveRun[]; onOpenReference: (reference: TraceReference) => void | Promise<void> }) {
   if (!runs.length) return null;
-  return <div className="run-list live-runs"><h3>实时运行过程</h3><p className="process-hint">这里展示公开的步骤、角色、模型、等待参数和文件引用；不会展示模型原始思考内容。</p>{runs.slice(0, 8).map((run) => <details className={`run-card live-run ${run.status}`} open={run.status === "running" || run.status === "waiting"} key={`live-${run.id}`}><summary><strong>{String(run.method ? methodLabel(run.method) : "墨流任务")}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : run.status === "waiting" ? "等待处理" : "进行中"}</span></summary><p>{run.summary}</p><ol className="live-timeline">{run.steps.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; const stepStatus = step.status || "info"; const role = String(step.role || metadata.agent_role || ""); const model = String(step.model || metadata.model || ""); const refs = step.references || []; const publicMetadata = Object.fromEntries(Object.entries(metadata).filter(([key]) => !isSensitivePresentationKey(key))); return <li className={`live-step ${stepStatus}`} key={`${step.timestamp || index}-${index}`}><div className="live-step-main"><span className="live-step-marker">{stepStatus === "completed" ? "✓" : stepStatus === "failed" ? "!" : stepStatus === "started" ? "…" : "·"}</span><div><strong>{eventLabel(step.type || step.stage)}</strong><p>{step.summary || step.stage || "过程"}</p><small>{step.timestamp ? formatTime(step.timestamp) : "刚刚"}{role ? ` · ${agentRoleLabel(role)}` : ""}{model ? ` · ${model}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small></div></div>{step.details && <p className="live-step-details">{step.details}</p>}{(metadata.timeout_seconds || metadata.max_tokens || typeof metadata.thinking === "boolean") && <small className="live-step-meta">请求参数：{metadata.timeout_seconds ? `超时 ${String(metadata.timeout_seconds)} 秒` : ""}{metadata.max_tokens ? ` · 输出上限 ${Number(metadata.max_tokens).toLocaleString()} tokens` : ""}{typeof metadata.thinking === "boolean" ? ` · 深度推理 ${metadata.thinking ? "开启" : "关闭"}` : ""}</small>}{refs.length > 0 && <div className="settings-inline-actions">{refs.map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {reference.relative_path}</button>)}</div>}{Object.keys(publicMetadata).length > 0 && <details><summary>查看本步公开记录</summary><pre className="compact-json">{JSON.stringify(publicMetadata, null, 2)}</pre></details>}</li>; })}</ol><small className="live-run-footnote">可复核文件由运行记录自动发现；点击文件按钮可在本地打开。</small></details>)}</div>;
+  return <div className="run-list live-runs"><h3>实时运行过程</h3><p className="process-hint">这里展示公开的步骤、角色、模型、等待参数和文件引用；不会展示模型原始思考内容。</p>{runs.slice(0, 8).map((run) => <details className={`run-card live-run ${run.status}`} open={run.status === "running" || run.status === "waiting"} key={`live-${run.id}`}><summary><strong>{String(run.method ? methodLabel(run.method) : "墨流任务")}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : run.status === "waiting" ? "等待处理" : "进行中"}</span></summary><p>{readableSourceText(run.summary)}</p><ol className="live-timeline">{run.steps.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; const stepStatus = step.status || "info"; const role = String(step.role || metadata.agent_role || ""); const model = String(step.model || metadata.model || ""); const refs = step.references || []; const publicMetadata = Object.fromEntries(Object.entries(metadata).filter(([key]) => !isSensitivePresentationKey(key))); return <li className={`live-step ${stepStatus}`} key={`${step.timestamp || index}-${index}`}><div className="live-step-main"><span className="live-step-marker">{stepStatus === "completed" ? "✓" : stepStatus === "failed" ? "!" : stepStatus === "started" ? "…" : "·"}</span><div><strong>{eventLabel(step.type || step.stage)}</strong><p>{readableSourceText(step.summary || step.stage || "过程")}</p><small>{step.timestamp ? formatTime(step.timestamp) : "刚刚"}{role ? ` · ${agentRoleLabel(role)}` : ""}{model ? ` · ${model}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small></div></div>{step.details && <p className="live-step-details">{readableSourceText(step.details)}</p>}{(metadata.timeout_seconds || metadata.max_tokens || typeof metadata.thinking === "boolean") && <small className="live-step-meta">请求参数：{metadata.timeout_seconds ? `超时 ${String(metadata.timeout_seconds)} 秒` : ""}{metadata.max_tokens ? ` · 输出上限 ${Number(metadata.max_tokens).toLocaleString()} tokens` : ""}{typeof metadata.thinking === "boolean" ? ` · 深度推理 ${metadata.thinking ? "开启" : "关闭"}` : ""}</small>}{refs.length > 0 && <div className="settings-inline-actions">{refs.map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {documentLabel(reference.relative_path)}</button>)}</div>}{Object.keys(publicMetadata).length > 0 && <details><summary>查看本步说明</summary><p className="record-summary">{readableRecord(displaySafeValue(publicMetadata))}</p></details>}</li>; })}</ol><small className="live-run-footnote">可复核文件由运行记录自动发现；点击文件按钮可在本地打开。</small></details>)}</div>;
 }
 
 function ReferenceDocumentViewer({ document, onClose }: { document: DocumentData; onClose: () => void }) {
-  return <article className="reference-viewer"><header><div><span className="reference-viewer-icon">↗</span><div><strong>运行记录 · 只读复核</strong><small>{document.relative_path}</small></div></div><button type="button" onClick={onClose}>关闭预览</button></header><pre>{document.content}</pre><footer>{document.reason || "文件来自本地 .inkflow 运行记录，只能在墨流内查看。"}</footer></article>;
+  return <article className="reference-viewer"><header><div><span className="reference-viewer-icon">↗</span><div><strong>运行记录 · 只读复核</strong><small>{documentLabel(document.relative_path)}</small></div></div><button type="button" onClick={onClose}>关闭预览</button></header><div className="record-summary">{readableRecordText(document.content)}</div><footer>{document.reason || "文件来自本地 .inkflow 运行记录，只能在墨流内查看。"}</footer></article>;
 }
 
 function workflowIcon(stage: string) {
@@ -2895,7 +2914,7 @@ function ProcessPanel({ events, collaboration, context, provider, workspace, req
   const retrieval = context?.retrieval_diagnostics;
   const retrievalStats = retrievalCounts(retrieval);
   const openThreads = (collaboration?.threads || []).filter((thread) => ["open", "waiting", "escalated"].includes(String(thread.status))).length;
-  return <div className="scroll-panel process-panel"><div className="section-heading"><p className="eyebrow">协作台</p><h2>工作流与运行状态</h2><p>任务、Agent 讨论、上下文、检索、学习和费用信息集中查看；正文和版本仍留在各自工作区。</p></div>{workspace && <ChapterStatusStrip workspace={workspace} />}
+  return <div className="scroll-panel process-panel"><div className="section-heading"><p className="eyebrow">协作台</p><h2>工作流与运行状态</h2><p>任务、角色讨论、上下文、检索和费用信息集中查看；正文和版本仍留在各自工作区。</p></div>{workspace && <ChapterStatusStrip workspace={workspace} />}
      {referenceDocument && <ReferenceDocumentViewer document={referenceDocument} onClose={onCloseReference} />}
      <WorkflowProgressStrip runs={runs} />
      <ContextCapacityCard value={context} />
@@ -2909,18 +2928,17 @@ function ProcessPanel({ events, collaboration, context, provider, workspace, req
       <article><header><strong>检索诊断</strong><span>{retrieval ? `新增 ${retrievalStats.added} 条` : "暂无记录"}</span></header><p>{retrieval ? `从 ${retrievalStats.candidates} 条候选中取回 ${retrievalStats.retrieved} 条，其中 ${retrievalStats.alreadyLoaded} 条已在正史上下文，避免重复输入。这里不是模型缓存命中率。` : "完成一次章节上下文编译后显示本地检索情况。"}</p></article>
       <article><header><strong>正史变更</strong><span>验收后</span></header><p>记忆服务 的新增、更新和结束事实会先预览，再进入事务提交。</p></article>
       <article><header><strong>版本对比</strong><span>正文右侧</span></header><p>草稿、修改提案与历史快照均可打开 Diff，不静默覆盖旧版本。</p></article>
-      <article><header><strong>学习中心</strong><span>{learning.length} 条信号</span></header><p>{learning[0] ? `${learningLabel(learning[0].event_type)}${learning[0].chapter_no ? ` · 第 ${learning[0].chapter_no} 章` : ""}` : "记录接受、拒绝、撤回和重写，只用于本机优化。"}</p></article>
       <article><header><strong>费用记录</strong><span>不设固定金额上限</span></header><CostSummary usage={usage} /><p>当前模型：{String(provider?.model || "未配置")}。</p></article>
     </div>
-    {context && <div className="run-list"><h3>Context Packet 质量报告</h3><article className="run-card"><header><strong>预算分配</strong><span>输出预留 {Number((context as unknown as Record<string, unknown>).output_reserve_tokens || 0).toLocaleString()} tokens</span></header><div className="context-budget-list">{(context.budget_allocation || []).map((item) => <p key={item.key}><strong>{item.key} · {item.title}</strong><span>{item.estimated_tokens.toLocaleString()} tokens · {item.hard ? "固定保留" : "可压缩"} · {item.source_count} 来源</span></p>)}</div></article>{Boolean(retrieval?.discarded?.length) && <details className="run-card"><summary>查看未取回候选的前 {retrieval?.discarded?.length} 条原因</summary><pre className="compact-json">{JSON.stringify(retrieval?.discarded, null, 2)}</pre></details>}</div>}
-    <div className="run-list"><h3>真实调用与引用</h3>{!(collaboration?.trace_runs || []).length && <p className="empty-mini">运行写作、审查或记忆任务后，这里会显示每一步参考了什么、使用了哪个模型、产生了哪些文件。</p>}{(collaboration?.trace_runs || []).slice(0, 10).map((traceRun) => <details className="run-card" key={traceRun.run_id}><summary><strong>{operationLabel(traceRun.operation)}</strong><span>{traceRun.status === "completed" ? "已完成" : traceRun.status === "failed" ? "未完成" : traceRun.status}</span></summary><p>{traceRun.summary}</p><div className="settings-inline-actions">{traceRun.trace_reference?.exists && <button type="button" onClick={() => void onOpenReference(traceRun.trace_reference!)}>打开完整运行记录</button>}</div><ol>{traceRun.events.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; return <li key={`${step.timestamp}-${index}`}><div><strong>{step.stage}</strong> · {step.summary}</div><small>{formatTime(step.timestamp)} · {step.status}{metadata.model ? ` · 模型 ${String(metadata.model)}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small>{step.details && <p>{step.details}</p>}{(step.references || []).length > 0 && <div className="settings-inline-actions">{(step.references || []).map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {reference.relative_path}</button>)}</div>}{Object.keys(metadata).length > 0 && <details><summary>查看本步全部记录</summary><pre className="compact-json">{JSON.stringify(metadata, null, 2)}</pre></details>}</li>; })}</ol></details>)}</div>
+    {context && <div className="run-list"><h3>Context Packet 质量报告</h3><article className="run-card"><header><strong>预算分配</strong><span>输出预留 {Number((context as unknown as Record<string, unknown>).output_reserve_tokens || 0).toLocaleString()} tokens</span></header><div className="context-budget-list">{(context.budget_allocation || []).map((item) => <p key={item.key}><strong>{item.title}</strong><span>{item.estimated_tokens.toLocaleString()} tokens · {item.hard ? "固定保留" : "可压缩"} · {item.source_count} 来源</span></p>)}</div></article>{Boolean(retrieval?.discarded?.length) && <details className="run-card"><summary>查看未取回候选的前 {retrieval?.discarded?.length} 条原因</summary><p className="record-summary">{readableRecord(displaySafeValue(retrieval?.discarded))}</p></details>}</div>}
+    <div className="run-list"><h3>真实调用与引用</h3>{!(collaboration?.trace_runs || []).length && <p className="empty-mini">运行写作、审查或记忆任务后，这里会显示每一步参考了什么、使用了哪个模型、产生了哪些文件。</p>}{(collaboration?.trace_runs || []).slice(0, 10).map((traceRun) => <details className="run-card" key={traceRun.run_id}><summary><strong>{operationLabel(traceRun.operation)}</strong><span>{traceRun.status === "completed" ? "已完成" : traceRun.status === "failed" ? "未完成" : traceRun.status}</span></summary><p>{readableSourceText(traceRun.summary)}</p><div className="settings-inline-actions">{traceRun.trace_reference?.exists && <button type="button" onClick={() => void onOpenReference(traceRun.trace_reference!)}>打开完整运行记录</button>}</div><ol>{traceRun.events.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; return <li key={`${step.timestamp}-${index}`}><div><strong>{eventLabel(step.stage)}</strong> · {readableSourceText(step.summary)}</div><small>{formatTime(step.timestamp)} · {step.status}{metadata.model ? ` · 模型 ${String(metadata.model)}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small>{step.details && <p>{readableSourceText(step.details)}</p>}{(step.references || []).length > 0 && <div className="settings-inline-actions">{(step.references || []).map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {documentLabel(reference.relative_path)}</button>)}</div>}{Object.keys(metadata).length > 0 && <details><summary>查看本步说明</summary><p className="record-summary">{readableRecord(displaySafeValue(metadata))}</p></details>}</li>; })}</ol></details>)}</div>
     <div className="run-list"><h3>定向讨论</h3>{(collaboration?.threads || []).slice(0, 8).map((thread) => { const current = threadUpdates[String(thread.thread_id)] || thread; const active = ["open", "waiting"].includes(String(current.status)); return <article className="run-card" key={String(thread.thread_id)}><header><strong>{String(thread.topic)}</strong><span>{String(current.status)} · 第 {String(current.current_round || 1)}/{String(current.max_rounds || 2)} 轮</span></header><p>{String(current.resolution || "等待目标 Agent 回答")}</p>{active && <button onClick={async () => { const value = await request<{ thread: Record<string, unknown> }>("collaboration.reply", { thread_id: thread.thread_id }); setThreadUpdates((items) => ({ ...items, [String(thread.thread_id)]: value.thread })); }}>让目标 Agent 回答</button>}{String(current.status) === "escalated" && <small>两轮后仍有分歧，已暂停分支并交给 Coordinator 向你提出最小问题。</small>}</article>; })}</div>
     <div className="run-list"><h3>任务计划</h3>{runs.length === 0 && <p className="empty-mini">发送需求后，这里显示本次任务的安排。</p>}{runs.slice(0, 8).map(run => {
     const planned = [...run.steps].reverse().find((step) => step.dispatch_plan?.steps?.length);
     const ticket = planned?.task_ticket || {};
     const dispatchSteps = planned?.dispatch_plan?.steps || [];
     const plan = dispatchSteps.length > 0 ? dispatchSteps.map((step) => `${agentRoleLabel(String(step.role || "engine"))} · ${operationLabel(String(step.operation || ""))}${step.gate ? `（${String(step.gate)}）` : ""}`) : run.method === "project.ideate" ? ["读取开书偏好", "构思故事方向与开篇", "展示方案，等待你选择"] : run.method === "provider.test" ? ["发送连接检查", "等待模型回答", "显示连接结果"] : ["读取任务范围与相关章节", "执行本次任务", "交付结果供你查看"];
-    return <article className={`run-card ${run.status}`} key={run.id}><header><strong>{String(ticket.objective || methodLabel(run.method))}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : run.status === "waiting" ? "等待处理" : "进行中"}</span></header>{Boolean(ticket.chapter_no) && <p>章节：第 {String(ticket.chapter_no)} 章{ticket.chapter_version ? ` · v${String(ticket.chapter_version)}` : ""}；验收模式：{acceptanceModeLabel(String(ticket.acceptance_confirmation_mode || "per_chapter"))}；授权来源：{authorizationLabel(String(ticket.authorization_source || "none"))}</p>}<ol>{plan.map((step, index) => <li key={`${index}-${step}`}><span>计划 {index + 1} · {step}</span></li>)}</ol><p>{run.summary}</p>{planned?.dispatch_plan?.stop_conditions?.length ? <details><summary>停止条件</summary><ul>{planned.dispatch_plan.stop_conditions.map((item) => <li key={item}>{item}</li>)}</ul></details> : null}<small>{run.method === "project.ideate" ? "结果位置：新建小说窗口" : run.method === "provider.test" ? "结果位置：模型设置窗口" : "结果位置：中间对话区；生成文件可从左侧小说结构打开"}</small></article>;
+    return <article className={`run-card ${run.status}`} key={run.id}><header><strong>{String(ticket.objective || methodLabel(run.method))}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : run.status === "waiting" ? "等待处理" : "进行中"}</span></header>{Boolean(ticket.chapter_no) && <p>章节：第 {String(ticket.chapter_no)} 章{ticket.chapter_version ? ` · v${String(ticket.chapter_version)}` : ""}；验收模式：{acceptanceModeLabel(String(ticket.acceptance_confirmation_mode || "per_chapter"))}；授权来源：{authorizationLabel(String(ticket.authorization_source || "none"))}</p>}<ol>{plan.map((step, index) => <li key={`${index}-${step}`}><span>计划 {index + 1} · {step}</span></li>)}</ol><p>{readableSourceText(run.summary)}</p>{planned?.dispatch_plan?.stop_conditions?.length ? <details><summary>停止条件</summary><ul>{planned.dispatch_plan.stop_conditions.map((item) => <li key={item}>{item}</li>)}</ul></details> : null}<small>{run.method === "project.ideate" ? "结果位置：新建小说窗口" : run.method === "provider.test" ? "结果位置：模型设置窗口" : "结果位置：中间对话区；生成文件可从左侧小说结构打开"}</small></article>;
   })}</div></div>;
 }
 
@@ -3053,7 +3071,7 @@ function ProcessPanelCompact({ events, collaboration, context, provider, workspa
     detailContent = <>
       <WorkflowProgressStrip runs={runs} />
       <LiveRunTimeline runs={runs} onOpenReference={onOpenReference} />
-      <section className="detail-section"><header><h4>真实调用与引用</h4><span>{traceRuns.length} 条</span></header>{traceRuns.length === 0 && <p className="empty-mini">完成一次写作、审查或记忆任务后显示。</p>}{traceRuns.slice(0, 10).map((traceRun) => <details className="run-card" key={traceRun.run_id}><summary><strong>{operationLabel(traceRun.operation)}</strong><span>{traceRun.status === "completed" ? "已完成" : traceRun.status === "failed" ? "未完成" : traceRun.status}</span></summary><p>{traceRun.summary}</p><div className="settings-inline-actions">{traceRun.trace_reference?.exists && <button type="button" onClick={() => void onOpenReference(traceRun.trace_reference!)}>打开运行记录</button>}</div><ol>{traceRun.events.map((step, index) => { const metadata = step.metadata || {}; const usageData = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; return <li key={`${step.timestamp}-${index}`}><div><strong>{step.stage}</strong> · {step.summary}</div><small>{formatTime(step.timestamp)} · {step.status}{metadata.model ? ` · ${String(metadata.model)}` : ""}{usageData ? ` · 输入 ${Number(usageData.prompt_tokens || usageData.input_tokens || 0).toLocaleString()} / 输出 ${Number(usageData.completion_tokens || usageData.output_tokens || 0).toLocaleString()}` : ""}</small>{step.details && <p>{step.details}</p>}{(step.references || []).length > 0 && <div className="settings-inline-actions">{(step.references || []).map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {reference.relative_path}</button>)}</div>}</li>; })}</ol></details>)}</section>
+      <section className="detail-section"><header><h4>真实调用与引用</h4><span>{traceRuns.length} 条</span></header>{traceRuns.length === 0 && <p className="empty-mini">完成一次写作、审查或记忆任务后显示。</p>}{traceRuns.slice(0, 10).map((traceRun) => <details className="run-card" key={traceRun.run_id}><summary><strong>{operationLabel(traceRun.operation)}</strong><span>{traceRun.status === "completed" ? "已完成" : traceRun.status === "failed" ? "未完成" : traceRun.status}</span></summary><p>{readableSourceText(traceRun.summary)}</p><div className="settings-inline-actions">{traceRun.trace_reference?.exists && <button type="button" onClick={() => void onOpenReference(traceRun.trace_reference!)}>打开运行记录</button>}</div><ol>{traceRun.events.map((step, index) => { const metadata = step.metadata || {}; const usageData = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; return <li key={`${step.timestamp}-${index}`}><div><strong>{eventLabel(step.stage)}</strong> · {readableSourceText(step.summary)}</div><small>{formatTime(step.timestamp)} · {step.status}{metadata.model ? ` · ${String(metadata.model)}` : ""}{usageData ? ` · 输入 ${Number(usageData.prompt_tokens || usageData.input_tokens || 0).toLocaleString()} / 输出 ${Number(usageData.completion_tokens || usageData.output_tokens || 0).toLocaleString()}` : ""}</small>{step.details && <p>{readableSourceText(step.details)}</p>}{(step.references || []).length > 0 && <div className="settings-inline-actions">{(step.references || []).map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {documentLabel(reference.relative_path)}</button>)}</div>}</li>; })}</ol></details>)}</section>
     </>;
   } else if (detail === "tasks") {
     detailContent = <section className="detail-section">
@@ -3100,13 +3118,13 @@ function ProcessPanelCompact({ events, collaboration, context, provider, workspa
     </section>;
   } else if (detail === "agents") {
     detailContent = <>
-      <section className="detail-section"><header><h4>结构化消息</h4><span>{messages.length} 条</span></header>{messages.length === 0 && <p className="empty-mini">暂时没有需要处理的 Agent 消息。</p>}{messages.slice(0, 16).map((message) => <article className="detail-message" key={message.message_id}><div><strong>{agentRoleLabel(String(message.sender_role))} → {agentRoleLabel(String(message.recipient_role))}</strong><small>{formatTime(message.created_at)} · {collaborationStatusLabel(String(message.status))}</small></div><p>{message.claim}</p>{message.requested_response && <p className="detail-lead"><strong>要求返回：</strong>{message.requested_response}</p>}<details className="detail-disclosure"><summary>查看输入与证据</summary><dl className="message-audit-grid"><div><dt>章节版本</dt><dd>{message.chapter_no ? `第 ${message.chapter_no} 章${message.chapter_version ? ` · v${message.chapter_version}` : ""}` : "全局任务"}</dd></div><div><dt>Context Packet</dt><dd>{message.context_packet_id || "本步未绑定"}</dd></div><div><dt>输入 / 证据来源</dt><dd>{message.evidence_refs?.length ? message.evidence_refs.join("、") : "无额外文件引用"}</dd></div><div><dt>消息类型</dt><dd>{message.message_type}</dd></div></dl></details></article>)}</section>
+      <section className="detail-section"><header><h4>结构化消息</h4><span>{messages.length} 条</span></header>{messages.length === 0 && <p className="empty-mini">暂时没有需要处理的 Agent 消息。</p>}{messages.slice(0, 16).map((message) => <article className="detail-message" key={message.message_id}><div><strong>{agentRoleLabel(String(message.sender_role))} → {agentRoleLabel(String(message.recipient_role))}</strong><small>{formatTime(message.created_at)} · {collaborationStatusLabel(String(message.status))}</small></div><p>{message.claim}</p>{message.requested_response && <p className="detail-lead"><strong>要求返回：</strong>{message.requested_response}</p>}<details className="detail-disclosure"><summary>查看输入与证据</summary><dl className="message-audit-grid"><div><dt>章节版本</dt><dd>{message.chapter_no ? `第 ${message.chapter_no} 章${message.chapter_version ? ` · v${message.chapter_version}` : ""}` : "全局任务"}</dd></div><div><dt>输入资料</dt><dd>{message.context_packet_id ? "已绑定这一步使用的资料" : "本步未绑定额外资料"}</dd></div><div><dt>输入 / 证据来源</dt><dd>{message.evidence_refs?.length ? message.evidence_refs.map(reference => readableSourceText(reference)).join("、") : "无额外文件引用"}</dd></div><div><dt>消息类型</dt><dd>{message.message_type}</dd></div></dl></details></article>)}</section>
       <section className="detail-section"><header><h4>定向讨论</h4><span>{openThreads} 待处理</span></header>{threads.slice(0, 10).map((thread) => { const current = threadUpdates[String(thread.thread_id)] || thread; const active = ["open", "waiting"].includes(String(current.status)); return <article className="detail-thread" key={String(thread.thread_id)}><header><strong>{String(thread.topic)}</strong><span>{String(current.status)} · {String(current.current_round || 1)}/{String(current.max_rounds || 2)} 轮</span></header><p>{String(current.resolution || "等待目标 Agent 回答")}</p>{threadErrors[String(thread.thread_id)] && <p className="form-error" role="status">回应未完成：{threadErrors[String(thread.thread_id)]}。已有成果保留，可先查看任务记录中的恢复条件。</p>}{active && <button type="button" disabled={threadPending[String(thread.thread_id)]} onClick={() => void replyToThread(thread.thread_id)}>{threadPending[String(thread.thread_id)] ? "正在等待回应…" : "让目标 Agent 回答"}</button>}{threadErrors[String(thread.thread_id)] && <button type="button" onClick={() => onNavigate("project")}>查看恢复条件与任务记录</button>}{String(current.status) === "escalated" && <small>已交给 Coordinator 向你提出最小问题。</small>}</article>; })}</section>
     </>;
   } else if (detail === "context") {
     detailContent = <>
       <ContextCapacityCard value={context} />
-      {context && <section className="detail-section"><header><h4>预算分配</h4><span>输出预留 {Number((context as unknown as Record<string, unknown>).output_reserve_tokens || 0).toLocaleString()} tokens</span></header><div className="context-budget-list">{(context.budget_allocation || []).map((item) => <p key={item.key}><strong>{item.key} · {item.title}</strong><span>{item.estimated_tokens.toLocaleString()} tokens · {item.hard ? "固定保留" : "可压缩"} · {item.source_count} 来源</span></p>)}</div>{context.warnings.length > 0 && <ul className="detail-warning-list">{context.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}</section>}
+      {context && <section className="detail-section"><header><h4>预算分配</h4><span>输出预留 {Number((context as unknown as Record<string, unknown>).output_reserve_tokens || 0).toLocaleString()} tokens</span></header><div className="context-budget-list">{(context.budget_allocation || []).map((item) => <p key={item.key}><strong>{item.title}</strong><span>{item.estimated_tokens.toLocaleString()} tokens · {item.hard ? "固定保留" : "可压缩"} · {item.source_count} 来源</span></p>)}</div>{context.warnings.length > 0 && <ul className="detail-warning-list">{context.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}</section>}
       <button type="button" className="subtle-button" onClick={() => setDetail("retrieval")}>查看检索诊断 <span aria-hidden="true">→</span></button>
     </>;
   } else if (detail === "retrieval") {
@@ -3121,15 +3139,15 @@ function ProcessPanelCompact({ events, collaboration, context, provider, workspa
       </div>
       {retrieval && <p className="detail-lead">其余 {retrievalStats.notRetrieved} 条未取回，按相关性与本次预算筛选；初始上限 {retrieval.initial_top_k || 0} 条。下面仅展示前 {retrieval.discarded?.length || 0} 条原因，不是舍弃总数。</p>}
       {context?.warnings?.length ? <ul className="detail-warning-list">{context.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul> : null}
-      {retrieval?.adaptive_factors && <details className="detail-disclosure"><summary>查看筛选依据</summary><pre className="compact-json">{JSON.stringify(retrieval.adaptive_factors, null, 2)}</pre></details>}
-      {retrieval?.discarded?.length ? <details className="detail-disclosure"><summary>查看未取回候选的前 {retrieval.discarded.length} 条原因</summary><pre className="compact-json">{JSON.stringify(retrieval.discarded, null, 2)}</pre></details> : null}
+      {retrieval?.adaptive_factors && <details className="detail-disclosure"><summary>查看筛选依据</summary><p className="record-summary">{readableRecord(displaySafeValue(retrieval.adaptive_factors))}</p></details>}
+      {retrieval?.discarded?.length ? <details className="detail-disclosure"><summary>查看未取回候选的前 {retrieval.discarded.length} 条原因</summary><p className="record-summary">{readableRecord(displaySafeValue(retrieval.discarded))}</p></details> : null}
     </section>;
   } else if (detail === "canon") {
     detailContent = <section className="detail-section"><header><h4>正史入口</h4><span>验收后提交</span></header><p className="detail-lead">记忆服务 只读取已接受正文，先生成补丁预览，再经过事务提交。</p><div className="detail-metrics"><DetailMetric label="已接受章节" value={String(workspace?.accepted_chapters ?? workspace?.acceptedChapterCount ?? "—")} /><DetailMetric label="开放线索" value={String(workspace?.open_threads ?? "—")} /></div><button type="button" className="subtle-button" onClick={() => onNavigate("memory")}>打开正史与记忆 <span aria-hidden="true">→</span></button></section>;
   } else if (detail === "versions") {
     detailContent = <section className="detail-section"><header><h4>版本入口</h4><span>保留旧版</span></header><p className="detail-lead">新草稿生成新版本；正文、审查和差异查看在各自工作区完成。</p><div className="detail-link-grid"><button type="button" onClick={() => onNavigate("editor")}>正文与草稿 <span aria-hidden="true">→</span></button><button type="button" onClick={() => onNavigate("review")}>审查与差异 <span aria-hidden="true">→</span></button></div></section>;
   } else if (detail === "learning") {
-    detailContent = <section className="detail-section"><header><h4>反馈记录</h4><span>{learning.length} 条</span></header>{learning.length === 0 && <p className="empty-mini">完成接受、拒绝或重写后，这里会出现反馈。</p>}{learning.slice(0, 20).map((item) => <article className="detail-list-row" key={item.event_id}><div><strong>{learningLabel(item.event_type)}{item.chapter_no ? ` · 第 ${item.chapter_no} 章` : ""}</strong><small>{formatTime(item.created_at)}</small></div><details><summary>数据</summary><pre className="compact-json">{JSON.stringify(item.payload, null, 2)}</pre></details></article>)}</section>;
+    detailContent = <section className="detail-section"><header><h4>反馈记录</h4><span>{learning.length} 条</span></header>{learning.length === 0 && <p className="empty-mini">完成接受、拒绝或重写后，这里会出现反馈。</p>}{learning.slice(0, 20).map((item) => <article className="detail-list-row" key={item.event_id}><div><strong>{learningLabel(item.event_type)}{item.chapter_no ? ` · 第 ${item.chapter_no} 章` : ""}</strong><small>{formatTime(item.created_at)}</small></div><details><summary>数据</summary><p className="record-summary">{readableRecord(displaySafeValue(item.payload))}</p></details></article>)}</section>;
   } else if (detail === "usage") {
     detailContent = <><CacheSummary usage={usage} /><section className="detail-section"><header><h4>运行环境</h4><span>{String(provider?.model || "未配置")}</span></header><div className="detail-metrics"><DetailMetric label="已记录调用次数" value={usage?.calls || 0} /><DetailMetric label="已记录总 Token" value={(usage?.total_tokens || 0).toLocaleString()} /></div><CostSummary usage={usage} /><p className="detail-lead">历史缓存统计来自运行记录，新费用账本从启用后逐请求记录；服务商未回报时显示“未知”，不会把未知当成未命中。</p></section></>;
   }
@@ -3147,7 +3165,6 @@ function ProcessPanelCompact({ events, collaboration, context, provider, workspa
       <ProcessSummaryCard icon="⌁" title="检索" value={retrieval ? `+${retrievalStats.added}` : "—"} status={retrieval ? `${retrievalStats.retrieved} 条取回 · ${retrievalStats.alreadyLoaded} 条已在上下文` : "等待编译"} onOpen={() => setDetail("retrieval")} />
       <ProcessSummaryCard icon="▣" title="正史" value="预览" status="验收后提交" onOpen={() => setDetail("canon")} />
       <ProcessSummaryCard icon="⇄" title="版本" value="保留" status="正文区查看" onOpen={() => setDetail("versions")} />
-      <ProcessSummaryCard icon="✦" title="学习" value={learning.length} status={learning.length ? "有新反馈" : "等待反馈"} onOpen={() => setDetail("learning")} />
       <ProcessSummaryCard icon="◐" title="调用" value={usage?.calls || 0} status={usage?.recent_deepseek_cache?.hit_rate != null ? `最近 ${Math.round(usage.recent_deepseek_cache.hit_rate * 100)}% 缓存` : "查看统计"} onOpen={() => setDetail("usage")} />
     </div>
     {detail && <ProcessDetailPane title={detailTitle[detail]} subtitle={detailSubtitle[detail]} onBack={() => setDetail(null)} detailRef={detailRef}>{detailContent}</ProcessDetailPane>}
@@ -3300,7 +3317,7 @@ const PROVIDER_OPTIONS = [
   { id: "custom", name: "自定义", note: "其他 OpenAI 兼容服务", baseUrl: "", models: [] },
 ] as const;
 
-type SettingsSection = "story_settings" | "author" | "appearance" | "models" | "creation" | "voice" | "context" | "review" | "learning" | "advanced";
+type SettingsSection = "story_settings" | "author" | "appearance" | "models" | "creation" | "voice" | "context" | "review" | "advanced";
 const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string; note: string }> = [
   { id: "story_settings", label: "本书设定", note: "人物、场景、道具与自定义资料模块" },
   { id: "author", label: "作者习惯与记忆", note: "跨书习惯、本书偏好和来源历史" },
@@ -3310,7 +3327,6 @@ const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string; note: strin
   { id: "voice", label: "语音", note: "输入、朗读与设备" },
   { id: "context", label: "上下文", note: "预算与记忆检索" },
   { id: "review", label: "审查", note: "证据与核验方式" },
-  { id: "learning", label: "学习", note: "本地反馈与内测数据" },
   { id: "advanced", label: "高级", note: "本机开发能力" },
 ];
 
@@ -3375,8 +3391,6 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, pre
   const [section, setSection] = useState<SettingsSection>("appearance");
   const [search, setSearch] = useState("");
   const [remoteModels, setRemoteModels] = useState<string[]>([]);
-  const [learningSettings, setLearningSettings] = useState({ enabled: true });
-  const [learningNotice, setLearningNotice] = useState("");
   const [voiceDevices, setVoiceDevices] = useState<MediaDeviceInfo[]>([]);
   const [mossInstalling, setMossInstalling] = useState(false);
   const [edgeInstalling, setEdgeInstalling] = useState(false);
@@ -3402,13 +3416,6 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, pre
   const settingsSaveInFlightRef = useRef(false);
   const voiceFormDirtyRef = useRef(false);
   const initialVoiceSettingsRef = useRef<VoiceSettings | null>(voiceSettings);
-  const learningSettingsDirtyRef = useRef(false);
-  useEffect(() => {
-    if (!projectRoot) return;
-    void window.inkflow.request<{ enabled: boolean }>("learning.settings.get", { project_root: projectRoot }).then((value) => {
-      if (!learningSettingsDirtyRef.current) setLearningSettings(value);
-    }).catch(() => undefined);
-  }, [projectRoot]);
   useEffect(() => {
     if (!projectRoot) { setUsageSummary(null); return; }
     void window.inkflow.request<CollaborationOverview["usage"]>("usage.overview", { project_root: projectRoot })
@@ -3498,10 +3505,6 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, pre
   // 所有设置控件都用函数式更新，连续点击或拖动时不会拿到上一次渲染的旧值。
   const updateForm = (patch: Partial<typeof form>) => setForm((value) => ({ ...value, ...patch }));
   const updatePreferences = (patch: Partial<UiPreferences>) => onPreferencesChange((value) => ({ ...value, ...patch }));
-  const updateLearningSettings = (patch: Partial<typeof learningSettings>) => {
-    learningSettingsDirtyRef.current = true;
-    setLearningSettings((value) => ({ ...value, ...patch }));
-  };
   const updateAgentGeneration = (role: AgentRole, patch: Partial<AgentGeneration>) => setForm((value) => ({ ...value, agent_generation: { ...value.agent_generation, [role]: { ...value.agent_generation[role], ...patch } } }));
   const updateAgentContextBudget = (role: AgentRole, patch: Partial<{ soft: number; hard: number }>) => setForm((value) => ({ ...value, agent_context_budgets: { ...value.agent_context_budgets, [role]: { ...value.agent_context_budgets[role], ...patch } } }));
   const persist = async () => {
@@ -3532,14 +3535,6 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, pre
         onSaved({ ...provider, ...saved });
       } catch (cause) {
         failures.push(`模型设置未更新：${errorMessage(cause)}`);
-      }
-      if (projectRoot) {
-        try {
-          await withDeadline(window.inkflow.request("learning.settings.update", { project_root: projectRoot, ...learningSettings }), 15000, "学习设置保存超时，请重新打开设置核对。");
-          learningSettingsDirtyRef.current = false;
-        } catch (cause) {
-          failures.push(`学习设置未更新：${errorMessage(cause)}`);
-        }
       }
       setResult(failures.length ? `已尝试保存；${failures.join("；")}` : "设置已保存。");
     } catch (cause) {
@@ -3574,7 +3569,7 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, pre
   };
   const activePreset = SETTINGS_PRESETS.find((preset) => preset.reasoning_effort === form.reasoning_effort && preset.inquiry_frequency === form.inquiry_frequency && preset.context_soft_tokens === form.context_soft_tokens && preset.context_hard_tokens === form.context_hard_tokens)?.id;
   const inferredProvider = form.provider_kind;
-  const settingKeywords: Record<SettingsSection, string> = { story_settings: "本书 设定 人物 场景 道具 世界 模板 资料 记录 证据 分类", author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", learning: "学习 反馈 偏好 恢复 经验", advanced: "高级 temperature top p top k PowerShell" };
+  const settingKeywords: Record<SettingsSection, string> = { story_settings: "本书 设定 人物 场景 道具 世界 模板 资料 记录 证据 分类", author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", advanced: "高级 temperature top p top k PowerShell" };
   const visibleSections = SETTINGS_SECTIONS.filter((item) => `${item.label}${item.note}${settingKeywords[item.id]}`.toLowerCase().includes(search.trim().toLowerCase()));
   const chooseProvider = (id: string) => {
     const choice = PROVIDER_OPTIONS.find((item) => item.id === id);
@@ -3777,11 +3772,6 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, pre
           <SettingGroup title="手动修改自动核对" note="默认开启。只核对实际变化的设定、正文与草稿；后台处理，有冲突才提示。关闭后暂停自动审核，已存在的问题和正史保护仍保留。"><label className="setting-check"><input type="checkbox" checked={form.manual_edit_review_enabled} onChange={event => updateForm({ manual_edit_review_enabled: event.target.checked })} />开启手动修改后台核对</label></SettingGroup>
           <div className="settings-fields"><label>核验模式<select value={form.review_verification_mode} onChange={(event) => updateForm({ review_verification_mode: event.target.value })}><option value="evidence">基础：本地证据门禁</option><option value="assisted">增强：纠错并逐条核验</option><option value="strict">严格：争议时调用裁判</option></select></label><label>阅读体验建议<select value={form.review_experience_detail} onChange={(event) => updateForm({ review_experience_detail: event.target.value })}><option value="concise">精简：只提最重要一项</option><option value="standard">标准：优先 1～3 项</option><option value="detailed">详细：完整说明但不扩大硬门禁</option></select></label><label>本地中文 NLI <small>留空关闭</small><input value={form.review_local_nli_model} onChange={(event) => updateForm({ review_local_nli_model: event.target.value })} placeholder="本机模型路径或名称" /></label><label>争议裁判模型 <small>留空关闭</small><input value={form.review_judge_model} onChange={(event) => updateForm({ review_judge_model: event.target.value })} placeholder="当前兼容接口中的模型 ID" /></label></div><p className="form-hint">钩子的未知项、延后回应和开放问题本身不算表达不清；Editor 只阻止有证据的剧情硬冲突、知识越界和无法成立的因果。</p>
         </SettingsPane>}
-        {section === "learning" && <SettingsPane title="本地反馈与恢复经验" note="在本书记录有来源的反馈和处理结果，供后续相关任务参考。">
-          <SettingGroup title="反馈记录" note={projectRoot ? "当前项目" : "打开项目后可设置"}><label className="setting-check"><input type="checkbox" disabled={!projectRoot} checked={learningSettings.enabled} onChange={(event) => updateLearningSettings({ enabled: event.target.checked })} />记录接受、拒绝、撤回、重写、偏好和检索反馈</label></SettingGroup>
-          <p className="form-hint">具体偏好在“作者习惯与记忆”管理；失败恢复与已尝试动作在协作台查看。暂停后不新增隐式反馈，既有记录和必要审计保留。</p>
-          {learningNotice && <p className="form-success">{learningNotice}</p>}
-        </SettingsPane>}
         {section === "story_settings" && <SettingsPane title="本书设定" note="持续维护小说资料，模块和记录立即保存；正文与正史保留独立审核。"><StorySettings key={projectRoot} projectRoot={projectRoot} /></SettingsPane>}
         {section === "author" && <SettingsPane title="作者习惯与记忆" note="管理长期习惯，保留每本书自己的声音。"><AuthorPreferences projectRoot={projectRoot} /></SettingsPane>}
         {section === "advanced" && <SettingsPane title="高级" note="普通创作不需要修改这里。模型参数已归到模型页，语音参数只在语音页出现一次。">
@@ -3810,7 +3800,7 @@ function VoiceInstallProgressCard({ value }: { value: VoiceInstallProgress | nul
 function SearchDialog({ request, result, setResult, onClose, onOpen }: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; result: Record<string, unknown> | null; setResult: (value: Record<string, unknown> | null) => void; onClose: () => void; onOpen: (path: string) => void }) {
   const [query, setQuery] = useState("");
   const matches = (result?.matches || []) as Array<Record<string, unknown>>;
-  return <Modal title="搜索整本小说" subtitle="搜索设定、规划、正文和审查报告，不读取 .inkflow 内部库。" onClose={onClose}><form className="search-form" onSubmit={async (event) => { event.preventDefault(); if (query.trim()) setResult(await request("document.search", { query })); }}><input autoFocus value={query} onChange={(e) => setQuery(e.target.value)} placeholder="人物、地点、伏笔或一句原文" /><button className="primary">搜索</button></form><div className="search-results">{matches.map((item, index) => <button key={index} onClick={() => onOpen(String(item.relative_path))}><strong>{String(item.relative_path)} · 第 {String(item.line)} 行</strong><p>{String(item.preview)}</p></button>)}{result && matches.length === 0 && <p className="empty-mini">没有找到匹配内容。</p>}</div></Modal>;
+  return <Modal title="搜索整本小说" subtitle="搜索设定、规划、正文和审查报告，不读取 .inkflow 内部库。" onClose={onClose}><form className="search-form" onSubmit={async (event) => { event.preventDefault(); if (query.trim()) setResult(await request("document.search", { query })); }}><input autoFocus value={query} onChange={(e) => setQuery(e.target.value)} placeholder="人物、地点、伏笔或一句原文" /><button className="primary">搜索</button></form><div className="search-results">{matches.map((item, index) => <button key={index} onClick={() => onOpen(String(item.relative_path))}><strong>{documentLabel(String(item.relative_path))} · 第 {String(item.line)} 行</strong><p>{String(item.preview)}</p></button>)}{result && matches.length === 0 && <p className="empty-mini">没有找到匹配内容。</p>}</div></Modal>;
 }
 
 function QuestionDialog({ questions, onClose, onSubmit }: { questions: QuestionCard[]; onClose: () => void; onSubmit: (answer: string) => void }) {
@@ -3946,7 +3936,7 @@ function ProcessDisclosure({ startedAt, finishedAt, status = "running", steps, r
       {reasoning.length > 0 && <ul className="reasoning-list">{reasoning.map((line, index) => <li key={index}>{line}</li>)}</ul>}
       <ol>{visible.map((step, index) => <li key={index}>
         <small>{step.timestamp ? formatTime(step.timestamp) : ""}{step.role ? ` · ${agentRoleLabel(step.role)}` : ""} · {step.status === "completed" ? "本步完成" : step.status === "failed" ? "本步未完成" : step.status === "started" ? "处理中" : "公开记录"}</small>
-        <p>{step.summary}</p>
+        <p>{readableSourceText(step.summary || "")}</p>
         {collectPublicSummaries(step.metadata).map((line, number) => <p className="process-reason" key={number}>{line}</p>)}
       </li>)}</ol>
       {!visible.length && <p>正在理解请求，尚未返回新的公开判断。</p>}
@@ -4003,7 +3993,7 @@ function visibleResult(result: unknown): { summary: string; details?: string; re
   if (!result || typeof result !== "object") return { summary: "任务完成，可以从右侧工作台查看结果。", reasoning: [] };
   const value = result as Record<string, unknown>;
   const reasoning = collectPublicSummaries(result);
-  const safeDetails = JSON.stringify(displaySafeValue(value), null, 2);
+  const safeDetails = readableRecord(displaySafeValue(value));
   if (value.workflow_failure || value.gate || value.stop_reason) {
     return { summary: `尚未完成：${String(value.workflow_failure || value.gate || value.stop_reason)}${value.next_action ? `\n下一步：${String(value.next_action)}` : ""}`, reasoning, details: safeDetails };
   }
@@ -4072,7 +4062,7 @@ function isSensitivePresentationKey(key: string): boolean {
     || normalized === "thinking";
 }
 function errorMessage(cause: unknown): string {
-  const message = (cause instanceof Error ? cause.message : String(cause))
+  const message = readableSourceText(cause instanceof Error ? cause.message : String(cause))
     .replace(/^Error invoking remote method ['"]engine:request['"]:\s*Error:\s*/i, "")
     .replace(/^Error:\s*/i, "")
     .trim();
@@ -4088,7 +4078,7 @@ async function withDeadline<T>(request: Promise<T>, ms: number, message: string)
 }
 function currentChapter(path?: string): number | null { const match = path?.match(/chapter_(\d+)/); return match ? Number(match[1]) : null; }
 function tabLabel(tab: Tab): string { return ({ project: "项目", editor: "正文", chapter: "章工位", review: "审查", memory: "记忆", references: "参考", listen: "听读", process: "协作台" })[tab]; }
-function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "run.cancelled": "任务已停止", "run.waiting_user": "等待你回答", "run.waiting_condition": "等待条件", "recovery.waiting": "自动等待项目空闲", "workflow.waiting_user": "等待你回答", "workflow.waiting_condition": "已保存断点", "model.recovering": "模型步骤自修复", "run.steered": "已接收人工引导", "workflow.started": "工作流启动", "workflow.planned": "真实任务单", "workflow.completed": "工作流完成", "workflow.conflict": "正在处理分歧", "controller.routing": "理解与路由", "coordinator.model.started": "Coordinator 请求模型", "writer.started": "Writer 请求模型", "writer.completed": "Writer 完成", "editor.started": "Editor 开始审查", "reviewer.started": "开始审查", "workflow.stage": "工作流阶段", "outline.model": "Writer 生成独立大纲", "voice.moss.install.queued": "MOSS 已进入后台安装", "voice.asr.install.queued": "语音输入已进入后台安装", "voice.moss.install.progress": "MOSS 安装进度", "voice.asr.install.progress": "语音输入安装进度", "voice.moss.install.failed": "MOSS 安装失败", "voice.asr.install.failed": "语音输入安装失败", "provider.testing": "模型连接" } as Record<string, string>)[value || ""] || value || "过程"; }
+function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "run.cancelled": "任务已停止", "run.waiting_user": "等待你回答", "run.waiting_condition": "等待条件", "recovery.waiting": "自动等待项目空闲", "workflow.waiting_user": "等待你回答", "workflow.waiting_condition": "已保存断点", "model.recovering": "模型步骤自修复", "run.steered": "已接收人工引导", "workflow.started": "工作流启动", "workflow.planned": "真实任务单", "workflow.completed": "工作流完成", "workflow.conflict": "正在处理分歧", "controller.routing": "理解与路由", "coordinator.model.started": "Coordinator 请求模型", "writer.started": "Writer 请求模型", "writer.completed": "Writer 完成", "editor.started": "Editor 开始审查", "reviewer.started": "开始审查", "workflow.stage": "工作流阶段", "outline.model": "Writer 生成独立大纲", "voice.moss.install.queued": "MOSS 已进入后台安装", "voice.asr.install.queued": "语音输入已进入后台安装", "voice.moss.install.progress": "MOSS 安装进度", "voice.asr.install.progress": "语音输入安装进度", "voice.moss.install.failed": "MOSS 安装失败", "voice.asr.install.failed": "语音输入安装失败", "provider.testing": "模型连接" } as Record<string, string>)[value || ""] || (value && /^[a-z_]+[.:-]/i.test(value) ? /^writer/.test(value) ? "写作处理" : /^(?:editor|reviewer|review)/.test(value) ? "审查核对" : /^memory/.test(value) ? "记忆整理" : /^coordinator|controller|session/.test(value) ? "任务协调" : "处理过程" : value) || "处理过程"; }
 function agentRoleLabel(value: string): string { return ({ coordinator: "调度", writer: "创作", editor: "编辑", reviewer: "专项审查", memory_keeper: "记忆整理", engine: "工作引擎", user: "你" } as Record<string, string>)[value] || value; }
 function operationLabel(value: string): string { return ({ "plan.generate": "生成四级规划", "plan.outline": "生成独立章节大纲", "settings.update": "修改运行设置", "chapter.write": "生成章节草稿", "chapter.review_mode": "按任务模式审查当前版本", "chapter.revise": "修订为新版本", "chapter.accept": "提交已通过版本的正史补丁", "batch.draft_loop": "逐章写作、审查与临时连续性", "batch.accept_loop": "按顺序提交通过章节", "arc.audit": "复审篇章承诺" } as Record<string, string>)[value] || value; }
 function authorizationLabel(value: string): string { return ({ none: "未取得", current_request: "当前明确操作", per_chapter_click: "逐章点击", batch_preapproval: "批次一次确认", settings_auto_accept: "设置中的自动验收" } as Record<string, string>)[value] || value; }
@@ -4122,7 +4112,7 @@ function processRuns(events: EngineEvent[]) {
 }
 function statusLabel(value: string): string { return ({ open: "待处理", resolved: "已处理", dismissed: "已忽略", orphaned: "原文已变化" } as Record<string, string>)[value] || value; }
 function kindLabel(value: string): string { return ({ character: "人物", location: "地点", organization: "组织", item: "物品", lore: "世界观", style: "文风" } as Record<string, string>)[value] || value; }
-function stringifyShort(value: unknown): string { return typeof value === "string" ? value : JSON.stringify(value, null, 0); }
+function stringifyShort(value: unknown): string { return readableValue(value); }
 function formatTime(value: string): string { const parsed = new Date(value); return Number.isNaN(parsed.valueOf()) ? value : parsed.toLocaleString("zh-CN", { hour12: false }); }
 function referenceTitle(value: Record<string, unknown>): string { const source = String(value.source || ""); try { const url = new URL(source); return url.hostname; } catch { return source.split(/[\\/]/).pop() || String(value.reference_id); } }
 

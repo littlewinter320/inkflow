@@ -30,22 +30,22 @@ ROLE_CAPABILITIES: tuple[RoleCapability, ...] = (
     RoleCapability(
         role="writer",
         novel_production_agent=True,
-        can=["规划", "写作", "按证据定点修订"],
+        can=["规划", "写作", "按证据定点修订", "在同次交稿中解释叙事意图、提出设定候选并回答原审核角色的定点问题"],
         cannot=["批准自己的正文", "写入正史", "修改审核规则"],
     ),
     RoleCapability(
         role="editor", novel_production_agent=True,
-        can=["日常综合审读", "给出定点修订建议", "复审同版本正文", "仅在承担记忆职责时产出记忆候选"],
+        can=["日常综合审读", "给出定点修订建议", "复审同版本正文", "为其他角色定位原文、解释表达分歧和提供反证", "仅在承担记忆职责时产出记忆候选"],
         cannot=["直接改正文", "代替专项角色完成检查", "提交正史", "批准未审版本"],
     ),
     RoleCapability(
         role="reviewer", novel_production_agent=True,
-        can=["按指定范围检查因果和连续性", "引用证据报告硬问题和缺失依据"],
+        can=["按指定范围检查因果和连续性", "引用证据报告硬问题和缺失依据", "在已启用职责内协助定位来源、核对因果并提出有据替代解读"],
         cannot=["默认重复综合编辑", "直接改正文", "产出记忆补丁", "提交正史"],
     ),
     RoleCapability(
         role="memory_keeper", novel_production_agent=True,
-        can=["整理有来源的事实与人物认知", "提出时间线和伏笔变更", "报告记忆冲突"],
+        can=["整理有来源的事实与人物认知", "提出时间线和伏笔变更", "报告记忆冲突", "为写作和审核整理已核来源、人物认知与参考边界"],
         cannot=["批准正文文学质量", "无依据改写事实", "自行修改剧情", "提交正史"],
     ),
 )

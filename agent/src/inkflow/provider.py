@@ -400,6 +400,8 @@ class DeepSeekProvider:
                 ProviderError,
             ) as exc:
                 accounting.failure = accounting.failure or type(exc).__name__
+                validation_errors = [{"location": ".".join(map(str, item["loc"])), "type": item["type"], "message": item["msg"][:500]}
+                    for item in exc.errors(include_input=False, include_url=False)[:8]] if isinstance(exc, ValidationError) else []
                 last_error = exc
                 if retry_kind == "permanent":
                     exc.recovery_node = "provider.request"
@@ -416,13 +418,15 @@ class DeepSeekProvider:
                         "error_type": type(exc).__name__,
                         "strategy": "等待后重连，保留原任务" if retry_kind == "transport" else "修复 JSON 结构，保留完整内容要求",
                         "usage_unknown": isinstance(exc, (httpx.HTTPError, asyncio.TimeoutError)),
+                        **({"validation_errors": validation_errors} if validation_errors else {}),
                     })
                     if runtime:
                         problem = "网络或限流" if retry_kind == "transport" else "输出格式"
                         runtime.publish({
                             "type": "model.recovering",
                             "summary": f"模型请求遇到{problem}问题，正在第 {attempt + 2}/3 次尝试；不重做已保存的正文或提交。",
-                            "metadata": {"kind": retry_kind, "attempt": attempt + 2, "error_type": type(exc).__name__},
+                            "metadata": {"kind": retry_kind, "attempt": attempt + 2, "error_type": type(exc).__name__,
+                                         **({"validation_errors": validation_errors} if validation_errors else {})},
                         })
                     if retry_kind == "transport":
                         # Only model generation is retried, never a file/canon commit.
@@ -733,21 +737,6 @@ def _model_from_json_content(content: str, output_model: type[T]) -> T:
 
     last_validation: ValidationError | None = None
     for candidate in candidates:
-        # The ban on the Chinese enumeration comma is a deterministic output
-        # format rule, not a creative decision. DeepSeek occasionally keeps a
-        # few after otherwise valid retries. Normalize those marks before
-        # schema validation so a punctuation slip cannot stop a whole batch.
-        if (
-            getattr(output_model, "__name__", "") == "DraftOutput"
-            and isinstance(candidate, dict)
-            and isinstance(candidate.get("content"), str)
-            and "、" in candidate["content"]
-        ):
-            candidate = dict(candidate)
-            candidate["content"] = candidate["content"].replace("、", "，")
-            if isinstance(candidate.get("hook_note"), dict):
-                from .writer_notes import align_annotation_quotes
-                candidate["hook_note"], _ = align_annotation_quotes(candidate["hook_note"], candidate["content"])
         # 兼容 Reviewer 偶尔把一条 finding 直接放在顶层的情况。它仍然
         # 必须具备 finding 的完整字段；包装后继续走 ReviewReport 的严格
         # 校验与后续证据门禁，不能因此自动放行。

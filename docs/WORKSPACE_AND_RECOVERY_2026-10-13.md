@@ -18,6 +18,10 @@
 
 面板关闭只改变可见性；“回到上一步布局”撤销最近一次布局修改，恢复初始布局也能返回独立面板。独立窗口的临时移出状态不写成永久隐藏，避免重启后找不到面板。正文编辑区仍是阅读与写作主区域，没有引入任意拆分编辑器、额外停靠库或新的窗口任务引擎。
 
+新增覆盖拖靠：左右区域随工作区宽度、下方区域随高度形成覆盖候选，面板可见面积覆盖达到45%才进入，已经命中的方向降至30%才退出，减少边界抖动。预览使用提交同一份布局计算出的实际矩形，小窗口无法容纳停靠时保留浮动。拖动标题到临时收起区可隐藏面板，拖出工作区阈值可拆到鼠标所放位置的系统窗口；不删除小说内容，原对话与任务仍共享。拖动独立窗口进入主工作台使用同一覆盖预览，Windows原生`will-move`/`move`显示预览，`moved`结束才提交，暂停不当作松手。取消、缩放、系统贴靠和失焦清理预览；未命中继续独立摆放。拆窗位置按目标显示器工作区及缩放适配，返回时沿用窗口尺寸。顶部菜单保留恢复与单步撤销入口，按钮不再是转换的必要条件。
+
+参考 [Dockview浮动组文档](https://github.com/dockview/dockview/blob/master/packages/docs/docs/core/groups/floatingGroups.mdx) 的标题拖动与视口边界，以及 [Electron窗口事件实现](https://github.com/electron/electron/blob/main/shell/browser/api/electron_api_base_window.cc) 与 [原生窗口移动说明](https://github.com/electron/electron/blob/main/spec/api-base-window.spec.ts) 中Windows拖动结束事件的区别。使用已有React/Electron契约实现，没有安装Dockview或复制其源码。
+
 ## 灵活工作流与反思
 
 Coordinator 在原有一次理解调用中，根据用户要的最终产物选择现有节点，不要求查看、试写、修订、审查和接受每次全部执行。后续普通节点仍由代码推进；当前模式、授权、来源和质量门禁继续约束执行。

@@ -4,7 +4,7 @@
 
 本版用户可见变化见 [CHANGELOG](../CHANGELOG.md)，逐项改动和已执行的相关检查见 [后续修复记录](FIXES_2026-10-11.md)、[MiMo契约](MIMO_API_2026-10-11.md)、[界面与音频](UI_PROGRESS_PENDING_AUDIO_2026-10-11.md)及[墨宝媒体](MOBAO_MEDIA_2026-10-11.md)。
 
-10月12—13日的后续源码见[实际运行修复](QUALITY_CACHE_2026-10-12.md)和[直接布局与恢复增量](WORKSPACE_AND_RECOVERY_2026-10-13.md)，由PR #4管理，未重建本页所列安装包或挪动标签。本页原有编译、媒体和发布回执不能作为后续增量的运行验证。
+10月12—14日的后续源码见[实际运行修复](QUALITY_CACHE_2026-10-12.md)、[直接布局与恢复增量](WORKSPACE_AND_RECOVERY_2026-10-13.md)、[内置写作技能与当前修复](SOURCE_PROGRESS_2026-10-13.md)及[接口与后台偏好学习](INTERFACE_AND_LEARNING_AUDIT_2026-10-14.md)，由PR #4管理，未重建本页所列安装包或挪动标签。本页原有编译、媒体和发布回执不能作为后续增量的运行验证。
 
 ## 已完成的编译与包身份
 

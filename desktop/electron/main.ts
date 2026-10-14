@@ -477,10 +477,12 @@ class EngineBridge {
   pendingWorkCount(conversationId?: string): number {
     const reads = new Set(["project.open", "project.status", "project.tree", "collaboration.overview", "collaboration.list",
       "context.status", "task.status", "task.list", "document.read", "document.read_reference", "document.version.read", "document.search",
-      "settings.get", "computer.actions.list", "voice.status", "voice.settings.get", "voice.job.list", "voice.job.status", "voice.profile.list", "voice.roles.get", "project.trash.list", "project.canon_migration.status"]);
+      "settings.get", "computer.actions.list", "voice.status", "voice.settings.get", "voice.job.list", "voice.job.status", "voice.profile.list", "voice.roles.get", "project.trash.list", "project.canon_migration.status",
+      "story_settings.list", "story_settings.records", "story_settings.templates", "manual_edits.status", "memory.audit"]);
     // Unknown requests still protect exit; only known status and read requests are passive.
     return [...this.pending.values()].filter(item => (!conversationId || item.conversationId === conversationId)
       && !reads.has(item.method) && item.method !== "run.cancel"
+      && !(item.method === "preferences.manage" && ["list", "usage", "history"].includes(item.action))
       && !(item.method === "workflow.run" && ["checkpoint_list", "rollback_preview"].includes(item.action))).length;
   }
 
@@ -581,7 +583,7 @@ class EngineBridge {
 
 let mainWindow: BrowserWindow | null = null;
 type WorkspacePanelId = "navigation" | "assistant" | "inspector";
-const conversationWindows = new Map<number, { projectRoot: string; conversationId: string; panel?: WorkspacePanelId; ownerId?: number; relativePath?: string; shared?: boolean }>();
+const conversationWindows = new Map<number, { projectRoot: string; conversationId: string; panel?: WorkspacePanelId; ownerId?: number; relativePath?: string; shared?: boolean; returnHidden?: boolean }>();
 const workspaceStates = new Map<number, Record<string, unknown>>();
 let bridge: EngineBridge | null = null;
 let updates: UpdateManager | null = null;
@@ -688,25 +690,45 @@ function createConversationWindow(projectRoot: string, requestedId?: string): { 
   return { conversationId };
 }
 
-function createWorkspacePanel(owner: BrowserWindow, projectRoot: string, panel: WorkspacePanelId, relativePath?: string): void {
+function createWorkspacePanel(owner: BrowserWindow, projectRoot: string, panel: WorkspacePanelId, relativePath?: string, requested?: Electron.Rectangle): void {
   const existing = [...conversationWindows].find(([, item]) => item.ownerId === owner.id && item.panel === panel && sameProjectRoot(item.projectRoot, projectRoot));
   const opened = existing ? BrowserWindow.fromId(existing[0]) : null;
   if (opened && !opened.isDestroyed()) { if (opened.isMinimized()) opened.restore(); opened.focus(); return; }
-  const display = screen.getDisplayMatching(owner.getBounds()).workArea;
-  const width = Math.min(panel === "assistant" ? 620 : 460, display.width), height = Math.min(760, display.height);
+  const display = screen.getDisplayMatching(requested || owner.getBounds()).workArea;
+  const minimumWidth = panel === "assistant" ? 280 : panel === "navigation" ? 180 : 200;
+  const width = Math.min(Math.max(minimumWidth, requested?.width || (panel === "assistant" ? 620 : 460)), display.width);
+  const height = Math.min(Math.max(240, requested?.height || 760), display.height);
   const bounds = owner.getBounds();
   const window = new BrowserWindow({
-    x: Math.max(display.x, Math.min(display.x + display.width - width, bounds.x + 48)), y: Math.max(display.y, Math.min(display.y + display.height - height, bounds.y + 48)),
-    width, height, minWidth: Math.min(300, display.width), minHeight: Math.min(260, display.height), title: `墨流 · ${{ navigation: "小说结构", assistant: "墨宝对话", inspector: "批注与版本" }[panel]}`,
+    x: Math.max(display.x, Math.min(display.x + display.width - width, requested?.x ?? bounds.x + 48)), y: Math.max(display.y, Math.min(display.y + display.height - height, requested?.y ?? bounds.y + 48)),
+    width, height, minWidth: Math.min(minimumWidth, display.width), minHeight: Math.min(240, display.height), title: `墨流 · ${{ navigation: "小说结构", assistant: "墨宝对话", inspector: "批注与版本" }[panel]}`,
     icon: applicationIconPath(), backgroundColor: "#11110f", show: true, autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
   const conversationId = conversationWindows.get(owner.id)?.conversationId || "main";
   conversationWindows.set(window.id, { projectRoot, conversationId, panel, ownerId: owner.id, relativePath, shared: true });
+  let dragOrigin: Electron.Rectangle | null = null;
+  const notifyDrag = (phase: "move" | "drop" | "cancel") => {
+    if (owner.isDestroyed() || window.isDestroyed() || owner.isMinimized() && phase === "move") return;
+    owner.webContents.send("workspace:event", { type: "native-drag", panel, projectRoot, phase: owner.isMinimized() ? "cancel" : phase,
+      rect: window.getContentBounds(), origin: owner.getContentBounds(), point: screen.getCursorScreenPoint(), scale: owner.webContents.getZoomFactor() });
+  };
+  const cancelDrag = () => { if (dragOrigin) { dragOrigin = null; if (!window.isDestroyed()) window.setOpacity(1); notifyDrag("cancel"); } };
+  // Windows 'moved' ends the native drag; a pause during 'move' is not a drop.
+  window.on("will-move", () => { if (!dragOrigin && process.platform === "win32") { dragOrigin = window.getBounds(); window.setOpacity(.84); } });
+  window.on("move", () => { if (dragOrigin) notifyDrag("move"); });
+  window.on("moved", () => {
+    if (!dragOrigin) return;
+    const current = window.getBounds(), original = dragOrigin; dragOrigin = null; window.setOpacity(1);
+    const cancelled = current.x === original.x && current.y === original.y || window.isMaximized() || window.snapped;
+    notifyDrag(cancelled ? "cancel" : "drop");
+  });
+  window.on("will-resize", cancelDrag); window.on("blur", cancelDrag); window.on("minimize", cancelDrag);
   const returned = () => {
+    const hidden = conversationWindows.get(window.id)?.returnHidden === true;
     conversationWindows.delete(window.id);
     owner.removeListener("closed", ownerClosed);
-    if (!owner.isDestroyed()) owner.webContents.send("workspace:event", { type: "returned", panel, projectRoot });
+    if (!owner.isDestroyed()) owner.webContents.send("workspace:event", { type: "returned", panel, projectRoot, hidden });
   };
   const ownerClosed = () => { if (!window.isDestroyed()) window.close(); workspaceStates.delete(owner.id); };
   window.once("closed", returned);
@@ -924,23 +946,32 @@ function createWindow(): void {
     return createConversationWindow(projectRoot ? resolveInkFlowProject(projectRoot) : "", conversationId);
   });
   ipcMain.handle("app:conversation-windows", (_event, projectRoot: string) => recentConversationWindows(projectRoot));
-  ipcMain.handle("workspace:open", (event, projectRoot: string, panel: WorkspacePanelId, relativePath?: string) => {
+  ipcMain.handle("workspace:open", (event, projectRoot: string, panel: WorkspacePanelId, relativePath?: string, value?: unknown) => {
     const source = BrowserWindow.fromWebContents(event.sender);
     if (!source || (source !== mainWindow && !conversationWindows.has(source.id)) || !["navigation", "assistant", "inspector"].includes(panel) || typeof projectRoot !== "string" || !projectRoot) throw new Error("请先打开小说，再移动这个面板。");
     if (conversationWindows.get(source.id)?.shared) throw new Error("请先回到主工作台，再打开独立面板。");
-    createWorkspacePanel(source, resolveInkFlowProject(projectRoot), panel, typeof relativePath === "string" ? relativePath : undefined);
+    let requested: Electron.Rectangle | undefined;
+    if (value !== undefined) {
+      const rect = value as Electron.Rectangle;
+      if (!rect || typeof rect !== "object" || ![rect.x, rect.y, rect.width, rect.height].every(item => typeof item === "number" && Number.isFinite(item)) || rect.width <= 0 || rect.height <= 0) throw new Error("面板的落位尺寸无效，请重新拖动。");
+      const origin = source.getContentBounds(), scale = source.webContents.getZoomFactor();
+      requested = { x: Math.round(origin.x + rect.x * scale), y: Math.round(origin.y + rect.y * scale), width: Math.round(rect.width * scale), height: Math.round(rect.height * scale) };
+    }
+    createWorkspacePanel(source, resolveInkFlowProject(projectRoot), panel, typeof relativePath === "string" ? relativePath : undefined, requested);
   });
-  ipcMain.handle("workspace:return", (event, panel?: WorkspacePanelId) => {
+  ipcMain.handle("workspace:return", (event, panel?: WorkspacePanelId, hide = false) => {
     const source = BrowserWindow.fromWebContents(event.sender);
     if (panel && source && (source === mainWindow || conversationWindows.has(source.id))) {
       if (!["navigation", "assistant", "inspector"].includes(panel)) throw new Error("这个面板不能返回工作台。");
       const opened = [...conversationWindows].find(([, item]) => item.ownerId === source.id && item.panel === panel);
+      if (opened) opened[1].returnHidden = hide === true;
       const window = opened ? BrowserWindow.fromId(opened[0]) : null;
       if (window && !window.isDestroyed()) window.close();
       return;
     }
     const context = source ? conversationWindows.get(source.id) : null;
     if (!source || !context?.panel) return;
+    context.returnHidden = hide === true;
     const owner = context.ownerId ? BrowserWindow.fromId(context.ownerId) : mainWindow;
     if (owner && !owner.isDestroyed()) { if (owner.isMinimized()) owner.restore(); owner.focus(); }
     source.close();

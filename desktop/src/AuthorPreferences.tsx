@@ -1,8 +1,13 @@
 import { useEffect, useState } from "react";
+import { readableSourceText } from "./readableNames";
 
 type Preference = {
   preference_id: string; text: string; strength: string; scope: string; status: string;
   source_quote?: string; source_ref?: string; topic?: string; revision?: number; level?: string; usage_source?: string;
+};
+type StyleDefault = {
+  name: string; basis: string; priority: string; guides: Array<{ name: string; guidance: string }>;
+  examples?: Array<{ name: string; before: string; after: string; method: string }>;
 };
 type PreferenceSelection = {
   chapter_no?: number; task?: string; mode?: string; collaboration_mode?: string;
@@ -10,6 +15,7 @@ type PreferenceSelection = {
   budget_reason?: string; warnings?: string[];
   actor?: string; context_packet_id?: string; recorded_at?: string;
   voice_budget_tokens?: number; voice_selected_tokens?: number;
+  writing_guides?: Array<{ name: string; source_id: string }>;
 };
 type PreferenceDecision = {
   run_id: string; created_at: string;
@@ -29,6 +35,7 @@ type MemoryAudit = { facts: Array<{ fact_id: string; subject: string; predicate:
 export function AuthorPreferences({ projectRoot }: { projectRoot: string }) {
   const [level, setLevel] = useState("author");
   const [items, setItems] = useState<Preference[]>([]);
+  const [styleDefault, setStyleDefault] = useState<StyleDefault | null>(null);
   const [editing, setEditing] = useState<Preference | null>(null);
   const [text, setText] = useState("");
   const [scope, setScope] = useState("project");
@@ -52,12 +59,17 @@ export function AuthorPreferences({ projectRoot }: { projectRoot: string }) {
   const levelText = (value?: string) => value === "author" ? "作者默认" : value === "project" ? "本书偏好" : "旧记录未保存层级";
   const mode = usage.collaboration_mode || usage.mode;
   const modeLabels: Record<string, string> = { everyday: "日常", review_boost: "审查加强", memory_boost: "记忆加强", full_specialist: "全专项", review: "章节审核", draft: "写章", revise: "修订" };
-  const actorLabels: Record<string, string> = { writer: "Writer", editor: "Editor", reviewer: "Reviewer", memory_keeper: "Memory Keeper", coordinator: "Coordinator" };
+  const actorLabels: Record<string, string> = { writer: "写作", editor: "综合审读", reviewer: "专项审查", memory_keeper: "记忆整理", coordinator: "任务协调" };
+  const preferenceName = (id: string) => {
+    const item = [...items, ...(usage.selected || [])].find(value => value.preference_id === id);
+    return item?.topic || (item?.text ? item.text.slice(0, 60) + (item.text.length > 60 ? "…" : "") : "相关习惯（原话见下方）");
+  };
   const api = <T,>(action: string, values: Record<string, unknown> = {}) =>
     window.inkflow.request<T>("preferences.manage", { project_root: projectRoot, level, action, ...values });
   const refresh = async () => {
-    const value = await api<{ preferences: Preference[] }>("list");
+    const value = await api<{ preferences: Preference[]; style_default?: StyleDefault }>("list");
     setItems(value.preferences);
+    setStyleDefault(value.style_default || null);
     if (projectRoot) {
       const result = await api<PreferenceUsage>("usage");
       setDisabled(result.disabled); setUsage(result.selection); setDecisions(result.decisions || []);
@@ -69,9 +81,9 @@ export function AuthorPreferences({ projectRoot }: { projectRoot: string }) {
     setItems([]); setEvents([]); setEditing(null); setText(""); setUsage({}); setError(""); setMemory(null);
     setDisabled([]); setDecisions([]); setLearningEnabled(null);
     if (level === "project" && !projectRoot) return;
-    void window.inkflow.request<{ preferences: Preference[] }>("preferences.manage", {
+    void window.inkflow.request<{ preferences: Preference[]; style_default?: StyleDefault }>("preferences.manage", {
       project_root: projectRoot, level, action: "list",
-    }).then(value => { if (current) setItems(value.preferences); })
+    }).then(value => { if (current) { setItems(value.preferences); setStyleDefault(value.style_default || null); } })
       .catch(cause => { if (current) setError(String(cause)); });
     if (projectRoot) void window.inkflow.request<PreferenceUsage>(
       "preferences.manage", { project_root: projectRoot, level, action: "usage" },
@@ -96,15 +108,30 @@ export function AuthorPreferences({ projectRoot }: { projectRoot: string }) {
     await api("save", { ...item, status, expected_revision: item.revision || 0,
       reason: status === "active" ? "用户确认采用" : "用户停止使用，保留历史" }); await refresh();
   });
-  return <section className="stack-section">
+  return <section className="stack-section author-preferences">
     <p className="form-hint">作者默认习惯可跨书使用。本书要求和当前指令优先；人物经历与剧情不会进入作者习惯。这里的保存立即生效。</p>
+    {styleDefault && <details className="memory-card">
+      <summary>基础写作技能 · {styleDefault.name} · 默认启用</summary>
+      <p className="form-hint">{styleDefault.basis} 写作、局部修订与表达审核共用这些引导。</p>
+      <p className="form-hint">{styleDefault.priority} 可以在下方保存自己的要求来调整。</p>
+      {styleDefault.guides.map(guide => <p key={guide.name}><strong>{guide.name}：</strong>{guide.guidance}</p>)}
+      <details><summary>查看表达示例</summary>
+        {styleDefault.examples?.map(example => <article key={example.name}>
+          <strong>{example.name}</strong>
+          <p className="form-hint">常见问题：{example.before}</p>
+          <blockquote style={{ whiteSpace: "pre-line" }}>{example.after}</blockquote>
+          <p>{example.method}</p>
+        </article>)}
+        <p className="form-hint">示例只演示表达，不会作为本书人物或剧情使用。基础技能随软件提供，无需每次导入样稿。</p>
+      </details>
+    </details>}
     <label>管理范围<select disabled={busy} value={level} onChange={event => { setLevel(event.target.value); edit(null); }}>
       <option value="author">作者默认习惯 · 所有小说</option>
       <option value="project" disabled={!projectRoot}>本书偏好</option>
     </select></label>
     {projectRoot && <div className="memory-card">
       <strong>本书反馈学习：{learningEnabled === null ? "尚未读取" : learningEnabled ? "已开启" : "已暂停"}</strong>
-      <p className="form-hint">从有原话依据的反馈保留待确认参考，明确长期要求才启用为习惯。暂停学习后，现有习惯仍按范围使用，历史记录保留。</p>
+      <p className="form-hint">墨流在后台参考你明确喜欢或希望改进的写法，不逐次打扰。具体反馈会影响普通参考的取用顺序；长期范围明确才启用为习惯。暂停后不新增隐式学习，现有习惯仍按范围使用。</p>
       <button type="button" disabled={busy || learningEnabled === null} onClick={() => void run(async () => {
         await api("learning", { enabled: !learningEnabled }); await refresh();
       })}>{learningEnabled === null ? "读取学习状态中" : learningEnabled ? "暂停本书学习" : "恢复本书学习"}</button>
@@ -138,8 +165,8 @@ export function AuthorPreferences({ projectRoot }: { projectRoot: string }) {
     {error && <p role="alert" className="form-error">{error}</p>}
     {items.map(item => <article className="memory-card" key={item.preference_id}>
       <strong>{({ active: "正在使用", paused: "已暂停", candidate: "待确认反馈参考，非硬要求", deleted: "已移出使用" } as Record<string, string>)[item.status] || item.status} · {scopeText(item.scope)}</strong>
-      <p className="form-hint">主题：{item.topic || "未指定"} · 修订：{item.revision === undefined ? "旧记录未保存" : `v${item.revision}`} · ID：{item.preference_id}</p>
-      <p>{item.text}</p><small>来源：{item.source_quote || "旧记录未保存原话"}{item.source_ref ? ` · ${item.source_ref}` : ""}</small>
+      <p className="form-hint">主题：{item.topic || "未指定"} · 修订：{item.revision === undefined ? "旧记录未保存" : `第${item.revision}次`}</p>
+      <p>{item.text}</p><details><summary>查看来源原话</summary><blockquote>{item.source_quote || "旧记录未保存原话"}</blockquote></details>
       <div className="settings-inline-actions">
         <button type="button" disabled={busy} onClick={() => edit(item)}>编辑</button>
         <button type="button" disabled={busy} onClick={() => void changeStatus(item, item.status === "active" ? "paused" : "active")}>{item.status === "active" ? "暂停" : "采用"}</button>
@@ -156,18 +183,20 @@ export function AuthorPreferences({ projectRoot }: { projectRoot: string }) {
     </article>)}</details>}
     {projectRoot && <details><summary>最近一次上下文的偏好选择记录</summary>
       <p>{usage.chapter_no === undefined ? "旧记录未保存章节" : `第 ${usage.chapter_no} 章`} · {mode ? modeLabels[mode] || mode : "旧记录未保存模式"}{usage.actor ? ` · ${actorLabels[usage.actor] || usage.actor}` : ""}</p>
-      {usage.recorded_at && <small>{usage.recorded_at}{usage.context_packet_id ? ` · 上下文：${usage.context_packet_id}` : ""}</small>}
-      {usage.task && <p>任务：{usage.task}</p>}
+      {usage.recorded_at && <small>{usage.recorded_at}</small>}
+      {usage.task && <details><summary>查看本次完整要求</summary><p>{readableSourceText(usage.task)}</p></details>}
       <p className="form-hint">这里显示记录中实际进入上下文的条目；最终模型输入可在关联运行记录中核对。</p>
       <strong>实际选用</strong>
+      {usage.writing_guides?.length ? <p>本次提供的写作技能：{usage.writing_guides.map(item => item.name).join("、")}。是否正确用在正文中，仍需对照具体段落。</p>
+        : <p className="form-hint">这份旧记录未单独登记内置技能，不能根据当前设置反推当时使用了哪些技能。</p>}
       {usage.selected?.length ? usage.selected.map(item => <article className="memory-card" key={item.preference_id}>
-        <p>{item.text}</p><small>{levelText(item.level)} · {scopeText(item.scope)} · ID：{item.preference_id}</small>
+        <p>{item.text}</p><small>{levelText(item.level)} · {scopeText(item.scope)}</small>
         {item.status === "candidate" && <p className="form-hint">待确认反馈参考，非硬要求。</p>}
         {item.usage_source && <p className="form-hint">选用位置：{item.usage_source}</p>}
-      </article>) : <p>没有记录实际选用条目。</p>}
+      </article>) : <p>这份记录没有额外作者习惯或本书偏好。内置写作技能与当前任务要求分别处理，不计入这里的习惯条目。</p>}
       <strong>未选用及原因</strong>
       {usage.omitted?.length ? usage.omitted.map(item => <article className="memory-card" key={item.preference_id}>
-        {item.text && <p>{item.text}</p>}<small>ID：{item.preference_id}</small><p>原因：{item.reason || "旧记录未保存原因"}</p>
+        <p>{item.text || preferenceName(item.preference_id)}</p><p>原因：{readableSourceText(item.reason || "旧记录未保存原因")}</p>
       </article>) : <p>没有记录未选用条目。</p>}
       {usage.voice_budget_tokens !== undefined && <p className="form-hint">
         声音参考预算：{usage.voice_budget_tokens.toLocaleString()} token；
@@ -178,21 +207,20 @@ export function AuthorPreferences({ projectRoot }: { projectRoot: string }) {
         ? "旧记录未保存具体预算；不能据此推断某项一定因预算被省略。"
         : "普通习惯与待确认反馈参考按声音预算选取；具体未选用原因见各条记录，整份上下文仍受当前角色预算限制。")}</p>
       {usage.warnings?.map((warning, index) => <p className="form-hint" key={index}>{warning}</p>)}
-      <details><summary>原始选择诊断</summary><pre>{JSON.stringify(usage, null, 2)}</pre></details>
+      <p className="form-hint">这些参考已按记录提供给对应角色；是否写进正文，需要看实际段落和审查结果。尚未确认的反馈只作参考。</p>
     </details>}
     {projectRoot && <details><summary>最近冲突取舍与待答原因</summary>
       {decisions.length ? decisions.map((record, recordIndex) => <article className="memory-card" key={`${record.run_id}-${recordIndex}`}>
-        <small>{record.created_at} · 运行：{record.run_id}</small>
+        <small>{record.created_at}</small>
         {record.decisions.map((decision, index) => <div key={index}>
           <strong>{({ resolved: "已确定本次取舍", needs_choice: "等待你选择", stale: "来源变化，取舍待重核" })[decision.status]}</strong>
-          <p>{decision.reason}</p>
-          {decision.selected_id && <p>本次选用 ID：{decision.selected_id}</p>}
-          <p>关联项：{decision.preference_ids.join("、") || "当前任务要求"}</p>
+          <p>{readableSourceText(decision.reason)}</p>
+          {decision.selected_id && <p>本次选用：{preferenceName(decision.selected_id)}</p>}
+          <p>关联习惯：{decision.preference_ids.map(preferenceName).join("、") || "当前任务要求"}</p>
           {decision.source_quotes.map((source, sourceIndex) => <blockquote key={sourceIndex}>{source}</blockquote>)}
         </div>)}
       </article>) : <p>暂无冲突取舍记录。</p>}
       <p className="form-hint">取舍绑定原任务与来源版本；等待选择时请回答关联对话中的提问卡。这里显示记录，不改写已保存习惯。</p>
-      <details><summary>原始取舍诊断</summary><pre>{JSON.stringify(decisions, null, 2)}</pre></details>
     </details>}
     {projectRoot && <details><summary>本书事实、证据与变更追踪</summary>
       <button type="button" disabled={busy} onClick={() => void run(async () => {

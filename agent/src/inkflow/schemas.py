@@ -654,30 +654,12 @@ class DraftOutput(StrictModel):
     hook_note: HookNote | None = None
     scene_blueprint: list[SceneBlueprintItem] = Field(default_factory=list, max_length=8)
 
-    @field_validator("content")
-    @classmethod
-    def validate_novel_punctuation(cls, value: str) -> str:
-        count = value.count("、")
-        if count:
-            raise ValueError(
-                f"小说正文禁止使用中文顿号，当前仍有 {count} 个；请改写包含顿号的完整句子，"
-                "用自然句法或‘和’‘跟’‘与’连接，不要机械替换成其他标点"
-            )
-        return value
-
-
 class SceneDraftOutput(StrictModel):
     """Writer prose for an isolated scene draft; no review or canon authority."""
 
     title: str = Field(min_length=1, max_length=120)
     content: str = Field(min_length=1, max_length=20_000)
     decision_summary: list[str] = Field(min_length=1, max_length=8)
-
-    @field_validator("content")
-    @classmethod
-    def validate_novel_punctuation(cls, value: str) -> str:
-        return DraftOutput.validate_novel_punctuation(value)
-
 
 class ParagraphInsertion(StrictModel):
     before_paragraph: int = Field(ge=0)
@@ -1126,9 +1108,10 @@ class ContextSection(StrictModel):
             return self.content or "（无）"
         if self.key == "MEMORY" and isinstance(value, dict):
             value.pop("query_input", None)
+            value.pop("canonical_batch_scope", None)
             retrieval = value.get("retrieval")
             if isinstance(retrieval, dict):
-                for key in ("query", "discarded", "discarded_display_limit", "branches", "overlaps", "selected", "source_reads"):
+                for key in ("query", "discarded", "discarded_display_limit", "branches", "overlaps", "selected", "source_reads", "writer_reference_omissions"):
                     retrieval.pop(key, None)
         elif self.key == "WORK" and isinstance(value, list):
             for work in value:
@@ -1188,8 +1171,10 @@ class ContextPacket(StrictModel):
             # outline boundary. Keep it ahead of O0 so a new outline draft
             # does not invalidate the book-level DeepSeek cache.
             book_order = {"J": 0, "B": 1, "O0": 2, "O1": 3, "O2": 4, "C0": 5}
+            canon_order = {"B": 0, "D": 1, "CSET": 2, "G": 3}
             # Append-only batch memory remains reusable ahead of the changing chapter card.
             order = (book_order.get(section.key, 10 + index) if section.cache_scope == "book"
+                     else canon_order.get(section.key, 10 + index) if section.cache_scope == "canon"
                      else -1 if section.cache_scope == "chapter" and section.key == "E0" else index)
             return (scopes[section.cache_scope], order, index)
 
@@ -1505,6 +1490,7 @@ class PreferenceObservation(StrictModel):
     explicit: bool = False
     preference_id: str = Field(default="", max_length=180)
     expected_revision: int | None = Field(default=None, ge=0)
+    feedback_kind: Literal["none", "liked", "corrective", "disliked"] = "none"
 
 
 class CoordinatorRecoveryStep(StrictModel):

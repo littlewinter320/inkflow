@@ -17,7 +17,7 @@ from .project_lock import project_write_lock_sync
 from .render import render_state
 from .review_verifier import legacy_accepted_conflict
 from .schemas import BookBrief, TerminalIntent
-from .utils import atomic_write_json, atomic_write_text, content_hash, safe_filename, utc_now
+from .utils import atomic_write_json, atomic_write_text, content_hash, safe_filename, source_display_name, utc_now
 
 
 class InkFlowProject:
@@ -71,7 +71,8 @@ class InkFlowProject:
                         "status": job["status"], "chapter_no": job.get("chapter_no"),
                         "reason": job.get("summary") or "手动修改候选仍需核对",
                         "next_action": "按候选原快照与来源续核；需要创作选择时先询问，不直接覆盖已接受正文。",
-                        "source": {key: job.get(key) for key in ("job_id", "relative_path", "current_hash", "attempts")}})
+                        "source": {**{key: job.get(key) for key in ("job_id", "relative_path", "current_hash", "attempts")},
+                            "display_name": source_display_name(self, str(job.get("relative_path") or ""))}})
         with self.db.connect() as connection:
             revisions = connection.execute("SELECT key,value_json FROM metadata WHERE key LIKE 'pending_plan_revision:%'").fetchall()
         for row in revisions:
@@ -103,6 +104,15 @@ class InkFlowProject:
                 item["parent_id"] = parent["id"]
             if item["kind"] == "workflow":
                 intent = item.get("intent", {})
+                if intent.get("action") in {"accept", "review_accept", "write_review_accept", "revise_review_accept", "continue_run", "batch_accept", "batch_draft_accept"}:
+                    first, last = intent.get("chapter_no"), intent.get("end_chapter_no") or intent.get("chapter_no")
+                    if isinstance(first, int) and isinstance(last, int) and 1 <= first <= last:
+                        remaining = [number for number in range(first, last + 1)
+                            if not (chapter := self.db.get_chapter(number)) or chapter["status"] != "accepted"]
+                        if remaining and remaining[0] != first:
+                            item["remaining_chapter_no"] = remaining[0]
+                            item["completed_through"] = remaining[0] - 1
+                            item["next_action"] = f"第 {first}～{remaining[0] - 1} 章已入正史；原任务只剩第 {remaining[0]}～{last} 章。核对原快照与当前断点后续接，不重放已完成章节。"
                 owner = next((work for work in native if work["kind"] == "plan_revision"
                     and (intent.get("pending_work_id") == work["id"] or (
                         intent.get("action") == "review" and not intent.get("end_chapter_no")
@@ -352,6 +362,30 @@ class InkFlowProject:
                     self.update_pending_work(item["id"], status="completed",
                         resolution={"run_id": active[0]["trace_id"], "revision_no": active[0].get("revision_no", 1)})
 
+    def completed_acceptance_receipt(self, chapter_no: int) -> dict[str, Any] | None:
+        """A prior complete commit can satisfy a repeated accept-only request."""
+        chapter = self.db.get_chapter(chapter_no)
+        if not chapter or chapter["status"] != "accepted" or self.db.canonical_content_migration_required():
+            return None
+        body = self.db.canonical_chapter_content(chapter_no)
+        path = self.resolve_user_path(chapter["path"])
+        if not body or content_hash(body) != chapter["content_hash"]:
+            return None
+        try:
+            if not path.is_file() or content_hash(path.read_text(encoding="utf-8")) != chapter["content_hash"]:
+                return None
+        except (OSError, UnicodeError):
+            return None
+        with self.db.connect() as connection:
+            rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE ?", (f"workflow_accept:%:{chapter_no}",)).fetchall()
+        for row in rows:
+            receipt = json.loads(row["value_json"])
+            if (receipt.get("version") == chapter["version"] and receipt.get("content_hash") == chapter["content_hash"]
+                    and receipt.get("path") == chapter["path"]
+                    and all(receipt.get("post_commit", {}).get(step) == "completed" for step in ("settings", "checkpoint"))):
+                return receipt
+        return None
+
     def _reconcile_workflow_outputs(self, items: list[dict[str, Any]], *, current_pass: Callable[[int], dict[str, Any] | None] | None = None) -> None:
         """Reconcile concrete later outputs, without replaying old requests or accepting prose."""
         if self.db.canonical_content_migration_required():
@@ -378,7 +412,8 @@ class InkFlowProject:
             status, resolution = None, None
             if action in accept_actions or action == "review":
                 chapters = [self.db.get_chapter(number) for number in range(first, last + 1)]
-                if (all(chapter and chapter["status"] == "accepted" and later(chapter.get("accepted_at"), item.get("created_at")) for chapter in chapters)
+                if (all(chapter and chapter["status"] == "accepted" and (later(chapter.get("accepted_at"), item.get("created_at"))
+                            or action in {"accept", "batch_accept"} and self.completed_acceptance_receipt(chapter["chapter_no"])) for chapter in chapters)
                         and (action == "review" or not any(work.get("kind") == "accept_finalization" and work.get("chapter_no") in range(first, last + 1)
                                     and work.get("status") not in {"completed", "superseded"} for work in items))
                         and all((body := self.db.canonical_chapter_content(chapter["chapter_no"]))

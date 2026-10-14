@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { readableSourceText } from "./readableNames";
 
 type Request = <T>(method: string, params?: Record<string, unknown>) => Promise<T>;
 
@@ -493,15 +494,14 @@ export function ProjectCenter({
                   <input aria-label="任务名称" value={taskTitleDraft} maxLength={60} onChange={(event) => setTaskTitleDraft(event.target.value)} autoFocus />
                   <button type="submit" disabled={working}>保存</button>
                   <button type="button" onClick={() => setEditingTaskId(null)}>取消</button>
-                </form> : <div className="task-title-row"><strong>{taskLabel(task)}</strong><button type="button" disabled={working} onClick={() => { setEditingTaskId(task.run_id); setTaskTitleDraft(taskLabel(task)); }}>改名</button></div>}
-                <p>{taskPreview(task)}</p>
-                <p className="task-next-step">下一步：{task.next_step || "查看完整记录后决定是否继续。"}</p>
+                </form> : <div className="task-title-row"><strong>{readableSourceText(taskLabel(task))}</strong><button type="button" disabled={working} onClick={() => { setEditingTaskId(task.run_id); setTaskTitleDraft(readableSourceText(taskLabel(task))); }}>改名</button></div>}
+                <p>{readableSourceText(taskPreview(task))}</p>
+                <p className="task-next-step">下一步：{readableSourceText(task.next_step || "查看完整记录后决定是否继续。")}</p>
                 <details className="task-detail"><summary>完整原因与运行记录</summary>
-                  <p>{task.error_message || task.summary || "没有更详细的错误说明。"}</p>
-                  {task.error_code && <small>诊断类型：{task.error_code}</small>}
-                  {task.retry_note && <p>{task.retry_note}</p>}
-                  {!!task.progress?.length && <ol className="task-progress">{task.progress.slice(-6).map((step, index) => <li key={`${task.run_id}-${index}`}>{step.summary}</li>)}</ol>}
-                  <small>{formatTime(task.updated_at)} · {task.run_id}</small>
+                  <p>{readableSourceText(task.error_message || task.summary || "没有更详细的错误说明。")}</p>
+                  {task.retry_note && <p>{readableSourceText(task.retry_note)}</p>}
+                  {!!task.progress?.length && <ol className="task-progress">{task.progress.slice(-6).map((step, index) => <li key={`${task.run_id}-${index}`}>{readableSourceText(step.summary)}</li>)}</ol>}
+                  <small>{formatTime(task.updated_at)}</small>
                 </details>
               </div>
               <div className="task-actions">
@@ -562,7 +562,7 @@ export function ProjectCenter({
           {checkpoints.map((checkpoint) => (
             <article className="checkpoint-card" key={checkpoint.checkpoint_id}>
               <div><strong>{checkpoint.label}</strong><small>{formatTime(checkpoint.created_at)}</small></div>
-              <p>第 {checkpoint.boundary_chapter} 章后 · {checkpoint.branch_id || "main"}</p>
+              <p>第 {checkpoint.boundary_chapter} 章后 · {!checkpoint.branch_id || checkpoint.branch_id === "main" ? "主线" : "故事分支"}</p>
               <button disabled={working} onClick={() => void previewRollback(checkpoint)}>预览回退</button>
             </article>
           ))}

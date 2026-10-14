@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Literal
 
@@ -20,6 +21,7 @@ from .writer_notes import recent_approved_notes
 
 
 _COMPRESSED_NOTE = "（已按完整条目压缩；完整资料仍保存在本地）"
+active_batch_context: ContextVar[dict[str, Any] | None] = ContextVar("inkflow_batch_operation", default=None)
 
 
 def named_prior_chapters(task: str, before_chapter: int, loaded: set[int]) -> list[int]:
@@ -38,6 +40,24 @@ def _chapter_history_query(task: str, card: dict[str, Any], mode: str, protected
         # selection surroundings or its same-version review. It is never canon.
         query += "\n" + protected_input
     return query
+
+
+def _batch_canonical_query(project: Any, chapter_no: int, history_query: str) -> tuple[str, dict | None]:
+    binding = active_batch_context.get()
+    if not binding or binding["root"] != project.root.resolve():
+        return history_query, None
+    manifest = binding["manifest"]
+    start, end = int(manifest["start_chapter_no"]), int(manifest["end_chapter_no"])
+    if not start <= chapter_no <= end:
+        return history_query, None
+    window_start = start + (chapter_no - start) // 10 * 10
+    window_end = min(end, window_start + 9)
+    cards = [project.db.get_chapter_card(number) for number in range(window_start, window_end + 1)]
+    if not all(cards):
+        return history_query, None
+    query = str(manifest.get("instruction") or "") + "\n" + "\n".join(
+        _chapter_history_query("", item, "draft", "") for item in cards)
+    return query, {"start": window_start, "end": window_end, "query_hash": content_hash(query)}
 
 
 def _packet_input_tokens(packet: ContextPacket, protected_input: str = "") -> int:
@@ -194,7 +214,8 @@ def _voice_preferences_content(items: list[dict[str, Any]]) -> str:
 
 
 def _voice_preferences_for_context(
-    preferences: list[dict[str, Any]], task: str, card: dict[str, Any], limit: int | None = None
+    preferences: list[dict[str, Any]], task: str, card: dict[str, Any], limit: int | None = None,
+    feedback_scores: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Budget the exact JSON for upstream scope-filtered preferences and candidates."""
     ranked = []
@@ -203,10 +224,10 @@ def _voice_preferences_for_context(
         if item.get("strength") != "weak" and not candidate:
             continue
         targeted = str(item.get("scope") or "project").partition(":")[0] != "project"
-        ranked.append((not candidate, targeted, -index, item))
-    ranked.sort(key=lambda row: row[:3], reverse=True)
+        ranked.append((not candidate, targeted, (feedback_scores or {}).get(item["preference_id"], 0.0), -index, item))
+    ranked.sort(key=lambda row: row[:4], reverse=True)
     selected = []
-    for _, _, _, item in ranked:
+    for _, _, _, _, item in ranked:
         if estimate_tokens(_voice_preferences_content([*selected, item])) > 8_000:
             continue
         selected.append(item)
@@ -283,7 +304,9 @@ class ContextBuilder:
         candidates = [item for item in applicable if item.get("status") == "candidate"]
         forced_preferences = [item for item in preferences if item["strength"] == "hard"]
         forced_texts = list(dict.fromkeys(str(item["text"]).strip() for item in forced_preferences if str(item["text"]).strip()))
-        voice_preferences = _voice_preferences_for_context([*preferences, *candidates], task, preference_scope)
+        from .learning import LearningService
+        voice_preferences = _voice_preferences_for_context([*preferences, *candidates], task, preference_scope,
+            feedback_scores=LearningService(self.project).preference_scores(applicable))
         studio_context = self._studio_context(chapter_no, task, card)
         pinned_sources = {str(item["source_id"]) for item in studio_context["pins"]}
         effective_recent_limit = recent_limit if recent_limit is not None else {
@@ -381,6 +404,10 @@ class ContextBuilder:
             )
 
         history_query = _chapter_history_query(task, card, mode, protected_input)
+        canonical_query = history_query
+        batch_scope = None
+        if mode == "draft" and self.actor == "writer":
+            canonical_query, batch_scope = _batch_canonical_query(self.project, chapter_no, history_query)
         reference_cards = self._load_reference_cards(limit=6)
         chapter = database.get_chapter(chapter_no)
         retrieval_hits = self.retriever.retrieve(
@@ -407,7 +434,7 @@ class ContextBuilder:
             return (
                 subject in {"世界", "世界观", "全书"}
                 or predicate.startswith(("rule.", "world.", "constraint."))
-                or bool(subject and subject.casefold() in history_query.casefold())
+                or bool(subject and subject.casefold() in canonical_query.casefold())
             )
 
         # Accepted facts arrive in subject order; chapter order keeps unchanged canon
@@ -431,6 +458,9 @@ class ContextBuilder:
         eligible_preference_ids = {str(item["preference_id"]) for item in applicable}
         preference_retrieval_omissions = []
         selected_hits = []
+        writer_reference_tokens = 0
+        writer_reference_budget = min(12_000, max(4_000, self.soft_token_limit // 8))
+        writer_reference_omissions = []
         preference_tokens = estimate_tokens(_voice_preferences_content(voice_preferences))
         for item in retrieval_hits:
             identity = str(item["source_id"])
@@ -445,6 +475,13 @@ class ContextBuilder:
                     preference_retrieval_omissions.append({"source_id": identity, "reason": "完整检索偏好条目超过本轮声音段共享8,000 token预算"})
                     continue
                 preference_tokens += tokens
+            if (mode == "draft" and self.actor == "writer" and identity not in pinned_sources
+                    and item.get("source_type") not in {"canon_fact", "user_preference", "story_setting"}):
+                tokens = estimate_tokens(str(item.get("body") or ""))
+                if writer_reference_tokens + tokens > writer_reference_budget:
+                    writer_reference_omissions.append({"source_id": identity, "reason": "本章软参考预算已满；必要点名原文、正史、设定与锁定资料另计"})
+                    continue
+                writer_reference_tokens += tokens
             selected_hits.append(item)
         retrieval_hits = selected_hits
         retrieved_canon = [item for item in retrieval_hits if item.get("source_type") == "canon_fact"]
@@ -457,6 +494,8 @@ class ContextBuilder:
             self.retriever.last_diagnostics["preference_omissions"] = preference_retrieval_omissions
         self.retriever.last_diagnostics["already_in_context_count"] = len(duplicate_retrieval_ids)
         self.retriever.last_diagnostics["additional_selected_count"] = len(retrieval_hits)
+        self.retriever.last_diagnostics["writer_reference_omissions"] = writer_reference_omissions
+        self.retriever.last_diagnostics["canonical_batch_scope"] = batch_scope
 
         craft_guides = select_craft_guides(task=task, genre=brief.genre, card=card, limit=1)
         plan_view = _plan_for_model(bundle, card)
@@ -467,7 +506,7 @@ class ContextBuilder:
         sections = [
             ContextSection(key="A", title="当前任务与用户要求", content=task, hard=True),
             ContextSection(key="CSET", title="用户定制设定：创作假设与证据参考（非正史）",
-                           content=setting_context, hard=True, cache_scope="chapter",
+                           content=setting_context, hard=True, cache_scope="canon" if batch_scope else "chapter",
                            source_ids=[record["record_id"] for collection in setting_payload["collections"] for record in collection["records"]]),
             *outline_sections(self.project.root, chapter_no, chapter_no),
             ContextSection(
@@ -619,7 +658,7 @@ class ContextBuilder:
                 else "当前无已提交未结线索。",
                 source_ids=[str(item["thread_id"]) for item in threads],
                 hard=True,
-                cache_scope="chapter",
+                cache_scope="canon" if batch_scope else "chapter",
             ),
             ContextSection(
                 key="H",
@@ -634,7 +673,7 @@ class ContextBuilder:
             ),
             ContextSection(
                 key="I",
-                title="按本章任务选择的写作引导",
+                title="默认基础写作技能与本章表达引导",
                 content=json.dumps(craft_guides, ensure_ascii=False, indent=2),
                 source_ids=[f"craft:{item['技能编号']}" for item in craft_guides],
                 cache_scope="chapter",
@@ -748,10 +787,11 @@ class ContextBuilder:
             content=json_dumps({"layers": ["正史", "任务临时", "作者偏好", "参考与设计"],
                 "boundary_chapter": chapter_no - 1, "source_gaps": source_gaps,
                 "query_input": query_input,
+                "canonical_batch_scope": batch_scope,
                 "thread_history": thread_recovery,
                 "retrieval": {**{key: self.retriever.last_diagnostics.get(key) for key in
                     ("query", "candidate_count", "retrieved_count", "already_in_context_count",
-                     "additional_selected_count", "discarded", "discarded_display_limit", "source_reads", "preference_omissions")},
+                     "additional_selected_count", "discarded", "discarded_display_limit", "source_reads", "preference_omissions", "writer_reference_omissions")},
                     "branches": self.retriever.last_diagnostics.get("branches", {}),
                     "overlaps": self.retriever.last_diagnostics.get("overlaps", []),
                     "source_conflicts": self.retriever.last_diagnostics.get("source_conflicts", []),
@@ -845,6 +885,11 @@ class ContextBuilder:
             "selected": [{**item, "usage_source": usage_sources[str(item["preference_id"])]}
                          for item in available_by_id.values() if str(item["preference_id"]) in usage_sources],
             "omitted": omitted,
+            "writing_guides": [{"name": item.get("技能", ""), "source_id": "craft:" + item["技能编号"]}
+                for section in packet.sections if section.key == "I" and section.source_ids
+                for item in json.loads(section.content)
+                if isinstance(item, dict) and item.get("技能编号")
+                and "craft:" + item["技能编号"] in section.source_ids],
             "meaning": "已完整装入最终编译上下文，不表示模型已经正确采用；candidate仍是未确认参考。"}
         database.set_metadata("preference.selection", selection)
         database.set_metadata(f"preference.selection:{chapter_no}:{mode}:{self.actor}", selection)

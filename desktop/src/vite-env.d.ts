@@ -7,8 +7,8 @@ interface Window {
     request<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>;
     openConversationWindow(projectRoot: string, conversationId?: string): Promise<{ conversationId: string }>;
     conversationWindows(projectRoot: string): Promise<Array<{ conversationId: string; projectRoot: string; openedAt: string }>>;
-    openWorkspacePanel(projectRoot: string, panel: "navigation" | "assistant" | "inspector", relativePath?: string): Promise<void>;
-    returnWorkspacePanel(panel?: "navigation" | "assistant" | "inspector"): Promise<void>;
+    openWorkspacePanel(projectRoot: string, panel: "navigation" | "assistant" | "inspector", relativePath?: string, bounds?: { x: number; y: number; width: number; height: number }): Promise<void>;
+    returnWorkspacePanel(panel?: "navigation" | "assistant" | "inspector", hide?: boolean): Promise<void>;
     publishWorkspaceState(state: InkFlowEvent): Promise<void>;
     workspaceCommand(command: "document" | "compare" | "chat" | "annotation", value: string, relativePath?: string): Promise<void>;
     onWorkspaceEvent(listener: (event: InkFlowEvent) => void): () => void;

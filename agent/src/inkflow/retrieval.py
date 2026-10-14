@@ -199,7 +199,9 @@ class HybridRetriever:
             "adaptive_factors": factors,
             "selected": [{"source_id": item["source_id"], "score": item["score"], "reasons": item["retrieval_reasons"]} for item in result],
             "discarded": [
-                {"source_id": item["source_id"], "reason": "低于动态预算截断线" if item["source_id"] in scores else "未匹配查询"}
+                {"source_id": item["source_id"], "title": item.get("title", "相关资料"),
+                 "source_type": item["source_type"], "chapter_no": item.get("chapter_no"),
+                 "reason": "本次相关性排序和资料容量下未选中" if item["source_id"] in scores else "没有匹配本次查找内容"}
                 for item in candidates if item["source_id"] not in selected_ids
             ][:80],
             "discarded_display_limit": 80,

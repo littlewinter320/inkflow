@@ -198,7 +198,7 @@ class TraceRecorder:
             },
         )
 
-    def record_model(self, stage: str, result: ProviderResult[Any], decision_summary: str) -> None:
+    def record_model(self, stage: str, result: ProviderResult[Any], decision_summary: str, *, public: bool = True) -> None:
         metadata = {
             "model": result.model,
             "response_id": result.response_id,
@@ -230,14 +230,16 @@ class TraceRecorder:
             self.record(
                 f"{stage}.recovery", "completed", str(recovery.get("strategy", "请求已自动恢复")),
                 metadata={**recovery, "agent_role": metadata.get("agent_role", "")},
+                public=public,
             )
-        self.record(stage, "completed", decision_summary, metadata=json.loads(json_dumps(metadata)))
+        self.record(stage, "completed", decision_summary, metadata=json.loads(json_dumps(metadata)), public=public)
         if self.trace_level == "full" and result.reasoning_content:
             self.record(
                 f"{stage}.provider_reasoning",
                 "info",
                 "模型已完成内部推理；原始思维链不写入项目",
                 metadata={"reasoning_characters": len(result.reasoning_content)},
+                public=False,
             )
 
     def record_model_started(

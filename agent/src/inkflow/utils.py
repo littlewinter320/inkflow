@@ -77,6 +77,30 @@ def content_hash(value: str | bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def source_display_name(project: Any, source: str) -> str:
+    """Describe a user-facing reference without changing its stored identity."""
+    normalized = source.replace("\\", "/")
+    if normalized.startswith("story-setting:"):
+        from .story_settings import StorySettingsService
+        service = StorySettingsService(project)
+        record = service._get(normalized.split(":", 1)[1], "record")
+        collection = service._get(record["collection_id"], "collection") if record else None
+        return f"{collection['name'] if collection else '设定参考'}：{record['title']}" if record else "需要定位的设定参考条目"
+    name = Path(normalized).name
+    known = {"BOOK.md": "本书设定", "OUTLINE.md": "全书大纲", "STORY_DETAIL.md": "卷细纲",
+        "RECENT_PLAN.md": "近期章节规划", "PLAN.md": "旧版近期规划", "STATE.md": "正史与故事状态", "DIALOGUE.md": "对话记录"}
+    if name in known:
+        return known[name]
+    match = re.search(r"chapter_(\d+)", name)
+    if match:
+        kind = "审查报告" if normalized.startswith("reviews/") else "草稿" if "draft" in name else "正文"
+        return f"第{int(match[1])}章{kind}"
+    if normalized.startswith("planning/history/"):
+        from .planning_cleanup import planning_document_label
+        return planning_document_label(normalized)
+    return "后台核对记录" if ".inkflow/" in normalized or re.search(r"[a-f0-9]{16,}", name) else name
+
+
 def effective_character_count(content: str) -> int:
     body = re.sub(r"\A\s*#{1,6}[^\n]*(?:\n|$)", "", content, count=1)
     return len(re.findall(r"[\u3400-\u9fffA-Za-z0-9]", body))

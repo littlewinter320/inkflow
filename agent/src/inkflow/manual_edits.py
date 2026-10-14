@@ -72,7 +72,9 @@ class ManualEditsService:
         return value if isinstance(value, dict) else {}
 
     def status(self):
-        jobs = sorted(self.jobs().values(), key=lambda item: item["updated_at"], reverse=True)
+        from .utils import source_display_name
+        jobs = [{**item, "display_name": source_display_name(self.project, item["relative_path"])}
+                for item in sorted(self.jobs().values(), key=lambda item: item["updated_at"], reverse=True)]
         return {"jobs": jobs, "issues": [item for item in jobs if item["status"] in
                 {"awaiting_confirmation", "needs_evidence", "failed", "revision_requested"}]}
 
@@ -591,6 +593,8 @@ class ManualEditsService:
             return
         for job in self.jobs().values():
             setting_hard = job["kind"]=="setting_record" and any(issue.get("hard_conflict") for issue in job.get("issues",[]) if isinstance(issue,dict))
-            relevant=job["kind"]=="setting_document" or setting_hard or (job.get("chapter_no") and int(job["chapter_no"])<=chapter_no)
+            relevant=job["kind"]=="setting_document" or setting_hard or (job["kind"]!="setting_record" and job.get("chapter_no") and int(job["chapter_no"])<=chapter_no)
             if relevant and job["status"] in {"pending","reviewing","awaiting_confirmation","needs_evidence","failed","revision_requested"}:
-                raise ValidationGateError(f"手动修改仍待核对：{job['relative_path']}。原文件和正史已保留，请查看后台核对窗口。")
+                from .utils import source_display_name
+                name = source_display_name(self.project, job["relative_path"])
+                raise ValidationGateError(f"{name}的改动还需要核对。请在“修改核对”查看具体疑点，处理后从当前步骤继续。")

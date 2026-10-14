@@ -112,6 +112,7 @@ requested_outcome 用一句中文保留用户最终想看到的完整结果，�
 先识别本次目标与希望停在哪种产物，再选择已有节点；不把读文件、解释问题、草稿试写、记忆预览默认升级为完整写作验收链。原授权内的可选依赖失败时，先选择仍可用的取材或局部修复路径；缺资料修资料、候选归类修候选、已定位正文问题才定向改正文。多种真实创作方向才提供选择，普通排障由代码推进，后台保留方法、来源与结果。不得因此越过版本、必要审查、写入权限或原任务预算。
 user_message 保留当前用户原话；operation_instruction 也须保留否定限制和范围，不把“先聊聊”“不要写正文”“只改这一段”压缩掉。用 narrative_scope、edit_scope、target_excerpt、preserve_constraints、forbidden_actions 标出实际边界。当前消息若回答待答问题，response_kind=question_answer 并引用上下文的 pending_question_id；若修改运行中任务，response_kind=task_revision 并引用 related_task_id，不把新指令悄悄附加到旧任务。
 alternative_action 只在两种理解确实都合理时填写；不要为了凑字段虚构候选。
+对话和协作允许适度灵活：能从本次原话、当前产物和唯一关联任务确定的常规选择，直接采用合理默认并说明，不把轻微省略变成强制问答。角色可互相补充原文资料、表达建议、创作或记忆候选及反证；这些是支持性输出，交当前责任角色核验采用，不要求用户逐一安排角色。原目标内的查资料、检查来源和修候选可沿已有白名单节点接力，普通分歧保留建议并继续成立的部分。最终正文写入、审核签署、记忆归类和正史提交仍各由当前任务的责任角色或引擎执行；不能把协助当作越权放行，不能新增角色、调用额度或重置原尝试次数。需要用户决定的是会改变目标、创作方向或无法同时满足的明确要求，不是普通排障和可逆的工作安排。
 confidence 表示语义识别把握：high=目标与动作清楚，medium=大意清楚但有轻微省略，low=两种以上理解都合理或关键指代不明。它不能作为绕过门禁的许可。
 authorization 表示当前话语行为：none=询问/讨论，proposed=提出可能方案或条件句，approved=明确要求现在执行或明确接受最近待确认方案。
 missing_fields 列出无法从本条消息、最近对话和项目状态可靠确定的必要字段；clarification_question 兼容只写一句最小澄清问题，无需让用户重述全部需求。
@@ -136,6 +137,15 @@ target_characters 只表示“已接受正文”的有效字符目标，不把�
 
 # 墨宝口吻统一注入：路由与回复都由 Coordinator 负责，但对用户说话时始终以墨宝的身份。
 TERMINAL_ROUTER_SYSTEM = TERMINAL_ROUTER_SYSTEM + "\n\n墨宝口吻（适用于你写出的所有 conversation_reply）：\n" + MOBAO_PERSONA
+TERMINAL_ROUTER_SYSTEM += (
+    "\n偏好反馈在原路由同次提取，不额外调用：只有具体写法或体验反馈才填写feedback_kind。"
+    "liked表示用户明确喜欢所述方法；corrective表示用户明确不满意实际输出，text记录希望采用的具体改法；"
+    "disliked只用于用户否定输入中某条已有偏好，须用其preference_id、expected_revision和原text，不能把希望采用的改法扣分。"
+    "普通任务命令、审核通过、正文接受、沉默或笼统不错都用none，不能推断满意，更不能推断全部已装入习惯都被正确使用。"
+    "后台学习不在conversation_reply逐条通报，不展示积分、内部学习记录或自动添加的新硬门禁。"
+    "同一类具体反馈在已有语义相同的条目上补来源；当前任务、本书与跨书范围分别理解。"
+    "仅真正互斥的适用要求或无法确定的长期范围才提一个必要问题，不按次数或定时弹窗。"
+)
 TERMINAL_ROUTER_SYSTEM += "\n\n" + PREFERENCE_USE_CONTRACT + PREFERENCE_CONFLICT_OUTPUT
 TERMINAL_ROUTER_SYSTEM += (
     "\n反馈与已有习惯语义相同时，在preference_observations填写输入里的preference_id和expected_revision，"
@@ -835,6 +845,37 @@ class TerminalSession:
                     thinking=False,
                     agent_role="coordinator",
                 )
+            # A local continuation saves routing calls, but must not discard concrete feedback.
+            feedback_routing = (re.search(r"写法|文风|风格|表达|口气|对白|标点|段落|病句|措辞|协作习惯", text)
+                and re.search(r"满意|喜欢|生硬|机械|不自然|没做好|没改好|太重复|默认|以后|长期|记住|跨书|每本书", text))
+            if (str(route_result.model).startswith("local-") and feedback_routing
+                    and not set(route_result.data.forbidden_actions) & {"extra_calls", "extra_model_calls"}
+                    and not re.search(r"(?:不要|禁止|不允许|无需).{0,10}额外.{0,8}(?:调用|模型)", text)):
+                try:
+                    feedback_system = (TERMINAL_ROUTER_SYSTEM + "\n本次工作范围已经由代码绑定，不重新安排工作流。"
+                        "action用discuss，只提取preference_observations；不得改变原批次、次数、权限或章节。"
+                        "内置基础技能已经覆盖的普通使用指令不另建重复习惯。")
+                    available = []
+                    room = min(8_000, self.engine.settings.context_budget_for("coordinator")[1]
+                        - estimate_tokens(feedback_system + text) - self.engine.settings.effective_output_tokens(1600, "coordinator"))
+                    for item in project.db.effective_preferences() + preference_candidates(project.db):
+                        candidate = {key: item.get(key) for key in ("preference_id", "revision", "text", "scope", "level", "status", "topic")}
+                        if estimate_tokens(json_dumps([*available, candidate], indent=None)) <= room:
+                            available.append(candidate)
+                    if room < 0:
+                        raise ValidationGateError("具体反馈超过当前协调资料预算，未追加学习调用。")
+                    feedback_result = await self.engine.provider.generate_json(
+                        system_prompt=feedback_system,
+                        user_prompt="用户本次原话：\n" + text + "\n已有习惯（仅所列条目可更新；未列出不代表不存在）：" + json_dumps(available, indent=None),
+                        output_model=TerminalIntent, max_tokens=1600, thinking=False, agent_role="coordinator",
+                    )
+                    trace.record_model("coordinator.preference_feedback", feedback_result, "已在原任务范围内核对具体反馈", public=False)
+                    route_result = ProviderResult(data=route_result.data.model_copy(update={
+                        "preference_observations": feedback_result.data.preference_observations}),
+                        model=route_result.model, response_id=None, reasoning_content=None, usage={})
+                except Exception as exc:
+                    trace.record("coordinator.preference_feedback", "not_run", "后台偏好核对未完成，原任务按既有授权继续",
+                        details=str(exc), public=False)
             raw_intent = self._coerce_settings_intent(text, route_result.data)
             from .preferences import capture_observations
             captured_preferences = capture_observations(project.db, raw_intent.preference_observations,
@@ -1162,7 +1203,6 @@ class TerminalSession:
                 self._remember_question(project, intent, ticket, response)
             if captured_preferences:
                 response["preference_updates"] = captured_preferences
-                response["reply"] = str(response.get("reply", "")) + "\n\n已记录写作偏好或待确认反馈，可在设置 → 作者习惯与记忆中查看、调整。"
             self._append_dialogue(project, text, intent, response)
             failure = workflow_failure_reason(response)
             outcome = workflow_result_status(response)

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import ExitStack, asynccontextmanager, contextmanager
-from contextvars import ContextVar
 from difflib import SequenceMatcher
 import json
 import re
@@ -16,7 +15,7 @@ from .checkpoints import CheckpointService
 from .preferences import (preference_section, preference_candidates, resolve_preference_conflicts,
                           use_preference_decisions)
 from .config import Settings
-from .context import ContextBuilder, planning_bundle_for_chapter
+from .context import ContextBuilder, active_batch_context, planning_bundle_for_chapter
 from .outline_context import outline_neighbor_boundaries, outline_sections, replace_outline_range, replace_story_detail_volume
 from .planning_pipeline import PlanningNeedsAttention, load_active_planning, redesign_existing_story, synchronize_v2_projection, v2_chapter_card
 from .errors import ProjectError, ProviderError, ValidationGateError
@@ -117,7 +116,7 @@ from .task_settings import TASK_SETTINGS_FIELDS, TaskSettingsError, active_task_
 from .utils import SOURCE_RECOVERY_TOKEN_LIMIT, atomic_write_text, content_hash, effective_character_count, estimate_tokens, json_dumps, utc_now
 
 
-_active_batch_operation: ContextVar[dict[str, Any] | None] = ContextVar("inkflow_batch_operation", default=None)
+_active_batch_operation = active_batch_context
 
 
 def _review_context_fingerprint(packet: ContextPacket) -> str:
@@ -2768,7 +2767,7 @@ class InkFlowEngine:
                 clean_content,
                 chapter_no=chapter_no,
                 card=card,
-                base_prompt=writer_prompt,
+                base_prompt=_length_repair_context(packet),
                 system_prompt=WRITER_SYSTEM,
                 trace=trace,
                 stage="writer.length_repair",
@@ -3442,9 +3441,16 @@ class InkFlowEngine:
             "before_hash": before_hash, "source_hash": chapter["content_hash"] if chapter else "",
             "chapter_version": chapter["version"] if chapter else None, "review_id": review["id"] if current else None,
             "matched_evidence_count": len(old_keys & new_keys), "finding_count": len(new_keys),
+            "issue_categories": sorted({item.rule_id for item in (before["report"].findings if before else []) if item.rule_id}),
             "review_verdict": review["report"].verdict if current else "unknown", "role": "writer",
             "task_id": scope.task_id if scope else "", "snapshot_hash": scope.snapshot_hash if scope else "",
             "run_id": runtime.run_id if runtime else "", "recovery_trace_id": trace.run_id}
+        result["method_feedback"] = (
+            "这次替换没有改变正文；先核对原句定位与实际差异，不重复同一替换。" if unchanged
+            else "局部改动已通过当前完整审查；只在同类问题中参考该处理方法。" if verified
+            else f"改动后仍有{len(old_keys & new_keys)}项相同证据的问题；先查残留原因，不把改稿次数当作改善。"
+            if old_keys & new_keys else "本次改动尚未通过完整审查；核对当前剩余问题和来源，不作为成功经验。"
+        )
         key = "native_recovery:" + content_hash(json_dumps([result["task_id"], "chapter.revision", chapter_no]))
         async with project_write_lock(project.root):
             state = project.db.get_metadata(key, {})
@@ -3532,7 +3538,7 @@ class InkFlowEngine:
                 packet = _review_evidence_packet(project, packet, chapter_no,
                     recheck_report.missing_source_ids if recheck_report else [])
                 packets[role] = packet
-                from .review_verifier import mode_output_model
+                from .review_verifier import mode_output_model, mode_output_requirements
                 output_model = mode_output_model(packet, primary=role == (owners.get("general") or owners.get("logic_continuity")))
                 user_prompt = (
                     packet.to_model_prompt() + "\n\n# 当前正文\n" + content
@@ -3559,13 +3565,15 @@ class InkFlowEngine:
                         "待补资料": recheck_report.missing_source_ids,
                     })
                 user_prompt += (
-                    "\n\n# 输出前核对\nsource_comparisons 先分别填写 OUTLINE.md、STORY_DETAIL.md、"
+                    "\n\n# 输出前核对\nsource_comparisons 先分别填写 book:requirements、OUTLINE.md、STORY_DETAIL.md、"
                     "RECENT_PLAN.md 三份当前原文，再填写紧邻前章（本批临时前章也算）的原文；章节执行卡不能替代三份文件。"
                     "核对关键物件在前章末的持有人和位置，以及本章首次取用它的动作。"
                     "每条只摘一处连续短句，不合并相隔的对话冒充连续原句。"
                     "新人物、新事件不必已在正史出现；同姓或职业差异不是身份同一的证明。"
                     "被语义核验判为 not_blocking 的指控，若无新的双方证据，不再当作必需项失败。"
                 )
+                if role == (owners.get("general") or owners.get("logic_continuity")):
+                    user_prompt += "\n\n# 本次必须覆盖的原文与设定条目\n" + json_dumps(mode_output_requirements(packet))
                 user_prompt, compressed = self._fit_review_prompt(project, packet,
                     system_prompt=systems[role], tail=user_prompt[len(packet.to_model_prompt()):],
                     output_model=ModeCheckOutput, role=role)
@@ -3703,6 +3711,9 @@ class InkFlowEngine:
                             and self._review_source_fingerprint(project, chapter_no, writer_notes_hash=notes_hash(writer_notes)) == source_fingerprint):
                         writer_notes = current_notes
                         source_fingerprint = self._review_source_fingerprint(project, chapter_no)
+                        recovery["writer_notes_input_hash"] = recovery.get("writer_notes_hash")
+                        recovery["writer_notes_hash"] = notes_hash(current_notes)
+                        atomic_write_text(trace.run_dir / f"source-recovery-{role}.json", json_dumps(recovery))
                     if self._review_source_fingerprint(project, chapter_no) != source_fingerprint:
                         raise ValidationGateError("审查结果返回时正文或审查依据已变化；迟到结果未写回。")
                     if _recovered_sources_changed(project, recovery):
@@ -4019,7 +4030,9 @@ class InkFlowEngine:
                 and previous["data"].get("writer_notes_hash") == notes_hash(notes)
                 and previous["data"].get("story_fingerprint") == story_fingerprint)
             if previous and not manual_retry:
-                if (previous["data"].get("writer_notes_hash") != notes_hash(notes)
+                applied_answer = (previous["data"].get("status") == "answered"
+                    and notes.get("clarification_source", {}).get("artifact_id") == previous["artifact_id"])
+                if ((previous["data"].get("writer_notes_hash") != notes_hash(notes) and not applied_answer)
                         or previous["data"].get("story_fingerprint") != story_fingerprint):
                     return {"status": "attempt_limit", "artifact_id": previous["artifact_id"],
                             "reason": "同一正文已经追问过；说明变化不重置次数，保留问题供定向处理。"}
@@ -4258,6 +4271,9 @@ class InkFlowEngine:
         choice_count = len(quote_choices)
         from .review_verifier import mode_output_model
         output_model = mode_output_model(packet, primary=primary)
+        if primary:
+            from .review_verifier import mode_output_requirements
+            choice_note += "\n本次必须覆盖的原文与设定条目：\n" + json_dumps(mode_output_requirements(packet))
         before_sections = {section.key: section.content for section in packet.sections}
         while True:
             tail = repair_tail + "\n\n# 本次可选择的逐字原文，代码按编号回填，语义仍由你核对\n" + json_dumps(quote_choices) + choice_note
@@ -4294,7 +4310,7 @@ class InkFlowEngine:
             atomic_write_text(trace_path, json_dumps(recovery))
             return output.model_copy(update={"verdict": "unknown"}), packet, recovery
         trace.record_model("review.source_recovery", result, "同责任角色补核已返回，核验来源与交接后采用")
-        repaired = resolve_review_quote_refs(result.data, quote_choices, chapter_no=chapter_no)
+        repaired = resolve_review_quote_refs(result.data, quote_choices, chapter_no=boundary)
         recovery["quote_choices"] = {key: {"source_id": value["source_id"], "quote_hash": content_hash(value["quote"])}
             for key, value in quote_choices.items()}
         # An omitted or merely relabelled concrete two-quote conflict still
@@ -5043,8 +5059,18 @@ class InkFlowEngine:
                 "写作角色已装载修订技能；只修有依据的问题并保留有效声线",
                 metadata={"skills": active_skills, "skill_contract_version": "1", "packet_section": "I", "extra_model_calls": 0},
             )
+            expression_only = (local_only and not plan_revision
+                and bool(re.search(r"(?:只|仅)[^。；\n]{0,16}(?:表达|文风|语气|标点)", instruction))
+                and all(item.category in {"style", "format", "readability"}
+                        for item in review_record["report"].findings))
+            revision_context = _expression_revision_context(packet) if expression_only else packet.to_model_prompt()
+            if expression_only:
+                trace.record("writer.expression_context", "completed", "本次只修表达，使用当前正文、设定、用户要求与样稿引导；随后完整审查来源",
+                    metadata={"context_packet_id": content_hash(packet.to_model_prompt()), "input_context_hash": content_hash(revision_context),
+                              "full_context_tokens": packet.estimated_tokens, "selected_context_tokens": estimate_tokens(revision_context),
+                              "extra_model_calls": 0})
             user_prompt = (
-                packet.to_model_prompt()
+                revision_context
                 + "\n\n# 当前草稿\n\n"
                 + current_draft
                 + "\n\n# 当前版本 Editor 审查报告\n\n"
@@ -5093,6 +5119,7 @@ class InkFlowEngine:
                 thinking=revision_thinking,
                 agent_role="writer",
             )
+            trace.record_model("writer.revise", result, "Writer 已返回修订候选，正在核对原句和来源")
             if local_only:
                 patch = result.data
                 header_end = current_draft.find("\n") if current_draft.startswith("#") else 0
@@ -5103,7 +5130,6 @@ class InkFlowEngine:
                 draft = DraftOutput(title=str(chapter["title"]), content=patched, decision_summary=[patch.reason])
             else:
                 draft = result.data
-            trace.record_model("writer.revise", result, "Writer 读取旧稿与审查证据后完成定点修订")
             if self._revision_source_fingerprint(project, chapter_no) != source_fingerprint:
                 candidate_path = trace.run_dir / "stale-revision-candidate.md"
                 atomic_write_text(candidate_path, draft.content)
@@ -5119,7 +5145,7 @@ class InkFlowEngine:
                     clean_content,
                     chapter_no=chapter_no,
                     card=card,
-                    base_prompt=user_prompt,
+                    base_prompt=_length_repair_context(packet),
                     system_prompt=REVISER_SYSTEM,
                     trace=trace,
                     stage="writer.revise.length_repair",
@@ -5474,6 +5500,15 @@ class InkFlowEngine:
                         **tail, "post_commit_status": "waiting_condition" if tail["warnings"] else "completed",
                         "projection_status": "synced",
                         "next_action": "继续原接受任务，补齐所列本地收尾。" if tail["warnings"] else f"写第 {chapter_no + 1} 章"}
+            if (chapter and chapter["status"] == "accepted" and _prepared_patch is None
+                    and not _preview_artifact_id and not _provisional_batch_id
+                    and (completed := project.completed_acceptance_receipt(chapter_no))):
+                trace.finish(summary=f"第 {chapter_no} 章已完成验收和收尾，复用实际提交结果")
+                return {"chapter_no": chapter_no, "status": "accepted", "reused": True,
+                        "version": chapter["version"], "content_hash": chapter["content_hash"],
+                        "review_id": completed["review_id"], "path": str(project.root / chapter["path"]),
+                        "post_commit_status": "completed", "projection_status": "synced", "warnings": [],
+                        "next_action": f"第 {chapter_no} 章已入正史，无需重复验收。", "trace_id": trace.run_id}
             from .manual_edits import ManualEditsService
             ManualEditsService(project).scan()
             ManualEditsService(project).assert_ready(chapter_no)
@@ -6507,6 +6542,50 @@ class InkFlowEngine:
                         await self._review_batch_chapter(project.root, chapter_no, provisional_chapters=provisional)
                     revised = await self.revise_chapter(project.root, chapter_no, instruction, provisional_chapters=provisional)
                     trace.record("batch.writer.resume", "completed", f"第 {chapter_no} 章已应用本次要求后继续，未沿用旧指令", metadata={"trace_id": revised["trace_id"], "version": revised["version"]})
+
+                # Formatting is a local, non-semantic preparation step. It
+                # must not spend another Writer call or reset repair counters.
+                chapter = project.db.get_chapter(chapter_no)
+                source_path = project.root / chapter["path"]
+                source_text = source_path.read_text(encoding="utf-8")
+                formatted = _normalise_unambiguous_dialogue(source_text)
+                if formatted != source_text:
+                    previous_notes = version_notes(project, chapter_no)
+                    from .schemas import HookNote
+                    saved_hook = previous_notes.get("hook_note") or {}
+                    hook = json.loads(json_dumps({key: value for key, value in saved_hook.items()
+                        if key in HookNote.model_fields})) if saved_hook else None
+                    if hook:
+                        for annotation in hook.get("annotations", []):
+                            annotation["quote"] = _normalise_unambiguous_dialogue(annotation.get("quote", ""))
+                    setting_updates = json.loads(json_dumps(saved_hook.get("setting_updates", [])))
+                    for proposal in setting_updates:
+                        for reference in proposal.get("evidence_refs", []):
+                            if reference.get("source_kind") == "draft" and reference.get("chapter_no") == chapter_no:
+                                reference["quote"] = _normalise_unambiguous_dialogue(reference.get("quote", ""))
+                    formatting_draft = DraftOutput(title=str(chapter["title"]), content=formatted,
+                        hook_note=hook, setting_updates=setting_updates,
+                        new_fact_candidates=saved_hook.get("new_fact_candidates", []), thread_changes=saved_hook.get("thread_changes", []),
+                        scene_blueprint=(previous_notes.get("scene_blueprint") or {}).get("scenes", []),
+                        decision_summary=saved_hook.get("decision_summary") or ["为明确的直接对白补齐引号，原字词与事件保持。"])
+                    async with project_write_lock(project.root):
+                        current = project.db.get_chapter(chapter_no)
+                        if (not current or current["status"] != "draft" or int(current["version"]) != int(chapter["version"])
+                                or source_path.read_text(encoding="utf-8") != source_text):
+                            raise ValidationGateError("整理对白标点期间正文版本已变化，请按当前草稿继续。")
+                        original_path = trace.run_dir / f"format-before-{chapter_no:05d}-v{chapter['version']}.md"
+                        atomic_write_text(original_path, source_text)
+                        atomic_write_text(trace.run_dir / f"format-notes-{chapter_no:05d}-v{chapter['version']}.json", json_dumps(previous_notes))
+                        atomic_write_text(source_path, formatted)
+                        version = project.db.upsert_draft(chapter_no, str(chapter["title"]), chapter["path"], formatted)
+                        self._save_hook_note(project, chapter_no=chapter_no, chapter_version=version,
+                            run_id=trace.run_id, draft=formatting_draft, card=project.db.get_chapter_card(chapter_no))
+                        self._save_scene_blueprint(project, chapter_no=chapter_no, chapter_version=version,
+                            run_id=trace.run_id, draft=formatting_draft)
+                    trace.record("batch.format", "completed", f"第 {chapter_no} 章已补齐明确对白的引号，接下来审查当前版本",
+                        metadata={"chapter_no": chapter_no, "before_version": chapter["version"], "after_version": version,
+                                  "before_hash": content_hash(source_text), "after_hash": content_hash(formatted),
+                                  "original_path": str(original_path), "extra_model_calls": 0})
 
                 revision_round = 0
                 while True:
@@ -8919,6 +8998,46 @@ def _apply_unique_replacements(source: str, replacements: list[tuple[str, str]])
     return source
 
 
+def _expression_revision_context(packet: ContextPacket) -> str:
+    retained = {"A0", "J", "CSET", "D", "D2", "I", "J2", "C", "A"}
+    sections = [section.model_copy(update={"cache_scope": "canon" if section.key == "CSET"
+                else "book" if section.key in {"I", "J2"} else section.cache_scope})
+        for section in packet.sections if section.key in retained]
+    compact = packet.model_copy(update={"sections": sections, "warnings": []})
+    compact.estimated_tokens = estimate_tokens(compact.to_model_prompt())
+    return compact.to_model_prompt() + (
+        "\n本次只修当前正文的表达，最多四处小范围原句替换。不新增、删除或改变人物、事件、时间、证据来源、"
+        "物件转移与结尾结果，不按未来规划改写已发生场景。当前原稿和用户指定的样稿表达是本次材料；"
+        "有必要改变事实才能修好的地方先说明原因，不擅自改变。修订后仍由原审核角色对照完整正史与规划。\n"
+    )
+
+
+def _length_repair_context(packet: ContextPacket) -> str:
+    """Keep scene constraints for length-only work; final review retains full canon."""
+    retained = {"A0", "J", "CSET", "C0", "C", "D", "D2", "E0", "E", "F0", "G", "H", "I", "J2", "A"}
+    sections = [section for section in packet.sections if section.key in retained]
+    compact = packet.model_copy(update={"sections": sections, "warnings": []})
+    compact.estimated_tokens = estimate_tokens(compact.to_model_prompt())
+    return compact.to_model_prompt() + (
+        "\n这是原任务的篇幅调整资料，不是新的创作授权。仅展开当前正文已有的动作、反应与必要转场，"
+        "不增加新事实、证据、人物关系或承诺；涉及未装入的旧章事实时保持原稿含义。"
+        "完整正史与当前来源仍由同一章节审查核对，篇幅合格不等于正文通过。\n"
+    )
+
+
+def _normalise_unambiguous_dialogue(content: str) -> str:
+    """Quote a complete utterance after an explicit speech cue; preserve words."""
+    protected = r"(```[\s\S]*?```|(?m:^#{1,6}[ \t][^\n]*$)|“[^”]*”|「[^」]*」|‘[^’]*’)"
+    parts = re.split(protected, content)
+    utterance = re.compile(
+        r"((?:说|问|喊|答|应|开口|嘟囔|念叨|招呼)(?:道|着|了(?:一声|一句)?|一句|一声)?：[ \t]*)"
+        r"([^\n“”「」‘’。！？]+[。！？])"
+    )
+    for index in range(0, len(parts), 2):
+        parts[index] = utterance.sub(lambda match: match[1] + "“" + match[2] + "”", parts[index])
+    return "".join(parts)
+
+
 def _strip_model_chapter_heading(content: str, chapter_no: int) -> str:
     """Remove repeated headings and fix an unambiguous Chinese comma typo."""
 
@@ -8935,7 +9054,7 @@ def _strip_model_chapter_heading(content: str, chapter_no: int) -> str:
     # A comma between two Han characters is Chinese prose punctuation, not a
     # number separator or part of an English quotation. Preserve the pause;
     # do not strip punctuation or rewrite the author's sentence.
-    return re.sub(r"(?<=[\u3400-\u9fff]),[ \t]*(?=[\u3400-\u9fff])", "，", prose)
+    return _normalise_unambiguous_dialogue(re.sub(r"(?<=[\u3400-\u9fff]),[ \t]*(?=[\u3400-\u9fff])", "，", prose))
 
 
 def _deduplicate_exact_paragraphs(content: str) -> str:
@@ -9678,13 +9797,15 @@ def _deterministic_audit(
                 repair_instruction="补写占位内容后重新审查。",
             )
         )
-    if enumeration_commas:
+    punctuation_ban = re.compile(r"(?:禁用|禁止使用|不要使用|不使用|不用)(?:中文|汉语)?顿号|顿号(?:必须|一律)?(?:禁用|禁止使用|不用)")
+    ban_reversal = re.compile(r"(?:不要|不必|无需|不应|不能|取消|解除)(?:再|一律|强制)?(?:禁用|禁止使用|禁止)(?:中文|汉语)?顿号")
+    if enumeration_commas and any(punctuation_ban.search(rule) for rule in (user_rules or []) if not ban_reversal.search(rule)):
         findings.append(
             ReviewFinding(
                 category="style",
                 severity="major",
                 evidence=f"正文使用了 {enumeration_commas} 个中文顿号‘、’",
-                explanation="墨流小说正文已明确禁用中文顿号，当前版本未满足交稿格式。",
+                explanation="本书当前明确要求禁用中文顿号，当前版本未满足这一要求。",
                 repair_instruction="删除全部中文顿号；按语义改成自然短句、动作递进或使用‘和’‘与’连接，不要机械替换成其他标点。",
             )
         )

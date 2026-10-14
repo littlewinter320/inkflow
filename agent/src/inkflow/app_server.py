@@ -19,6 +19,7 @@ from pydantic import ValidationError
 from . import __version__
 from .config import Settings, adapt_settings, api_key_status, save_api_key_to_keyring, save_user_settings
 from .coordinator import Coordinator
+from .craft import AUTHOR_VOICE_CONTRACT
 from .engine import InkFlowEngine
 from .errors import ConfigurationError, InkFlowError, ProjectBusyError, ProjectError, ProviderError
 from .learning import LearningService
@@ -91,7 +92,8 @@ def _task_rows_with_history(project: InkFlowProject, limit: int, instance_id: st
         work_rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
     completed_tasks = {item["source"]["task_id"]: item for row in work_rows
                        if (item := json.loads(row["value_json"])).get("kind") == "workflow"
-                       and item.get("status") == "completed" and item.get("progress", {}).get("status") == "completed"
+                       and item.get("status") == "completed" and (item.get("progress", {}).get("status") == "completed"
+                           or isinstance(item.get("resolution"), dict) and item["resolution"].get("chapters"))
                        and item.get("source", {}).get("task_id")}
     pending = project.db.get_metadata(conversation_key("pending_creation_task"))
     if isinstance(pending, dict) and pending.get("status") == "running" and pending.get("run_id"):
@@ -261,17 +263,25 @@ class InkFlowAppService:
         from .config import Settings
         from .manual_edits import ManualEditsService
         from .runtime import RunRuntime
-        settings = Settings.from_env(project.root)
         key = str(project.root)
-        if not settings.manual_edit_review_enabled or (key in self._manual_workers and not self._manual_workers[key].done()):
-            return
-        if any(task["status"] == "running" for task in StudioService(project).db.list_tasks(100)):
-            return
-        if not any(item["status"] == "pending" for item in ManualEditsService(project).jobs().values()):
+        if key in self._manual_workers and not self._manual_workers[key].done():
             return
         async def work():
-            scope = StudioService(project).db.prepare_task_settings(f"manual-run-{uuid.uuid4().hex}",
-                novel_id=project.project_id, settings=settings, workspace_root=project.root)
+            def prepare():
+                settings = Settings.from_env(project.root)
+                if not settings.manual_edit_review_enabled:
+                    return None
+                if any(task["status"] == "running" for task in StudioService(project).db.list_tasks(100)):
+                    return None
+                if not any(item["status"] == "pending" for item in ManualEditsService(project).jobs().values()):
+                    return None
+                return StudioService(project).db.prepare_task_settings(f"manual-run-{uuid.uuid4().hex}",
+                    novel_id=project.project_id, settings=settings, workspace_root=project.root)
+            # Settings snapshots may wait for a project lock. Keep that wait
+            # off the RPC event loop so a finished foreground request can reply.
+            scope = await asyncio.to_thread(prepare)
+            if scope is None:
+                return
             settings_token = active_task_settings.set(scope)
             runtime_token = active_runtime.set(RunRuntime(publish=lambda event: None,task_id=scope.task_id,run_id=scope.task_id))
             conversation_token = active_conversation.set("manual-review")
@@ -360,7 +370,9 @@ class InkFlowAppService:
                 return {"learning_enabled": params["enabled"]}
             with (author_connection() if level == "author" else preference_db.connect()) as connection:
                 if action == "list":
-                    return {"preferences": list_items(connection, active_only=False, level=level)}
+                    from .craft import AUTHOR_STYLE_DEFAULT
+                    return {"preferences": list_items(connection, active_only=False, level=level),
+                            "style_default": AUTHOR_STYLE_DEFAULT}
                 if action == "history":
                     return {"events": history(connection, str(params.get("preference_id", "")))}
                 if action == "save":
@@ -611,6 +623,7 @@ class InkFlowAppService:
                 ),
                 user_prompt=f"请优化下面这条提示词。\n\n--- 原提示词 ---\n{prompt}",
                 output_model=PromptOptimization,
+                agent_role="coordinator",
                 effort="low",
                 max_tokens=1800,
                 thinking=False,
@@ -1109,10 +1122,16 @@ class InkFlowAppService:
             }
         if method == "document.prefill":
             relative_path = str(params.get("relative_path") or "")
-            chapter_match = re.search(r"chapter_(\d+)\.draft\.md$", relative_path)
+            path = project.resolve_user_path(relative_path)
+            relative_path = path.relative_to(project.root).as_posix()
+            chapter_match = re.fullmatch(r"chapters/chapter_(\d{5})\.draft\.md", relative_path)
             if not chapter_match:
                 raise ValueError("预填续写只用于章节草稿")
             chapter_no = int(chapter_match.group(1))
+            chapter = project.db.get_chapter(chapter_no)
+            if (not chapter or chapter["status"] != "draft" or chapter["path"] != relative_path
+                    or not path.is_file() or content_hash(path.read_text(encoding="utf-8")) != chapter["content_hash"]):
+                raise ValueError("这份草稿已经变更或不再是当前版本，请重新打开后再使用预填。")
             content = str(params.get("content") or "")
             cursor_offset = int(params.get("cursor_offset", len(content)))
             if cursor_offset < 0 or cursor_offset > len(content):
@@ -1125,9 +1144,11 @@ class InkFlowAppService:
             length_limit = {"short": 80, "medium": 240, "long": 600}.get(length, 240)
             before = content[max(0, cursor_offset - 6_000):cursor_offset]
             after = content[cursor_offset:cursor_offset + 2_000]
-            settings = self._engine(project.root).settings
+            engine = self._engine(project.root)
+            settings = engine.settings
+            source_fingerprint = engine._planning_source_fingerprint(project, chapter_no, chapter_no)
             prefill_trace = TraceRecorder(project.root, "prefill", settings.trace_level)
-            packet = self._engine(project.root)._context_builder(project, "writer").build(
+            packet = engine._context_builder(project, "writer").build(
                 chapter_no, "在光标处生成一段可选续写；不得保存、审查或提交正史。", mode="draft"
             )
             packet.sections.append(ContextSection(
@@ -1136,18 +1157,30 @@ class InkFlowAppService:
                 source_ids=[f"draft:{chapter_no}:{current_hash}"],
             ))
             packet.estimated_tokens = estimate_tokens(packet.to_model_prompt())
+            system_prompt = (
+                "你是墨流的 Writer，只生成编辑器光标处可插入的正文候选。保持人物、时态、视角和声线连续；"
+                "不要解释，不要重复光标前后的文字，不要修改文件，不要提交正史。\n\n"
+                + AUTHOR_VOICE_CONTRACT
+            )
+            output_budget = settings.effective_output_tokens(1_200, "writer")
+            if estimate_tokens(system_prompt + packet.to_model_prompt()) + output_budget > settings.context_budget_for("writer")[1]:
+                raise ValueError("当前草稿附近文字与写作资料超过预填容量，请缩小参考范围后再试。")
             result = await create_provider(settings).generate_json(
-                system_prompt=(
-                    "你是墨流的 Writer，只生成编辑器光标处可插入的正文候选。保持人物、时态、视角和声线连续；"
-                    "不要解释，不要重复光标前后的文字，不要修改文件，不要提交正史。"
-                ),
+                system_prompt=system_prompt,
                 user_prompt=packet.to_model_prompt(),
                 output_model=PrefillSuggestion,
-                max_tokens=min(1_200, settings.max_output_tokens),
+                max_tokens=output_budget,
                 thinking=False,
                 agent_role="writer",
             )
             prefill_trace.record_model("writer.prefill", result, "Writer 已生成未落盘的光标候选")
+            current = project.db.get_chapter(chapter_no)
+            if (not current or current["status"] != "draft" or current["version"] != chapter["version"]
+                    or current["content_hash"] != chapter["content_hash"] or current["path"] != relative_path
+                    or not path.is_file() or content_hash(path.read_text(encoding="utf-8")) != chapter["content_hash"]
+                    or source_fingerprint != engine._planning_source_fingerprint(project, chapter_no, chapter_no)):
+                prefill_trace.finish(status="waiting_condition", summary="预填期间正文或参考来源更新，旧候选未采用")
+                raise ValueError("预填期间正文、设定或规划已经更新，旧候选未采用；请在当前草稿上继续。")
             prefill_trace.finish(summary="预填候选已返回；未修改文件")
             return {
                 **result.data.model_dump(),
@@ -1268,6 +1301,8 @@ class InkFlowAppService:
             dimensions = list(params.get("dimensions") or ["continuity", "character", "narrative", "style"])
             allowed_dimensions = {"continuity", "character", "narrative", "style"}
             dimensions = [item for item in dimensions if item in allowed_dimensions][:4]
+            if not dimensions:
+                raise ValueError("请至少选择连续性、人物、叙事或表达中的一个审查方向；本次没有发送空审查。")
             packet = self._engine(project.root)._context_builder(project, "editor").build(
                 chapter_no, "多维审查当前正文", mode="review", protected_input=content
             )
@@ -1566,7 +1601,10 @@ class InkFlowAppService:
             saved = project.db.get_metadata("learning_settings", {})
             return {"enabled": saved.get("enabled", True) is not False}
         if method == "learning.settings.update":
-            value = {"enabled": bool(params.get("enabled", True))}
+            enabled = params.get("enabled", True)
+            if type(enabled) is not bool:
+                raise ValueError("学习开关必须明确为开启或关闭，文字不能代替开关。")
+            value = {"enabled": enabled}
             with project_write_lock_sync(project.root):
                 project.db.set_metadata("learning_settings", value)
             return value
@@ -2797,7 +2835,7 @@ class JsonLineServer:
             )
             if task_db is not None and params.get("project_root"):
                 try:
-                    self.service._schedule_manual_reviews(InkFlowProject(params["project_root"], recover_on_open=False))
+                    self.service._schedule_manual_reviews(project)
                 except Exception as exc:
                     # Auxiliary scheduling cannot revoke a durable foreground result.
                     warning = "后台手动核对尚未安排，请在核对窗口查看或重试：" + str(exc)[:1000]
@@ -3510,6 +3548,13 @@ def _error_payload(exc: Exception, operation: dict[str, Any] | None = None) -> d
             title="本地文件或进程访问失败",
             message="系统不允许访问这一步需要的文件或进程。请检查目录权限、文件占用及安全软件的拦截记录。" if isinstance(exc, PermissionError) else "这一步需要的本地文件或程序不存在。请检查应用资源是否完整，以及项目文件是否被移动。" if isinstance(exc, FileNotFoundError) else "系统无法完成这一步的文件或进程操作。请在诊断中核对失败位置，检查文件占用、目录权限及磁盘状态。",
             actions=[{"id": "open_process", "label": "查看失败位置和系统错误详情"}],
+            retryable=False,
+        )
+    elif isinstance(exc, NameError):
+        payload.update(
+            title="任务衔接出了程序错误",
+            message="审核结果已经返回，但墨流整理引用时没有正确取得当前章号。需要修复引用整理步骤，再续接本章审核。" if exc.name == "chapter_no" else "程序执行这一步时读取了尚未建立的内部信息。需要修复本步的信息传递，再从断点继续。",
+            actions=[{"id": "open_process", "label": "查看出错步骤与恢复条件"}],
             retryable=False,
         )
     elif isinstance(exc, InkFlowError):

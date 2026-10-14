@@ -1,7 +1,7 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, PointerEvent, ReactNode, RefObject } from "react";
-import { defaultWorkspaceLayout, dockedWidth, dockTarget, fitFloatingRect, layoutStorageKey, panelIds, panelLabels, readWorkspaceLayout, workspaceGeometry } from "./workspaceLayout";
-import type { DockPosition, PanelId, Rect, WorkspaceLayout, WorkspaceSize } from "./workspaceLayout";
+import { closeDropRect, defaultWorkspaceLayout, dockedWidth, dropLayout, fitFloatingRect, layoutStorageKey, panelIds, panelLabels, readWorkspaceLayout, workspaceDropTarget, workspaceGeometry } from "./workspaceLayout";
+import type { DockPosition, DropPreview, PanelId, Rect, WorkspaceLayout, WorkspaceSize } from "./workspaceLayout";
 import "./workspace.css";
 
 const rectStyle = (rect: Rect): CSSProperties => ({ left: rect.x, top: rect.y, width: rect.width, height: rect.height });
@@ -13,17 +13,21 @@ function loadLayout() {
   catch { return readWorkspaceLayout(null, null); }
 }
 
-export function useWorkspaceLayout(area: RefObject<HTMLElement | null>, projectRoot: string) {
+export function useWorkspaceLayout(area: RefObject<HTMLElement | null>, projectRoot: string,
+  onDetach: (id: PanelId, bounds?: Rect) => Promise<void>, onReturn: (id: PanelId, hide?: boolean) => Promise<void>) {
   const [layout, setLayout] = useState(loadLayout);
   const layoutRef = useRef(layout);
-  const [previous, setPrevious] = useState<WorkspaceLayout | null>(null);
+  const [previous, setPrevious] = useState<{ layout: WorkspaceLayout; native: PanelId[] } | null>(null);
   const [size, setSize] = useState({ width: Math.max(1, window.innerWidth), height: Math.max(1, window.innerHeight - 100) });
   const [moving, setMoving] = useState<PanelId | null>(null);
-  const [preview, setPreview] = useState<ReturnType<typeof dockTarget>>(null);
+  const [preview, setPreview] = useState<DropPreview | null>(null);
   const [active, setActive] = useState<PanelId | null>(null);
   const [nativePanels, setNativePanels] = useState<PanelId[]>([]);
   const nativePanelsRef = useRef(nativePanels); nativePanelsRef.current = nativePanels;
-  const gesture = useRef<{ id: PanelId; pointerId: number; x: number; y: number; rect: Rect; original: WorkspaceLayout; edge: string; moved: boolean; dock: ReturnType<typeof dockTarget> } | null>(null);
+  const gesture = useRef<{ id: PanelId; pointerId: number; x: number; y: number; rect: Rect; original: WorkspaceLayout; edge: string; moved: boolean; drop: DropPreview | null; detachedRect: Rect } | null>(null);
+  const nativeDragRef = useRef<{ id: PanelId; drop: DropPreview | null } | null>(null);
+  const detachRef = useRef(onDetach); detachRef.current = onDetach;
+  const returnRef = useRef(onReturn); returnRef.current = onReturn;
   const pendingFrame = useRef<number | null>(null);
   const geometryFor = (value: WorkspaceLayout, dimensions: WorkspaceSize) => {
     const panels = { ...value.panels };
@@ -33,7 +37,12 @@ export function useWorkspaceLayout(area: RefObject<HTMLElement | null>, projectR
   const geometry = geometryFor(layout, size);
   const sizeRef = useRef(size); sizeRef.current = size;
   const update = (next: WorkspaceLayout) => { layoutRef.current = next; setLayout(next); };
-  const change = (next: WorkspaceLayout) => { setPrevious(layoutRef.current); update(next); };
+  const remember = (value = layoutRef.current) => setPrevious({ layout: value, native: [...nativePanelsRef.current] });
+  const change = (next: WorkspaceLayout) => { remember(); update(next); };
+  const updatePreview = (next: DropPreview | null) => setPreview(old => old?.action === next?.action && old?.position === next?.position
+    && old?.rect.x === next?.rect.x && old?.rect.y === next?.rect.y && old?.rect.width === next?.rect.width && old?.rect.height === next?.rect.height ? old : next);
+  const previewLayout = (value: WorkspaceLayout) => ({ ...value, panels: Object.fromEntries(panelIds.map(id => [id,
+    { ...value.panels[id], visible: value.panels[id].visible && !nativePanelsRef.current.includes(id) }])) as WorkspaceLayout["panels"] });
 
   useLayoutEffect(() => {
     const element = area.current;
@@ -76,11 +85,16 @@ export function useWorkspaceLayout(area: RefObject<HTMLElement | null>, projectR
       if (!current.moved && Math.hypot(dx, dy) < 5) return;
       current.moved = true;
       const bounds = area.current?.getBoundingClientRect();
-      current.dock = !current.edge && bounds ? dockTarget(event.clientX - bounds.left, event.clientY - bounds.top, sizeRef.current) : null;
-      setMoving(current.id); setPreview(current.dock);
+      const raw = { ...current.rect, height: Math.min(current.rect.height, current.original.panels[current.id].height), x: current.rect.x + dx, y: current.rect.y + dy };
+      const proposed = { ...current.original, panels: { ...current.original.panels,
+        [current.id]: { ...current.original.panels[current.id], ...fitFloatingRect(current.id, raw, sizeRef.current), position: "floating" as const } } };
+      current.drop = !current.edge && bounds ? workspaceDropTarget(current.id, raw,
+        { x: event.clientX - bounds.left, y: event.clientY - bounds.top }, previewLayout(proposed), sizeRef.current, current.drop) : null;
+      if (bounds) current.detachedRect = { ...raw, x: bounds.left + raw.x, y: bounds.top + raw.y };
+      setMoving(current.id); updatePreview(current.drop);
       const next: WorkspaceLayout = { ...current.original, panels: { ...current.original.panels } };
       const panel = current.original.panels[current.id];
-      if (!current.edge) next.panels[current.id] = { ...panel, ...fitFloatingRect(current.id, { ...current.rect, height: Math.min(current.rect.height, panel.height), x: current.rect.x + dx, y: current.rect.y + dy }, sizeRef.current), position: "floating" };
+      if (!current.edge) next.panels[current.id] = { ...panel, ...fitFloatingRect(current.id, raw, sizeRef.current), position: "floating" };
       else {
         const floating = geometryFor(current.original, sizeRef.current).panels[current.id]?.floating;
         if (floating) {
@@ -118,12 +132,13 @@ export function useWorkspaceLayout(area: RefObject<HTMLElement | null>, projectR
       if (pendingFrame.current !== null) { window.cancelAnimationFrame(pendingFrame.current); pendingFrame.current = null; }
       if (current.moved && event.type === "pointerup") {
         const next = layoutRef.current;
-        const order = current.dock === "left" ? Math.min(...panelIds.map(id => next.panels[id].order)) - 1 : Math.max(...panelIds.map(id => next.panels[id].order)) + 1;
-        setPrevious(current.original);
-        const finished = current.dock ? { ...next, panels: { ...next.panels, [current.id]: { ...next.panels[current.id], position: current.dock, order } } } : next;
+        remember(current.original);
+        const finished = current.drop?.action === "dock" ? dropLayout(next, current.id, current.drop.position!)
+          : current.drop?.action === "close" ? { ...current.original, panels: { ...current.original.panels, [current.id]: { ...current.original.panels[current.id], visible: false } } } : next;
         if (area.current) area.current.dataset.moving = "false";
         draw(finished);
         update(finished);
+        if (current.drop?.action === "detach") void detachRef.current(current.id, current.detachedRect);
       } else { draw(current.original); update(current.original); }
       gesture.current = null; setMoving(null); setPreview(null);
       window.document.body.classList.remove("workspace-interacting");
@@ -137,7 +152,7 @@ export function useWorkspaceLayout(area: RefObject<HTMLElement | null>, projectR
     if (event.button !== 0 || detachedPanel) return;
     const rect = geometry.panels[id]; if (!rect) return;
     event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); setActive(id);
-    gesture.current = { id, pointerId: event.pointerId, x: event.clientX, y: event.clientY, rect, original: layoutRef.current, edge, moved: false, dock: null };
+    gesture.current = { id, pointerId: event.pointerId, x: event.clientX, y: event.clientY, rect, original: layoutRef.current, edge, moved: false, drop: null, detachedRect: rect };
     window.document.body.classList.add("workspace-interacting");
   };
   const setPosition = (id: PanelId, position: DockPosition) => {
@@ -148,11 +163,40 @@ export function useWorkspaceLayout(area: RefObject<HTMLElement | null>, projectR
   const toggle = (id: PanelId, visible = !layoutRef.current.panels[id].visible) => {
     const current = layoutRef.current; change({ ...current, panels: { ...current.panels, [id]: { ...current.panels[id], visible } } });
   };
-  const markNative = (id: PanelId, open: boolean) => {
+  const markNative = (id: PanelId, open: boolean, restore = true) => {
     const ids = [...nativePanelsRef.current.filter(item => item !== id), ...(open ? [id] : [])];
     nativePanelsRef.current = ids; setNativePanels(ids);
-    if (!open && !layoutRef.current.panels[id].visible) toggle(id, true);
+    if (!open && !restore) update({ ...layoutRef.current, panels: { ...layoutRef.current.panels, [id]: { ...layoutRef.current.panels[id], visible: false } } });
+    else if (!open && !layoutRef.current.panels[id].visible) update({ ...layoutRef.current, panels: { ...layoutRef.current.panels, [id]: { ...layoutRef.current.panels[id], visible: true } } });
+    if (nativeDragRef.current?.id === id) { nativeDragRef.current = null; setMoving(null); setPreview(null); }
   };
+  const nativeDrag = (value: Record<string, unknown>) => {
+    const id = value.panel as PanelId, bounds = area.current?.getBoundingClientRect();
+    if (detachedPanel || !bounds || !panelIds.includes(id) || !nativePanelsRef.current.includes(id)) return;
+    const rect = value.rect as Rect, origin = value.origin as { x: number; y: number }, point = value.point as { x: number; y: number };
+    if (!rect || !origin || !point || ![rect.x, rect.y, rect.width, rect.height, origin.x, origin.y, point.x, point.y].every(Number.isFinite)) return;
+    const cancelled = value.phase === "cancel";
+    const scale = typeof value.scale === "number" && Number.isFinite(value.scale) && value.scale > 0 ? value.scale : 1;
+    const localRect = { x: (rect.x - origin.x) / scale - bounds.left, y: (rect.y - origin.y) / scale - bounds.top, width: rect.width / scale, height: rect.height / scale };
+    const incoming = { ...layoutRef.current, panels: { ...layoutRef.current.panels, [id]: { ...layoutRef.current.panels[id], width: localRect.width, height: localRect.height } } };
+    const drop = cancelled ? null : workspaceDropTarget(id,
+      localRect, { x: (point.x - origin.x) / scale - bounds.left, y: (point.y - origin.y) / scale - bounds.top }, previewLayout(incoming), sizeRef.current,
+      nativeDragRef.current?.id === id ? nativeDragRef.current.drop : null, true);
+    if (value.phase === "move") { nativeDragRef.current = { id, drop }; setMoving(id); updatePreview(drop); return; }
+    nativeDragRef.current = null; setMoving(null); setPreview(null);
+    if (value.phase === "drop" && drop) {
+      remember();
+      if (drop.action === "dock") update(dropLayout(incoming, id, drop.position!));
+      else if (drop.action === "close") update({ ...layoutRef.current, panels: { ...layoutRef.current.panels, [id]: { ...layoutRef.current.panels[id], visible: false } } });
+      void returnRef.current(id, drop.action === "close");
+    }
+  };
+  const undo = previous ? () => {
+    const saved = previous;
+    update(saved.layout); setPrevious(null);
+    for (const id of nativePanelsRef.current) if (!saved.native.includes(id)) void returnRef.current(id, !saved.layout.panels[id].visible);
+    for (const id of saved.native) if (!nativePanelsRef.current.includes(id)) void detachRef.current(id);
+  } : null;
   const keyMove = (id: PanelId, event: KeyboardEvent<HTMLButtonElement>) => {
     const direction = ({ ArrowLeft: [-20, 0], ArrowRight: [20, 0], ArrowUp: [0, -20], ArrowDown: [0, 20] } as Record<string, number[]>)[event.key];
     if (!direction) return;
@@ -162,7 +206,7 @@ export function useWorkspaceLayout(area: RefObject<HTMLElement | null>, projectR
     const fitted = fitFloatingRect(id, event.shiftKey ? { ...rect, width: rect.width + direction[0], height: rect.height + direction[1] } : { ...rect, x: rect.x + direction[0], y: rect.y + direction[1] }, size);
     change({ ...current, panels: { ...current.panels, [id]: { ...current.panels[id], ...fitted, position: "floating" } } });
   };
-  return { layout, geometry, size, moving, preview, active, nativePanels, markNative, start, setActive, keyMove, setPosition, toggle, undo: previous ? () => { update(previous); setPrevious(null); } : null, reset: () => change(readWorkspaceLayout(defaultWorkspaceLayout, null)) };
+  return { layout, geometry, size, moving, preview, active, nativePanels, markNative, nativeDrag, remember, start, setActive, keyMove, setPosition, toggle, undo, reset: () => change(readWorkspaceLayout(defaultWorkspaceLayout, null)) };
 }
 type WorkspaceController = ReturnType<typeof useWorkspaceLayout>;
 
@@ -193,8 +237,13 @@ export function WorkspacePanel({ id, workspace, className, actions, onDetach, ch
 }
 
 export function WorkspaceDropPreview({ workspace }: { workspace: WorkspaceController }) {
-  if (!workspace.moving || !workspace.preview) return null;
-  const position = workspace.preview;
-  const rect = position === "bottom" ? { x: 0, y: workspace.size.height - Math.min(workspace.layout.bottomHeight, workspace.size.height / 2), width: workspace.size.width, height: Math.min(workspace.layout.bottomHeight, workspace.size.height / 2) } : { x: position === "left" ? 0 : workspace.size.width - Math.min(workspace.layout.panels[workspace.moving].width, workspace.size.width / 2), y: 0, width: Math.min(workspace.layout.panels[workspace.moving].width, workspace.size.width / 2), height: workspace.size.height };
-  return <div className="workspace-drop-preview" style={rectStyle(rect)} role="status">松开后放到{position === "left" ? "左侧" : position === "right" ? "右侧" : "下方"}</div>;
+  if (!workspace.moving) return null;
+  const preview = workspace.preview, label = panelLabels[workspace.moving];
+  return <>
+    <div className={`workspace-close-drop${preview?.action === "close" ? " active" : ""}`} style={rectStyle(closeDropRect(workspace.size))} aria-hidden="true">拖到这里收起面板</div>
+    {preview && <div className={`workspace-drop-preview action-${preview.action}`} style={rectStyle(preview.rect)} role="status">
+      <span>{preview.action === "close" ? `松开后收起${label}` : preview.action === "detach" ? "松开后移到独立窗口" : `松开后放到${preview.position === "left" ? "左侧" : preview.position === "right" ? "右侧" : "下方"}`}</span>
+      <small>{preview.action === "close" ? "可从顶端布局重新打开" : "移出预览区域可继续自由摆放"}</small>
+    </div>}
+  </>;
 }

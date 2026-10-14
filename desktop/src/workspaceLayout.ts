@@ -5,6 +5,7 @@ export type Rect = { x: number; y: number; width: number; height: number };
 export type PanelLayout = Rect & { visible: boolean; position: DockPosition; order: number };
 export type WorkspaceLayout = { panels: Record<PanelId, PanelLayout>; bottomHeight: number };
 export type WorkspaceSize = { width: number; height: number };
+export type DropPreview = { action: "dock" | "close" | "detach"; position?: Exclude<DockPosition, "floating">; rect: Rect };
 export const panelLabels: Record<PanelId, string> = { navigation: "小说结构", assistant: "墨宝对话", inspector: "批注与版本" };
 export const layoutStorageKey = "inkflow.workspace-layout.v3";
 const minimumWidths: Record<PanelId, number> = { navigation: 180, assistant: 280, inspector: 200 };
@@ -86,11 +87,45 @@ export function workspaceGeometry(layout: WorkspaceLayout, size: WorkspaceSize) 
   return { panels, editor: { x: left, y: 0, width: Math.max(1, right - left), height: bodyHeight } };
 }
 
-export function dockTarget(x: number, y: number, size: WorkspaceSize): Exclude<DockPosition, "floating"> | null {
-  if (x < 0 || y < 0 || x > size.width || y > size.height) return null;
-  const edge = Math.min(64, size.width / 5, size.height / 5);
-  if (y >= size.height - edge) return "bottom";
-  return x <= edge ? "left" : x >= size.width - edge ? "right" : null;
+export function closeDropRect(size: WorkspaceSize): Rect {
+  const width = Math.min(280, size.width * .4), height = Math.min(64, size.height * .14);
+  return { x: (size.width - width) / 2, y: size.height - height - 12, width, height };
+}
+
+export function dropLayout(layout: WorkspaceLayout, id: PanelId, position: Exclude<DockPosition, "floating">): WorkspaceLayout {
+  const order = position === "left" ? Math.min(...panelIds.map(item => layout.panels[item].order)) - 1
+    : Math.max(...panelIds.map(item => layout.panels[item].order)) + 1;
+  return { ...layout, panels: { ...layout.panels, [id]: { ...layout.panels[id], visible: true, position, order } } };
+}
+
+export function workspaceDropTarget(id: PanelId, rect: Rect, point: { x: number; y: number }, layout: WorkspaceLayout,
+  size: WorkspaceSize, previous: DropPreview | null = null, native = false): DropPreview | null {
+  const inside = (box: Rect) => point.x >= box.x && point.x <= box.x + box.width && point.y >= box.y && point.y <= box.y + box.height;
+  const close = closeDropRect(size);
+  if (inside(close)) return { action: "close", rect: close };
+  const outside = Math.max(-point.x, -point.y, point.x - size.width, point.y - size.height);
+  const margin = Math.max(24, Math.min(size.width, size.height) * .045);
+  if (!native && outside > margin) return { action: "detach", rect: fitFloatingRect(id, rect, size) };
+  if (outside > margin * 2) return null;
+  const overlap = (left: Rect, right: Rect) => Math.max(0, Math.min(left.x + left.width, right.x + right.width) - Math.max(left.x, right.x))
+    * Math.max(0, Math.min(left.y + left.height, right.y + right.height) - Math.max(left.y, right.y));
+  const visibleArea = overlap(rect, { x: 0, y: 0, ...size });
+  if (!visibleArea) return null;
+  const side = size.width * .3, bottom = size.height * .26;
+  const zones = [
+    { position: "bottom" as const, rect: { x: 0, y: size.height - bottom, width: size.width, height: bottom }, near: point.y > size.height * .68 },
+    { position: "left" as const, rect: { x: 0, y: 0, width: side, height: size.height }, near: point.x < size.width * .4 },
+    { position: "right" as const, rect: { x: size.width - side, y: 0, width: side, height: size.height }, near: point.x > size.width * .6 },
+  ];
+  const candidates = zones.map(zone => ({ ...zone, coverage: overlap(rect, zone.rect) / visibleArea,
+    threshold: previous?.action === "dock" && previous.position === zone.position ? .3 : .45 }))
+    .filter(zone => zone.near && zone.coverage >= zone.threshold);
+  candidates.sort((a, b) => b.coverage - a.coverage);
+  for (const candidate of candidates) {
+    const destination = workspaceGeometry(dropLayout(layout, id, candidate.position), size).panels[id];
+    if (destination && !destination.floating) return { action: "dock", position: candidate.position, rect: destination };
+  }
+  return null;
 }
 
 export function dockedWidth(id: PanelId, width: number, rect: Rect, editor: Rect, size: WorkspaceSize): number {

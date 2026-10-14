@@ -2,11 +2,11 @@
 .workspace-free > .workbench, .workspace-free > .workspace-panel { position: absolute; min-width: 0; min-height: 0; margin: 0; box-sizing: border-box; grid-area: auto; }
 .workspace-free > .workspace-panel { overflow: visible; padding: 0; }
 .workspace-free > .workbench { border: 0; }
-.workspace-panel { display: flex; flex-direction: column; border: 1px solid var(--line-soft); background: var(--panel); padding: 0; }
+.workspace-panel { display: flex; flex-direction: column; border: 1px solid color-mix(in srgb, var(--text) 7%, transparent); background: var(--panel); padding: 0; }
 .workspace-panel[hidden] { display: none; }
-.workspace-panel[data-floating="true"] { border-color: var(--line); border-radius: 12px; box-shadow: 0 16px 48px #0005; }
+.workspace-panel[data-floating="true"] { border-color: color-mix(in srgb, var(--text) 11%, transparent); border-radius: 12px; background: color-mix(in srgb, var(--panel) 92%, transparent); backdrop-filter: blur(8px); box-shadow: 0 12px 36px #0003, inset 0 1px color-mix(in srgb, var(--text) 4%, transparent); }
 .workspace-free:not([data-moving="true"]) > .workspace-panel, .workspace-free:not([data-moving="true"]) > .workbench { transition: left 180ms cubic-bezier(.2,.8,.2,1), top 180ms cubic-bezier(.2,.8,.2,1), width 180ms cubic-bezier(.2,.8,.2,1), height 180ms cubic-bezier(.2,.8,.2,1), border-radius 180ms ease; }
-.workspace-panel-heading { display: flex; flex: 0 0 38px; align-items: center; justify-content: space-between; gap: 4px; min-width: 0; padding: 3px 6px; border-bottom: 1px solid var(--line-soft); }
+.workspace-panel-heading { display: flex; flex: 0 0 38px; align-items: center; justify-content: space-between; gap: 4px; min-width: 0; padding: 3px 6px; border-bottom: 1px solid color-mix(in srgb, var(--text) 5%, transparent); }
 .workspace-title-handle { display: flex; flex: 1; align-items: center; gap: 7px; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 4px; border: 0; background: transparent; cursor: grab; touch-action: none; font-size: 12px; text-align: left; }
 .panel-grip { color: var(--faint); font-size: 18px; }
 .workspace-title-handle:active { cursor: grabbing; }
@@ -37,11 +37,17 @@
 .edge-ne, .edge-nw, .edge-se, .edge-sw { width: 13px; height: 13px; }
 .edge-ne { top: -3px; right: -3px; cursor: nesw-resize; } .edge-nw { top: -3px; left: -3px; cursor: nwse-resize; }
 .edge-se { bottom: -3px; right: -3px; cursor: nwse-resize; } .edge-sw { bottom: -3px; left: -3px; cursor: nesw-resize; }
-.workspace-drop-preview { position: absolute; z-index: 30; pointer-events: none; display: grid; place-items: center; border: 1px dashed var(--accent); border-radius: 9px; background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--text); font-size: 13px; animation: workspace-drop-in 120ms ease-out; }
+.workspace-drop-preview { position: absolute; z-index: 30; pointer-events: none; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 16px; box-sizing: border-box; border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent); border-radius: 12px; background: color-mix(in srgb, var(--accent) 18%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text) 8%, transparent); backdrop-filter: blur(5px); color: var(--text); font-size: 14px; text-align: center; animation: workspace-drop-in 120ms ease-out; }
+.workspace-drop-preview small { max-width: 28em; font-size: 12px; line-height: 1.5; }
+.workspace-drop-preview.action-close { padding: 6px 12px; gap: 2px; border-color: color-mix(in srgb, var(--red) 45%, transparent); background: color-mix(in srgb, var(--red) 16%, var(--panel)); }
+.workspace-close-drop { position: absolute; z-index: 28; pointer-events: none; display: grid; place-items: center; border: 1px solid var(--line-soft); border-radius: 12px; background: color-mix(in srgb, var(--panel) 85%, transparent); color: var(--muted); font-size: 13px; backdrop-filter: blur(5px); }
+.workspace-close-drop.active { opacity: 0; }
 .workspace-interacting, .workspace-interacting * { user-select: none !important; }
 .workspace-panel-heading button:focus-visible, .workspace-layout-button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .workspace-detached .topbar { display: none; }
 .app-shell.workspace-detached { grid-template-rows: minmax(0, 1fr) 29px; }
 .workspace-detached .workbench { display: none; }
+.workspace-detached .workspace-title-handle { -webkit-app-region: drag; }
+.workspace-detached .workspace-panel-actions { -webkit-app-region: no-drag; }
 @keyframes workspace-drop-in { from { opacity: 0; } to { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { .workspace-free > .workspace-panel, .workspace-free > .workbench, .workspace-drop-preview { transition: none !important; animation: none !important; } }

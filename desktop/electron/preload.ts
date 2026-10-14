@@ -7,8 +7,8 @@ contextBridge.exposeInMainWorld("inkflow", {
     ipcRenderer.invoke("engine:request", method, { ...params, conversation_id: conversationId }),
   openConversationWindow: (projectRoot: string, conversationId?: string) => ipcRenderer.invoke("app:conversation-window", projectRoot, conversationId),
   conversationWindows: (projectRoot: string) => ipcRenderer.invoke("app:conversation-windows", projectRoot),
-  openWorkspacePanel: (projectRoot: string, panel: string, relativePath?: string) => ipcRenderer.invoke("workspace:open", projectRoot, panel, relativePath),
-  returnWorkspacePanel: (panel?: string) => ipcRenderer.invoke("workspace:return", panel),
+  openWorkspacePanel: (projectRoot: string, panel: string, relativePath?: string, bounds?: { x: number; y: number; width: number; height: number }) => ipcRenderer.invoke("workspace:open", projectRoot, panel, relativePath, bounds),
+  returnWorkspacePanel: (panel?: string, hide = false) => ipcRenderer.invoke("workspace:return", panel, hide),
   publishWorkspaceState: (state: unknown) => ipcRenderer.invoke("workspace:state", state),
   workspaceCommand: (command: string, value: string, relativePath?: string) => ipcRenderer.invoke("workspace:command", command, value, relativePath),
   onWorkspaceEvent: (listener: (event: unknown) => void) => {

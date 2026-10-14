@@ -923,6 +923,10 @@ class VoiceRuntime:
             )
             if not self._sherpa_status()["asr_ready"]:
                 raise RuntimeError("普通话识别组件不完整：依赖或模型文件仍不可用。")
+            # Preparing input should also select the installed engine. Keep
+            # explicit feature switches and an existing browser choice intact.
+            if self.settings()["voice_input_engine"] == "off":
+                await asyncio.to_thread(self.configure, {"voice_input_engine": "local"})
             await self._publish_install_progress(
                 component="asr",
                 state_path=self.sherpa_state_path,

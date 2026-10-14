@@ -205,6 +205,16 @@ def setting_review_gaps(output: Any, content: str, packet: ContextPacket) -> lis
     return gaps
 
 
+def mode_output_requirements(packet: ContextPacket) -> dict:
+    sources = packet_sources(packet)
+    section = next((item for item in packet.sections if item.key == "CSET"), None)
+    payload = json.loads(section.content) if section else {}
+    return {"source_comparisons": [key for key in ("book:requirements", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md") if key in sources],
+        "setting_checks": [{"record_id": record["record_id"], "record_revision": record["revision"], "title": record["title"]}
+            for collection in payload.get("collections", []) for record in collection.get("records", [])],
+        "instruction": "每份原文分别对照；设定条目逐项核对，不适用时明确说明，不省略。编号和修订号照抄，结论和引文由实际阅读判断，不编造已读或通过。"}
+
+
 def mode_output_model(packet: ContextPacket, *, primary: bool) -> type:
     """Require structural coverage in the existing Provider format retry, before a second review."""
     from pydantic import create_model, model_validator
@@ -212,10 +222,9 @@ def mode_output_model(packet: ContextPacket, *, primary: bool) -> type:
     if not primary:
         return ModeCheckOutput
     sources = packet_sources(packet)
-    required = {key for key in ("book:requirements", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md") if key in sources}
-    section = next((item for item in packet.sections if item.key == "CSET"), None)
-    payload = json.loads(section.content) if section else {}
-    records = {record["record_id"]: record["revision"] for collection in payload.get("collections", []) for record in collection.get("records", [])}
+    requirements = mode_output_requirements(packet)
+    required = set(requirements["source_comparisons"])
+    records = {item["record_id"]: item["record_revision"] for item in requirements["setting_checks"]}
     def coverage(output):
         seen = [check.record_id for check in output.context_use_audit.setting_checks]
         missing = required - {resolve_packet_source_id(item.source_id, sources) for item in output.source_comparisons}

@@ -1260,6 +1260,7 @@ class StudioService:
         }
 
     def read_document(self, relative_path: str) -> dict[str, Any]:
+        relative_path = self.project.resolve_user_path(relative_path).relative_to(self.project.root).as_posix()
         path = self.project.resolve_user_path(relative_path)
         if not path.is_file():
             raise ProjectError(f"文件不存在：{relative_path}")
@@ -1295,9 +1296,9 @@ class StudioService:
 
     def delete_document(self, relative_path: str, *, expected_hash: str) -> dict[str, Any]:
         """Move one unchanged, non-canon file to the project recovery area."""
-        relative = relative_path.replace("\\", "/")
+        relative = self.project.resolve_user_path(relative_path).relative_to(self.project.root).as_posix()
         with project_write_lock_sync(self.project.root):
-            candidate = self.project.root / relative
+            candidate = self.project.root / relative_path
             if candidate.is_symlink():
                 raise ProjectError("符号链接不能从文档工作区删除。")
             path = self.project.resolve_user_path(relative)
@@ -1330,7 +1331,7 @@ class StudioService:
         expected_hash: str | None,
         source: str = "desktop_manual",
     ) -> dict[str, Any]:
-        relative = relative_path.replace("\\", "/")
+        relative = self.project.resolve_user_path(relative_path).relative_to(self.project.root).as_posix()
         path = self.project.resolve_user_path(relative)
         old_content = path.read_text(encoding="utf-8") if path.is_file() else ""
         old_hash = content_hash(old_content)
@@ -1357,6 +1358,10 @@ class StudioService:
                 "gate": protection["reason"],
                 "requires_canon_revision": True,
             }
+        chapter_no = _chapter_number_from_path(relative)
+        chapter = self.project.db.get_chapter(chapter_no) if chapter_no else None
+        if chapter and relative.endswith(".draft.md") and chapter.get("status") == "accepted":
+            raise ValidationGateError("这一章已经进入正史，不能另存同章草稿覆盖记录；请从正文修订入口建立提案。")
         if old_content:
             self.db.capture_version(
                 relative,
@@ -1366,7 +1371,6 @@ class StudioService:
                 applied=True,
             )
         atomic_write_text(path, content)
-        chapter_no = _chapter_number_from_path(relative)
         if chapter_no and relative.endswith(".draft.md"):
             title = _title_from_document(content, chapter_no)
             self.project.db.upsert_draft(chapter_no, title, relative, content)
@@ -1374,7 +1378,7 @@ class StudioService:
         from .manual_edits import ManualEditsService
         manual = ManualEditsService(self.project)
         manual_job = (manual.mark_saved(relative, content, old_hash, source=source)
-                      if source.startswith(("desktop_manual", "upload", "external", "story_setting")) else None)
+                      if source.startswith(("desktop_manual", "upload", "external", "story_setting", "mcp_editor")) else None)
         if manual_job is None:
             manual.note_engine_write(relative, content)
         return {
@@ -1402,7 +1406,7 @@ class StudioService:
         end_offset: int,
         comment: str,
     ) -> dict[str, Any]:
-        relative = relative_path.replace("\\", "/")
+        relative = self.project.resolve_user_path(relative_path).relative_to(self.project.root).as_posix()
         path = self.project.resolve_user_path(relative)
         if not path.is_file():
             raise ProjectError(f"文件不存在：{relative}")
@@ -1522,6 +1526,7 @@ class StudioService:
         }
 
     def _document_protection(self, relative_path: str) -> dict[str, Any]:
+        relative_path = self.project.resolve_user_path(relative_path).relative_to(self.project.root).as_posix()
         chapter_no = _chapter_number_from_path(relative_path)
         if chapter_no and relative_path.endswith(f"chapter_{chapter_no:05d}.md"):
             record = self.project.db.get_chapter(chapter_no)
