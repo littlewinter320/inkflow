@@ -81,8 +81,17 @@ class ManualEditsService:
 
     def reconcile_setting_reviews(self):
         """A current, verified successor retires its old setting-review job."""
+        from .errors import ProjectBusyError
+        try:
+            self._reconcile_setting_reviews()
+        except ProjectBusyError:
+            # This is optional read-side maintenance. A concurrent write must
+            # not prevent viewing the board or starting an unrelated request.
+            return
+
+    def _reconcile_setting_reviews(self):
         from .story_settings import StorySettingsService
-        with project_write_lock_sync(self.project.root):
+        with project_write_lock_sync(self.project.root, timeout=0):
             jobs = self.jobs()
             candidates = [job for job in jobs.values() if job.get("kind") == "setting_record"
                 and job.get("applied") and type(job.get("record_revision")) is int
