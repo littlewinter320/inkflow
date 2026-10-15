@@ -356,12 +356,7 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .plan-empty { padding: 15px; border: 1px dashed #465037; background: #151911; }
 .plan-empty strong { font-size: 12px; }
 .plan-empty p { margin: 6px 0 12px; color: var(--muted); font-size: 10px; line-height: 1.55; }
-.current-planning-note { margin: 10px 0; padding: 12px; border: 1px solid #465d3b; background: #192016; }
-.current-planning-note.changed, .current-planning-note.unknown { border-color: #6d512a; background: #241d12; }
-.current-planning-note strong { color: var(--accent); font-size: 12px; }
-.current-planning-note.changed strong, .current-planning-note.unknown strong { color: #e2c78d; }
-.current-planning-note p, .legacy-plan-note { margin: 5px 0 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
-.legacy-plan-note { margin: 10px 0; }
+.legacy-plan-note { margin: 10px 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
 .plan-levels { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .foundation-flow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 12px 0; }
 .foundation-flow button { min-width: 0; padding: 11px; text-align: left; border: 1px solid #3d4630; background: #171b13; color: var(--text); cursor: pointer; }

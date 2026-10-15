@@ -351,9 +351,6 @@ export function ProjectCenter({
   const currentWorkspace = workspace as ChapterWorkspaceLike | null;
   const documentItems = tree?.items || [];
   const hasRecentPlan = documentItems.some((item) => item.relative_path === "RECENT_PLAN.md");
-  const planningPublication = dashboard?.chapter_outline?.state === "active" ? "active"
-    : dashboard?.chapter_outline?.state === "needs_attention" ? "changed" : "unknown";
-  const planningRevisionNo = dashboard?.chapter_outline?.revision_no;
   const suggestions = projectSuggestions(dashboard, documentItems.map(item => item.relative_path));
   const legacyPlan = dashboard?.current_plan || null;
   const currentPlan = hasRecentPlan ? null : legacyPlan;
@@ -434,7 +431,6 @@ export function ProjectCenter({
           return <button key={item.path} type="button" disabled={!documentItem} className={documentItem ? "ready" : "missing"} onClick={() => documentItem && onOpen(documentItem)}><strong>{item.label}</strong><small>{documentItem ? item.note : "待建立"}</small></button>;
         })}</div>
         {!hasRecentPlan && !!dashboard?.planning_impact?.affected.length && <div className="planning-impact"><strong>依据已有变化</strong><p>{dashboard.planning_impact.affected.join("；")}。{dashboard.planning_impact.next_step}</p><button onClick={() => onPrompt("大纲或设定改过了，请先核对细纲与还没写的章节安排，指出影响范围；保留已接受的正文。")}>让墨流核对未来安排</button></div>}
-        {hasRecentPlan && <div className={`current-planning-note ${planningPublication}`}><strong title="正式版号累计记录本书已采用的规划更新，不是自动重试次数。审核未过、中断和等待确认不会增加版号；补救次数见本次任务记录。">{planningPublication === "active" ? `当前规划已生效 · 正式第 ${planningRevisionNo || 1} 版` : planningPublication === "changed" ? "规划文档与生效记录不一致" : planningPublication === "unknown" ? "规划文档已存在，生效状态待核对" : "正在核对规划状态"}</strong><details><summary>查看规划说明</summary><p>上方卡片可查看当前大纲、卷细纲和近期安排。规划更新只安排后续故事，已经接受的正文仍以正史为准。</p></details></div>}
         {!hasRecentPlan && !currentPlan && <div className="plan-empty"><strong>还没有近期章节规划</strong><p>先确定大纲与细纲，再安排接下来的章节。</p></div>}
         {currentPlan && <>
           <p className="legacy-plan-note">以下卷、篇章及章节卡来自旧版规划记录，仅供核对。当前三层规划完成后，请查看上方文档。</p>
