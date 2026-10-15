@@ -4,9 +4,11 @@ import asyncio
 import json
 import math
 import threading
+import warnings
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import wraps
+from pathlib import Path
 from typing import Any, Generic, Protocol, TypeVar
 from uuid import uuid4
 
@@ -79,6 +81,11 @@ def _budgeted_generation(method):
     @wraps(method)
     async def generate(self, **kwargs):
         with ensure_run_runtime():
+            role = _model_role(kwargs.get("agent_role"))
+            kwargs["agent_role"] = role
+            kwargs["thinking"] = self.settings.thinking_for(role, kwargs.get("thinking", True))
+            kwargs["max_tokens"] = self.settings.generation_output_budget(
+                role, kwargs.get("max_tokens", 32_000), kwargs["thinking"])
             return await method(self, **kwargs)
     return generate
 
@@ -91,6 +98,73 @@ def _generation_settings(settings: Settings, role: str | None) -> dict[str, floa
     if role is None:
         return {}
     return settings.generation_for(role)
+
+
+def _bound_batch_chapter_count(settings: Settings) -> int:
+    from .context import active_batch_context
+    binding, scope, runtime = active_batch_context.get(), active_task_settings.get(), active_runtime.get()
+    if not isinstance(binding, dict) or scope is None or runtime is None or runtime.task_id != scope.task_id:
+        return 1
+    manifest = binding.get("manifest")
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("task_settings"), dict):
+        return 1
+    reference = manifest["task_settings"]
+    if (not manifest.get("batch_id") or not scope.task_id or not scope.snapshot_hash or not scope.novel_id
+            or any(reference.get(key) != getattr(scope, key) for key in ("task_id", "snapshot_hash", "novel_id"))):
+        return 1
+    first, last = manifest.get("start_chapter_no"), manifest.get("end_chapter_no")
+    if type(first) is not int or type(last) is not int or not 1 <= first < last:
+        return 1
+    stopped = manifest.get("stopped_at_chapter")
+    if stopped is not None and (type(stopped) is not int or not first <= stopped <= last):
+        return 1
+    try:
+        # Batch binding and task restoration already canonicalize roots; this projection does no I/O.
+        if (settings.workspace_root is None or scope.settings.workspace_root is None
+                or Path(binding["root"]) != Path(settings.workspace_root)
+                or Path(binding["root"]) != Path(scope.settings.workspace_root)
+                or settings.to_mapping() != scope.settings.to_mapping()):
+            return 1
+    except (KeyError, OSError, TypeError, ValueError):
+        return 1
+    return last - first + 1
+
+
+def _request_wait_policy(settings: Settings, role: str | None,
+                         timeout_seconds: float | None) -> dict[str, Any]:
+    timeout = timeout_seconds or settings.request_timeout_seconds
+    policy = {"request_timeout_seconds": timeout, "soft_wait_seconds": _MIMO_SOFT_WAIT_SECONDS,
+              "timeout_policy": "explicit" if timeout_seconds else "configured", "batch_chapter_count": 1}
+    if role not in {"coordinator", "writer", "editor", "reviewer", "memory_keeper"}:
+        return policy
+    count = _bound_batch_chapter_count(settings)
+    preset = "balanced" if settings.quality_preset == "custom" else settings.quality_preset
+    scale = 2 if preset == "balanced" else 1
+    return {"request_timeout_seconds": None if preset == "quality" else max(timeout, (360.0 + 120.0 * (count - 1)) * scale),
+            "soft_wait_seconds": None if preset == "quality" else (_MIMO_SOFT_WAIT_SECONDS + 60.0 * (count - 1)) * scale,
+            "timeout_policy": f"{preset}_production", "batch_chapter_count": count}
+
+
+def _http_wait_timeout(settings: Settings, timeout_seconds: float | None, wait_policy: dict[str, Any]):
+    hard = wait_policy["request_timeout_seconds"]
+    if hard is not None:
+        return hard
+    finite = timeout_seconds or settings.request_timeout_seconds
+    return httpx.Timeout(connect=finite, read=None, write=finite, pool=finite)
+
+
+def _publish_request_started(runtime, *, role: str | None, model: str, attempt: int,
+                             wait_policy: dict[str, Any]) -> None:
+    if runtime is None:
+        return
+    try:
+        hard = wait_policy["request_timeout_seconds"]
+        waiting = f"最长等待 {hard:g} 秒。" if hard is not None else "不设总等待时限，可随时停止。"
+        runtime.publish({"type": "model.request.started", "role": role, "model": model,
+            "summary": "本次模型请求已发送，" + waiting,
+            "metadata": {"attempt": attempt, **wait_policy}})
+    except Exception as exc:
+        warnings.warn(f"模型等待信息暂未送达（{type(exc).__name__}）；原请求继续。", RuntimeWarning, stacklevel=2)
 
 
 def _generation_schema(output_model: type[T]) -> dict[str, Any]:
@@ -232,22 +306,24 @@ async def _mimo_stream_response(client: httpx.AsyncClient, url: str, *, headers:
 
 
 async def _mimo_response_with_reminder(client: httpx.AsyncClient, url: str, *, headers: dict[str, str],
-                                      payload: dict[str, Any], timeout: float, role: str | None,
-                                      attempt: int) -> httpx.Response:
+                                      payload: dict[str, Any], timeout: float | None, role: str | None,
+                                      attempt: int, soft_wait_seconds: float | None = None) -> httpx.Response:
     runtime = active_runtime.get()
 
     async def remind() -> None:
-        await asyncio.sleep(_MIMO_SOFT_WAIT_SECONDS)
+        await asyncio.sleep(soft_wait_seconds)
         label = {"coordinator": "协调", "writer": "写作", "editor": "编辑", "reviewer": "专项审查",
                  "memory_keeper": "记忆整理"}.get(role, "模型")
+        waiting = f"最长等待 {timeout:g} 秒。" if timeout is not None else "不设总等待时限，可随时停止。"
         runtime.publish({
             "type": "model.waiting", "role": role,
-            "summary": f"{label}请求已等待 {_MIMO_SOFT_WAIT_SECONDS:g} 秒，仍在等待小米 MiMo 返回完整结果；继续保留当前请求，最长等待 {timeout:g} 秒。",
+            "summary": f"{label}请求已等待 {soft_wait_seconds:g} 秒，仍在等待小米 MiMo 返回完整结果；继续保留当前请求，" + waiting,
             "metadata": {"provider": "mimo", "role": role, "attempt": attempt,
-                         "elapsed_seconds": _MIMO_SOFT_WAIT_SECONDS, "timeout_seconds": timeout},
+                         "elapsed_seconds": soft_wait_seconds, "timeout_seconds": timeout},
         })
 
-    reminder = asyncio.create_task(remind()) if runtime is not None and timeout > _MIMO_SOFT_WAIT_SECONDS else None
+    reminder = (asyncio.create_task(remind()) if runtime is not None and soft_wait_seconds is not None
+                and (timeout is None or timeout > soft_wait_seconds) else None)
     try:
         return await _mimo_stream_response(client, url, headers=headers, payload=payload)
     finally:
@@ -470,13 +546,15 @@ class DeepSeekProvider:
             reserved = runtime.reserve(
                 estimate_tokens(serialized_input) + reservation_output
             ) if runtime else 0
+            wait_policy = _request_wait_policy(self.settings, agent_role, timeout_seconds)
+            request_timeout = wait_policy["request_timeout_seconds"]
             # One ledger entry per actual HTTP attempt, including format retries.
             # UTF-8 bytes plus framing allowance is deliberately conservative;
             # it is separate from the UI's approximate token estimate.
             accounting = ModelAttempt(self.settings, request_id=request_id,
                 model=str(payload["model"]), role=agent_role or "unspecified",
                 prompt_family=prefix_diagnostic["prompt_family"],
-                diagnostic={**prefix_diagnostic, "stage": output_model.__name__,
+                diagnostic={**prefix_diagnostic, **wait_policy, "stage": output_model.__name__,
                             "user_prefix_4096_hash": content_hash(str(payload["messages"][1]["content"])[:4096]),
                             "materials_hash": content_hash(serialized_input),
                             "quality_hash": content_hash(json.dumps({key: value for key, value in payload.items()
@@ -490,18 +568,19 @@ class DeepSeekProvider:
             retry_kind = "format"
             retry_delay = 0.0
             try:
-                request_timeout = timeout_seconds or self.settings.request_timeout_seconds
                 async with _model_request_slot(self.settings):
-                    async with httpx.AsyncClient(timeout=request_timeout) as client:
+                    async with httpx.AsyncClient(timeout=_http_wait_timeout(self.settings, timeout_seconds, wait_policy)) as client:
                         accounting.mark_request_sent(max_task_role_attempts=(
                             self.settings.writer_task_attempt_limit if agent_role == "writer" else None))
                         attempt_record["request_sent"] = True
-                        response = await asyncio.wait_for(
-                            _mimo_response_with_reminder(client, url, headers=headers, payload=payload,
-                                                        timeout=request_timeout, role=agent_role, attempt=attempt + 1)
-                            if self.settings.is_mimo else client.post(url, headers=headers, json=payload),
-                            timeout=request_timeout,
-                        )
+                        _publish_request_started(runtime, role=agent_role, model=str(payload["model"]),
+                                                 attempt=attempt + 1, wait_policy=wait_policy)
+                        request = (_mimo_response_with_reminder(client, url, headers=headers, payload=payload,
+                                                        timeout=request_timeout, role=agent_role, attempt=attempt + 1,
+                                                        soft_wait_seconds=wait_policy["soft_wait_seconds"])
+                            if self.settings.is_mimo else client.post(url, headers=headers, json=payload))
+                        response = (await request if request_timeout is None
+                                    else await asyncio.wait_for(request, timeout=request_timeout))
                 if response.status_code >= 400:
                     accounting.failure = f"HTTP_{response.status_code}"
                     message = _safe_error_message(response)
@@ -611,16 +690,14 @@ class DeepSeekProvider:
                         # Only model generation is retried, never a file/canon commit.
                         await asyncio.sleep(retry_delay)
                         continue
-                    # 对 DeepSeek 而言，空内容且 finish_reason=length 通常表示推理
-                    # 已经耗尽预算，却没有留下最终 JSON。第二次机会应优先交付
-                    # 可解析的答案：关闭推理，且绝不因为重试而突破本次任务预算。
-                    if self.settings.is_deepseek or self.settings.is_mimo:
+                    preserve_thinking = self.settings.thinking_for(agent_role, False)
+                    if (self.settings.is_deepseek or self.settings.is_mimo) and not preserve_thinking:
                         payload["thinking"] = {"type": "disabled"}
                         payload.pop("reasoning_effort", None)
-                    if self.settings.is_mimo:
+                    if self.settings.is_mimo and not preserve_thinking:
                         payload.update(temperature=generation.get("temperature", 1.0),
                                        top_p=generation.get("top_p", 0.95))
-                    elif self.settings.is_deepseek and "non_thinking_top_p" in capabilities["sampling_constraints"]:
+                    elif self.settings.is_deepseek and not preserve_thinking and "non_thinking_top_p" in capabilities["sampling_constraints"]:
                         payload.update(temperature=generation.get("temperature", 1.0),
                             top_p=capabilities["sampling_constraints"]["non_thinking_top_p"])
                     elif capabilities["reasoning_effort"] and not self.settings.is_deepseek:
@@ -632,7 +709,7 @@ class DeepSeekProvider:
                     payload[token_parameter] = requested_max_tokens
                     payload["messages"][-1]["content"] = (
                         dynamic_prompt
-                        + "\n\n上一次输出为空、截断或不符合 Schema。此轮不展开推理，"
+                        + "\n\n上一次输出为空、截断或不符合 Schema。此轮保留当前档位的思考策略，"
                         + "保持原任务的字数、内容和证据要求，只修复输出结构；所有必填字段都必须存在，只返回一个 JSON 对象。"
                         + ("校验缺口：" + "; ".join(
                             f"{'.'.join(map(str, item['loc']))}: {item['type']} - {item['msg']}"
@@ -736,7 +813,6 @@ class AnthropicProvider:
                     payload[name] = generation[name]
             if generation.get("top_k") is not None and capabilities["top_k"]:
                 payload["top_k"] = generation["top_k"]
-        request_timeout = timeout_seconds or self.settings.request_timeout_seconds
         runtime = active_runtime.get()
         serialized_input = json.dumps({"system": payload["system"], "messages": payload["messages"]}, ensure_ascii=False)
         request_id = uuid4().hex
@@ -750,10 +826,12 @@ class AnthropicProvider:
             reserved = runtime.reserve(
                 estimate_tokens(serialized_input) + int(payload["max_tokens"])
             ) if runtime else 0
+            wait_policy = _request_wait_policy(self.settings, agent_role, timeout_seconds)
+            request_timeout = wait_policy["request_timeout_seconds"]
             accounting = ModelAttempt(self.settings, request_id=request_id,
                 model=str(payload["model"]), role=agent_role or "unspecified",
                 prompt_family=f"anthropic:{payload['model']}:{agent_role or 'unknown'}:{output_model.__name__}",
-                diagnostic={"stage": output_model.__name__, "system_contract_hash": content_hash(payload["system"]),
+                diagnostic={**wait_policy, "stage": output_model.__name__, "system_contract_hash": content_hash(payload["system"]),
                             "user_prefix_4096_hash": content_hash(user_prompt[:4096]),
                             "materials_hash": content_hash(serialized_input),
                             "quality_hash": content_hash(json.dumps({key: value for key, value in payload.items()
@@ -763,13 +841,14 @@ class AnthropicProvider:
                 task_id=runtime.task_id if runtime else "")
             try:
                 async with _model_request_slot(self.settings):
-                    async with httpx.AsyncClient(timeout=request_timeout) as client:
+                    async with httpx.AsyncClient(timeout=_http_wait_timeout(self.settings, timeout_seconds, wait_policy)) as client:
                         accounting.mark_request_sent(max_task_role_attempts=(
                             self.settings.writer_task_attempt_limit if agent_role == "writer" else None))
-                        response = await asyncio.wait_for(
-                            client.post(f"{self.settings.base_url}/v1/messages", headers=self._headers(), json=payload),
-                            timeout=request_timeout,
-                        )
+                        _publish_request_started(runtime, role=agent_role, model=str(payload["model"]),
+                                                 attempt=attempt + 1, wait_policy=wait_policy)
+                        request = client.post(f"{self.settings.base_url}/v1/messages", headers=self._headers(), json=payload)
+                        response = (await request if request_timeout is None
+                                    else await asyncio.wait_for(request, timeout=request_timeout))
                 if response.status_code == 429 and attempt + 1 < attempts:
                     accounting.failure = "HTTP_429"
                     recovery_events.append({

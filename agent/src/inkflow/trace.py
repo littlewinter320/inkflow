@@ -268,6 +268,19 @@ class TraceRecorder:
             metadata["timeout_seconds"] = float(timeout_seconds)
         if thinking is not None:
             metadata["thinking"] = bool(thinking)
+        from .task_settings import active_task_settings
+        scope = active_task_settings.get()
+        if scope is not None:
+            from .provider import _request_wait_policy
+            policy_role = "editor" if agent_role in {"reviewer_verifier", "reviewer_judge"} else agent_role
+            effective_thinking = scope.settings.thinking_for(policy_role, True if thinking is None else thinking)
+            metadata["thinking"] = effective_thinking
+            # This is the purpose budget; the Provider still clips the actual
+            # payload against its complete input and frozen user/model limits.
+            metadata["max_tokens"] = scope.settings.generation_output_budget(policy_role, max_tokens, effective_thinking)
+            wait_policy = _request_wait_policy(scope.settings, policy_role, timeout_seconds)
+            metadata.update(wait_policy)
+            metadata["timeout_seconds"] = wait_policy["request_timeout_seconds"]
         self.record(stage, "started", "已提交模型请求，等待结构化结果", metadata=metadata)
 
     def record_model_failed(

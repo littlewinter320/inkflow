@@ -752,6 +752,19 @@ class Settings:
     def prompt_cache_policy(self) -> str:
         return "mimo" if self.is_mimo else "deepseek" if self.is_deepseek else "standard"
 
+    def thinking_for(self, role: str | None, requested: bool = True) -> bool:
+        if not (self.is_mimo or self.is_deepseek):
+            return requested
+        if role in {"writer", "coordinator"}:
+            return self.quality_preset != "economy"
+        return True if role in {"editor", "reviewer", "memory_keeper"} else requested
+
+    def generation_output_budget(self, role: str | None, requested: int, thinking: bool) -> int:
+        # Thinking and final JSON share the output limit; tiny routing budgets preceded thinking presets.
+        if (self.is_mimo or self.is_deepseek) and thinking and role in self.agent_generation:
+            return max(requested, 8192)
+        return requested
+
     def get_api_key(self) -> str | None:
         provider_env = PROVIDER_ENV_KEYS.get(self.provider_kind)
         for name in tuple(name for name in ("INKFLOW_API_KEY", provider_env) if name):

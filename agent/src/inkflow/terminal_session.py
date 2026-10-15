@@ -367,6 +367,13 @@ class TerminalSession:
     @staticmethod
     def pending_resume(project: InkFlowProject, text: str) -> dict[str, Any] | None:
         """Share the exact resume decision with callers restoring task settings."""
+        authorization = project.db.get_metadata(conversation_key("writer_authorization:" + content_hash(text.strip())))
+        if authorization is not None:
+            if (not isinstance(authorization, dict) or authorization.get("novel_id") != project.project_id
+                    or authorization.get("message_hash") != content_hash(text.strip())
+                    or not all(authorization.get(key) for key in ("task_id", "run_id", "snapshot_hash", "intent"))):
+                raise ValidationGateError("这次写作授权的来源记录不完整，未新增请求次数；请查看原任务。")
+            return {**authorization, "status": "waiting_condition", "resume_end": len(text), "writer_authorization": True}
         improvement = TerminalSession._confirmed_improvement_intent(project, text)
         if improvement is not None:
             question = TerminalSession._pending_question(project)
@@ -462,18 +469,51 @@ class TerminalSession:
             scope = active_task_settings.get()
             checkpoint = {"response": response, "source": TerminalSession._work_source(project),
                           "task_id": scope.task_id if scope else "", "snapshot_hash": scope.snapshot_hash if scope else ""}
-        project.db.set_metadata(conversation_key("pending_creation_task"), {
-            "status": status, "intent": serialized_intent, **identifiers,
-            **({"response_checkpoint": checkpoint} if checkpoint else {}),
-        })
+        # A late completion/failure may update its own work receipt, but must
+        # not replace a different task/run now owning the conversation pointer.
+        different_owner = isinstance(previous, dict) and runtime is not None and any(
+            previous.get(key) and previous[key] != identifiers.get(key) for key in ("run_id", "task_id"))
+        if status == "running" or not different_owner:
+            project.db.set_metadata(conversation_key("pending_creation_task"), {
+                "status": status, "intent": serialized_intent, **identifiers,
+                **({"response_checkpoint": checkpoint} if checkpoint else {}),
+            })
         if identifiers.get("task_id") or identifiers.get("run_id"):
             item = project.record_pending_work(kind="workflow",
                 reason=intent.requested_outcome or intent.visible_reason,
                 next_action="在原授权范围内从尚未完成节点续接；扩大范围或新增优化先询问。",
                 source={"task_id": identifiers.get("task_id") or identifiers["run_id"],
+                        **({"related_task_id": intent.related_task_id} if intent.related_task_id else {}),
                         "conversation": conversation_key("pending_creation_task")},
                 intent=serialized_intent, run_id=identifiers.get("run_id", ""), chapter_no=intent.chapter_no)
             project.update_pending_work(item["id"], status=status)
+
+    @staticmethod
+    def _fresh_writer_authorization(project: InkFlowProject, message: str, intent: TerminalIntent,
+                                    work: dict[str, Any] | None) -> TerminalIntent | None:
+        """A new human grant has its own cap; an old recovery keeps its used attempts."""
+        scope, runtime = active_task_settings.get(), active_runtime.get()
+        grant = re.match(
+            r"^\s*(?:我)?(?:这次|本次|现在)(?:明确)?(?:新增|追加|重新)一次第\s*(\d+)\s*章"
+            r"(?:写作|Writer)(?:尝试|请求)(?:的)?授权(?=[：:，,。；;])", message, re.I)
+        if (grant is None or scope is None or runtime is None or runtime.task_id != scope.task_id
+                or scope.novel_id != project.project_id or scope.settings.writer_task_attempt_limit != 1
+                or intent.authorization != "approved" or intent.authorization_source not in {"none", "current_request"}
+                or intent.action not in {"write_draft", "write_review", "write_review_accept"}):
+            return None
+        target = int(grant.group(1))
+        if (TerminalSession._explicit_chapter_range(message) != (target, None)
+                or intent.chapter_no != target or intent.end_chapter_no not in {None, target}):
+            return None
+        if work is None:
+            return intent
+        previous, source = work.get("intent"), work.get("source", {})
+        if (work.get("kind") != "workflow" or not isinstance(previous, dict)
+                or not source.get("task_id") or source["task_id"] == scope.task_id or work["id"] in message
+                or previous.get("chapter_no") != target or previous.get("end_chapter_no") not in {None, target}):
+            return None
+        return intent.model_copy(update={"pending_work_id": None, "response_kind": "new_task",
+            "related_task_id": source["task_id"], "authorization_source": "current_request"})
 
     @staticmethod
     def _confirmed_pending_work_intent(project: InkFlowProject, text: str) -> TerminalIntent | None:
@@ -533,6 +573,28 @@ class TerminalSession:
                 {"id": "pending-work-other", "label": "其他", "description": "补充新的处理要求。", "kind": "other"}]}]
 
     @staticmethod
+    def _update_task_pending_work(project: InkFlowProject, identity: str, **changes: Any) -> bool:
+        """Only write a work item belonging to the verified active task scope."""
+        scope = active_task_settings.get()
+        saved = project.db.get_metadata(f"pending_work:{identity}", {})
+        if (scope is None or not isinstance(saved, dict) or saved.get("id") != identity
+                or saved.get("source", {}).get("task_id") != scope.task_id):
+            return False
+        project.update_pending_work(identity, **changes)
+        return True
+
+    async def _save_failed_task_state(self, project: InkFlowProject, intent: TerminalIntent, reason: str) -> None:
+        async with project_write_lock(project.root):
+            self._mark_current_pending_task_failed(project)
+            if intent.pending_work_id:
+                self._update_task_pending_work(project, intent.pending_work_id, status="failed", resolution=reason)
+            runtime = active_runtime.get()
+            if runtime:
+                for work in project.pending_work():
+                    if work.get("run_id") == runtime.run_id:
+                        self._update_task_pending_work(project, work["id"], resolution=reason, reason=reason)
+
+    @staticmethod
     def _mark_current_pending_task_interrupted(project: InkFlowProject) -> bool:
         runtime = active_runtime.get()
         run_id = str(getattr(runtime, "run_id", "") or "")
@@ -541,10 +603,13 @@ class TerminalSession:
         pending = project.db.get_metadata(conversation_key("pending_creation_task"))
         if not isinstance(pending, dict) or str(pending.get("run_id") or "") != run_id:
             return False
+        scope = active_task_settings.get()
+        if scope is None or pending.get("task_id") != scope.task_id:
+            return False
         project.db.set_metadata(conversation_key("pending_creation_task"), {**pending, "status": "interrupted"})
         for item in project.pending_work():
             if item.get("kind") == "workflow" and item.get("run_id") == run_id:
-                project.update_pending_work(item["id"], status="paused", resolution="用户停止或运行中断，等待明确继续。")
+                TerminalSession._update_task_pending_work(project, item["id"], status="paused", resolution="用户停止或运行中断，等待明确继续。")
         return True
 
     @staticmethod
@@ -556,12 +621,15 @@ class TerminalSession:
         pending = project.db.get_metadata(conversation_key("pending_creation_task"))
         if not isinstance(pending, dict) or str(pending.get("run_id") or "") != run_id:
             return False
+        scope = active_task_settings.get()
+        if scope is None or pending.get("task_id") != scope.task_id:
+            return False
         if pending.get("status") != "running":
             return False
         project.db.set_metadata(conversation_key("pending_creation_task"), {**pending, "status": "failed"})
         for item in project.pending_work():
             if item.get("kind") == "workflow" and item.get("run_id") == run_id:
-                project.update_pending_work(item["id"], status="failed")
+                TerminalSession._update_task_pending_work(project, item["id"], status="failed")
         return True
 
     @staticmethod
@@ -824,6 +892,10 @@ class TerminalSession:
                 metadata={"estimated_tokens": packet.estimated_tokens, "sections": [item.key for item in packet.sections]},
             )
             pending = self.pending_resume(project, text)
+            if pending and pending.get("writer_authorization"):
+                scope = active_task_settings.get()
+                if not scope or pending["task_id"] != scope.task_id or pending["snapshot_hash"] != scope.snapshot_hash:
+                    raise ValidationGateError("这次单次写作授权已绑定原任务，未创建新次数；请恢复原授权任务。")
             if pending is not None and not pending.get("route_answer"):
                 saved_intent = TerminalIntent.model_validate(pending["intent"])
                 # A normal user often resumes a task and adds one short writing
@@ -1090,19 +1162,56 @@ class TerminalSession:
                 if intent.action in {"batch_draft", "batch_draft_accept"}:
                     updates.update(chapter_no=manifest["start_chapter_no"], end_chapter_no=manifest["end_chapter_no"])
                 intent = intent.model_copy(update=updates)
-            intent = self._apply_acceptance_policy(text, intent)
+            task_scope = active_task_settings.get()
+            trace.record("controller.route_output", "completed", "已保存协调结果与原任务来源",
+                metadata={"raw_intent": route_result.data.model_dump(mode="json"), "model": route_result.model,
+                          "response_id": route_result.response_id, "message_hash": content_hash(text),
+                          "source": proposal_basis, "task_settings": task_scope.public_summary() if task_scope else None}, public=False)
+            writer_authorized = self._fresh_writer_authorization(project, text, intent, None) is not None
             if intent.pending_work_id and intent.action != "pending_work":
                 selected_work = next((item for item in project.pending_work() if item["id"] == intent.pending_work_id), None)
                 trace.record("controller.pending_work.selection", "completed", "核对 Coordinator 提出的待办关联",
                     metadata={"work_id": intent.pending_work_id, "current_source": selected_work is not None,
                               "response_kind": intent.response_kind, "action": intent.action})
-                if (pending is None and local_work is None
+                fresh = self._fresh_writer_authorization(project, text, intent, selected_work) if isinstance(selected_work, dict) else None
+                if fresh is not None:
+                    trace.record("controller.pending_work.authorization", "completed", "按本次明确新增的单次写作授权建立独立限次记录，保留旧任务次数",
+                        metadata={"previous_work_id": selected_work["id"], "previous_task_id": selected_work["source"]["task_id"],
+                                  "previous_run_id": selected_work.get("run_id"), "previous_source": selected_work["source"],
+                                  "message_hash": content_hash(text), "writer_task_attempt_limit": 1}, public=False)
+                    intent = fresh
+                elif (pending is None and local_work is None
                         and intent.response_kind == "new_task" and not intent.related_task_id
                         and intent.pending_work_id not in text
                         and not re.search(r"待办|待处理|续接|恢复原任务|继续原任务|处理这项", text)):
                     # Model-suggested IDs cannot turn an independent request into an old-task recovery.
                     intent = intent.model_copy(update={"pending_work_id": None})
                     trace.record("controller.pending_work.selection", "superseded", "旧待办关联不属于当前请求，按本次原话核验范围与权限")
+            intent = self._apply_acceptance_policy(text, intent)
+            task_scope = active_task_settings.get()
+            trace.record("session.intent", "completed", "已保存本次操作参数用于内部诊断",
+                metadata={"intent": intent.model_dump(mode="json"), "raw_intent": route_result.data.model_dump(mode="json"),
+                          "message_hash": content_hash(text), "source": proposal_basis,
+                          "model": route_result.model, "response_id": route_result.response_id,
+                          "task_settings": task_scope.public_summary() if task_scope else None}, public=False)
+            if routing_response is None and intent.authorization == "approved" and _resumable_intent(intent):
+                # Preserve successful understanding even when a later local gate cannot proceed.
+                async with project_write_lock(project.root):
+                    if writer_authorized and not intent.pending_work_id:
+                        key = conversation_key("writer_authorization:" + content_hash(text))
+                        authorization = project.db.get_metadata(key)
+                        if authorization is not None and (not isinstance(authorization, dict)
+                                or authorization.get("task_id") != task_scope.task_id
+                                or authorization.get("snapshot_hash") != task_scope.snapshot_hash
+                                or authorization.get("novel_id") != project.project_id):
+                            raise ValidationGateError("这次单次写作授权已绑定原任务，未创建新次数；请恢复原授权任务。")
+                        if authorization is None:
+                            runtime = active_runtime.get()
+                            project.db.set_metadata(key, {"task_id": task_scope.task_id, "run_id": runtime.run_id,
+                                "snapshot_hash": task_scope.snapshot_hash, "novel_id": project.project_id,
+                                "trace_id": trace.run_id, "message_hash": content_hash(text),
+                                "intent": intent.model_dump(mode="json")})
+                    self._save_pending_task(project, intent, "running")
             if intent.pending_work_id and intent.action != "pending_work":
                 if not isinstance(selected_work, dict) or not selected_work.get("intent"):
                     raise ValidationGateError("待处理任务没有可执行的原任务，请先核对具体问题。")
@@ -1116,10 +1225,6 @@ class TerminalSession:
                     project.update_pending_work(intent.pending_work_id, status="waiting_condition",
                         resolution="提出优化之后来源已变化，须按当前版本重新安排。")
                     raise ValidationGateError("优化任务的来源已变化，请重新查看待处理工作，按当前版本安排。")
-            task_scope = active_task_settings.get()
-            trace.record("session.intent", "completed", "已保存本次操作参数用于内部诊断",
-                metadata={"intent": intent.model_dump(mode="json"),
-                          "task_settings": task_scope.public_summary() if task_scope else None}, public=False)
             from .studio import bind_active_collaboration
             task_scope = bind_active_collaboration(project, intent.action, specialist=intent.specialist_role,
                 reason=intent.specialist_reason, forbidden_actions=[*intent.forbidden_actions,
@@ -1199,9 +1304,6 @@ class TerminalSession:
                 else:
                     response = await self.engine.brainstorm(project.root, text, packet)
             else:
-                if intent.authorization == "approved" and _resumable_intent(intent):
-                    async with project_write_lock(project.root):
-                        self._save_pending_task(project, intent, "running")
                 async def tracked_steering() -> list[str]:
                     updates = await consume_steering() if consume_steering else []
                     if updates:
@@ -1394,7 +1496,8 @@ class TerminalSession:
             return payload
         except asyncio.CancelledError:
             try:
-                self._mark_current_pending_task_interrupted(project)
+                async with project_write_lock(project.root):
+                    self._mark_current_pending_task_interrupted(project)
             except Exception as exc:
                 try:
                     trace.record("session.recovery", "waiting_condition", "无法更新任务断点状态", str(exc))
@@ -1431,13 +1534,14 @@ class TerminalSession:
             if intent.authorization == "approved" and _resumable_intent(intent):
                 async with project_write_lock(project.root):
                     self._save_pending_task(project, intent, "waiting_condition")
-            if intent.pending_work_id:
-                project.update_pending_work(intent.pending_work_id, status="waiting_condition", resolution=str(exc))
-            runtime = active_runtime.get()
-            if runtime:
-                for work in project.pending_work():
-                    if work.get("run_id") == runtime.run_id:
-                        project.update_pending_work(work["id"], resolution=str(exc), next_action=exc.next_action)
+            async with project_write_lock(project.root):
+                if intent.pending_work_id:
+                    self._update_task_pending_work(project, intent.pending_work_id, status="waiting_condition", resolution=str(exc))
+                runtime = active_runtime.get()
+                if runtime:
+                    for work in project.pending_work():
+                        if work.get("run_id") == runtime.run_id:
+                            self._update_task_pending_work(project, work["id"], resolution=str(exc), next_action=exc.next_action)
             if "ticket" in locals() and "dispatch_plan" in locals():
                 try:
                     planning_response = await self._recover_failed_workflow(project, intent, ticket, dispatch_plan,
@@ -1449,7 +1553,8 @@ class TerminalSession:
             trace.record("session", planning_outcome, "规划依赖与协调恢复结果已记录", str(exc))
             trace.finish(status=planning_outcome, summary=str(exc))
             if planning_outcome == "completed" and _resumable_intent(intent):
-                self._save_pending_task(project, intent, "completed")
+                async with project_write_lock(project.root):
+                    self._save_pending_task(project, intent, "completed")
             return planning_response | {
                 "session": {"trace_id": trace.run_id, "trace_path": str(trace.trace_path)},
                 "status": planning_outcome, "reply": "已从故障节点恢复，原任务完成。" if planning_outcome == "completed" else str(exc),
@@ -1462,21 +1567,15 @@ class TerminalSession:
                 "recovery_node": exc.recovery_node, "recovery_attempts": exc.recovery_attempts,
                 "recovery_exhausted": exc.recovery_exhausted}
             try:
-                self._mark_current_pending_task_failed(project)
-                if intent.pending_work_id:
-                    project.update_pending_work(intent.pending_work_id, status="failed", resolution=str(exc))
-                runtime = active_runtime.get()
-                if runtime:
-                    for work in project.pending_work():
-                        if work.get("run_id") == runtime.run_id:
-                            project.update_pending_work(work["id"], resolution=str(exc), reason=str(exc))
+                await self._save_failed_task_state(project, intent, str(exc))
             except Exception as recovery_exc:
                 trace.record("session.recovery", "waiting_condition", "无法更新失败任务状态", str(recovery_exc))
             if not connection and "ticket" in locals() and "dispatch_plan" in locals():
                 try:
                     failure_response = await self._recover_failed_workflow(project, intent, ticket, dispatch_plan, failure_response, trace)
                     if workflow_result_status(failure_response) == "completed" and _resumable_intent(intent):
-                        self._save_pending_task(project, intent, "completed")
+                        async with project_write_lock(project.root):
+                            self._save_pending_task(project, intent, "completed")
                 except Exception as recovery_exc:
                     failure_response["recovery_error"] = str(recovery_exc)
             recovery_outcome = workflow_result_status(failure_response)
@@ -1499,7 +1598,8 @@ class TerminalSession:
             }
         except Exception as exc:
             try:
-                self._mark_current_pending_task_failed(project)
+                async with project_write_lock(project.root):
+                    self._mark_current_pending_task_failed(project)
             except Exception as recovery_exc:
                 trace.record("session.recovery", "waiting_condition", "无法更新失败任务状态", str(recovery_exc))
             self._append_dialogue_entry(project, text, "运行遇到异常，已有内容保留；请查看任务提示。", "任务异常")
@@ -1557,6 +1657,12 @@ class TerminalSession:
         # Late results may not erase a concurrently reserved second attempt.
         with project_write_lock_sync(project.root):
             saved = project.db.get_metadata(key, {})
+            scope = active_task_settings.get()
+            if (any(saved.get(field) and saved[field] != record.get(field)
+                    for field in ("task_id", "snapshot_hash"))
+                    or scope is not None and (record.get("task_id") != scope.task_id
+                        or record.get("snapshot_hash") != scope.snapshot_hash)):
+                raise ValidationGateError("恢复记录与原任务配置身份不一致，未覆盖已有断点。")
             attempts = {item["number"]: item for item in saved.get("attempts", [])}
             for item in record.get("attempts", []):
                 if item["status"] != "started" or attempts.get(item["number"], {}).get("status", "started") == "started":
@@ -1686,10 +1792,11 @@ class TerminalSession:
                             and step.chapter_no <= intent.chapter_no <= (step.end_chapter_no or step.chapter_no)):
                         raise ValidationGateError("同版报告已经补读复核，不能在外围再做整份重审；保留原结果并定位尚缺节点。")
                     if step.action in {"ask_user", "development_fix"}:
-                        project.record_pending_work(kind="development_repair" if step.action == "development_fix" else "recovery_decision",
-                            reason=step.reason, next_action=step.instruction or step.reason,
-                            source={"task_id": scope.task_id, "snapshot_hash": scope.snapshot_hash, "node": node,
-                                    "failure_case": case}, status="waiting_user", run_id=runtime.run_id)
+                        async with project_write_lock(project.root):
+                            project.record_pending_work(kind="development_repair" if step.action == "development_fix" else "recovery_decision",
+                                reason=step.reason, next_action=step.instruction or step.reason,
+                                source={"task_id": scope.task_id, "snapshot_hash": scope.snapshot_hash, "node": node,
+                                        "failure_case": case}, status="waiting_user", run_id=runtime.run_id)
                         attempt["nodes"].append({"action": signature, "status": "waiting_user", "reason": step.reason})
                         reason = step.reason
                         break
@@ -1722,7 +1829,8 @@ class TerminalSession:
                         break
                     done.add(signature)
                     record.update(completed_nodes=sorted(done), attempts=history)
-                    self._store_recovery_record(project, key, record)
+                    async with project_write_lock(project.root):
+                        self._store_recovery_record(project, key, record)
                 # Re-check the actual current pass gate, never the plan's summary.
                 reviewed = self._reuse_current_pass_review(project, intent.chapter_no) if intent.chapter_no else None
                 goal_ready = node in {"engine.review_mode", "memory.accept"}
@@ -1738,7 +1846,8 @@ class TerminalSession:
                     if completed is not None:
                         attempt["status"] = "completed"
                         record.update(attempts=history, completed_nodes=sorted(done), status="completed")
-                        self._store_recovery_record(project, key, record)
+                        async with project_write_lock(project.root):
+                            self._store_recovery_record(project, key, record)
                         return completed | {"coordinator_recovery": record}
                 if reviewed and goal_ready and not waiting_decision and intent.action in {"review", "review_accept", "write_review", "write_review_accept", "revise_review", "revise_review_accept"}:
                     preserved = [item for item in response.get("steps", []) if workflow_result_status(item) == "completed"]
@@ -1748,13 +1857,15 @@ class TerminalSession:
                     attempt["status"] = workflow_result_status(repaired)
                     if attempt["status"] == "completed":
                         record.update(attempts=history, completed_nodes=sorted(done), status="completed")
-                        self._store_recovery_record(project, key, record)
+                        async with project_write_lock(project.root):
+                            self._store_recovery_record(project, key, record)
                         return repaired | {"coordinator_recovery": record | {"initial_failure": case["failure"]}}
                 attempt["status"] = "waiting_user" if any(item["status"] == "waiting_user" for item in attempt["nodes"]) else "failed"
             except asyncio.CancelledError:
                 attempt["status"] = "interrupted"
-                self._store_recovery_record(project, key, record)
-                self._mark_current_pending_task_interrupted(project)
+                async with project_write_lock(project.root):
+                    self._store_recovery_record(project, key, record)
+                    self._mark_current_pending_task_interrupted(project)
                 raise
             except RunBudgetExceeded as exc:
                 attempt.update(status="waiting_condition", reason=str(exc), error_type=type(exc).__name__)
@@ -1762,7 +1873,8 @@ class TerminalSession:
             except Exception as exc:
                 attempt.update(status="failed", reason=str(exc), error_type=type(exc).__name__)
                 reason = str(exc)
-            self._store_recovery_record(project, key, record)
+            async with project_write_lock(project.root):
+                self._store_recovery_record(project, key, record)
             trace.record("coordinator.recovery", attempt["status"], "Coordinator多节点恢复已记录", reason,
                 metadata={"node": node, "attempt": attempt["number"]})
             if attempt["status"] in {"waiting_user", "waiting_condition"} or self._work_source(project) != source:
@@ -1770,17 +1882,18 @@ class TerminalSession:
         record.update(task_id=scope.task_id, snapshot_hash=scope.snapshot_hash, node=node,
             attempts=history, completed_nodes=sorted(done), failure_case=case, source=source,
             status="waiting_user" if len(history) >= 2 or exhausted else "waiting_condition")
-        self._store_recovery_record(project, key, record)
-        next_action = ("自动恢复已达到两次上限，请先核对动作结果并修复来源或交开发处理，再按原任务定点续接。"
-                       if len(record["attempts"]) >= 2 or exhausted else
-                       "当前依赖或预算尚未满足，请核对动作结果后定点续接。")
-        next_action += "已完成正文和提交不重放，源码缺陷不在小说运行时自动修改。"
-        work = project.record_pending_work(kind="coordinator_recovery", reason=reason, next_action=next_action,
-            source={"task_id": scope.task_id, "snapshot_hash": scope.snapshot_hash, "node": node, "recovery_record_key": key},
-            status=record["status"], run_id=runtime.run_id)
-        project.update_pending_work(work["id"], progress={"node": node, "attempts": record["attempts"],
-            "underlying_recovery_exhausted": exhausted, "original_node_receipts": nodes,
-            "status": record["status"]})
+        async with project_write_lock(project.root):
+            self._store_recovery_record(project, key, record)
+            next_action = ("自动恢复已达到两次上限，请先核对动作结果并修复来源或交开发处理，再按原任务定点续接。"
+                           if len(record["attempts"]) >= 2 or exhausted else
+                           "当前依赖或预算尚未满足，请核对动作结果后定点续接。")
+            next_action += "已完成正文和提交不重放，源码缺陷不在小说运行时自动修改。"
+            work = project.record_pending_work(kind="coordinator_recovery", reason=reason, next_action=next_action,
+                source={"task_id": scope.task_id, "snapshot_hash": scope.snapshot_hash, "node": node, "recovery_record_key": key},
+                status=record["status"], run_id=runtime.run_id)
+            project.update_pending_work(work["id"], progress={"node": node, "attempts": record["attempts"],
+                "underlying_recovery_exhausted": exhausted, "original_node_receipts": nodes,
+                "status": record["status"]})
         return response | {"coordinator_recovery": record, "recovery_results": results,
             "status": record["status"], "next_action": next_action}
 
@@ -2785,9 +2898,17 @@ class TerminalSession:
         for match in pattern.finditer(message):
             prefix = re.split(r"[。！？；\n，,]", message[:match.start()])[-1]
             suffix = re.split(r"[。！？；\n，,]", message[match.end():], maxsplit=1)[0]
-            protected_after = re.match(r"\s*(?:的)?(?:正史|已接受正文|正文|原稿)?\s*(?:保持不动|保持原样|不动|不改|不要改|不重写|不要重写|仅作参考)", suffix)
+            # Protection describes this range, not a new writing target. Keep
+            # the match local to its clause so another requested range survives.
+            protected_after = re.match(
+                r"\s*(?:的)?(?:正史|已接受正文|正文|原稿|原文)?\s*"
+                r"(?:保持(?:不动|原样|原文)|保留(?:原文|原稿|正文)|"
+                r"(?:不(?:再)?|不要)(?:动|改|重写|修改|改动|覆盖|生成|续写|创作|写)|仅作参考)",
+                suffix,
+            )
             completed_plan = re.match(
                 r"\s*(?:的)?(?:近期规划|章节规划|规划|大纲|卷细纲|细纲|章节卡)"
+                r"\s*(?:(?:第\s*)?\d+\s*版|[vV]\s*\d+)?"
                 r"\s*(?:已经|已|刚刚|刚)?(?:正式)?(?:采用|生效|完成|发布|通过)", suffix,
             )
             if not protected_after and not completed_plan and not re.search(r"(?:保留|保护|不(?:再)?(?:重写|修改|改动|覆盖|生成|续写|创作|写)|不要(?:重写|修改|改动|覆盖|生成|续写|创作|写))[^。！？；\n，,]*$", prefix):

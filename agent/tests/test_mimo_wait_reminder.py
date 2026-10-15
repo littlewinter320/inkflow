@@ -20,7 +20,10 @@ class ReminderProbe(BaseModel):
 def test_mimo_soft_reminder_single_attempt_and_cleanup(tmp_path, monkeypatch):
     monkeypatch.setenv("INKFLOW_SETTINGS_PATH", str(tmp_path / "settings.json"))
     monkeypatch.setattr(Settings, "require_api_key", lambda self: "offline-test")
-    monkeypatch.setattr("inkflow.provider._MIMO_SOFT_WAIT_SECONDS", .01)
+    # Scale transport timing only; creation-profile formulas have their own check.
+    monkeypatch.setattr("inkflow.provider._request_wait_policy", lambda *_: {
+        "request_timeout_seconds": .1, "soft_wait_seconds": .01,
+        "timeout_policy": "offline_scaled", "batch_chapter_count": 1})
     original_client = httpx.AsyncClient
 
     async def scenario(mode):

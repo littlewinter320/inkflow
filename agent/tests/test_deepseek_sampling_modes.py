@@ -25,7 +25,8 @@ def test_official_sampling_modes_use_selected_role_model_and_preserve_profile(tm
             "usage": {"prompt_tokens": 30, "completion_tokens": 5}})
     client = httpx.AsyncClient
     monkeypatch.setattr("inkflow.provider.httpx.AsyncClient", lambda **kwargs: client(transport=httpx.MockTransport(respond), **kwargs))
-    settings = Settings(model="deepseek-flash", role_models={"writer": "deepseek-v4-pro"},
+    settings = Settings(quality_preset="balanced" if thinking else "economy",
+        model="deepseek-flash", role_models={"writer": "deepseek-v4-pro"},
         agent_generation={"writer": {"temperature": .8, "top_p": .7, "top_k": None}})
     original = settings.generation_for("writer")
     response = asyncio.run(DeepSeekProvider(settings).generate_json(system_prompt="检查参数", user_prompt="离线用例",

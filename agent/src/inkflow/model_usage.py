@@ -254,9 +254,12 @@ class UsageLedger:
                  settings.provider_kind, urlparse(settings.base_url).hostname or "", model, role,
                  prompt_family, utc_now(),
                  input_estimate, max_output_tokens, json.dumps(price), pending_cost))
-            safe = {key: str(value) for key, value in (diagnostic or {}).items() if key in {
+            safe = {key: value if key in {"request_timeout_seconds", "soft_wait_seconds"}
+                    and (value is None or type(value) in (int, float)) else str(value)
+                    for key, value in (diagnostic or {}).items() if key in {
                 "system_contract_hash", "user_prefix_4096_hash", "reference_prefix_hash", "materials_hash", "quality_hash", "stage",
-                "cache_policy", "message_layout", "thinking", "reference_prefix_tokens"}}
+                "cache_policy", "message_layout", "thinking", "reference_prefix_tokens",
+                "request_timeout_seconds", "soft_wait_seconds", "timeout_policy", "batch_chapter_count"}}
             safe["context_limit_tokens"] = settings.context_budget_for(
                 role if role in {"coordinator", "writer", "editor", "reviewer", "memory_keeper"} else None,
                 model_override=model)[1]
@@ -638,8 +641,10 @@ class ModelAttempt:
                     "usage_state": "reported" if self.counts["input_tokens"] is not None and self.counts["output_tokens"] is not None else "unknown_or_partial",
                     "ledger_available": self.ledger is not None,
                     "request_sent": self.request_sent,
-                    "diagnostic": {key: str(value) for key, value in self.fields.get("diagnostic", {}).items()
-                                   if key in {"system_contract_hash", "user_prefix_4096_hash", "reference_prefix_hash", "materials_hash", "quality_hash", "stage", "request_endpoint", "response_model", "cache_policy", "message_layout", "thinking", "reference_prefix_tokens"}}}
+                    "diagnostic": {key: value if key in {"request_timeout_seconds", "soft_wait_seconds"}
+                                   and (value is None or type(value) in (int, float)) else str(value)
+                                   for key, value in self.fields.get("diagnostic", {}).items()
+                                   if key in {"system_contract_hash", "user_prefix_4096_hash", "reference_prefix_hash", "materials_hash", "quality_hash", "stage", "request_endpoint", "response_model", "cache_policy", "message_layout", "thinking", "reference_prefix_tokens", "request_timeout_seconds", "soft_wait_seconds", "timeout_policy", "batch_chapter_count"}}}
         if self.ledger:
             try:
                 self.ledger.finish(self.attempt_id, self.outcome, self.failure, duration_ms=duration_ms,

@@ -27,7 +27,7 @@ def test_disabled_top_k_is_retained_but_never_sent_or_retried(tmp_path, monkeypa
 
     client = httpx.AsyncClient
     monkeypatch.setattr("inkflow.provider.httpx.AsyncClient", lambda **kwargs: client(transport=httpx.MockTransport(respond), **kwargs))
-    settings = Settings(agent_generation={"writer": {"temperature": .8, "top_p": .9, "top_k": 17}})
+    settings = Settings(quality_preset="economy", agent_generation={"writer": {"temperature": .8, "top_p": .9, "top_k": 17}})
     result = asyncio.run(DeepSeekProvider(settings).generate_json(system_prompt="离线检查", user_prompt="检查参数",
         output_model=SamplingProbe, agent_role="writer", thinking=False))
     assert result.data.answer == "ok" and len(requests) == 1
