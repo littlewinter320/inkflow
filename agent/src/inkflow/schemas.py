@@ -646,8 +646,8 @@ class StorySettingsAudit(StrictModel):
 
 class DraftOutput(StrictModel):
     setting_updates: list[SettingRecordProposal] = Field(default_factory=list, max_length=8)
-    title: str
-    content: str = Field(min_length=100)
+    title: str = Field(description="独立的章节标题，必须单独返回；不能只把标题写进content。")
+    content: str = Field(min_length=100, description="完整小说正文，不含Markdown章节标题；公开创作说明放在其他专用字段。")
     decision_summary: list[str] = Field(
         default_factory=lambda: ["模型未提供结构化摘要；正文将由后续审查确认。"],
         min_length=1,

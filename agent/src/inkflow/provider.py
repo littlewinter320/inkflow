@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import threading
 import warnings
 from contextlib import asynccontextmanager
@@ -17,7 +18,7 @@ from pydantic import BaseModel, ValidationError
 
 from .config import Settings
 from .errors import ConfigurationError, ProviderError
-from .utils import content_hash, strip_json_fence, estimate_tokens
+from .utils import atomic_write_text, content_hash, json_dumps, strip_json_fence, estimate_tokens
 from .runtime import active_runtime, ensure_run_runtime
 from .model_usage import ModelAttempt, aggregate_usage, normalized_usage
 from .role_protocol import normalize_role, roles_for_mode
@@ -165,6 +166,57 @@ def _publish_request_started(runtime, *, role: str | None, model: str, attempt: 
             "metadata": {"attempt": attempt, **wait_policy}})
     except Exception as exc:
         warnings.warn(f"模型等待信息暂未送达（{type(exc).__name__}）；原请求继续。", RuntimeWarning, stacklevel=2)
+
+
+def _preserve_writer_response(settings: Settings, accounting: ModelAttempt, *, role: str | None,
+                              output_model: type[BaseModel], content: str, model: str,
+                              response_id: str | None, finish_reason: str | None,
+                              serialized_input: str, attempt: int) -> Path | None:
+    from .model_usage import project_identity
+    from .schemas import DraftOutput
+    from .task_settings import TASK_SETTINGS_FIELDS
+
+    scope, runtime = active_task_settings.get(), active_runtime.get()
+    if (role != "writer" or output_model is not DraftOutput or finish_reason not in {"stop", "end_turn", "stop_sequence"}
+            or not content or scope is None or runtime is None or settings.workspace_root is None
+            or scope.settings.workspace_root is None or not scope.task_id or not scope.snapshot_hash
+            or not scope.novel_id or runtime.task_id != scope.task_id
+            or accounting.fields.get("task_id") != scope.task_id):
+        return None
+    root = Path(settings.workspace_root).resolve()
+    if (root != Path(scope.settings.workspace_root).resolve() or project_identity(settings) != scope.novel_id
+            or {key: value for key, value in settings.to_mapping().items() if key in TASK_SETTINGS_FIELDS}
+            != {key: value for key, value in scope.settings.to_mapping().items() if key in TASK_SETTINGS_FIELDS}):
+        return None
+    # Use a local UUID, never task IDs or provider-controlled response IDs, as a path component.
+    path = root / ".inkflow" / "recovery" / f"provider-response-{uuid4().hex}" / "writer-response.unverified.json"
+    if not path.resolve().is_relative_to(root):
+        return None
+    artifact = {"status": "unverified", "authority": "task_temporary_not_canon",
+                "task_settings": scope.public_summary(), "run_id": runtime.run_id,
+                "request_id": accounting.fields.get("request_id"),
+                "attempt_id": accounting.attempt_id or f"unrecorded-{uuid4().hex}", "attempt": attempt,
+                "role": role, "model": model, "response_id": response_id, "finish_reason": finish_reason,
+                "schema": output_model.__name__, "schema_hash": content_hash(json_dumps(_generation_schema(output_model))),
+                "input_hash": content_hash(serialized_input), "content_hash": content_hash(content), "content": content}
+    try:
+        atomic_write_text(path, json_dumps(artifact) + "\n")
+    except (OSError, UnicodeError) as exc:
+        failure = ProviderError("已收到写作返回，但本地未验证产物保存失败；本步骤不会重新请求模型。请修复本地存储条件后处理，不能把这次返回视为已保存草稿。")
+        failure.recovery_node = "provider.response_preservation"
+        failure.recovery_attempts = attempt
+        failure.recovery_exhausted = True
+        failure.unsaved_response = artifact
+        raise failure from exc
+    try:
+        runtime.publish({"type": "model.response_preserved", "role": role,
+            "summary": "已保存本次写作返回，仍须完成格式、来源和正文核验。",
+            "metadata": {"status": "unverified", "artifact_path": path.relative_to(root).as_posix(),
+                         "task_id": scope.task_id, "snapshot_hash": scope.snapshot_hash,
+                         "content_hash": artifact["content_hash"], "attempt": attempt}})
+    except Exception as exc:
+        warnings.warn(f"写作返回已保存，通知暂未送达（{type(exc).__name__}）；未重发模型请求。", RuntimeWarning, stacklevel=2)
+    return path
 
 
 def _generation_schema(output_model: type[T]) -> dict[str, Any]:
@@ -625,6 +677,9 @@ class DeepSeekProvider:
                         f"completion_tokens={usage.get('completion_tokens', 'unknown')}, "
                         f"reasoning_tokens={detail.get('reasoning_tokens', 'unknown')}）。"
                     )
+                _preserve_writer_response(self.settings, accounting, role=agent_role, output_model=output_model,
+                    content=content, model=str(body.get("model") or payload["model"]), response_id=body.get("id"),
+                    finish_reason=choice.get("finish_reason"), serialized_input=serialized_input, attempt=attempt + 1)
                 result = _model_from_json_content(content, output_model)
                 accounting.outcome = "completed"
                 return ProviderResult(
@@ -726,9 +781,15 @@ class DeepSeekProvider:
             reason = "未能建立到模型服务的连接，本步还没有收到模型结果。请检查网络、代理或服务可用性；连接恢复后续接当前步骤。"
         elif isinstance(last_error, httpx.RemoteProtocolError):
             reason = _remote_protocol_diagnostic(last_error)["transport_reason"]
+        elif isinstance(last_error, ValidationError):
+            labels = {"title": "标题", "content": "正文"}
+            missing = list(dict.fromkeys(labels[item["loc"][0]]
+                for item in last_error.errors(include_input=False, include_url=False)
+                if item["type"] == "missing" and len(item["loc"]) == 1 and item["loc"][0] in labels))
+            reason = ("模型返回结果缺少" + "、".join(missing) + "。" if missing else "模型返回结构未通过校验。") + "请查看本步输出诊断。"
         else:
             reason = str(last_error).strip() or type(last_error).__name__
-        exhausted = ProviderError(f"模型请求经过 {attempts} 次限次自恢复仍未完成：{reason}")
+        exhausted = ProviderError(f"模型请求尝试 {attempt + 1} 次仍未完成：{reason}")
         exhausted.recovery_node = "provider.request"
         exhausted.recovery_attempts = attempt
         exhausted.recovery_exhausted = True
@@ -876,6 +937,9 @@ class AnthropicProvider:
                 if runtime:
                     runtime.settle(reserved, raw_usage, anthropic=True)
                 content = "".join(str(block.get("text") or "") for block in blocks if block.get("type") == "text")
+                _preserve_writer_response(self.settings, accounting, role=agent_role, output_model=output_model,
+                    content=content, model=str(body.get("model") or payload["model"]), response_id=body.get("id"),
+                    finish_reason=body.get("stop_reason"), serialized_input=serialized_input, attempt=attempt + 1)
                 result = _model_from_json_content(content, output_model)
                 usage = dict(raw_usage)
                 counts = normalized_usage(raw_usage, anthropic=True)
@@ -1017,6 +1081,15 @@ def _model_from_json_content(content: str, output_model: type[T]) -> T:
 
     last_validation: ValidationError | None = None
     for candidate in candidates:
+        if (getattr(output_model, "__name__", "") == "DraftOutput" and isinstance(candidate, dict)
+                and "title" not in candidate and isinstance(candidate.get("content"), str)):
+            first_line = next((line for line in candidate["content"].lstrip("\ufeff").splitlines() if line.strip()), "")
+            heading = re.fullmatch(r" {0,3}#[ \t]+(.+)", first_line)
+            if heading:
+                title = re.sub(r"[ \t]+#+[ \t]*$", "", heading.group(1)).strip()
+                if title:
+                    # Reuse the model's own heading without editing prose or inventing a title.
+                    candidate = {**candidate, "title": title}
         # 兼容 Reviewer 偶尔把一条 finding 直接放在顶层的情况。它仍然
         # 必须具备 finding 的完整字段；包装后继续走 ReviewReport 的严格
         # 校验与后续证据门禁，不能因此自动放行。

@@ -1884,9 +1884,12 @@ class TerminalSession:
             status="waiting_user" if len(history) >= 2 or exhausted else "waiting_condition")
         async with project_write_lock(project.root):
             self._store_recovery_record(project, key, record)
-            next_action = ("自动恢复已达到两次上限，请先核对动作结果并修复来源或交开发处理，再按原任务定点续接。"
-                           if len(record["attempts"]) >= 2 or exhausted else
-                           "当前依赖或预算尚未满足，请核对动作结果后定点续接。")
+            if len(record["attempts"]) >= 2:
+                next_action = "自动恢复已达到两次上限，请先核对动作结果并修复来源或交开发处理，再按原任务定点续接。"
+            elif exhausted:
+                next_action = "本步已用完原授权尝试，请先修复具体输出或来源条件，再按原任务定点续接；新增模型尝试须明确授权。"
+            else:
+                next_action = "当前依赖或预算尚未满足，请核对动作结果后定点续接。"
             next_action += "已完成正文和提交不重放，源码缺陷不在小说运行时自动修改。"
             work = project.record_pending_work(kind="coordinator_recovery", reason=reason, next_action=next_action,
                 source={"task_id": scope.task_id, "snapshot_hash": scope.snapshot_hash, "node": node, "recovery_record_key": key},

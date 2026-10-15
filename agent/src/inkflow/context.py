@@ -1717,7 +1717,7 @@ def _output_contract(
             + _review_detail_instruction(review_experience_detail)
         )
     return (
-        "只输出章节草稿结构。正文约 "
+        "只输出完整章节草稿结构，title单独返回标题，content只放正文。正文约 "
         f"{card['target_words']} 字，完成目标—阻力—决定—后果与不可逆变化即可；"
         "表达、场景调度与修辞可自由发挥；正文外填写 hook_note，说明实际锚点、留白边界和预计回应，"
         "不得把说明混入小说正文。"
