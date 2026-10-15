@@ -416,7 +416,7 @@ class ManualEditsService:
                 sources = json.dumps({"book":self.project.db.get_brief().model_dump(mode="json"),
                     "facts":self.project.db.current_facts()[:128],"threads":self.project.db.open_threads()[:64],
                     "recent_canon":recent},ensure_ascii=False)
-                packet = ContextPacket(project_id=self.project.project_id,chapter_no=boundary,task="手动修改核对",
+                packet = ContextPacket(cache_policy=engine.settings.prompt_cache_policy,project_id=self.project.project_id,chapter_no=boundary,task="手动修改核对",
                     sections=[ContextSection(key="CANON",title="公开正史与用户约定",content=sources,hard=True),
                         ContextSection(key="SET",title="设定合集：非正史",
                         content=StorySettingsService(self.project).context(chapter_no=boundary,actor=canonical_role),hard=False)],

@@ -45,6 +45,7 @@ PERSISTED_SETTING_NAMES = {
     "agent_context_budgets",
     "max_output_tokens",
     "max_concurrent_model_requests",
+    "writer_task_attempt_limit",
     "request_timeout_seconds",
     "planning_timeout_seconds",
     "trace_level",
@@ -246,6 +247,7 @@ class Settings:
     )
     max_output_tokens: int = 32_000
     max_concurrent_model_requests: int = 3
+    writer_task_attempt_limit: int | None = None
     request_timeout_seconds: float = 180.0
     planning_timeout_seconds: float = 600.0
     trace_level: str = "full"
@@ -485,6 +487,11 @@ class Settings:
             1,
             16,
         )
+        writer_task_attempt_limit = value.get("writer_task_attempt_limit", defaults.writer_task_attempt_limit)
+        if writer_task_attempt_limit is not None:
+            if isinstance(writer_task_attempt_limit, bool) or not isinstance(writer_task_attempt_limit, (int, str)):
+                raise ConfigurationError("本任务写作请求上限必须是正整数或留空。")
+            writer_task_attempt_limit = _positive_int(writer_task_attempt_limit, "本任务写作请求上限")
         if soft > hard:
             raise ConfigurationError("软上下文预算不能大于硬上下文上限。")
         context_budget_mode = _choice(
@@ -586,6 +593,7 @@ class Settings:
             role_settings_warnings=tuple(dict.fromkeys((*context_warnings, *generation_warnings))),
             max_output_tokens=output,
             max_concurrent_model_requests=max_concurrent_model_requests,
+            writer_task_attempt_limit=writer_task_attempt_limit,
             request_timeout_seconds=timeout,
             planning_timeout_seconds=planning_timeout,
             trace_level=trace_level,
@@ -690,6 +698,7 @@ class Settings:
             "context_hard_tokens": "INKFLOW_CONTEXT_HARD_TOKENS",
             "max_output_tokens": "INKFLOW_MAX_OUTPUT_TOKENS",
             "max_concurrent_model_requests": "INKFLOW_MAX_CONCURRENT_MODEL_REQUESTS",
+            "writer_task_attempt_limit": "INKFLOW_WRITER_TASK_ATTEMPT_LIMIT",
             "request_timeout_seconds": "INKFLOW_TIMEOUT_SECONDS",
             "planning_timeout_seconds": "INKFLOW_PLANNING_TIMEOUT_SECONDS",
             "trace_level": "INKFLOW_TRACE_LEVEL",
@@ -738,6 +747,10 @@ class Settings:
         return self.provider_kind == "mimo" or urlparse(self.base_url).hostname in {
             "api.xiaomimimo.com", "token-plan-cn.xiaomimimo.com",
         }
+
+    @property
+    def prompt_cache_policy(self) -> str:
+        return "mimo" if self.is_mimo else "deepseek" if self.is_deepseek else "standard"
 
     def get_api_key(self) -> str | None:
         provider_env = PROVIDER_ENV_KEYS.get(self.provider_kind)

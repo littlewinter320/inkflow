@@ -26,6 +26,7 @@ T = TypeVar("T", bound=BaseModel)
 
 _REQUEST_COUNTS_LOCK = threading.Lock()
 _ACTIVE_MODEL_REQUESTS: dict[str, int] = {}
+_MIMO_SOFT_WAIT_SECONDS = 180.0
 
 
 @asynccontextmanager
@@ -132,6 +133,30 @@ def _mimo_permanent_stream_error(error: Any) -> bool:
     return message.startswith(("invalid api key", "insufficient account balance", "invalid parameter"))
 
 
+def _remote_protocol_diagnostic(exc: Exception) -> dict[str, str]:
+    if not isinstance(exc, httpx.RemoteProtocolError):
+        return {}
+    from .trace import _redact_error
+
+    message = str(exc)
+    local_reasons = {
+        "MiMo 流式响应包含无效片段，未采用不完整内容。", "MiMo 流式响应未正常返回，未采用不完整内容。",
+        "MiMo 流式响应的结构不完整。", "MiMo 流式响应包含不支持的文本片段。",
+        "MiMo 流式响应在完成前中断，未采用不完整内容。",
+    }
+    if message in local_reasons:
+        reason = message
+    elif "incomplete chunked read" in message or "without sending complete message body" in message:
+        reason = "HTTPX：远端在响应正文传输完成前断开连接。"
+    elif "Server disconnected" in message:
+        reason = "HTTPX：远端在返回响应前断开连接。"
+    elif "illegal status line" in message or "illegal header line" in message:
+        reason = "HTTPX：远端返回了无效的 HTTP 状态行或响应头。"
+    else:
+        reason = "HTTPX：远端协议异常，未保留原始响应内容。"
+    return {"transport_reason": _redact_error(reason)[:240]}
+
+
 async def _mimo_stream_response(client: httpx.AsyncClient, url: str, *, headers: dict[str, str],
                                 payload: dict[str, Any]) -> httpx.Response:
     """Collect MiMo SSE into the existing completion contract within one attempt."""
@@ -204,6 +229,31 @@ async def _mimo_stream_response(client: httpx.AsyncClient, url: str, *, headers:
                             "message": {"role": "assistant", "content": "".join(content),
                                         "reasoning_content": "".join(reasoning) or None}}]
         return httpx.Response(response.status_code, json=body, request=response.request)
+
+
+async def _mimo_response_with_reminder(client: httpx.AsyncClient, url: str, *, headers: dict[str, str],
+                                      payload: dict[str, Any], timeout: float, role: str | None,
+                                      attempt: int) -> httpx.Response:
+    runtime = active_runtime.get()
+
+    async def remind() -> None:
+        await asyncio.sleep(_MIMO_SOFT_WAIT_SECONDS)
+        label = {"coordinator": "协调", "writer": "写作", "editor": "编辑", "reviewer": "专项审查",
+                 "memory_keeper": "记忆整理"}.get(role, "模型")
+        runtime.publish({
+            "type": "model.waiting", "role": role,
+            "summary": f"{label}请求已等待 {_MIMO_SOFT_WAIT_SECONDS:g} 秒，仍在等待小米 MiMo 返回完整结果；继续保留当前请求，最长等待 {timeout:g} 秒。",
+            "metadata": {"provider": "mimo", "role": role, "attempt": attempt,
+                         "elapsed_seconds": _MIMO_SOFT_WAIT_SECONDS, "timeout_seconds": timeout},
+        })
+
+    reminder = asyncio.create_task(remind()) if runtime is not None and timeout > _MIMO_SOFT_WAIT_SECONDS else None
+    try:
+        return await _mimo_stream_response(client, url, headers=headers, payload=payload)
+    finally:
+        if reminder is not None:
+            reminder.cancel()
+            await asyncio.gather(reminder, return_exceptions=True)
 
 
 @dataclass(slots=True)
@@ -331,6 +381,8 @@ class DeepSeekProvider:
         # writing novel text or credentials to usage logs. A matching hash is
         # necessary, not sufficient, for a provider-side cache hit.
         prefix_diagnostic = {
+            "cache_policy": self.settings.prompt_cache_policy,
+            "thinking": "enabled" if thinking else "disabled",
             "prompt_family": f"{self.settings.provider_kind}:{model_override or self.settings.model}:"
                              f"{agent_role or 'unknown'}:{output_model.__name__}",
             "system_contract_hash": content_hash(system),
@@ -351,20 +403,21 @@ class DeepSeekProvider:
             token_parameter: requested_max_tokens,
             "stream": False,
         }
-        # A separate user-message endpoint lets DeepSeek persist the stable
-        # reference prefix before the chapter-specific task on the first call.
-        # Other adapters keep their existing wire format; no beta endpoint or warm-up.
+        # Keep DeepSeek's established message layout; message boundaries do not
+        # promise persistence. MiMo retains one user message and no cache-control flags.
         dynamic_prompt = user_prompt
-        if cache_prefix and self.settings.is_deepseek:
+        if cache_prefix:
             if not user_prompt.startswith(cache_prefix) or len(cache_prefix) == len(user_prompt):
                 raise ProviderError("缓存参考段与本次输入不一致，请重新构建章节资料。")
-            dynamic_prompt = user_prompt[len(cache_prefix):]
-            payload["messages"] = [{"role": "system", "content": system},
-                                   {"role": "user", "content": cache_prefix},
-                                   {"role": "user", "content": dynamic_prompt}]
             prefix_diagnostic["reference_prefix_hash"] = content_hash(cache_prefix)
             prefix_diagnostic["reference_prefix_tokens"] = estimate_tokens(cache_prefix)
-        if self.settings.provider_kind == "openai" and not self.settings.is_mimo:
+            if self.settings.is_deepseek and not self.settings.is_mimo:
+                dynamic_prompt = user_prompt[len(cache_prefix):]
+                payload["messages"] = [{"role": "system", "content": system},
+                                       {"role": "user", "content": cache_prefix},
+                                       {"role": "user", "content": dynamic_prompt}]
+        prefix_diagnostic["message_layout"] = "system/reference/task" if len(payload["messages"]) == 3 else "system/user"
+        if self.settings.provider_kind == "openai" and not self.settings.is_mimo and not self.settings.is_deepseek:
             payload["prompt_cache_key"] = (
                 f"inkflow:{agent_role or 'unknown'}:{model_override or self.settings.model}:"
                 f"{output_model.__name__}:v1"
@@ -404,8 +457,11 @@ class DeepSeekProvider:
         attempt_usage: list[dict[str, Any]] = []
         request_id = uuid4().hex
         attempts = 2 if self.settings.quality_preset == "economy" else 3
+        if agent_role == "writer" and self.settings.writer_task_attempt_limit is not None:
+            attempts = min(attempts, self.settings.writer_task_attempt_limit)
         for attempt in range(attempts):
             runtime = active_runtime.get()
+            prefix_diagnostic["thinking"] = payload.get("thinking", {}).get("type", "enabled" if thinking else "disabled")
             serialized_input = json.dumps(payload["messages"], ensure_ascii=False)
             requested_max_tokens = self.settings.effective_output_tokens(
                 min(max_tokens, requested_max_tokens), agent_role, model_override, estimate_tokens(serialized_input))
@@ -437,10 +493,12 @@ class DeepSeekProvider:
                 request_timeout = timeout_seconds or self.settings.request_timeout_seconds
                 async with _model_request_slot(self.settings):
                     async with httpx.AsyncClient(timeout=request_timeout) as client:
-                        accounting.mark_request_sent()
+                        accounting.mark_request_sent(max_task_role_attempts=(
+                            self.settings.writer_task_attempt_limit if agent_role == "writer" else None))
                         attempt_record["request_sent"] = True
                         response = await asyncio.wait_for(
-                            _mimo_stream_response(client, url, headers=headers, payload=payload)
+                            _mimo_response_with_reminder(client, url, headers=headers, payload=payload,
+                                                        timeout=request_timeout, role=agent_role, attempt=attempt + 1)
                             if self.settings.is_mimo else client.post(url, headers=headers, json=payload),
                             timeout=request_timeout,
                         )
@@ -468,7 +526,7 @@ class DeepSeekProvider:
                     raise ProviderError(f"{provider_name} API 返回 HTTP {response.status_code}：{message}")
                 body = response.json()
                 usage = dict(body.get("usage") or {})
-                accounting.settle(usage)
+                accounting.settle(usage, response_model=body.get("model"))
                 attempt_record["usage"] = usage
                 if runtime:
                     runtime.settle(reserved, usage)
@@ -517,6 +575,8 @@ class DeepSeekProvider:
                 validation_errors = [{"location": ".".join(map(str, item["loc"])), "type": item["type"], "message": item["msg"][:500]}
                     for item in exc.errors(include_input=False, include_url=False)[:8]] if isinstance(exc, ValidationError) else []
                 last_error = exc
+                if getattr(exc, "recovery_exhausted", False):
+                    raise
                 if isinstance(exc, _MimoPermanentStreamError):
                     retry_kind = "permanent"
                 if retry_kind == "permanent":
@@ -527,6 +587,7 @@ class DeepSeekProvider:
                 if isinstance(exc, (httpx.HTTPError, asyncio.TimeoutError)):
                     retry_kind = "transport"
                     retry_delay = float(2 ** attempt)
+                transport_diagnostic = _remote_protocol_diagnostic(exc)
                 if attempt + 1 < attempts:
                     recovery_events.append({
                         "attempt": attempt + 1,
@@ -534,6 +595,7 @@ class DeepSeekProvider:
                         "error_type": type(exc).__name__,
                         "strategy": "等待后重连，保留原任务" if retry_kind == "transport" else "修复 JSON 结构，保留完整内容要求",
                         "usage_unknown": isinstance(exc, (httpx.HTTPError, asyncio.TimeoutError)),
+                        **transport_diagnostic,
                         **({"validation_errors": validation_errors} if validation_errors else {}),
                     })
                     if runtime:
@@ -542,6 +604,7 @@ class DeepSeekProvider:
                             "type": "model.recovering",
                             "summary": f"模型请求遇到{problem}问题，正在第 {attempt + 2}/{attempts} 次尝试；不重做已保存的正文或提交。",
                             "metadata": {"kind": retry_kind, "attempt": attempt + 2, "error_type": type(exc).__name__,
+                                         **transport_diagnostic,
                                          **({"validation_errors": validation_errors} if validation_errors else {})},
                         })
                     if retry_kind == "transport":
@@ -584,6 +647,8 @@ class DeepSeekProvider:
             reason = "连接或等待模型响应超时；请检查网络和模型服务后续接当前步骤。"
         elif isinstance(last_error, httpx.ConnectError):
             reason = "未能建立到模型服务的连接，本步还没有收到模型结果。请检查网络、代理或服务可用性；连接恢复后续接当前步骤。"
+        elif isinstance(last_error, httpx.RemoteProtocolError):
+            reason = _remote_protocol_diagnostic(last_error)["transport_reason"]
         else:
             reason = str(last_error).strip() or type(last_error).__name__
         exhausted = ProviderError(f"模型请求经过 {attempts} 次限次自恢复仍未完成：{reason}")
@@ -677,6 +742,8 @@ class AnthropicProvider:
         request_id = uuid4().hex
         recovery_events: list[dict[str, Any]] = []
         attempts = 2 if self.settings.quality_preset == "economy" else 3
+        if agent_role == "writer" and self.settings.writer_task_attempt_limit is not None:
+            attempts = min(attempts, self.settings.writer_task_attempt_limit)
         for attempt in range(attempts):
             payload["max_tokens"] = self.settings.effective_output_tokens(
                 max_tokens, agent_role, model_override, estimate_tokens(serialized_input))
@@ -697,7 +764,8 @@ class AnthropicProvider:
             try:
                 async with _model_request_slot(self.settings):
                     async with httpx.AsyncClient(timeout=request_timeout) as client:
-                        accounting.mark_request_sent()
+                        accounting.mark_request_sent(max_task_role_attempts=(
+                            self.settings.writer_task_attempt_limit if agent_role == "writer" else None))
                         response = await asyncio.wait_for(
                             client.post(f"{self.settings.base_url}/v1/messages", headers=self._headers(), json=payload),
                             timeout=request_timeout,
@@ -725,7 +793,7 @@ class AnthropicProvider:
                 body = response.json()
                 blocks = body.get("content") or []
                 raw_usage = dict(body.get("usage") or {})
-                accounting.settle(raw_usage, anthropic=True)
+                accounting.settle(raw_usage, anthropic=True, response_model=body.get("model"))
                 if runtime:
                     runtime.settle(reserved, raw_usage, anthropic=True)
                 content = "".join(str(block.get("text") or "") for block in blocks if block.get("type") == "text")
@@ -754,9 +822,10 @@ class AnthropicProvider:
             except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError, ValidationError, ProviderError) as exc:
                 accounting.failure = accounting.failure or type(exc).__name__
                 if isinstance(exc, ProviderError):
-                    exc.recovery_node = "provider.request"
-                    exc.recovery_attempts = attempt
-                    exc.recovery_exhausted = True
+                    if not getattr(exc, "recovery_exhausted", False):
+                        exc.recovery_node = "provider.request"
+                        exc.recovery_attempts = attempt
+                        exc.recovery_exhausted = True
                     raise
                 failure = ProviderError(f"Anthropic JSON 调用失败：{exc}")
                 failure.recovery_node = "provider.request"

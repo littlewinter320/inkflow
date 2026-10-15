@@ -186,7 +186,7 @@ class InkFlowEngine:
             "使用汉字写日期、数量和金额，避免数字缩写导致录音原文不一致。"
             "不使用本书人物、剧情或用户私人信息，不读取参考音频。"
         )
-        packet = ContextPacket(
+        packet = ContextPacket(cache_policy=self.settings.prompt_cache_policy,
             project_id=project.project_id,
             chapter_no=0,
             task="生成声音克隆参考朗读稿",
@@ -217,6 +217,7 @@ class InkFlowEngine:
             hook_strategy=self.settings.hook_strategy,
             review_experience_detail=self.settings.review_experience_detail,
             quality_preset=self.settings.quality_preset,
+            cache_policy=self.settings.prompt_cache_policy,
             actor=normalize_role(role),
             output_reserve_tokens=self.settings.effective_output_tokens(output_reserve, role),
         )
@@ -734,10 +735,8 @@ class InkFlowEngine:
         read_sources = {name: (project.root / name).read_text(encoding="utf-8")
             for name in ("BOOK.md", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md") if (project.root / name).is_file()}
         reference_text += "\n当前书籍要求与生效规划原文：\n" + json_dumps(read_sources)
-        reference_text += "\n当前书籍要求：\n" + json_dumps(project.db.get_brief().model_dump(mode="json"))
-        plan = project.db.get_current_plan_bundle()
-        if plan:
-            reference_text += "\n当前规划（未来假设，不是已发生事实）：\n" + plan.model_dump_json()
+        from .story_settings import setting_structured_sources
+        reference_text += "\n当前书籍与规划结构（未来假设，不是已发生事实）：\n" + json_dumps(setting_structured_sources(project, read_sources))
         if operation=="record_supplement":
             selected_record = next((record for record in collection["records"] if record["record_id"] == change.get("record_id")), None)
             if not selected_record:
@@ -1182,7 +1181,7 @@ class InkFlowEngine:
                         + _hook_planning_instruction(self.settings.hook_strategy)), hard=True),
                 ]
                 sections.append(preference_section(project.db))
-                packet = ContextPacket(project_id=project.project_id, chapter_no=begin, task=task,
+                packet = ContextPacket(cache_policy=self.settings.prompt_cache_policy, project_id=project.project_id, chapter_no=begin, task=task,
                                        sections=sections, estimated_tokens=estimate_tokens("\n".join(item.content for item in sections)))
                 atomic_write_text(trace.run_dir / "context-packet.md", packet.to_markdown())
                 trace.record_model_started("plan.supplement.model", model=self.settings.model, agent_role="writer",
@@ -1384,7 +1383,7 @@ class InkFlowEngine:
         if not project.db.latest_accepted_chapter_no():
             return arc, 0
         expected = (arc.chapter_start, arc.chapter_end, arc.volume_no)
-        packet = ContextPacket(project_id=project.project_id, chapter_no=arc.chapter_start,
+        packet = ContextPacket(cache_policy=self.settings.prompt_cache_policy, project_id=project.project_id, chapter_no=arc.chapter_start,
                                task="只核对候选近期计划与已接受正文；不改正史或书卷边界。",
                                sections=evidence, estimated_tokens=estimate_tokens("\n".join(item.content for item in evidence)))
         scope = active_task_settings.get()
@@ -1561,7 +1560,7 @@ class InkFlowEngine:
                            hard=True, cache_scope="request"),
         ]
         sections.append(preference_section(project.db))
-        packet = ContextPacket(project_id=project.project_id, chapter_no=start, task=task, sections=sections,
+        packet = ContextPacket(cache_policy=self.settings.prompt_cache_policy, project_id=project.project_id, chapter_no=start, task=task, sections=sections,
                                estimated_tokens=estimate_tokens("\n".join(item.content for item in sections)))
         try:
             atomic_write_text(trace.run_dir / "context-packet.md", packet.to_markdown())
@@ -1795,7 +1794,7 @@ class InkFlowEngine:
                 ),
             ]
             sections.append(preference_section(project.db))
-            packet = ContextPacket(
+            packet = ContextPacket(cache_policy=self.settings.prompt_cache_policy,
                 project_id=project.project_id,
                 chapter_no=1,
                 task=task,
@@ -2056,7 +2055,7 @@ class InkFlowEngine:
                 ),
             ]
             sections.append(preference_section(project.db))
-            packet = ContextPacket(
+            packet = ContextPacket(cache_policy=self.settings.prompt_cache_policy,
                 project_id=project.project_id,
                 chapter_no=start_chapter,
                 task=task,
@@ -2188,7 +2187,7 @@ class InkFlowEngine:
         try:
             scope_volume = 2 if re.search(r"第二卷|第\s*2\s*卷", instruction) else None
             source_fingerprint = self._planning_source_fingerprint(project, 1, 1)
-            packet = ContextPacket(
+            packet = ContextPacket(cache_policy=self.settings.prompt_cache_policy,
                 project_id=project.project_id, chapter_no=0, task="展开剧情细纲，不切分章节。",
                 sections=[
                     ContextSection(key="B", title="书籍设定", content=json_dumps(project.db.get_brief().model_dump(mode="json")), hard=True),
@@ -2376,7 +2375,7 @@ class InkFlowEngine:
                 ),
             ]
             sections.append(preference_section(project.db))
-            packet = ContextPacket(
+            packet = ContextPacket(cache_policy=self.settings.prompt_cache_policy,
                 project_id=project.project_id,
                 chapter_no=next_start,
                 task=task,
@@ -2619,7 +2618,7 @@ class InkFlowEngine:
                 ),
             ]
             sections.append(preference_section(project.db))
-            packet = ContextPacket(
+            packet = ContextPacket(cache_policy=self.settings.prompt_cache_policy,
                 project_id=project.project_id,
                 chapter_no=next_start,
                 task=task,
@@ -2795,7 +2794,7 @@ class InkFlowEngine:
         provisional_chapters: list[dict[str, Any]] | None = None,
         retry_expected_state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        project = InkFlowProject(root)
+        project = await asyncio.to_thread(InkFlowProject, root)
         trace = TraceRecorder(project.root, f"write-{chapter_no:05d}", self.settings.trace_level)
         try:
             if retry_expected_state is not None and chapter_retry_state(project, chapter_no) != retry_expected_state:
@@ -2804,7 +2803,7 @@ class InkFlowEngine:
                     "当前草稿和正史均保留，请从当前版本继续。"
                 )
             from .manual_edits import ManualEditsService
-            ManualEditsService(project).scan()
+            await asyncio.to_thread(ManualEditsService(project).scan)
             ManualEditsService(project).assert_ready(chapter_no)
             existing_chapter = project.db.get_chapter(chapter_no)
             if existing_chapter and existing_chapter["status"] == "accepted":
@@ -3480,7 +3479,7 @@ class InkFlowEngine:
                 )
         if type(max_revision_rounds) is not int or not 0 <= max_revision_rounds <= 2:
             raise ValidationGateError("自动修订轮数必须在 0～2 之间。")
-        project = InkFlowProject(root)
+        project = await asyncio.to_thread(InkFlowProject, root)
         trace = TraceRecorder(project.root, f"recover-{chapter_no:05d}", self.settings.trace_level)
         recovery = await self._native_recovery_attempts(project, "chapter.revision", chapter_no, limit=max_revision_rounds)
         revisions = recovery["attempts"]
@@ -3736,7 +3735,7 @@ class InkFlowEngine:
             raise ValidationGateError("审查模式必须与已冻结的任务配置一致。")
         self._assert_task_settings()
         owners = check_owners_for_mode(mode)
-        project = InkFlowProject(root)
+        project = await asyncio.to_thread(InkFlowProject, root)
         trace = TraceRecorder(project.root, f"review-{chapter_no:05d}", self.settings.trace_level)
         try:
             chapter = project.db.get_chapter(chapter_no)
@@ -5684,7 +5683,7 @@ class InkFlowEngine:
                     _provisional_batch_id=_provisional_batch_id,
                 )
         self._assert_task_settings()
-        project = InkFlowProject(root)
+        project = await asyncio.to_thread(InkFlowProject, root)
         trace = TraceRecorder(project.root, f"accept-{chapter_no:05d}", self.settings.trace_level)
         scope = active_task_settings.get()
         committed = False
@@ -5735,8 +5734,9 @@ class InkFlowEngine:
                     stored = connection.execute("SELECT data_json FROM memory_patches WHERE chapter_no=?", (chapter_no,)).fetchone()
                 if not stored or not review_record or review_record["id"] != receipt["review_id"]:
                     raise ValidationGateError("原提交的记忆补丁或审查身份缺失，保留正史，收尾需要恢复原依据。")
-                tail = self._complete_acceptance_tail(project, chapter_no, receipt["version"],
-                    MemoryPatch.model_validate_json(stored["data_json"]), review_record, trace, scope.task_id)
+                async with project_write_lock(project.root):
+                    tail = self._complete_acceptance_tail(project, chapter_no, receipt["version"],
+                        MemoryPatch.model_validate_json(stored["data_json"]), review_record, trace, scope.task_id)
                 trace.finish(status="waiting_condition" if tail["warnings"] else "completed",
                     summary="复用原任务已提交结果，未重复提交记忆")
                 return {"chapter_no": chapter_no, "status": "accepted", "reused": True,
@@ -5754,7 +5754,7 @@ class InkFlowEngine:
                         "post_commit_status": "completed", "projection_status": "synced", "warnings": [],
                         "next_action": f"第 {chapter_no} 章已入正史，无需重复验收。", "trace_id": trace.run_id}
             from .manual_edits import ManualEditsService
-            ManualEditsService(project).scan()
+            await asyncio.to_thread(ManualEditsService(project).scan)
             ManualEditsService(project).assert_ready(chapter_no)
             accepted_before = {item["chapter_no"] for item in project.db.accepted_chapters()
                                if item["chapter_no"] < chapter_no}

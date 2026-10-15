@@ -25,6 +25,55 @@ SCHEMA = "story-settings-v1"
 MARKER = "story_settings_type"
 
 
+def setting_structured_sources(project, read_sources: dict[str, str]) -> dict[str, Any]:
+    """Omit only proven duplicate projections; source texts and storage stay intact."""
+    from types import SimpleNamespace
+    from .planning_pipeline import PlanningNeedsAttention, load_active_planning, v2_execution_bundle
+    from .project import render_book_brief
+
+    brief = project.db.get_brief()
+    plan = project.db.get_current_plan_bundle()
+    notes = {"plan": "未来规划是假设，不是已发生正史。"}
+    result = {"book_brief": brief.model_dump(mode="json"),
+              "plan": plan.model_dump(mode="json") if plan else None, "source_notes": notes}
+    if read_sources.get("BOOK.md") == render_book_brief(brief):
+        result["book_brief"] = {"duplicate_projection_omitted": True, "source": "BOOK.md",
+                                "source_hash": content_hash(read_sources["BOOK.md"])}
+        notes["book_brief"] = "书籍契约与已装入的BOOK原文精确相同，内容只读取该原文。"
+    else:
+        notes["book_brief"] = "BOOK原文缺失或与数据库契约不完全相同，保留完整契约供对照，未省略差异。"
+    if plan is None:
+        notes["plan"] += " 数据库没有结构化规划。"
+        return result
+    try:
+        # The loader's failure notification must not write pending work from a projection helper.
+        view = SimpleNamespace(root=project.root, record_pending_work=lambda **_: None)
+        active = load_active_planning(view)
+        if active is None:
+            notes["plan"] += " 未找到完整生效的三层规划证明，保留数据库规划全文，未省略。"
+            return result
+        manifest, outline, detail, window = active
+        hashes = {name: manifest[key] for name, key in (
+            ("OUTLINE.md", "outline_hash"), ("STORY_DETAIL.md", "volume_detail_hash"),
+            ("RECENT_PLAN.md", "recent_plan_hash"))}
+        if any(name not in read_sources or content_hash(read_sources[name]) != expected
+               for name, expected in hashes.items()):
+            notes["plan"] += " 已装入的规划原文与当前生效来源不一致，保留数据库规划全文，未省略差异。"
+            return result
+        expected = v2_execution_bundle(project, manifest, outline, detail, window)
+        if plan.model_dump(mode="json") != expected.model_dump(mode="json"):
+            notes["plan"] += " 数据库执行视图含不同于生效原文投影的内容，保留全文，未省略独有内容。"
+            return result
+        result["plan"] = {"duplicate_projection_omitted": True, "source": "planning/active-v2.json",
+                          "revision_no": manifest.get("revision_no", 1), "trace_id": manifest["trace_id"],
+                          "volume_no": manifest["volume_no"], "chapter_window": manifest["chapter_window"],
+                          "source_hashes": hashes}
+        notes["plan"] += " 数据库执行视图与生效三层规划精确相同，正文内容只读取已装入的三份原文。"
+    except (PlanningNeedsAttention, OSError, ValueError, KeyError, TypeError, StopIteration):
+        notes["plan"] += " 生效规划未能完整核验或发布尚未完成，保留数据库规划全文与原文，未省略差异。"
+    return result
+
+
 def _fields(*items: tuple[str, str, str]) -> list[dict[str, Any]]:
     return [{"key": key, "label": label, "description": description, "default": ""}
             for key, label, description in items]

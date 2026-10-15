@@ -843,7 +843,7 @@ class TerminalSession:
                     saved_intent = saved_intent.model_copy(
                         update={
                             "operation_instruction": merged,
-                            "visible_reason": "继续原批次，并把本次新增的写作要求交给 Writer 与 Editor。",
+                            "visible_reason": "继续原任务，并把本次新增的写作要求交给 Writer 与 Editor。",
                         }
                     )
                 route_result = ProviderResult(data=saved_intent, model="local-resume", response_id=None, reasoning_content=None, usage={})
@@ -1593,6 +1593,9 @@ class TerminalSession:
             raise ValidationGateError("故障任务的原配置快照不一致，不能换当前配置恢复。")
         nodes = self._recovery_nodes(response)
         failed = next((item for item in nodes if item["status"] != "completed"), {})
+        if failed.get("error_type") == "ProjectBusyError":
+            return response | {"coordinator_recovery": {"status": "not_run",
+                "reason": "短暂写入占用由原节点等待和续接，不额外调用模型诊断，也不重放写作。"}}
         node = str(failed.get("recovery_node") or failed.get("step") or dispatch.workflow)
         # Counts bind task/node, never error wording, prose version or source hash.
         key = f"coordinator_recovery:{scope.task_id}:{node}"
@@ -3135,7 +3138,7 @@ class TerminalSession:
 
     def _build_packet(self, project: InkFlowProject, message: str) -> ContextPacket:
         if self._casual_message(project, message):
-            packet = ContextPacket(project_id=project.project_id, chapter_no=1, task="日常交流", estimated_tokens=0,
+            packet = ContextPacket(cache_policy=self.engine.settings.prompt_cache_policy, project_id=project.project_id, chapter_no=1, task="日常交流", estimated_tokens=0,
                 sections=[ContextSection(key="A", title="这次想说的话", content=message, hard=True),
                     ContextSection(key="MODEL", title="当前对话模型", content=self.engine.settings.model_for("coordinator"), hard=True),
                     ContextSection(key="F", title="最近对话，仅供理解话题", content=self._recent_dialogue(project, limit=3, char_limit=4000) or "暂无前文")])
@@ -3302,6 +3305,7 @@ class TerminalSession:
             section.cache_scope = {"B": "book", "D": "global", "E": "global", "SET": "canon", "A": "request", "C": "request"}.get(section.key, section.cache_scope)
         packet = ContextPacket(
             project_id=project.project_id,
+            cache_policy=self.engine.settings.prompt_cache_policy,
             chapter_no=1,
             task="理解用户的自然语言讨论、确认或执行请求，并路由到既有墨流工作流",
             sections=sections,
@@ -4078,7 +4082,7 @@ class TerminalSession:
                     self.engine.accept_chapter(root, chapter_no, force=False))]}
 
         if intent.action == "write_draft":
-            written = self._reuse_workflow_writer(InkFlowProject(root), chapter_no, "write", instruction)
+            written = self._reuse_workflow_writer(await asyncio.to_thread(InkFlowProject, root), chapter_no, "write", instruction)
             steps.append(written or await self._run_step("writer.write", self.engine.write_chapter(root, chapter_no, instruction)))
             return {
                 "steps": steps,
@@ -4086,14 +4090,14 @@ class TerminalSession:
             }
 
         if intent.action in {"write_review", "write_review_accept"}:
-            written = self._reuse_workflow_writer(InkFlowProject(root), chapter_no, "write", instruction)
+            written = self._reuse_workflow_writer(await asyncio.to_thread(InkFlowProject, root), chapter_no, "write", instruction)
             written = written or await self._run_step(
                 "writer.write", self.engine.write_chapter(root, chapter_no, instruction)
             )
             steps.append(written)
             if "gate" in written:
                 return {"steps": steps}
-            reviewed = self._reuse_current_pass_review(InkFlowProject(root), chapter_no)
+            reviewed = self._reuse_current_pass_review(await asyncio.to_thread(InkFlowProject, root), chapter_no)
             reviewed = reviewed or await self._run_step("engine.review_mode", self.engine.review_and_repair(
                 root, chapter_no, instruction=instruction, max_revision_rounds=intent.max_revision_rounds,
             ))

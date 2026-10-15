@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from .config import Settings, load_user_settings, user_settings_path
-from .errors import InkFlowError
+from .errors import InkFlowError, ProviderError
 from .utils import utc_now
 
 
@@ -82,6 +82,29 @@ def price_snapshot(settings: Settings, model: str) -> dict[str, Any]:
 
 def _count(value: Any) -> int | None:
     return value if type(value) is int and 0 <= value <= 2**63 - 1 else None
+
+
+def cache_endpoint(base_url: str) -> str | None:
+    """Identify the request route without retaining URL credentials or queries."""
+    try:
+        url = urlparse(base_url.strip())
+        if (url.scheme not in {"http", "https"} or not url.hostname
+                or url.username or url.password or url.query or url.fragment):
+            return None
+        host = f"[{url.hostname}]" if ":" in url.hostname else url.hostname
+        port = url.port
+        if port is not None and port != (443 if url.scheme == "https" else 80):
+            host += f":{port}"
+        return f"{url.scheme}://{host}{url.path.rstrip('/')}"
+    except ValueError:
+        return None
+
+
+def _task_attempt_limit_error(message: str) -> ProviderError:
+    error = ProviderError(message + "；尚未发送额外模型请求。")
+    error.recovery_node = "provider.task_attempt_limit"
+    error.recovery_exhausted = True
+    return error
 
 
 def normalized_usage(usage: dict[str, Any], *, anthropic: bool = False) -> dict[str, int | None]:
@@ -232,14 +255,39 @@ class UsageLedger:
                  prompt_family, utc_now(),
                  input_estimate, max_output_tokens, json.dumps(price), pending_cost))
             safe = {key: str(value) for key, value in (diagnostic or {}).items() if key in {
-                "system_contract_hash", "user_prefix_4096_hash", "reference_prefix_hash", "materials_hash", "quality_hash", "stage"}}
+                "system_contract_hash", "user_prefix_4096_hash", "reference_prefix_hash", "materials_hash", "quality_hash", "stage",
+                "cache_policy", "message_layout", "thinking", "reference_prefix_tokens"}}
             safe["context_limit_tokens"] = settings.context_budget_for(
                 role if role in {"coordinator", "writer", "editor", "reviewer", "memory_keeper"} else None,
                 model_override=model)[1]
-            db.execute("UPDATE model_attempts SET diagnostic_json=? WHERE attempt_id=?", (json.dumps(safe), attempt_id))
+            endpoint = cache_endpoint(settings.base_url)
+            if endpoint is not None:
+                safe["request_endpoint"] = endpoint
+            db.execute("UPDATE model_attempts SET diagnostic_json=?,request_sent=0 WHERE attempt_id=?", (json.dumps(safe), attempt_id))
         return attempt_id
 
-    def settle(self, attempt_id: str, usage: dict[str, Any], *, anthropic: bool = False) -> None:
+    def mark_request_sent(self, attempt_id: str, *, max_task_role_attempts: int | None = None) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT task_id,role,request_sent FROM model_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+            if row is None:
+                raise ValueError("模型尝试记录不存在，不能核验发送次数")
+            if max_task_role_attempts is not None:
+                if _count(max_task_role_attempts) in (None, 0) or not str(row["task_id"] or "").strip():
+                    raise _task_attempt_limit_error("本任务请求次数限制缺少有效上限或任务身份，无法核验授权")
+                if row["request_sent"] == 1:
+                    return
+                previous = db.execute("""SELECT COALESCE(SUM(request_sent=1),0) AS sent,
+                    COALESCE(SUM(request_sent IS NULL),0) AS unknown FROM model_attempts
+                    WHERE task_id=? AND role=? AND attempt_id!=?""", (row["task_id"], row["role"], attempt_id)).fetchone()
+                if previous["unknown"]:
+                    raise _task_attempt_limit_error("原任务存在发送状态未知的模型尝试，无法核验剩余授权次数")
+                if previous["sent"] >= max_task_role_attempts:
+                    raise _task_attempt_limit_error(f"本任务的写作角色已用完获准的 {max_task_role_attempts} 次请求")
+            db.execute("UPDATE model_attempts SET request_sent=1 WHERE attempt_id=?", (attempt_id,))
+
+    def settle(self, attempt_id: str, usage: dict[str, Any], *, anthropic: bool = False,
+               response_model: str | None = None) -> None:
         counts = normalized_usage(usage, anthropic=anthropic)
         known = counts["input_tokens"] is not None and counts["output_tokens"] is not None
         # Persist only usage fields, never arbitrary provider metadata.
@@ -249,9 +297,17 @@ class UsageLedger:
         raw = {key: value for key, value in usage.items() if key in allowed}
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT price_json,usage_state FROM model_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+            row = db.execute("SELECT price_json,usage_state,diagnostic_json FROM model_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
             if row is None:
                 raise ValueError("模型尝试记录不存在，不能结算")
+            if isinstance(response_model, str) and response_model.strip():
+                try:
+                    diagnostic = json.loads(row["diagnostic_json"] or "{}")
+                except (ValueError, TypeError):
+                    diagnostic = {}
+                diagnostic = diagnostic if isinstance(diagnostic, dict) else {}
+                diagnostic["response_model"] = response_model.strip()[:200]
+                db.execute("UPDATE model_attempts SET diagnostic_json=? WHERE attempt_id=?", (json.dumps(diagnostic), attempt_id))
             if row["usage_state"] == "reported":
                 return  # Idempotent settlement; never add the same usage twice.
             cost = _cost_micros(counts, json.loads(row["price_json"]))
@@ -333,6 +389,80 @@ class UsageLedger:
             "performance_diagnostic": self._performance_diagnostic([dict(row) for row in rows]),
             "qualified_production": self._qualified_production_cost(novel_id, qualified_task_products),
         }
+
+    def cache_observations(self, novel_id: str, settings: Settings) -> dict[str, Any]:
+        """Group actual requests by frozen route/model; retain unscoped history."""
+        with self._connect() as db:
+            rows = [dict(row) for row in db.execute("""SELECT provider,endpoint,model,role,prompt_family,
+                input_tokens,output_tokens,cache_hit_tokens,request_sent,diagnostic_json,started_at
+                FROM model_attempts WHERE novel_id=? ORDER BY started_at,rowid""", (novel_id,))]
+
+        def totals(items: list[dict[str, Any]]) -> dict[str, Any]:
+            attempted = [item for item in items if item["request_sent"] != 0]
+            inputs = [item for item in attempted if _count(item["input_tokens"]) is not None]
+            outputs = [item for item in attempted if _count(item["output_tokens"]) is not None]
+            reported = [item for item in inputs if _count(item["cache_hit_tokens"]) is not None
+                        and item["cache_hit_tokens"] <= item["input_tokens"]]
+            prompt = sum(item["input_tokens"] for item in inputs)
+            output = sum(item["output_tokens"] for item in outputs)
+            denominator = sum(item["input_tokens"] for item in reported)
+            hit = sum(item["cache_hit_tokens"] for item in reported)
+            return {"calls": len(attempted), "not_sent_calls": len(items) - len(attempted),
+                "unknown_sent_calls": sum(item["request_sent"] is None for item in attempted),
+                "prompt_tokens": prompt, "completion_tokens": output, "total_tokens": prompt + output,
+                "input_unknown_calls": len(attempted) - len(inputs),
+                "output_unknown_calls": len(attempted) - len(outputs),
+                "cache_reported_calls": len(reported), "cache_unknown_calls": len(attempted) - len(reported),
+                "cache_reported_input_tokens": denominator,
+                "cache_unknown_prompt_tokens": prompt - denominator,
+                "prompt_cache_hit_tokens": hit, "prompt_cache_miss_tokens": denominator - hit,
+                "prompt_cache_hit_rate": round(hit / denominator, 4) if denominator else None,
+                "prompt_cache_miss_rate": round((denominator - hit) / denominator, 4) if denominator else None,
+                "average_prompt_tokens": round(prompt / len(inputs)) if inputs else None,
+                "average_completion_tokens": round(output / len(outputs)) if outputs else None}
+
+        grouped: dict[tuple[str, str | None, str, str, str], list[dict[str, Any]]] = {}
+        for row in rows:
+            try:
+                diagnostic = json.loads(row["diagnostic_json"] or "{}")
+            except (ValueError, TypeError):
+                diagnostic = {}
+            row["diagnostic"] = diagnostic if isinstance(diagnostic, dict) else {}
+            recorded = row["diagnostic"].get("request_endpoint")
+            endpoint = cache_endpoint(recorded) if isinstance(recorded, str) else None
+            # Host-only legacy records cannot identify alternate paths/ports.
+            key = (row["provider"], endpoint, row["model"], row["role"], row["endpoint"] if endpoint is None else "")
+            grouped.setdefault(key, []).append(row)
+        history = []
+        for (provider, endpoint, model, role, legacy_host), items in grouped.items():
+            contracts: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+            for row in items:
+                d = row["diagnostic"]
+                key = (str(row["prompt_family"] or ""), *[str(d.get(name) or "") for name in
+                    ("system_contract_hash", "quality_hash", "thinking", "cache_policy", "message_layout")])
+                contracts.setdefault(key, []).append(row)
+            history.append({"provider": provider, "endpoint": endpoint, "legacy_endpoint_host": legacy_host or None,
+                "model": model, "role": role, "scope_known": endpoint is not None,
+                "last_at": items[-1]["started_at"], **totals(items),
+                "by_contract": [{"prompt_family": key[0], "system_contract_hash": key[1], "quality_hash": key[2],
+                    "thinking": key[3], "cache_policy": key[4], "message_layout": key[5],
+                    "reference_prefix_tokens_estimated": value[-1]["diagnostic"].get("reference_prefix_tokens"),
+                    "stage": value[-1]["diagnostic"].get("stage"),
+                    "response_models": sorted({item["diagnostic"]["response_model"] for item in value
+                        if isinstance(item["diagnostic"].get("response_model"), str)}), **totals(value)}
+                    for key, value in contracts.items()]})
+        selected_endpoint = cache_endpoint(settings.base_url)
+        current = {}
+        for role in settings.agent_generation:
+            model = settings.model_for(role)
+            selected = next((group for group in history if group["provider"] == settings.provider_kind
+                and group["endpoint"] == selected_endpoint and group["scope_known"] and group["model"] == model and group["role"] == role), None)
+            current[role] = selected or {"provider": settings.provider_kind, "endpoint": selected_endpoint,
+                "model": model, "role": role, "scope_known": selected_endpoint is not None, "by_contract": [], **totals([])}
+        return {"available": True, "provider": settings.provider_kind, "endpoint": selected_endpoint,
+                "cache_policy": settings.prompt_cache_policy,
+                "by_agent_role": current, "history_groups": sorted(history, key=lambda item: item["last_at"], reverse=True),
+                "unscoped_calls": sum(group["calls"] for group in history if not group["scope_known"])}
 
     @staticmethod
     def _attempt_totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -442,6 +572,10 @@ class ModelAttempt:
         self.runtime = active_runtime.get()
         self.started = time.monotonic()
         self.fields = fields
+        self.fields["diagnostic"] = {**fields.get("diagnostic", {})}
+        endpoint = cache_endpoint(settings.base_url)
+        if endpoint is not None:
+            self.fields["diagnostic"]["request_endpoint"] = endpoint
         self.model = fields.get("model", "")
         self.provider = settings.provider_kind
         self.counts = normalized_usage({})
@@ -468,15 +602,27 @@ class ModelAttempt:
             runtime.publish({"type": "usage.warning", "summary": message})
         self.ledger = None
 
-    def settle(self, usage: dict[str, Any], *, anthropic: bool = False) -> None:
+    def settle(self, usage: dict[str, Any], *, anthropic: bool = False,
+               response_model: str | None = None) -> None:
         self.counts = normalized_usage(usage, anthropic=anthropic)
+        if isinstance(response_model, str) and response_model.strip():
+            self.fields["diagnostic"]["response_model"] = response_model.strip()[:200]
         if self.ledger:
             try:
-                self.ledger.settle(self.attempt_id, usage, anthropic=anthropic)
+                self.ledger.settle(self.attempt_id, usage, anthropic=anthropic, response_model=response_model)
             except (OSError, sqlite3.Error) as exc:
                 self._unavailable(exc)
 
-    def mark_request_sent(self) -> None:
+    def mark_request_sent(self, *, max_task_role_attempts: int | None = None) -> None:
+        if self.ledger:
+            try:
+                self.ledger.mark_request_sent(self.attempt_id, max_task_role_attempts=max_task_role_attempts)
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                self._unavailable(exc)
+                if max_task_role_attempts is not None:
+                    raise _task_attempt_limit_error("用量账本不可核验，无法执行本任务的模型请求次数限制") from exc
+        elif max_task_role_attempts is not None:
+            raise _task_attempt_limit_error("用量账本不可用，无法执行本任务的模型请求次数限制")
         self.request_sent = True
 
     def finish(self) -> None:
@@ -493,7 +639,7 @@ class ModelAttempt:
                     "ledger_available": self.ledger is not None,
                     "request_sent": self.request_sent,
                     "diagnostic": {key: str(value) for key, value in self.fields.get("diagnostic", {}).items()
-                                   if key in {"system_contract_hash", "user_prefix_4096_hash", "reference_prefix_hash", "materials_hash", "quality_hash", "stage"}}}
+                                   if key in {"system_contract_hash", "user_prefix_4096_hash", "reference_prefix_hash", "materials_hash", "quality_hash", "stage", "request_endpoint", "response_model", "cache_policy", "message_layout", "thinking", "reference_prefix_tokens"}}}
         if self.ledger:
             try:
                 self.ledger.finish(self.attempt_id, self.outcome, self.failure, duration_ms=duration_ms,

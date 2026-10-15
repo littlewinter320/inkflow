@@ -1152,6 +1152,7 @@ class ContextPacket(StrictModel):
     sections: list[ContextSection]
     estimated_tokens: int
     warnings: list[str] = Field(default_factory=list)
+    cache_policy: Literal["standard", "deepseek", "mimo"] = "standard"
 
     def to_markdown(self) -> str:
         output = [
@@ -1172,35 +1173,67 @@ class ContextPacket(StrictModel):
     def to_model_prompt(self) -> str:
         return "".join(self.model_prompt_parts())
 
-    def model_prompt_parts(self) -> tuple[str, str]:
-        """Compile reusable source scopes before current chapter/request material."""
-
+    def model_sections(self) -> list[ContextSection]:
+        """Project provider-specific ordering without changing sources or gate material."""
+        sections = []
+        for section in self.sections:
+            if self.cache_policy in {"deepseek", "mimo"} and section.key in {"CSET", "SET"}:
+                try:
+                    value = json.loads(section.content)
+                except (ValueError, TypeError):
+                    value = None
+                if (isinstance(value, dict) and isinstance(value.get("collections"), list)
+                        and all(isinstance(item, dict) and isinstance(item.get("records", []), list)
+                                and all(isinstance(record, dict) for record in item.get("records", []))
+                                for item in value["collections"])):
+                    coverage = value.pop("coverage", None)
+                    if self.cache_policy == "mimo":
+                        # Relevance selects the set; stable identities order that same set on the wire.
+                        value["collections"].sort(key=lambda item: str(item.get("collection_id", "")))
+                        for collection in value["collections"]:
+                            if isinstance(collection.get("records"), list):
+                                collection["records"].sort(key=lambda item: (
+                                    item.get("epistemic_status") != "user_constraint", str(item.get("record_id", ""))))
+                    section = section.model_copy(update={"content": json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+                        "cache_scope": "canon" if self.cache_policy == "mimo" else section.cache_scope})
+                    if coverage is not None:
+                        sections.append(ContextSection(key=f"{section.key}-coverage", title="设定选择与未装入范围",
+                            content=json.dumps({"coverage": coverage}, ensure_ascii=False, separators=(",", ":")),
+                            hard=section.hard, cache_scope="request"))
+            if self.cache_policy == "mimo" and section.key in {"D", "G"} and section.cache_scope == "canon":
+                section = section.model_copy(update={"cache_scope": "chapter"})
+            sections.append(section)
         scopes = {"global": 0, "book": 1, "canon": 2, "chapter": 3, "request": 4}
 
         def priority(indexed: tuple[int, ContextSection]) -> tuple[int, int, int]:
             index, section = indexed
-            # Book sections have a fixed order. Sorting by their changing length
-            # invalidated DeepSeek's exact-prefix cache on unrelated edits.
-            # The book contract is a longer-lived prefix than a revisable
-            # outline boundary. Keep it ahead of O0 so a new outline draft
-            # does not invalidate the book-level DeepSeek cache.
             book_order = {"J": 0, "B": 1, "O0": 2, "O1": 3, "O2": 4, "C0": 5}
-            canon_order = {"B": 0, "D": 1, "CSET": 2, "G": 3}
+            canon_order = ({"CSET": 0, "SET": 0, "B": 1} if self.cache_policy == "mimo" else
+                           {"B": 0, "CSET": 1, "D": 2, "G": 3} if self.cache_policy == "deepseek" else
+                           {"B": 0, "D": 1, "CSET": 2, "G": 3})
             # Append-only batch memory remains reusable ahead of the changing chapter card.
             order = (book_order.get(section.key, 10 + index) if section.cache_scope == "book"
                      else canon_order.get(section.key, 10 + index) if section.cache_scope == "canon"
                      else -1 if section.cache_scope == "chapter" and section.key == "E0" else index)
             return (scopes[section.cache_scope], order, index)
 
+        return [section for _, section in sorted(enumerate(sections), key=priority)]
+
+    def model_prompt_parts(self) -> tuple[str, str]:
+        """Compile reusable source scopes before current chapter/request material."""
+
         output = ["# 墨流编译上下文", ""]
         prefix = ""
-        for _, section in sorted(enumerate(self.sections), key=priority):
+        for section in self.model_sections():
             if not prefix and section.cache_scope in {"chapter", "request"}:
                 prefix = "\n".join(output) + "\n"
                 output = []
             output.extend([f"## {section.key}. {section.title}", "", section.model_content(), ""])
             if section.source_ids:
                 output.extend([f"来源：{', '.join(sorted(section.source_ids))}", ""])
+        if not prefix:
+            prefix = "\n".join(output) + "\n"
+            output = []
         output.extend([
             "## 本次执行信息",
             "",

@@ -252,6 +252,7 @@ class ContextBuilder:
         quality_preset: str = "custom",
         actor: str = "writer",
         output_reserve_tokens: int = 32_000,
+        cache_policy: Literal["standard", "deepseek", "mimo"] = "standard",
     ):
         self.project = project
         self.actor = actor
@@ -268,6 +269,7 @@ class ContextBuilder:
         self.hook_strategy = hook_strategy
         self.review_experience_detail = review_experience_detail
         self.quality_preset = quality_preset
+        self.cache_policy = cache_policy
 
     def build(
         self,
@@ -827,6 +829,7 @@ class ContextBuilder:
                 hard=True, cache_scope="chapter", source_ids=[f"quality:{self.quality_preset}"]))
         packet = ContextPacket(
             project_id=self.project.project_id,
+            cache_policy=self.cache_policy,
             chapter_no=chapter_no,
             task=task,
             sections=sections,
@@ -1305,6 +1308,7 @@ class ContextBuilder:
         sections.extend(self._recovery_guidance(end_chapter_no))
         packet = ContextPacket(
             project_id=self.project.project_id,
+            cache_policy=self.cache_policy,
             chapter_no=end_chapter_no,
             task=task,
             sections=sections,
@@ -1396,13 +1400,8 @@ class ContextBuilder:
         previous_updated_at = str(previous.get("updated_at") or "")
         previous_estimated = int(previous.get("estimated_tokens") or 0) if previous_updated_at else 0
         updated_at = utc_now()
-        ordered = sorted(enumerate(packet.sections), key=lambda pair: (
-            {"global": 0, "book": 1, "canon": 2, "chapter": 3, "request": 4}[pair[1].cache_scope],
-            {"J": 0, "B": 1, "O0": 2, "O1": 3, "O2": 4, "C0": 5}.get(pair[1].key, 10 + pair[0]) if pair[1].cache_scope == "book"
-            else {"B": 0, "D": 1, "CSET": 2, "G": 3}.get(pair[1].key, 10 + pair[0]) if pair[1].cache_scope == "canon"
-            else -1 if pair[1].cache_scope == "chapter" and pair[1].key == "E0" else pair[0],
-        ))
-        prefix_sections = [item for _, item in ordered if item.cache_scope in {"global", "book", "canon"}]
+        model_sections = packet.model_sections()
+        prefix_sections = [item for item in model_sections if item.cache_scope in {"global", "book", "canon"}]
         prefix_hashes = {
             item.key: hashlib.sha256((
                 f"## {item.key}. {item.title}\n\n{item.model_content()}\n\n"
@@ -1425,6 +1424,7 @@ class ContextBuilder:
             "chapter_no": packet.chapter_no,
             "actor": role,
             "record_kind": "compiled_materials",
+            "cache_policy": packet.cache_policy,
             "task": packet.task,
             "estimated_tokens": packet.estimated_tokens,
             "input_budget_scope": "to_model_prompt编译资料及调用者protected_input；Provider另核系统契约、Schema、追加指令和输出预算。",
@@ -1481,7 +1481,7 @@ class ContextBuilder:
                     "changed": next((old.get("content_hash") != content_hash(item.model_content()) for old in previous.get("budget_allocation", []) if old.get("key") == item.key), True),
                     "content_hash": content_hash(item.model_content()),
                 }
-                for item in packet.sections
+                for item in model_sections
             ] + ([{"key": "INPUT", "title": "本次正文与交接说明", "estimated_tokens": estimate_tokens(protected_input),
                 "hard": True, "source_count": 1, "content_hash": content_hash(protected_input),
                 "changed": previous.get("protected_input_hash") != content_hash(protected_input)}] if protected_input else []),
@@ -1499,7 +1499,7 @@ class ContextBuilder:
         }
         atomic_write_text(status_path, json_dumps(payload))
         atomic_write_text(role_path, json_dumps({**payload, "material_contents": [
-            {"key": item.key, "title": item.title, "content": item.model_content()} for item in packet.sections]
+            {"key": item.key, "title": item.title, "content": item.model_content()} for item in model_sections]
             + ([{"key": "INPUT", "title": "本次正文与交接说明", "content": protected_input}] if protected_input else [])}))
         atomic_write_text(self.project.internal / f"context-status-{role}-summary.json", json_dumps({
             key: payload[key] for key in ("project_id", "actor", "updated_at", "packet_hash", "chapter_no",

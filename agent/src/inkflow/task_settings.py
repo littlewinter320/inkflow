@@ -195,7 +195,8 @@ def validate_task_settings_snapshot(
     values = snapshot["settings"]
     # New optional configuration must never be backfilled into a hashed old snapshot.
     required_fields = TASK_SETTINGS_FIELDS - {"planning_publication_mode", "role_models", "manual_edit_review_enabled",
-                                            "quality_preset", "quality_custom_context", "collaboration_preset"}
+                                            "quality_preset", "quality_custom_context", "collaboration_preset",
+                                            "writer_task_attempt_limit"}
     if not isinstance(values, dict) or not required_fields <= set(values) <= TASK_SETTINGS_FIELDS | {"role_settings_version"}:
         raise TaskSettingsError("任务配置字段与快照版本不一致，不能补入当前默认值。")
     _check_endpoint(values)

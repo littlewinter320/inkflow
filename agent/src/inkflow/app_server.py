@@ -427,6 +427,7 @@ class InkFlowAppService:
                 "provider_kind": settings.provider_kind,
                 "base_url": settings.base_url,
                 "model": settings.model,
+                "cache_policy": settings.prompt_cache_policy,
                 "reasoning_effort": settings.reasoning_effort,
                 "context_soft_tokens": settings.context_soft_tokens,
                 "context_hard_tokens": settings.context_hard_tokens,
@@ -435,6 +436,7 @@ class InkFlowAppService:
                 "max_output_tokens": settings.max_output_tokens,
                 "request_timeout_seconds": settings.request_timeout_seconds,
                 "planning_timeout_seconds": settings.planning_timeout_seconds,
+                "writer_task_attempt_limit": settings.writer_task_attempt_limit,
                 "model_limits": settings.model_limits(),
                 "effective_output_tokens": settings.effective_output_tokens(settings.max_output_tokens),
                 "role_output_limits": {role: {"model": settings.model_for(role),
@@ -502,6 +504,7 @@ class InkFlowAppService:
                     "max_output_tokens",
                     "request_timeout_seconds",
                     "planning_timeout_seconds",
+                    "writer_task_attempt_limit",
                     "inquiry_frequency",
                     "hook_strategy",
                     "quality_preset",
@@ -531,6 +534,7 @@ class InkFlowAppService:
                 if name in settings_params
                 and (
                     name in {
+                        "writer_task_attempt_limit",
                         "review_local_nli_model",
                         "review_judge_model",
                         "retrieval_embedding_model",
@@ -1570,6 +1574,7 @@ class InkFlowAppService:
             discussion_content = json.dumps({"thread": thread, "messages": scoped, "question": params.get("question", "")}, ensure_ascii=False)
             discussion_packet = ContextPacket(
                 project_id=project.root.name,
+                cache_policy=scope.settings.prompt_cache_policy,
                 chapter_no=int(thread.get("chapter_no") or 0),
                 task=f"回答结构化协作议题：{thread['topic']}",
                 sections=[ContextSection(key="A", title="议题、版本与证据", content=discussion_content, source_ids=sorted(allowed_evidence), hard=True)],
@@ -2360,6 +2365,7 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
     ) / 1_000_000
     try:
         ledger = UsageLedger()
+        current_model_cache = ledger.cache_observations(getattr(project, "project_id", ""), settings)
         accounting = {"available": True, "project": ledger.summary(getattr(project, "project_id", "")),
                       "all_projects": ledger.summary()}
         qualified_task_products: dict[str, int] = {}
@@ -2388,11 +2394,14 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
     except (OSError, sqlite3.Error):
         accounting = {"available": False, "warning": "本地用量账本暂不可读，金额未知；不影响查看或编辑正文。"}
         recent_deepseek_cache = None
+        current_model_cache = {"available": False, "by_agent_role": {}, "history_groups": [],
+                               "warning": "当前接口的缓存统计暂不可读；历史记录保留。"}
     return {
         **usage,
         "by_agent_role": {role: public_bucket(bucket) for role, bucket in by_agent_role.items()},
         "by_stage": {stage: public_bucket(bucket) for stage, bucket in by_stage.items()},
         "recent_deepseek_cache": recent_deepseek_cache,
+        "current_model_cache": current_model_cache,
         "estimated_cost": round(estimated_cost, 6)
         if not (overall["input_unknown_calls"] or overall["output_unknown_calls"]) else None,
         "currency": "CNY",
