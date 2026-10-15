@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlsplit
@@ -41,6 +41,22 @@ class TaskSettingsScope:
     source: str
     collaboration_mode: str
     settings: Settings
+    collaboration_selection_required: bool = False
+    resolved_collaboration_mode: str | None = None
+
+    @property
+    def collaboration_pending(self) -> bool:
+        return self.collaboration_selection_required and self.resolved_collaboration_mode is None
+
+    @property
+    def effective_collaboration_mode(self) -> str:
+        return self.resolved_collaboration_mode or self.collaboration_mode
+
+    def matches_collaboration_request(self, mode: str) -> bool:
+        if mode == "adaptive":
+            return self.settings.collaboration_preset == "adaptive" and (
+                self.collaboration_selection_required or self.collaboration_mode in {"review_boost", "memory_boost"})
+        return new_task_mode(mode) == self.effective_collaboration_mode
 
     @property
     def role_protocol_version(self) -> int:
@@ -56,6 +72,7 @@ class TaskSettingsScope:
             "captured_at": self.captured_at,
             "source": self.source,
             "collaboration_mode": self.collaboration_mode,
+            **({"collaboration_selection_required": True} if self.collaboration_selection_required else {}),
         }
 
 
@@ -106,9 +123,14 @@ def _check_endpoint(settings: dict[str, Any]) -> None:
 
 def capture_task_settings(
     settings: Settings, *, novel_id: str, task_id: str | None = None, source: str = "task_start",
-    role_protocol_version: int | None = None, collaboration_mode: str = "everyday",
+    role_protocol_version: int | None = None, collaboration_mode: str | None = None,
 ) -> dict[str, Any]:
-    collaboration_mode = _check_mode(collaboration_mode)
+    if collaboration_mode == "adaptive":
+        settings = replace(settings, collaboration_preset="adaptive")
+        collaboration_mode = None
+    selection_required = collaboration_mode is None and settings.collaboration_preset == "adaptive"
+    collaboration_mode = _check_mode(collaboration_mode or (
+        "full_specialist" if settings.collaboration_preset == "full_specialist" else "everyday"))
     values = {key: value for key, value in settings.to_mapping().items() if key in TASK_SETTINGS_FIELDS}
     _check_endpoint(values)
     snapshot = {
@@ -119,6 +141,7 @@ def capture_task_settings(
         "source": source,
         "collaboration_mode": collaboration_mode,
         "settings": values,
+        **({"collaboration_selection_required": True} if selection_required else {}),
     }
     snapshot["snapshot_hash"] = content_hash(_canonical(snapshot))
     validate_task_settings_snapshot(snapshot, novel_id=novel_id)
@@ -155,6 +178,7 @@ def validate_task_settings_snapshot(
         raise TaskSettingsError("任务配置快照版本不受当前程序支持。")
     input_fields = frozenset(snapshot)
     allowed_shapes = {_SNAPSHOT_FIELDS, _SNAPSHOT_FIELDS | {"role_protocol_version"}}
+    allowed_shapes.add(_SNAPSHOT_FIELDS | {"collaboration_selection_required"})
     if version == 1:
         allowed_shapes.add(_SNAPSHOT_IDENTITY_FIELDS)
     if input_fields not in allowed_shapes:
@@ -170,13 +194,18 @@ def validate_task_settings_snapshot(
         raise TaskSettingsError("任务配置来源无效。")
     values = snapshot["settings"]
     # New optional configuration must never be backfilled into a hashed old snapshot.
-    required_fields = TASK_SETTINGS_FIELDS - {"planning_publication_mode", "role_models", "manual_edit_review_enabled"}
+    required_fields = TASK_SETTINGS_FIELDS - {"planning_publication_mode", "role_models", "manual_edit_review_enabled",
+                                            "quality_preset", "quality_custom_context", "collaboration_preset"}
     if not isinstance(values, dict) or not required_fields <= set(values) <= TASK_SETTINGS_FIELDS | {"role_settings_version"}:
         raise TaskSettingsError("任务配置字段与快照版本不一致，不能补入当前默认值。")
     _check_endpoint(values)
     expected = content_hash(_canonical({key: value for key, value in snapshot.items() if key != "snapshot_hash"}))
     if snapshot["snapshot_hash"] != expected:
         raise TaskSettingsError("任务配置快照校验失败，不能用当前设置回填。")
+    if "collaboration_selection_required" in snapshot and (
+            snapshot["collaboration_selection_required"] is not True
+            or values.get("collaboration_preset") != "adaptive" or snapshot.get("collaboration_mode") != "everyday"):
+        raise TaskSettingsError("四人协作选择标记与原快照不一致。")
     # Consume format labels only after the original, unmodified envelope passes its hash.
     return adapt_task_reference({key: snapshot[key] for key in input_fields if key != "settings"})
 
@@ -220,4 +249,5 @@ def restore_task_settings(
         snapshot_hash=summary["snapshot_hash"], captured_at=summary["captured_at"],
         source=summary["source"],
         collaboration_mode=summary["collaboration_mode"], settings=settings,
+        collaboration_selection_required=summary.get("collaboration_selection_required", False),
     )

@@ -1,3 +1,7 @@
+import { ContextMaterials, type ContextMaterialsSnapshot } from "./ContextMaterials";
+import { SavedApiKey } from "./SavedApiKey";
+import { CacheMeter } from "./CacheMeter";
+import { settingsDiff, mergeSettings } from "./settingsPatch";
 import { VersionRepair } from "./VersionRepair";
 import { AuthorPreferences } from "./AuthorPreferences";
 import { BookSettingsBrowser, ManualEditMonitor, StorySettings } from "./StorySettings";
@@ -5,7 +9,7 @@ import type { ManualEditJob } from "./StorySettings";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { FormEvent, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MutableRefObject, ReactNode } from "react";
-import { Mascot, MascotShowcase, MobaoGuide, MobaoCompanion, MobaoAvatar, mobaoIdlePoster } from "./Mascot";
+import { Mascot, MobaoCompanion, MobaoAvatar } from "./Mascot";
 import type { MascotMood } from "./Mascot";
 import { ProjectCenter } from "./ProjectCenter";
 import { VoiceCenter } from "./VoiceCenter";
@@ -168,7 +172,7 @@ type SelectionDraft = {
 };
 type QuestionOption = { id: string; label: string; description?: string; recommended?: boolean; kind?: "choice" | "other" };
 type QuestionCard = { id: string; header: string; question: string; why_it_matters?: string; selection: "single" | "multiple"; options: QuestionOption[] };
-type Tab = "project" | "editor" | "chapter" | "review" | "memory" | "references" | "listen" | "process";
+type Tab = "project" | "editor" | "chapter" | "review" | "references" | "listen" | "process";
 type RecentProject = { root: string; title: string; openedAt: string };
 type NovelIdea = {
   concept_id: string;
@@ -193,7 +197,11 @@ type AgentGeneration = { temperature: number; top_p: number; top_k: number | nul
 type AgentGenerationProfiles = Record<AgentRole, AgentGeneration>;
 type AgentContextBudgets = Record<AgentRole, { soft: number; hard: number }>;
 type ContextStatus = {
-  status: "idle" | "safe" | "watch" | "near_limit" | "stale";
+  project_root?: string;
+  status: "idle" | "safe" | "watch" | "near_limit" | "stale" | "unavailable";
+  actor?: string;
+  read_error?: string;
+  roles?: Array<{ materials?: ContextMaterialsSnapshot; role: string; model: string; input_tokens: number | null; input_kind: "reported" | "estimated" | "unknown"; context_limit_tokens: number; limit_source: string; remaining_tokens: number | null; used_percent: number | null; output_reserve_tokens: number | null; updated_at?: string; request_state: string }>;
   estimated_tokens: number;
   before_compression_tokens: number;
   previous_updated_at?: string;
@@ -239,16 +247,16 @@ type BatchSummary = {
   chapters: BatchChapterSummary[];
 };
 type LearningEvent = { event_id: string; event_type: string; chapter_no?: number; created_at: string; payload: Record<string, unknown> };
-type UsageSummary = { calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; prompt_cache_hit_rate?: number | null; prompt_cache_miss_rate?: number | null; average_prompt_tokens?: number; average_completion_tokens?: number; cache_reported_calls?: number; cache_unknown_calls?: number; cache_unknown_prompt_tokens?: number };
+type UsageSummary = { calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; prompt_cache_hit_rate?: number | null; prompt_cache_miss_rate?: number | null; average_prompt_tokens?: number | null; average_completion_tokens?: number | null; cache_reported_calls?: number; cache_unknown_calls?: number; cache_unknown_prompt_tokens?: number };
 type PerformanceDiagnostic = { calls: number; sent_calls: number; not_sent_calls: number; unknown_sent_calls: number; request_count: number; failed_calls: number; unknown_usage_calls: number; unknown_cost_calls: number; raw_input_tokens: number | null; cached_input_tokens: number | null; uncached_input_tokens: number | null; output_tokens: number | null; attempt_elapsed_ms: number | null; unknown_duration_calls: number; same_scope_groups?: Array<{ stage: string; calls: number; scope_known: boolean; raw_input_tokens: number | null; cached_input_tokens: number | null; uncached_input_tokens: number | null; output_tokens: number | null }>; writer_sequence?: Array<{ before_attempt_id: string; after_attempt_id: string; conclusion: string }>; time_note?: string; quality_note?: string };
 type QualifiedProduction = { accepted_products: number; unknown_cost_calls: number; known_estimated_cost: number; estimated_cost_per_product: number | null; limitation: string };
 type RecentCacheSummary = { calls: number; reported_calls: number; unknown_calls: number; input_tokens: number; hit_tokens: number; miss_tokens: number; hit_rate: number | null; last_at: string | null; by_role?: Record<string, { calls: number; reported_calls: number; unknown_calls: number; hit_rate: number | null }>; by_family?: Record<string, { calls: number; reported_calls: number; input_tokens: number; hit_tokens: number; miss_tokens: number; hit_rate: number | null }>; performance_diagnostic?: PerformanceDiagnostic; qualified_production?: QualifiedProduction };
 type VoiceInstallProgress = { status: string; stage: string; progress: number; summary: string; downloaded_mb: number; retryable: boolean; error?: string };
 type PersistentUsage = { calls: number; since: string | null; estimated_cost: number; pending_estimated_cost: number; unknown_usage_calls: number; unknown_cost_calls: number; price_note: string };
 type PendingWorkItem = { id: string; kind: string; status: string; reason: string; next_action: string; chapter_no?: number | null; remaining_chapter_no?: number; completed_through?: number; handling?: string; can_process?: boolean; can_reject?: boolean; reject_label?: string; reject_impact?: string; reject_blocked_reason?: string; updated_at?: string; rejection?: { reason?: string; at?: string }; parent_id?: string; processing_attempts?: number; source?: Record<string, unknown>; intent?: { action?: string; batch_id?: string | null; end_chapter_no?: number | null } };
-type CollaborationOverview = { messages: CollaborationMessage[]; pending_work?: PendingWorkItem[]; rejected_work?: PendingWorkItem[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; trace_runs?: TraceRun[]; usage?: UsageSummary & { by_agent_role?: Record<string, UsageSummary>; recent_deepseek_cache?: RecentCacheSummary | null; estimated_cost: number; currency: string; pricing_configured: boolean; accounting?: { available: boolean; warning?: string; project?: PersistentUsage; all_projects?: PersistentUsage } } };
+type CollaborationOverview = { messages: CollaborationMessage[]; pending_work?: PendingWorkItem[]; rejected_work?: PendingWorkItem[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; trace_runs?: TraceRun[]; usage?: UsageSummary & { by_agent_role?: Record<string, UsageSummary>; recent_deepseek_cache?: RecentCacheSummary | null; estimated_cost: number | null; currency: string; pricing_configured: boolean; accounting?: { available: boolean; warning?: string; project?: PersistentUsage; all_projects?: PersistentUsage } } };
 type PrefillResult = { insertion: string; document_hash: string; cursor_offset: number; confidence: string };
-function busyMascotMood(events: EngineEvent[], runId: string | null): MascotMood {
+function busyMascotMood(events: EngineEvent[], runId: string | null): "writing" | "reviewing" | "thinking" {
   const current = [...events].reverse().find(event => event.run_id === runId && event.role);
   if (current?.role === "writer") return /outline|planning|plan|detail|window|candidate/.test(current.stage || "") ? "thinking" : "writing";
   return current && ["editor", "reviewer", "memory_keeper"].includes(current.role || "") ? "reviewing" : "thinking";
@@ -410,7 +418,6 @@ function App() {
   const [promptOptimization, setPromptOptimization] = useState<PromptOptimizationResult | null>(null);
   const [promptUndo, setPromptUndo] = useState<string | null>(null);
   const [contextStatus, setContextStatus] = useState<ContextStatus | null>(null);
-  const contextSnapshotRef = useRef<{ updatedAt: string; estimatedTokens: number } | null>(null);
   const [collaboration, setCollaboration] = useState<CollaborationOverview | null>(null);
   const [pendingRejection, setPendingRejection] = useState<{ root: string; item: PendingWorkItem; decision: "reject" | "reopen" } | null>(null);
   const [pendingDecisionWorking, setPendingDecisionWorking] = useState(false);
@@ -865,7 +872,6 @@ function App() {
       replaceEditorDocument(null, root);
       setReviewDocument(null);
       setReferenceDocument(null);
-      contextSnapshotRef.current = null;
       setActiveTab("project");
       const projectTitle = String(opened.dashboard.brief.title || "未命名小说");
       let recentProjectWarning = "";
@@ -1028,43 +1034,41 @@ function App() {
 
   useEffect(() => {
     if (sharedWorkspaceRef.current) return;
-    if (!projectRoot) { setContextStatus(null); setCollaboration(null); contextSnapshotRef.current = null; return; }
+    if (!projectRoot) { setContextStatus(null); setCollaboration(null); return; }
     let active = true;
-    let polling = false;
-    const poll = async () => {
-      if (!active || polling || activeRunIdRef.current || projectRefreshRef.current?.root === projectRoot || !canPollWorkspace(window.document.visibilityState, window.document.hasFocus())) return;
-      polling = true;
+    let pollingContext = false;
+    let pollingProgress = false;
+    const pollContext = async () => {
+      if (!active || pollingContext || !canPollWorkspace(window.document.visibilityState, window.document.hasFocus())) return;
+      pollingContext = true;
       try {
-        const [value, overview, projectStatus] = await Promise.all([
-          window.inkflow.request<ContextStatus>("context.status", { project_root: projectRoot }),
+        const value = await window.inkflow.request<ContextStatus>("context.status", { project_root: projectRoot });
+        if (active) setContextStatus(value);
+      } catch (cause) {
+        if (active) setContextStatus(previous => ({ ...(previous || { estimated_tokens: 0, before_compression_tokens: 0,
+          soft_limit_tokens: 0, hard_limit_tokens: 0, hard_usage_percent: 0, compression_applied: false,
+          hard_sections: [], compressible_sections: [], warnings: [] }), status: "unavailable",
+          read_error: `上下文状态暂时无法更新：${errorMessage(cause)}。稍后会自动再查，当前任务不会因此重新发送。` }));
+      } finally { pollingContext = false; }
+    };
+    const pollProgress = async () => {
+      if (!active || pollingProgress || activeRunIdRef.current || projectRefreshRef.current?.root === projectRoot || !canPollWorkspace(window.document.visibilityState, window.document.hasFocus())) return;
+      pollingProgress = true;
+      try {
+        const [overview, projectStatus] = await Promise.all([
           window.inkflow.request<CollaborationOverview>("collaboration.overview", { project_root: projectRoot }),
           window.inkflow.request<Dashboard>("project.status", { project_root: projectRoot }),
         ]);
-        if (active) {
-          const updatedAt = String(value.updated_at || "");
-          const estimatedTokens = Math.max(0, Number(value.estimated_tokens || 0));
-          const previous = contextSnapshotRef.current;
-          const changed = Boolean(updatedAt && previous && previous.updatedAt && updatedAt !== previous.updatedAt);
-          const change = changed && previous ? estimatedTokens - previous.estimatedTokens : value.change_since_previous_tokens ?? null;
-          if (updatedAt && (!previous || previous.updatedAt !== updatedAt)) {
-            contextSnapshotRef.current = { updatedAt, estimatedTokens };
-          }
-          setContextStatus({
-            ...value,
-            previous_updated_at: value.previous_updated_at || previous?.updatedAt || "",
-            previous_estimated_tokens: value.previous_estimated_tokens ?? previous?.estimatedTokens ?? null,
-            change_since_previous_tokens: change,
-          });
-          setCollaboration(overview);
-          setDashboard(projectStatus);
-        }
-      } catch { /* 状态面板不能打断正文工作流；下一轮继续读取。 */ }
-      finally { polling = false; }
+        if (active) { setCollaboration(overview); setDashboard(projectStatus); }
+      } catch { /* 状态查看失败不重发小说任务。 */ }
+      finally { pollingProgress = false; }
     };
-    void poll();
-    const timer = window.setInterval(() => void poll(), 15000);
-    window.addEventListener("focus", poll);
-    return () => { active = false; window.clearInterval(timer); window.removeEventListener("focus", poll); };
+    void pollContext(); void pollProgress();
+    const contextTimer = window.setInterval(() => void pollContext(), 4000);
+    const progressTimer = window.setInterval(() => void pollProgress(), 15000);
+    window.addEventListener("focus", pollContext); window.addEventListener("focus", pollProgress);
+    return () => { active = false; window.clearInterval(contextTimer); window.clearInterval(progressTimer);
+      window.removeEventListener("focus", pollContext); window.removeEventListener("focus", pollProgress); };
   }, [projectRoot]);
 
   const batchProgressActive = Boolean(activeRunId && ((collaboration?.batches || []).some(batch => batch.run_id === activeRunId)
@@ -1535,7 +1539,7 @@ function App() {
           !(completedIntent?.action === "pending_work" && ["inspect", "defer"].includes(String(completedIntent.pending_work_decision)))) {
         setMobaoCompletion({ id: `${runRoot}:${runId}:${assistantMessageId}`, root: runRoot, runId, messageId: assistantMessageId, summary: visible.summary });
       }
-      setMascotMood(resultState === "failed" ? "rest" :
+      setMascotMood(resultState === "failed" ? "frustrated" :
         ["waiting_user", "waiting_condition", "needs_input", "interrupted"].includes(resultState) ||
         (Array.isArray(questionSource) && questionSource.length > 0) ? "waiting" : "success");
     } catch (cause) {
@@ -1955,11 +1959,9 @@ function App() {
   return (
     <div className={`app-shell ${detachedPanel ? "workspace-detached" : ""}`}>
       <header className="topbar">
-        <div className="wordmark"><img src={mobaoIdlePoster} alt="墨宝" /><div><strong>墨流</strong><small>INKFLOW</small></div></div>
         <div className="project-heading">
           <strong>{title}</strong>
           {projectLoading ? <span className="working-dot">正在载入项目</span> : busy && <span className="working-dot">正在工作</span>}
-          <ChapterMilestones value={dashboard} />
           <WorkspaceMenu workspace={workspace} onReturn={returnWorkspacePanel} />
         </div>
         <nav className="top-actions">
@@ -1983,12 +1985,12 @@ function App() {
             group.id === "chapters" ? <ChapterTree key={`${dashboard?.root}:chapters`} items={group.items} outline={dashboard?.chapter_outline} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} /> : <TreeSection key={group.id} label={group.label} items={group.items} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
           ))}
           <section className="rail-pending" aria-label="待办摘要"><div><strong>待办与收尾</strong><span>{pendingSummary.count}</span></div><p>{pendingSummary.count ? "按章节查看下一步" : "当前没有待办"}{pendingSummary.messages.length ? ` · ${pendingSummary.messages.length} 条协作记录` : ""}</p><button type="button" onClick={() => setActiveTab("process")}>打开待办看板</button></section>
-          <details className="rail-tools"><summary>资料与容量详情</summary><ContextBudgetPanel value={contextStatus} onPin={setContextPin} /></details>
           <div className="rail-summary">
             <div><span>草稿</span><strong>{dashboard?.status.chapters?.draft || 0}</strong></div>
             <div><span>正史</span><strong>{dashboard?.status.chapters?.accepted || 0}</strong></div>
             <div><span>伏笔</span><strong>{dashboard?.status.open_threads || 0}</strong></div>
           </div>
+          <div className="rail-context"><ContextBudgetPanel value={contextStatus} onPin={setContextPin} /></div>
         </WorkspacePanel>
         <WorkspacePanel id="assistant" workspace={workspace} className="conversation-panel" onDetach={detachWorkspacePanel} actions={<button className="panel-icon" title="新建独立对话" aria-label="新建独立对话" onClick={() => void openConversationWindow()}>＋</button>}>
           {manualJobs.some(job => (job.kind !== "setting_record" || job.issues?.some(issue => issue.hard_conflict)) && ["needs_confirmation", "awaiting_confirmation", "waiting_user", "needs_evidence", "revision_requested", "conflict", "blocked", "failed"].includes(job.status)) && <details className="manual-edit-issues"><summary>有影响当前写作的修改待核对</summary><button type="button" onClick={() => setShowManualMonitor(true)}>查看问题并决定</button></details>}
@@ -2015,7 +2017,7 @@ function App() {
           <div className="messages" ref={messagesRef}>
             {messages.map((message) => (
               <article key={message.id} className={`message ${message.role}`} ref={message.id === mobaoCompletion?.messageId ? mobaoTargetRef : undefined}>
-                <span className={`avatar ${message.role === "user" ? "" : "mobao-message-avatar"}`}>{message.role === "user" ? "你" : <MobaoAvatar mood={message.process?.status === "failed" || /尚未完成|没有完成|失败|异常/.test(message.text) ? "frustrated" : /硬冲突|严重问题/.test(message.text) ? "angry" : message.process?.status?.startsWith("waiting") || /等待|需要你|正在思考/.test(message.text) ? "thinking" : message.process?.status === "completed" || /已完成|已核对|已接受|已保存/.test(message.text) ? "complete" : /休息|暂停/.test(message.text) ? "rest" : "calm"} />}</span>
+                <span className={`avatar ${message.role === "user" ? "" : "mobao-message-avatar"}`}>{message.role === "user" ? "你" : <MobaoAvatar animate={!busy && message.id === messages.at(-1)?.id} mood={message.process?.status === "failed" || /尚未完成|没有完成|失败|异常/.test(message.text) ? "frustrated" : /硬冲突|严重问题/.test(message.text) ? "angry" : message.process?.status?.startsWith("waiting") || /等待|需要你/.test(message.text) ? "waiting" : /正在思考/.test(message.text) ? "thinking" : message.process?.status === "completed" || /已完成|已核对|已接受|已保存/.test(message.text) ? "complete" : /休息|暂停/.test(message.text) ? "rest" : "calm"} />}</span>
                 <div>
                   <p>{message.role === "assistant" && message.text.startsWith("这次没有完成：") ? errorMessage(readableWorkMessage(message.text.replace(/^这次没有完成：\s*/, ""), collaborationPending(collaboration).work, manualJobs)) : readableWorkMessage(message.text, collaborationPending(collaboration).work, manualJobs)}</p>
                   {message.indices?.length ? <div className="message-indices">{message.indices.map(item => <button key={item.id} onClick={() => void openDocument(item)}>{item.label}</button>)}</div> : null}
@@ -2077,7 +2079,7 @@ function App() {
         </WorkspacePanel>
         <section className="workbench" style={{ left: workspace.geometry.editor.x, top: workspace.geometry.editor.y, width: workspace.geometry.editor.width, height: workspace.geometry.editor.height }}>
           <div className="tabbar">
-            {(["project", "editor", "chapter", "review", "memory", "references", "listen", "process"] as Tab[]).map((tab) => (
+            {(["project", "editor", "chapter", "review", "references", "listen", "process"] as Tab[]).map((tab) => (
               <button key={tab} className={activeTab === tab ? "active" : ""} onClick={() => setActiveTab(tab)}>
                 {tabLabel(tab)}
               </button>
@@ -2124,7 +2126,6 @@ function App() {
           )}
           {activeTab === "chapter" && <ChapterPanel workspace={chapterWorkspace} request={request} onPrompt={(value) => setChatInput(value)} />}
           {activeTab === "review" && <ReviewPanel document={document} reviewDocument={reviewDocument} tree={tree} workspace={chapterWorkspace} request={request} onOpen={openDocument} onPrompt={setChatInput} />}
-          {activeTab === "memory" && <MemoryPanel dashboard={dashboard} workspace={chapterWorkspace} request={request} onRefresh={() => refresh()} />}
           {activeTab === "references" && <ReferencesPanel request={request} />}
           {activeTab === "listen" && <VoiceCenter refreshKey={voiceRevision} projectRoot={projectRoot} source={voiceSource} characterNames={(dashboard?.bible_entries || []).filter((item) => String(item.kind || "") === "character").map((item) => String(item.name || "")).filter(Boolean)} request={request} onNotice={setNotice} onError={setError} onPlay={(path) => playAudioPath(path)} />}
           {activeTab === "process" && <ProcessPanelCompact events={events} collaboration={collaboration} context={contextStatus} provider={provider} workspace={chapterWorkspace} request={request} referenceDocument={referenceDocument} onOpenReference={openReference} onCloseReference={() => setReferenceDocument(null)} onNavigate={setActiveTab} pendingBoard={<CollaborationBoard value={collaboration} busy={busy || pendingDecisionWorking} onReject={(item) => { setPendingDecisionError(""); setPendingRejection({ root: projectRoot, item, decision: "reject" }); }} onReopen={(item) => { setPendingDecisionError(""); setPendingRejection({ root: projectRoot, item, decision: "reopen" }); }} onProcessAll={() => void sendChat(undefined, "处理所有待办")} onWork={(item, action) => { if (action === "inspect" && item.kind === "manual_edit" && item.handling === "decision") setShowManualMonitor(true); else void sendChat(undefined, `${action === "process" ? "处理待办" : action === "defer" ? "下次再处理待办" : "查看待办"} ${item.id}`); }} onAcceptBatch={(batchId) => void runWorkflow("batch_accept", { batch_id: batchId })} onResumeBatch={(batchId) => void runWorkflow("batch_resume", { batch_id: batchId })} onInspectBatch={(batch) => { workspace.toggle("assistant", true); setChatInput(`请查看批次 ${batch.batch_id}${batch.pending_work_id ? ` 的待处理事项 ${batch.pending_work_id}` : ""}，先说明保留正文及待核范围并询问我是否处理；现在不要改写或补审。`); window.setTimeout(() => chatInputRef.current?.focus(), 0); }} />} />}
@@ -2132,11 +2133,10 @@ function App() {
       </main>
       <footer className="status-strip project-body-total" aria-label="正文总字数" title="累计本书当前已保存的正文，草稿与已接受章节各计一次；规划、报告和历史版本不计入。"><span>{typeof dashboard?.written_characters === "number" ? `正文总字 ${dashboard.written_characters.toLocaleString()}` : "正文总字 待读取"}</span></footer>
 
-      <MobaoCompanion workAreaRef={mobaoWorkAreaRef} dockRef={mobaoDockRef} disabled={projectLoading || Boolean(chatInput.trim()) || voiceStarting || voiceRecording || voiceTranscribing || showSettings || showCreate || showManualMonitor || showHistory || showSearch || showUpdate || showMigration || Boolean(selectionDraft || compareContent) || !projectRoot} />
-      <MobaoGuide cue={mobaoCompletion?.root === projectRoot ? mobaoCompletion : null}
+      <MobaoCompanion cue={mobaoCompletion?.root === projectRoot ? mobaoCompletion : null}
         workAreaRef={mobaoWorkAreaRef} targetRef={mobaoTargetRef} dockRef={mobaoDockRef}
         autoPreview={Boolean(completionReference(events, mobaoCompletion?.runId))}
-        disabled={busy || projectLoading || Boolean(chatInput.trim()) || text !== savedText || voiceStarting || voiceRecording || voiceTranscribing || pendingQuestions.length > 0 || pendingComputerActions.length > 0 || showSettings || showCreate || showManualMonitor || showHistory || showSearch || showUpdate || showMigration || Boolean(pendingRejection) || Boolean(selectionDraft || compareContent)}
+        disabled={busy || projectLoading || !projectRoot || Boolean(chatInput.trim()) || text !== savedText || voiceStarting || voiceRecording || voiceTranscribing || pendingQuestions.length > 0 || pendingComputerActions.length > 0 || showSettings || showCreate || showManualMonitor || showHistory || showSearch || showUpdate || showMigration || Boolean(pendingRejection) || Boolean(selectionDraft || compareContent)}
         onPreview={() => {
           const reference = completionReference(events, mobaoCompletion?.runId);
           if (!reference) { mobaoTargetRef.current?.scrollIntoView({ block: "nearest" }); return; }
@@ -2211,21 +2211,15 @@ function App() {
 }
 
 function ContextBudgetPanel({ value, onPin }: { value: ContextStatus | null; onPin: (sourceId: string, pinned: boolean) => void }) {
-  const stale = value?.status === "stale";
-  const used = stale ? 0 : Math.max(0, Math.min(100, Number(value?.hard_usage_percent || 0)));
-  const label = stale ? "\u9879\u76ee\u8d44\u6599\u5df2\u53d8\u5316\uff0c\u7b49\u5f85\u91cd\u65b0\u7f16\u8bd1" : value?.status === "near_limit" ? "\u63a5\u8fd1\u4e0a\u9650" : value?.status === "watch" ? "\u6ce8\u610f\u5bb9\u91cf" : value?.status === "safe" ? "\u5bb9\u91cf\u5b89\u5168" : "\u7b49\u5f85\u4e0a\u4e0b\u6587";
-  const compressed = Boolean(value?.compression_applied);
-  const previousChange = value?.change_since_previous_tokens;
-  const previousLabel = typeof previousChange === "number" ? `${previousChange > 0 ? "+" : ""}${previousChange.toLocaleString()} tokens` : "首次编译";
   return <details className={`context-budget ${value?.status || "idle"}`}>
-    <summary><span>上下文容量</span><strong>{stale ? "—" : `${used.toFixed(1)}%`}</strong></summary>
-    <div className="context-meter"><i style={{ width: `${used}%` }} /></div>
-    <p>{stale ? label : `${label} · ${Number(value?.estimated_tokens || 0).toLocaleString()} / ${Number(value?.hard_limit_tokens || 0).toLocaleString()} tokens`}</p>
-    <small className="context-budget-change">与上次编译：{previousLabel}{compressed ? `；本轮压缩减少 ${Math.max(0, Number(value?.before_compression_tokens || 0) - Number(value?.estimated_tokens || 0)).toLocaleString()} tokens` : "；本轮未触发压缩"}</small>
-    {value?.cache_prefix && <small>缓存前缀 · {value.cache_prefix.role}：{value.cache_prefix.reason}{value.cache_prefix.first_changed_section ? `（起点 ${value.cache_prefix.first_changed_section}）` : ""}。这是本地诊断，实际命中以供应商返回为准。</small>}
-    <small>{value?.stale_reason || (compressed ? `\u5df2\u4ece ${Number(value?.before_compression_tokens || 0).toLocaleString()} tokens \u5b9a\u5411\u538b\u7f29\uff1b\u786c\u7ea6\u675f\u672a\u52a8\u3002` : "\u6bcf 4 \u79d2\u5237\u65b0\uff0c\u63a5\u8fd1\u8f6f\u9884\u7b97\u65f6\u53ea\u538b\u7f29\u4f4e\u6743\u5a01\u3001\u4f4e\u76f8\u5173\u8d44\u6599\u3002")}</small>
-    {value && <ul><li>不可压缩：{value.hard_sections.map((item) => item.title).join("、") || "尚未生成"}</li><li>可压缩：{value.compressible_sections.map((item) => item.title).join("、") || "尚未生成"}</li></ul>}
-    {value && <details className="context-explain"><summary>查看保留与压缩理由</summary>{[...value.hard_sections, ...value.compressible_sections].map((item) => <div key={`${item.key}-${item.title}`}><strong>{item.title}</strong><small>{item.reason || "由当前资料优先级决定。"}</small>{["D1", "D2"].includes(item.key) && (item.source_ids || []).slice(0, 6).map((sourceId) => <button key={sourceId} type="button" onClick={() => onPin(sourceId, item.key !== "D2")}>{item.key === "D2" ? `解除 ${sourceId}` : `锁定 ${sourceId}`}</button>)}</div>)}</details>}
+    <summary>上下文{value?.read_error ? " · 待更新" : ""}</summary>
+    <RoleContextCards value={value} />
+    {value && <details className="context-explain"><summary>资料保留与压缩详情</summary>
+      {[...value.hard_sections, ...value.compressible_sections].map(item => <div key={`${item.key}-${item.title}`}><strong>{item.title}</strong><small>{item.reason || "由当前资料优先级决定。"}</small>
+        {["D1", "D2"].includes(item.key) && (item.source_ids || []).slice(0, 6).map(sourceId => <button key={sourceId} type="button" onClick={() => onPin(sourceId, item.key !== "D2")}>{item.key === "D2" ? "解除这份资料的锁定" : "锁定这份资料"}</button>)}
+      </div>)}
+      {value.cache_prefix && <p>{roleLabel(value.cache_prefix.role)}的缓存参考：{value.cache_prefix.reason}。实际命中以服务返回为准。</p>}
+    </details>}
   </details>;
 }
 
@@ -2235,15 +2229,6 @@ function chapterMilestones(value: Dashboard | null) {
   const written = Math.max(accepted, Number(progress?.written ?? (accepted + Number(value?.status.chapters?.draft || 0))));
   return { written, accepted, awaitingReview: progress ? Math.max(0, Number(progress.awaiting_review)) : null,
     writtenThrough: progress?.written_through, acceptedThrough: progress?.accepted_through };
-}
-
-function ChapterMilestones({ value }: { value: Dashboard | null }) {
-  const progress = chapterMilestones(value);
-  return <span className="chapter-milestones" aria-label="正文产出、核对与接受分别统计">
-    <span title={progress.writtenThrough ? `已产出至第 ${progress.writtenThrough} 章；草稿与已接受正文各计一次` : "当前已保存的章节，包含草稿与已接受正文"}>已写 <strong>{progress.written}</strong></span>
-    <span title={progress.awaitingReview === null ? "当前引擎尚未提供可核实的审核统计" : "已保存但尚未接受的草稿；具体审核、记忆交接与等待原因见当前章节报告"}>待核/待接受 <strong>{progress.awaitingReview ?? "—"}</strong></span>
-    <span title={progress.acceptedThrough ? `已接受至第 ${progress.acceptedThrough} 章；仅统计已提交正史` : "仅统计已提交正史的章节"}>已接受 <strong>{progress.accepted}</strong></span>
-  </span>;
 }
 
 function roleLabel(role: string) {
@@ -2794,62 +2779,6 @@ function ReviewPanel({ document, reviewDocument, tree, workspace, request, onOpe
   </div>;
 }
 
-function MemoryPanel({ dashboard, workspace, request, onRefresh }: { dashboard: Dashboard | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; onRefresh: () => Promise<void> }) {
-  const [showAdd, setShowAdd] = useState(false);
-  const [kind, setKind] = useState("character");
-  const [name, setName] = useState("");
-  const [notes, setNotes] = useState("");
-  const [previewChapter, setPreviewChapter] = useState(1);
-  const [memoryPreview, setMemoryPreview] = useState<Record<string, unknown> | null>(null);
-  const [memoryWorking, setMemoryWorking] = useState(false);
-  const previewSequence = useRef(0);
-  useEffect(() => { previewSequence.current += 1; setMemoryPreview(null); }, [previewChapter, request]);
-  const generateMemoryPreview = async () => {
-    const sequence = ++previewSequence.current;
-    const chapter = previewChapter;
-    setMemoryWorking(true);
-    try {
-      const value = await request<Record<string, unknown>>("memory.preview", { chapter_no: chapter, user_accepted: true });
-      if (sequence === previewSequence.current) setMemoryPreview(value);
-    } finally { setMemoryWorking(false); }
-  };
-  const [voicePreferences, setVoicePreferences] = useState<Array<Record<string, unknown>>>([]);
-  const [voiceScope, setVoiceScope] = useState("project");
-  const [voiceTarget, setVoiceTarget] = useState("");
-  const [voiceStrength, setVoiceStrength] = useState("weak");
-  const [voiceText, setVoiceText] = useState("");
-  const loadVoicePreferences = useCallback(async () => {
-    const value = await request<{ preferences: Array<Record<string, unknown>> }>("preference.list", { active_only: false });
-    setVoicePreferences(value.preferences || []);
-  }, [request]);
-  useEffect(() => { void loadVoicePreferences(); }, [loadVoicePreferences]);
-  const save = async () => {
-    if (!name.trim()) return;
-    await request("bible.upsert", { kind, name, aliases: [], data: { notes } });
-    setName(""); setNotes(""); setShowAdd(false); await onRefresh();
-  };
-  const saveVoicePreference = async () => {
-    if (!voiceText.trim()) return;
-    const scope = voiceScope === "project" || !voiceTarget.trim() ? voiceScope : `${voiceScope}:${voiceTarget.trim()}`;
-    await request("preference.upsert", { text: voiceText.trim(), strength: voiceStrength, scope });
-    setVoiceText("");
-    setVoiceTarget("");
-    await loadVoicePreferences();
-    await onRefresh();
-  };
-  const previewData = ((memoryPreview?.preview as Record<string, unknown> | undefined)?.data || {}) as Record<string, unknown>;
-  return <div className="scroll-panel memory-panel">
-    <div className="section-heading"><p className="eyebrow">正史</p><h2>正史与故事圣经</h2><button onClick={() => setShowAdd(!showAdd)}>＋ 手动圣经条目</button></div>
-    {workspace && <ChapterStatusStrip workspace={workspace} />}
-    {showAdd && <div className="inline-form"><select value={kind} onChange={(event) => setKind(event.target.value)}><option value="character">人物</option><option value="location">地点</option><option value="organization">组织</option><option value="item">物品</option><option value="lore">世界观</option><option value="style">文风</option></select><input value={name} onChange={(event) => setName(event.target.value)} placeholder="名称" /><textarea value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="稳定设定、声线、禁忌或说明" /><button className="primary" onClick={() => void save()}>保存</button></div>}
-    <section className="stack-section"><h3>写作偏好与强制记忆</h3><p className="form-hint">“普通偏好”会按人物、场景和篇章相关度取用；“强制记忆”每次都交给 Writer，并由 Reviewer 核对。它们用于写作方式和长期要求，不会冒充小说正史。</p><div className="inline-form"><select value={voiceScope} onChange={(event) => setVoiceScope(event.target.value)}><option value="project">全书</option><option value="character">人物</option><option value="scene">场景</option><option value="arc">篇章</option></select>{voiceScope !== "project" && <input value={voiceTarget} onChange={(event) => setVoiceTarget(event.target.value)} placeholder={voiceScope === "character" ? "人物名" : voiceScope === "arc" ? "篇章名或编号" : "场景类型"} />}<select value={voiceStrength} onChange={(event) => setVoiceStrength(event.target.value)}><option value="weak">普通偏好：相关时使用</option><option value="hard">强制记忆：始终使用</option></select><textarea value={voiceText} onChange={(event) => setVoiceText(event.target.value)} placeholder="例如：女主紧张时会缩短句子，但不会直说害怕；认可片段……适用于女主视角。" /><button className="primary" onClick={() => void saveVoicePreference()}>保存</button></div><p className="form-hint">强制记忆过多时，墨流只会去除完全重复的副本，不会偷偷删改规则；容量接近上限时会在协作台提醒你暂停过期项或合并同义项。</p>{voicePreferences.map((item) => <article className="memory-card" key={String(item.preference_id)}><span>{String(item.scope)} · {String(item.strength) === "hard" ? "强制记忆" : "普通偏好"}</span><strong>{String(item.status) === "active" ? "正在使用" : "已暂停"}</strong><p>{String(item.text)}</p><div className="settings-inline-actions"><button onClick={async () => { await request("preference.set_status", { preference_id: item.preference_id, status: item.status === "active" ? "paused" : "active" }); await loadVoicePreferences(); }}>{item.status === "active" ? "暂停使用" : "恢复使用"}</button><button onClick={async () => { if (!(await window.inkflow.confirm("删除这条写作记忆吗？删除后，后续章节不会再使用它。"))) return; await request("preference.delete", { preference_id: item.preference_id }); await loadVoicePreferences(); await onRefresh(); }}>删除</button></div></article>)}</section>
-    <section className="stack-section canon-preview"><h3>正史变更预览</h3><p className="form-hint">只针对你已经接受且 Editor 审查已放行的当前草稿。先看事实与伏笔补丁，再决定是否提交 SQLite。</p><div className="settings-inline-actions"><input type="number" min={1} value={previewChapter} disabled={memoryWorking} onChange={(event) => setPreviewChapter(Number(event.target.value))} /><button disabled={memoryWorking} onClick={() => void generateMemoryPreview()}>生成预览</button></div>{memoryPreview && <article className="memory-card"><strong>第 {String((memoryPreview.preview as Record<string, unknown>).chapter_no)} 章 · 尚未提交</strong><p>新增或更新事实 {Array.isArray(previewData.facts) ? previewData.facts.length : 0} 条，线索变化 {Array.isArray(previewData.threads) ? previewData.threads.length : 0} 条，冲突 {Array.isArray(previewData.unresolved_conflicts) ? previewData.unresolved_conflicts.length : 0} 条。</p><details><summary>查看将记录的内容</summary><p className="record-summary">{readableRecord(displaySafeValue(previewData))}</p></details><button className="primary" disabled={memoryWorking} onClick={async () => { const preview = memoryPreview.preview as Record<string, unknown>; setMemoryWorking(true); try { await request("memory.commit_preview", { chapter_no: Number(preview.chapter_no), artifact_id: preview.artifact_id }); setMemoryPreview(null); await onRefresh(); } finally { setMemoryWorking(false); } }}>确认提交正史</button></article>}</section>
-    <section className="stack-section"><h3>人工故事圣经 <small>{dashboard?.bible_entries.length || 0}</small></h3>{dashboard?.bible_entries.map((entry) => <article className="memory-card" key={String(entry.entry_id)}><span>{kindLabel(String(entry.kind))}</span><strong>{String(entry.name)}</strong><p>{String(((entry.data || {}) as Record<string, unknown>).notes || "")}</p></article>)}</section>
-    <section className="stack-section"><h3>当前正史事实 <small>{dashboard?.facts.length || 0}</small></h3>{dashboard?.facts.slice(0, 30).map((fact) => <article className="fact-row" key={String(fact.fact_id)}><strong>{String(fact.subject)} · {String(fact.predicate)}</strong><p>{stringifyShort(fact.value)}</p><small>来源第 {String(fact.source_chapter)} 章</small></article>)}</section>
-    <section className="stack-section"><h3>开放线索 <small>{dashboard?.threads.length || 0}</small></h3>{dashboard?.threads.map((thread) => <article className="thread-card" key={String(thread.thread_id)}><strong>{String(thread.title)}</strong><p>{String(thread.description)}</p><small>{String(thread.status)} · 预计第 {String(thread.due_chapter || "—")} 章</small></article>)}</section>
-  </div>;
-}
-
 function CostSummary({ usage }: { usage?: CollaborationOverview["usage"] }) {
   const accounting = usage?.accounting;
   const total = accounting?.all_projects;
@@ -2931,19 +2860,34 @@ function WorkflowProgressStrip({ runs }: { runs: LiveRun[] }) {
   return <section className="workflow-progress"><header><div><h3>本次工作流</h3><p>只显示公开阶段与明确结束记录；正史接受以当前章节为准。</p></div><strong>{latest ? (latest.status === "done" ? "本次已结束" : latest.status === "failed" ? "需处理" : latest.status === "waiting" ? "等待处理" : "进行中") : "等待任务"}</strong></header><ol>{steps.map(step => { const state = workflowStageState(events, step.key as "plan" | "write" | "review" | "accept" | "memory"); return <li className={`progress-stage ${state}`} key={step.key}><span className="progress-stage-icon">{workflowIcon(step.label)}</span><div><strong>{step.label}</strong><small>{state === "done" ? "有结束记录" : state === "active" ? latest?.status === "running" ? "正在处理" : "未确认结束" : "本次未记录"}</small></div></li>; })}</ol><p className="workflow-progress-note">阶段调用结束不等于审核通过；正文、审核与接受分别核对当前来源。</p></section>;
 }
 
+function RoleContextCards({ value }: { value: ContextStatus | null }) {
+  return <section className="role-context-cards" aria-label="各角色最近一次请求的上下文状态">
+    {value?.read_error && <p role="status" className="form-error">{value.read_error}</p>}
+    {!value?.roles?.length && <p className="form-hint">{value?.read_error ? "记录恢复后会继续显示。" : "正在读取角色状态…"}</p>}
+    {value?.roles?.map(role => {
+      const known = role.input_tokens !== null && role.used_percent !== null;
+      const hasInput = role.input_tokens !== null;
+      const compiledLimit = role.materials?.configured_hard_limit_tokens;
+      const compiledPercent = compiledLimit && role.materials?.estimated_tokens != null
+        ? 100 * role.materials.estimated_tokens / compiledLimit : null;
+      const state = role.request_state === "not_called" ? "尚未调用" : role.request_state === "unknown" ? "记录不可用"
+        : role.request_state === "completed" ? "最近一次请求" : role.request_state === "pending" ? "等待用量回报" : "最近未完成请求";
+      const hint = `${role.model} · ${state}${role.updated_at ? ` · ${formatTime(role.updated_at)}` : ""}\n${hasInput ? `${role.input_kind === "reported" ? "服务返回" : "本地估算"}输入 ${role.input_tokens!.toLocaleString()} 标记。` : "尚无输入记录。"}${known ? `本次容量 ${role.context_limit_tokens.toLocaleString()}，剩余 ${role.remaining_tokens?.toLocaleString()} 标记。` : `当前设置容量 ${role.context_limit_tokens.toLocaleString()}；旧请求占比未知。`}`;
+      const label = known ? `${role.input_kind === "estimated" ? "约 " : ""}${role.used_percent!.toFixed(1)}% 已用`
+        : "—";
+      return <article className="role-context-row" key={role.role}><header title={`${hint}${compiledPercent !== null ? `\n最近准备的资料约占当时容量 ${compiledPercent.toFixed(1)}%，不含完整请求的系统说明与输出；不是历史调用占比。` : ""}`}><strong>{roleLabel(role.role)}</strong><span aria-label={known ? label : hasInput ? "历史记录缺少当时容量，比例未计算" : state}>{label}</span></header>
+        <ContextMaterials projectRoot={value?.project_root} role={role.role} snapshot={role.materials}
+          emptyLabel={`${hint}\n${hasInput ? "本次没有保存分类明细；下次准备任务时会更新。" : role.request_state === "unknown" ? "用量记录暂时无法读取，请稍后查看。" : "这个角色尚未准备任务资料；参与工作后会显示组成。"}`} />
+      </article>;
+    })}
+  </section>;
+}
+
 function ContextCapacityCard({ value }: { value: ContextStatus | null }) {
-  if (!value) return <article className="context-capacity-card idle"><header><div><strong>Context 容量</strong><small>等待第一次编译</small></div><span>—</span></header><p>发送一次规划、写作或审查请求后，这里会显示当前占用和变化。</p></article>;
-  const hard = Math.max(1, Number(value.hard_limit_tokens || 1));
-  const soft = Math.max(1, Number(value.soft_limit_tokens || 1));
-  const estimated = Math.max(0, Number(value.estimated_tokens || 0));
-  const before = Math.max(estimated, Number(value.before_compression_tokens || estimated));
-  const delta = Math.max(0, before - estimated);
-  const previousChange = typeof value.change_since_previous_tokens === "number" ? value.change_since_previous_tokens : null;
-  const configuredSoft = Math.max(1, Number(value.configured_soft_limit_tokens || soft));
-  const configuredHard = Math.max(1, Number(value.configured_hard_limit_tokens || hard));
-  const hardPercent = Math.max(0, Math.min(100, Number(value.hard_usage_percent || (estimated / hard) * 100)));
-  const softPercent = Math.max(0, Math.min(100, (estimated / soft) * 100));
-  return <article className={`context-capacity-card ${value.status}`}><header><div><strong>Context 容量变化</strong><small>当前编译包 · {value.updated_at ? formatTime(value.updated_at) : "刚刚"}</small></div><span>{hardPercent.toFixed(1)}%</span></header><div className="context-capacity-track"><i style={{ width: `${hardPercent}%` }} /></div><div className="context-capacity-stats"><div><small>当前占用</small><strong>{estimated.toLocaleString()}</strong><span>/ {hard.toLocaleString()} tokens</span></div><div><small>软阈值</small><strong>{softPercent.toFixed(1)}%</strong><span>{soft.toLocaleString()} tokens</span></div><div><small>与上次编译</small><strong>{previousChange === null ? "首次" : `${previousChange > 0 ? "+" : ""}${previousChange.toLocaleString()}`}</strong><span>{value.previous_updated_at ? `上次 ${formatTime(value.previous_updated_at)}` : "等待下一轮"}</span></div><div><small>本轮压缩</small><strong>{delta ? `-${delta.toLocaleString()}` : "0"}</strong><span>{value.compression_applied ? "压缩后保留" : "未触发压缩"}</span></div></div><p>{value.compression_applied ? `编译前 ${before.toLocaleString()} → 编译后 ${estimated.toLocaleString()} tokens，减少 ${delta.toLocaleString()} tokens；硬约束资料保持不变。` : `本轮没有触发压缩：${estimated.toLocaleString()} tokens 仍在软阈值内。0 不是缺失，而是本轮无需压缩。当前任务预算为 ${soft.toLocaleString()} / ${hard.toLocaleString()}，设置预算为 ${configuredSoft.toLocaleString()} / ${configuredHard.toLocaleString()}。`}</p></article>;
+  return <article className="context-capacity-card"><RoleContextCards value={value} />
+    {value?.stale_reason && <p>{value.stale_reason}</p>}
+    {value && value.status !== "idle" && value.status !== "unavailable" && <details><summary>上次编译的资料容量</summary><p>输入资料约 {value.estimated_tokens.toLocaleString()} 标记，资料预算 {value.hard_limit_tokens.toLocaleString()} 标记。完整请求还包含系统说明及输出预留，以对应角色的请求记录为准。</p></details>}
+  </article>;
 }
 
 function retrievalCounts(value?: ContextStatus["retrieval_diagnostics"]) {
@@ -3195,7 +3139,7 @@ function ProcessPanelCompact({ events, collaboration, context, provider, workspa
       {retrieval?.discarded?.length ? <details className="detail-disclosure"><summary>查看未取回候选的前 {retrieval.discarded.length} 条原因</summary><p className="record-summary">{readableRecord(displaySafeValue(retrieval.discarded))}</p></details> : null}
     </section>;
   } else if (detail === "canon") {
-    detailContent = <section className="detail-section"><header><h4>正史入口</h4><span>验收后提交</span></header><p className="detail-lead">记忆服务 只读取已接受正文，先生成补丁预览，再经过事务提交。</p><div className="detail-metrics"><DetailMetric label="已接受章节" value={String(workspace?.accepted_chapters ?? workspace?.acceptedChapterCount ?? "—")} /><DetailMetric label="开放线索" value={String(workspace?.open_threads ?? "—")} /></div><button type="button" className="subtle-button" onClick={() => onNavigate("memory")}>打开正史与记忆 <span aria-hidden="true">→</span></button></section>;
+    detailContent = <section className="detail-section"><header><h4>正史入口</h4><span>验收后提交</span></header><p className="detail-lead">记忆服务 只读取已接受正文，先生成补丁预览，再经过事务提交。</p><div className="detail-metrics"><DetailMetric label="已接受章节" value={String(workspace?.accepted_chapters ?? workspace?.acceptedChapterCount ?? "—")} /><DetailMetric label="开放线索" value={String(workspace?.open_threads ?? "—")} /></div><button type="button" className="subtle-button" onClick={() => onNavigate("review")}>查看本章审查与记忆交接 <span aria-hidden="true">→</span></button></section>;
   } else if (detail === "versions") {
     detailContent = <section className="detail-section"><header><h4>版本入口</h4><span>保留旧版</span></header><p className="detail-lead">新草稿生成新版本；正文、审查和差异查看在各自工作区完成。</p><div className="detail-link-grid"><button type="button" onClick={() => onNavigate("editor")}>正文与草稿 <span aria-hidden="true">→</span></button><button type="button" onClick={() => onNavigate("review")}>审查与差异 <span aria-hidden="true">→</span></button></div></section>;
   } else if (detail === "learning") {
@@ -3348,14 +3292,25 @@ type CreationPreset = {
   context_soft_tokens: number;
   context_hard_tokens: number;
   review_verification_mode: string;
-  agent_generation: Pick<AgentGenerationProfiles, EverydayAgentRole>;
+  agent_generation: AgentGenerationProfiles;
+  agent_context_budgets: AgentContextBudgets;
+};
+
+type ModelParameterCapabilities = {
+  reasoning_effort?: boolean;
+  reasoning_effort_map?: Record<string, string>;
+  sampling_parameters?: Partial<Record<"temperature" | "top_p" | "top_k", boolean>>;
+  sampling_without_reasoning_only?: boolean;
+  sampling_constraints?: { temperature?: number[]; top_p?: number[]; thinking_temperature?: number; thinking_top_p?: number; thinking_temperature_ignored?: boolean; thinking_top_p_min?: number; non_thinking_top_p?: number };
 };
 
 const SETTINGS_PRESETS: CreationPreset[] = [
-  { id: "balanced", name: "专业均衡", note: "适合多数长篇项目", reasoning_effort: "high", inquiry_frequency: "medium", context_soft_tokens: 256000, context_hard_tokens: 512000, review_verification_mode: "evidence", agent_generation: DEFAULT_AGENT_GENERATION },
-  { id: "stable", name: "稳健连载", note: "降低发散，优先连续与证据", reasoning_effort: "high", inquiry_frequency: "high", context_soft_tokens: 384000, context_hard_tokens: 512000, review_verification_mode: "assisted", agent_generation: { coordinator: { temperature: 0.15, top_p: 0.72, top_k: null }, writer: { temperature: 0.62, top_p: 0.88, top_k: null }, editor: { temperature: 0.1, top_p: 0.65, top_k: null } } },
-  { id: "explore", name: "灵感探索", note: "构思与正文保留更大空间", reasoning_effort: "max", inquiry_frequency: "medium", context_soft_tokens: 384000, context_hard_tokens: 512000, review_verification_mode: "evidence", agent_generation: { coordinator: { temperature: 0.35, top_p: 0.9, top_k: null }, writer: { temperature: 1.05, top_p: 0.98, top_k: null }, editor: { temperature: 0.22, top_p: 0.8, top_k: null } } },
-  { id: "economy", name: "节省模式", note: "缩小上下文和额外核验", reasoning_effort: "medium", inquiry_frequency: "low", context_soft_tokens: 128000, context_hard_tokens: 256000, review_verification_mode: "evidence", agent_generation: { coordinator: { temperature: 0.2, top_p: 0.75, top_k: null }, writer: { temperature: 0.72, top_p: 0.9, top_k: null }, editor: { temperature: 0.12, top_p: 0.7, top_k: null } } },
+  { id: "economy", name: "节省", note: "聚焦当前场景，优先直接相关资料；减少辅助补核", reasoning_effort: "medium", inquiry_frequency: "low", context_soft_tokens: 160000, context_hard_tokens: 256000, review_verification_mode: "evidence", agent_generation: { ...DEFAULT_AGENT_GENERATION, writer: { temperature: 0.8, top_p: 0.85, top_k: null }, editor: { temperature: 0.15, top_p: 0.75, top_k: null } },
+    agent_context_budgets: { coordinator: { soft: 80000, hard: 128000 }, writer: { soft: 160000, hard: 256000 }, editor: { soft: 160000, hard: 256000 }, reviewer: { soft: 128000, hard: 192000 }, memory_keeper: { soft: 128000, hard: 208000 } } },
+  { id: "balanced", name: "平衡", note: "沿用你的容量基准，兼顾自然表达、连续性和必要补核", reasoning_effort: "high", inquiry_frequency: "low", context_soft_tokens: 384000, context_hard_tokens: 512000, review_verification_mode: "assisted", agent_generation: { ...DEFAULT_AGENT_GENERATION, writer: { temperature: 1, top_p: 0.9, top_k: null }, editor: { temperature: 0.15, top_p: 0.75, top_k: null } },
+    agent_context_budgets: { coordinator: { soft: 160000, hard: 278000 }, writer: { soft: 256000, hard: 460000 }, editor: { soft: 240000, hard: 384000 }, reviewer: { soft: 192000, hard: 256000 }, memory_keeper: { soft: 208000, hard: 320000 } } },
+  { id: "quality", name: "高质量", note: "增加相关前史与因果对照，细化场景和人物表达；开销较高", reasoning_effort: "max", inquiry_frequency: "medium", context_soft_tokens: 384000, context_hard_tokens: 640000, review_verification_mode: "assisted", agent_generation: { ...DEFAULT_AGENT_GENERATION, writer: { temperature: 1, top_p: 0.95, top_k: null }, editor: { temperature: 0.1, top_p: 0.7, top_k: null }, reviewer: { temperature: 0.1, top_p: 0.7, top_k: null }, memory_keeper: { temperature: 0.1, top_p: 0.7, top_k: null } },
+    agent_context_budgets: { coordinator: { soft: 192000, hard: 320000 }, writer: { soft: 384000, hard: 640000 }, editor: { soft: 320000, hard: 512000 }, reviewer: { soft: 288000, hard: 448000 }, memory_keeper: { soft: 320000, hard: 512000 } } },
 ];
 
 const PROVIDER_OPTIONS = [
@@ -3420,6 +3375,10 @@ function agentContextBudgetsFromProvider(value: unknown): AgentContextBudgets {
   })) as AgentContextBudgets;
 }
 
+function modelSettingsForm(provider: Record<string, unknown> | null) {
+  return { request_timeout_seconds: Number(provider?.request_timeout_seconds ?? 180), planning_timeout_seconds: Number(provider?.planning_timeout_seconds ?? 600), collaboration_preset: String(provider?.collaboration_preset || "everyday"), quality_preset: String(provider?.quality_preset || "custom"), quality_custom_context: provider?.quality_custom_context !== false, provider_kind: String(provider?.provider_kind || "deepseek"), api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), hook_strategy: String(provider?.hook_strategy || "most_chapters"), chapter_length_tolerance: Number(provider?.chapter_length_tolerance ?? 0.1), review_min_confidence: Number(provider?.review_min_confidence ?? 0.8), acceptance_confirmation_mode: String(provider?.acceptance_confirmation_mode || "auto_after_review"), planning_publication_mode: String(provider?.planning_publication_mode || "auto_after_review"), planning_window_chapters: Number(provider?.planning_window_chapters ?? 10), dialogue_history_mode: String(provider?.dialogue_history_mode || "auto"), dialogue_history_interval: Number(provider?.dialogue_history_interval || 1), dialogue_history_limit: Number(provider?.dialogue_history_limit || 100), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), context_budget_mode: String(provider?.context_budget_mode || "unified"), agent_context_budgets: agentContextBudgetsFromProvider(provider?.agent_context_budgets), max_output_tokens: Number(provider?.max_output_tokens || 32000), input_price_per_million: Number(provider?.input_price_per_million || 0), output_price_per_million: Number(provider?.output_price_per_million || 0), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_experience_detail: String(provider?.review_experience_detail || "standard"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), manual_edit_review_enabled: provider?.manual_edit_review_enabled !== false, agent_generation: agentGenerationFromProvider(provider?.agent_generation), role_models: roleModelsFromProvider(provider?.role_models) };
+}
+
 function SettingsDialog({ initialSection = "appearance", projectRoot, provider, voiceSettings, voiceStatus, preferences, onPreferencesChange, onClose, onSaved, onVoiceSaved }: {
   initialSection?: SettingsSection;
   projectRoot: string;
@@ -3432,7 +3391,15 @@ function SettingsDialog({ initialSection = "appearance", projectRoot, provider, 
   onSaved: (value: Record<string, unknown>) => void;
   onVoiceSaved: (settings: VoiceSettings, status: VoiceStatus) => void;
 }) {
-  const [form, setForm] = useState({ provider_kind: String(provider?.provider_kind || "deepseek"), api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), hook_strategy: String(provider?.hook_strategy || "most_chapters"), chapter_length_tolerance: Number(provider?.chapter_length_tolerance ?? 0.1), review_min_confidence: Number(provider?.review_min_confidence ?? 0.8), acceptance_confirmation_mode: String(provider?.acceptance_confirmation_mode || "auto_after_review"), planning_publication_mode: String(provider?.planning_publication_mode || "auto_after_review"), planning_window_chapters: Number(provider?.planning_window_chapters ?? 10), dialogue_history_mode: String(provider?.dialogue_history_mode || "auto"), dialogue_history_interval: Number(provider?.dialogue_history_interval || 1), dialogue_history_limit: Number(provider?.dialogue_history_limit || 100), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), context_budget_mode: String(provider?.context_budget_mode || "unified"), agent_context_budgets: agentContextBudgetsFromProvider(provider?.agent_context_budgets), max_output_tokens: Number(provider?.max_output_tokens || 32000), input_price_per_million: Number(provider?.input_price_per_million || 0), output_price_per_million: Number(provider?.output_price_per_million || 0), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_experience_detail: String(provider?.review_experience_detail || "standard"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), manual_edit_review_enabled: provider?.manual_edit_review_enabled !== false, agent_generation: agentGenerationFromProvider(provider?.agent_generation), role_models: roleModelsFromProvider(provider?.role_models) });
+  const [form, setForm] = useState(() => modelSettingsForm(provider));
+  const modelBaseline = useRef(modelSettingsForm(provider));
+  useEffect(() => {
+    if (!provider) return;
+    const previous = modelBaseline.current;
+    const incoming = modelSettingsForm(provider);
+    modelBaseline.current = incoming;
+    setForm(current => mergeSettings(incoming, settingsDiff(current, previous)));
+  }, [provider]);
   const [voiceForm, setVoiceForm] = useState<VoiceSettings>(voiceSettings || {
     voice_enabled: false, voice_input_enabled: true, voice_output_enabled: true, voice_auto_read: false, voice_auto_send: false,
     voice_default_profile: "narrator_female", voice_speed: 1, voice_volume: 1, voice_pause_scale: 1, voice_input_device: "", voice_output_device: "",
@@ -3445,6 +3412,7 @@ function SettingsDialog({ initialSection = "appearance", projectRoot, provider, 
   const [section, setSection] = useState<SettingsSection>(initialSection);
   const [search, setSearch] = useState("");
   const [remoteModels, setRemoteModels] = useState<string[]>([]);
+  const [keyRevision, setKeyRevision] = useState(0);
   const [voiceDevices, setVoiceDevices] = useState<MediaDeviceInfo[]>([]);
   const [mossInstalling, setMossInstalling] = useState(false);
   const [edgeInstalling, setEdgeInstalling] = useState(false);
@@ -3452,7 +3420,7 @@ function SettingsDialog({ initialSection = "appearance", projectRoot, provider, 
   const [voiceDeleting, setVoiceDeleting] = useState(false);
   const [voiceMoving, setVoiceMoving] = useState(false);
   const [usageSummary, setUsageSummary] = useState<CollaborationOverview["usage"] | null>(null);
-  const [limitPreview, setLimitPreview] = useState<{ model_limits?: { context_tokens?: number; max_output_tokens?: number }; role_output_limits?: Partial<Record<AgentRole, { model_limits: { context_tokens?: number; max_output_tokens?: number } }>>; capabilities?: { reasoning_effort?: boolean; top_k?: boolean; sampling_constraints?: { temperature?: number[]; top_p?: number[]; thinking_temperature?: number; thinking_top_p?: number } } } | null>(null);
+  const [limitPreview, setLimitPreview] = useState<{ model_limits?: { context_tokens?: number; max_output_tokens?: number }; role_output_limits?: Partial<Record<AgentRole, { model_limits: { context_tokens?: number; max_output_tokens?: number }; capabilities?: ModelParameterCapabilities }>>; capabilities?: ModelParameterCapabilities } | null>(null);
   const [limitPreviewError, setLimitPreviewError] = useState("");
   const roleModelsKey = JSON.stringify(form.role_models);
   useEffect(() => {
@@ -3562,6 +3530,18 @@ function SettingsDialog({ initialSection = "appearance", projectRoot, provider, 
   const updatePreferences = (patch: Partial<UiPreferences>) => onPreferencesChange((value) => ({ ...value, ...patch }));
   const updateAgentGeneration = (role: AgentRole, patch: Partial<AgentGeneration>) => setForm((value) => ({ ...value, agent_generation: { ...value.agent_generation, [role]: { ...value.agent_generation[role], ...patch } } }));
   const updateAgentContextBudget = (role: AgentRole, patch: Partial<{ soft: number; hard: number }>) => setForm((value) => ({ ...value, agent_context_budgets: { ...value.agent_context_budgets, [role]: { ...value.agent_context_budgets[role], ...patch } } }));
+  const saveProvider = async () => {
+    if (!provider) throw new Error("模型设置尚未读取完成，请稍后保存。");
+    const submitted = form;
+    await withDeadline(window.inkflow.request<Record<string, unknown>>("provider.configure", settingsDiff(submitted, modelBaseline.current)), 15000, "保存未及时返回，请重新打开设置核对。");
+    const actual = await window.inkflow.request<Record<string, unknown>>("provider.status", {});
+    const incoming = modelSettingsForm(actual);
+    modelBaseline.current = incoming;
+    setForm(current => mergeSettings(incoming, settingsDiff(current, submitted)));
+    setKeyRevision(value => value + 1);
+    onSaved(actual);
+    return actual;
+  };
   const persist = async () => {
     if (settingsSaveInFlightRef.current) return;
     settingsSaveInFlightRef.current = true;
@@ -3585,11 +3565,10 @@ function SettingsDialog({ initialSection = "appearance", projectRoot, provider, 
         }
       }
       try {
-        const saved = await withDeadline(window.inkflow.request<Record<string, unknown>>("provider.configure", { ...form }), 15000, "本机保存没有及时返回。请重新打开设置核对保存结果后再试。");
-        setForm((value) => ({ ...value, api_key: "" }));
-        onSaved({ ...provider, ...saved });
+        await saveProvider();
+
       } catch (cause) {
-        failures.push(`模型设置未更新：${errorMessage(cause)}`);
+        failures.push(`模型设置：${errorMessage(cause)}`);
       }
       setResult(failures.length ? `已尝试保存；${failures.join("；")}` : "设置已保存。");
     } catch (cause) {
@@ -3600,18 +3579,23 @@ function SettingsDialog({ initialSection = "appearance", projectRoot, provider, 
       setWorking(false);
     }
   };
-  const saveModelSettings = async () => {
+  const saveModelSettings = async (probe = false) => {
     if (settingsSaveInFlightRef.current) return;
     settingsSaveInFlightRef.current = true;
     setWorking(true); setError(""); setResult("");
     try {
-      const saved = await withDeadline(window.inkflow.request<Record<string, unknown>>("provider.configure", { ...form }), 15000, "本机保存没有及时返回。请重新打开设置核对保存结果后再试。");
-      setForm((value) => ({ ...value, api_key: "" }));
-      onSaved({ ...provider, ...saved });
+      await saveProvider();
+
+      if (probe) {
+        const checked = await withDeadline(window.inkflow.request<{ connected: boolean; message: string }>("provider.test", { project_root: projectRoot }), 65000, "生成连接检查超时，请查看本次连接记录。");
+        if (!checked.connected) throw new Error(checked.message);
+        setResult(checked.message);
+        return;
+      }
       try {
         const value = await withDeadline(window.inkflow.request<{ models: string[] }>("provider.models", {}), 15000, "读取模型列表超时");
         setRemoteModels(value.models);
-        setResult(`模型设置已保存，读取到 ${value.models.length} 个模型。`);
+        setResult(`设置已保存，列表含 ${value.models.length} 个模型；生成连接尚未验证。`);
       } catch (cause) {
         setResult(`模型设置已保存；模型列表暂时读取失败，可直接使用已填写的模型名称。原因：${errorMessage(cause)}`);
       }
@@ -3622,29 +3606,28 @@ function SettingsDialog({ initialSection = "appearance", projectRoot, provider, 
       setWorking(false);
     }
   };
-  const activePreset = SETTINGS_PRESETS.find((preset) => preset.reasoning_effort === form.reasoning_effort && preset.inquiry_frequency === form.inquiry_frequency && preset.context_soft_tokens === form.context_soft_tokens && preset.context_hard_tokens === form.context_hard_tokens)?.id;
+  const activePreset = form.quality_custom_context || form.quality_preset === "custom" ? "custom" : form.quality_preset;
   const inferredProvider = form.provider_kind;
-  const settingKeywords: Record<SettingsSection, string> = { story_settings: "本书 设定 人物 场景 道具 世界 模板 资料 记录 证据 分类", author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", repair: "版本 修复 引擎 连接 组件 更新", advanced: "高级 temperature top p top k PowerShell" };
+  const settingKeywords: Record<SettingsSection, string> = { story_settings: "本书 设定 人物 场景 道具 世界 模板 资料 记录 证据 分类", author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", models: "模型 服务商 API 密钥 价格 费用 能力 列表 等待 超时 秒数", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", repair: "版本 修复 引擎 连接 组件 更新", advanced: "高级 temperature top p top k PowerShell" };
   const visibleSections = SETTINGS_SECTIONS.filter((item) => `${item.label}${item.note}${settingKeywords[item.id]}`.toLowerCase().includes(search.trim().toLowerCase()));
   const chooseProvider = (id: string) => {
     const choice = PROVIDER_OPTIONS.find((item) => item.id === id);
-    if (!choice) return;
+    if (!choice || id === form.provider_kind) return;
     setRemoteModels([]);
-    setForm((value) => ({ ...value, provider_kind: id, base_url: choice.baseUrl || value.base_url, model: Array.from(choice.models)[0] || value.model }));
+    setForm((value) => ({ ...value, provider_kind: id, base_url: choice.baseUrl || value.base_url, model: Array.from(choice.models)[0] || value.model, api_key: "" }));
   };
   const applyCreationPreset = (preset: CreationPreset) => setForm((value) => ({
     ...value,
+    quality_preset: preset.id,
+    quality_custom_context: false,
     reasoning_effort: preset.reasoning_effort,
     inquiry_frequency: preset.inquiry_frequency,
     context_soft_tokens: preset.context_soft_tokens,
     context_hard_tokens: preset.context_hard_tokens,
     review_verification_mode: preset.review_verification_mode,
-    agent_generation: {
-      ...value.agent_generation,
-      coordinator: { ...preset.agent_generation.coordinator },
-      writer: { ...preset.agent_generation.writer },
-      editor: { ...preset.agent_generation.editor },
-    },
+    context_budget_mode: "custom",
+    agent_context_budgets: structuredClone(preset.agent_context_budgets),
+    agent_generation: structuredClone(preset.agent_generation),
   }));
   const updateVoiceForm = (patch: Partial<VoiceSettings>) => {
     voiceFormDirtyRef.current = true;
@@ -3681,7 +3664,14 @@ function SettingsDialog({ initialSection = "appearance", projectRoot, provider, 
     setVoiceMoving(true); setError(""); setResult("正在复制并核对语音资料，完成前请暂缓录音与朗读…");
     try {
       const value = await window.inkflow.request<{ settings: VoiceSettings; status: VoiceStatus; message: string }>("voice.storage.move", { destination, confirmation: "move_voice_storage" });
-      onVoiceSaved(value.settings, value.status); setVoiceForm(value.settings); setResult(value.message);
+      const previous = initialVoiceSettingsRef.current || voiceSettings || voiceForm;
+      initialVoiceSettingsRef.current = value.settings;
+      setVoiceForm(current => {
+        const merged = mergeSettings(value.settings, settingsDiff(current, previous));
+        voiceFormDirtyRef.current = Object.keys(settingsDiff(merged, value.settings)).length > 0;
+        return merged;
+      });
+      onVoiceSaved(value.settings, value.status); setResult(value.message);
     } catch (cause) { setResult(""); setError(errorMessage(cause)); }
     finally { setVoiceMoving(false); }
   };
@@ -3754,9 +3744,16 @@ function SettingsDialog({ initialSection = "appearance", projectRoot, provider, 
     ? form.agent_context_budgets[role]
     : { soft: form.context_soft_tokens, hard: form.context_hard_tokens };
   const modelLimits = limitPreview?.model_limits;
-  const unsupportedEffort = form.provider_kind === "mimo" || limitPreview?.capabilities?.reasoning_effort === false;
-  const sampling = limitPreview?.capabilities?.sampling_constraints;
-  const temperatureCeiling = sampling?.temperature?.[1] ?? (form.provider_kind === "mimo" ? 1.5 : 2);
+  const roleCapabilities = (role: AgentRole) => limitPreview?.role_output_limits?.[role]?.capabilities ?? limitPreview?.capabilities;
+  const unsupportedEffort = AGENT_TUNING_META.every(meta => roleCapabilities(meta.id)?.reasoning_effort === false);
+  const effortLabel = (value: string) => {
+    const labels: Record<string, string> = { low: "低", medium: "中", high: "高", max: "最高" };
+    const actual = [...new Set(AGENT_TUNING_META.flatMap(meta => {
+      const capabilities = roleCapabilities(meta.id);
+      return capabilities?.reasoning_effort ? [capabilities.reasoning_effort_map?.[value] || value] : [];
+    }))];
+    return actual.length === 1 && actual[0] !== value ? `${labels[value]}（当前模型按${labels[actual[0]] || actual[0]}执行）` : labels[value];
+  };
   const outputCeiling = Math.min(form.context_hard_tokens, modelLimits?.max_output_tokens ?? Infinity);
   const roleLimits = (role: AgentRole) => limitPreview?.role_output_limits?.[role]?.model_limits;
   const roleOutput = (role: AgentRole) => Math.min(form.max_output_tokens, roleBudget(role).hard,
@@ -3771,42 +3768,43 @@ function SettingsDialog({ initialSection = "appearance", projectRoot, provider, 
       <div className="settings-content">
         {section === "appearance" && <SettingsPane title="外观" note="明暗主题与强调色只保存在这台电脑。">
           <SettingGroup title="主题"><div className="choice-row three">{(["dark", "light", "system"] as ThemeMode[]).map((mode) => <button type="button" key={mode} className={preferences.theme === mode ? "active" : ""} onClick={() => updatePreferences({ theme: mode })}>{mode === "dark" ? "黑色" : mode === "light" ? "白色" : "跟随系统"}</button>)}</div></SettingGroup>
-          <SettingGroup title="墨宝动作" note="工作时自动切换；跟随系统的减少动态效果设置。"><MascotShowcase /></SettingGroup>
           <SettingGroup title="配色"><div className="palette-grid">{(["lime", "jade", "blue", "violet", "amber", "rose"] as AccentPalette[]).map((accent) => <button type="button" key={accent} data-palette={accent} className={preferences.accent === accent ? "active" : ""} onClick={() => updatePreferences({ accent })}><i />{({ lime: "青柠", jade: "青玉", blue: "湖蓝", violet: "紫罗兰", amber: "琥珀", rose: "胭脂" } as Record<AccentPalette, string>)[accent]}</button>)}</div></SettingGroup>
           <SettingGroup title="界面密度"><div className="choice-row"><button type="button" className={preferences.density === "comfortable" ? "active" : ""} onClick={() => updatePreferences({ density: "comfortable" })}>舒适</button><button type="button" className={preferences.density === "compact" ? "active" : ""} onClick={() => updatePreferences({ density: "compact" })}>紧凑</button></div></SettingGroup>
         </SettingsPane>}
         {section === "repair" && <VersionRepair projectRoot={projectRoot} onVoiceSaved={onVoiceSaved} />}
         {section === "models" && <SettingsPane title="模型" note="先选服务商，再填写该服务商当前有效的模型 ID。">
           <div className="provider-grid">{PROVIDER_OPTIONS.map((item) => <button type="button" key={item.id} className={inferredProvider === item.id ? "active" : ""} onClick={() => chooseProvider(item.id)}><strong>{item.name}</strong><span>{item.note}</span></button>)}</div>
-          <div className={`provider-status ${provider?.api_key_configured ? "ready" : "missing"}`}><strong>{provider?.api_key_configured ? "模型密钥已保存" : "尚未保存模型密钥"}</strong><span>{provider?.api_key_configured ? `凭据来源：${credentialLabel(String(provider?.api_key_storage || ""))}` : "密钥只交给本机引擎，并保存在系统凭据库。"}</span></div>
-          <div className="settings-fields"><label>模型名称<input list="provider-models" value={form.model} onChange={(event) => updateForm({ model: event.target.value })} placeholder="填写平台当前模型 ID" /><datalist id="provider-models">{[...new Set([...(PROVIDER_OPTIONS.find(item => item.id === form.provider_kind)?.models || []), ...remoteModels])].map((model) => <option key={model} value={model} />)}</datalist></label><label>接口地址<input value={form.base_url} onChange={(event) => updateForm({ base_url: event.target.value })} /></label><label>更换密钥 <small>{provider?.api_key_configured ? "留空继续使用当前服务商的已有密钥" : "本机模型可以留空"}</small><input type="password" autoComplete="new-password" value={form.api_key} onChange={(event) => updateForm({ api_key: event.target.value })} placeholder="不会回显" /></label></div>
-           <div className="settings-inline-actions"><button type="button" disabled={working} onClick={() => void saveModelSettings()}>保存并读取模型列表</button><span>先保存模型配置，再尝试读取列表；读取失败不会撤销已保存的 Key。</span></div>
-          {form.provider_kind === "mimo" && <div className="mimo-connection-options"><p className="form-hint">普通接口与 Token Plan 使用不同地址和凭据。sk 密钥用于普通接口，tp/ttp 凭据用于 Token Plan；切换地址后请填写对应密钥并重新检查连接。</p><div className="settings-inline-actions"><button type="button" onClick={() => updateForm({ base_url: "https://api.xiaomimimo.com/v1", api_key: "" })}>普通 API</button><button type="button" onClick={() => updateForm({ base_url: "https://token-plan-cn.xiaomimimo.com/v1", api_key: "" })}>Token Plan</button></div><p className="form-hint">MiMo 思考请求由服务端使用 temperature 1.0 / top_p 0.95，不支持 reasoning_effort 档位；下方采样设置只用于非思考请求。此处不新增思考开关，也不修改原任务快照或角色模型。</p></div>}
+          <SavedApiKey provider={form.provider_kind} revision={keyRevision} />
+          <div className="settings-fields"><label>模型名称<input list="provider-models" value={form.model} onChange={(event) => updateForm({ model: event.target.value })} placeholder="填写平台当前模型 ID" /><datalist id="provider-models">{[...new Set([...(PROVIDER_OPTIONS.find(item => item.id === form.provider_kind)?.models || []), ...remoteModels])].map((model) => <option key={model} value={model} />)}</datalist></label><label>接口地址<input value={form.base_url} onChange={(event) => updateForm({ base_url: event.target.value })} /></label><label>更换密钥 <small>留空沿用该服务商已保存的密钥</small><input type="password" autoComplete="new-password" value={form.api_key} onChange={(event) => updateForm({ api_key: event.target.value })} placeholder="留空沿用已保存密钥" /></label></div>
+           <div className="settings-inline-actions"><button type="button" disabled={working || !provider} onClick={() => void saveModelSettings()}>保存并读取模型列表</button><button type="button" disabled={working || !provider} onClick={() => void saveModelSettings(true)}>检查生成连接</button><span>读取列表与生成连接分别检查。</span></div>
+          {form.provider_kind === "mimo" && <div className="mimo-connection-options"><p className="form-hint">普通 API 与 Token Plan 使用各自的地址和密钥。</p><div className="settings-inline-actions"><button type="button" onClick={() => updateForm({ base_url: "https://api.xiaomimimo.com/v1" })}>普通 API</button><button type="button" onClick={() => updateForm({ base_url: "https://token-plan-cn.xiaomimimo.com/v1" })}>Token Plan</button></div><p className="form-hint">MiMo 思考请求使用平台采样参数；下方参数用于非思考请求。</p></div>}
           <SettingGroup title="生成参数与实际效率" note="按角色设置；统计来自当前小说的真实调用。">
-            <div className="model-efficiency-head"><div><strong>{form.model || "未选择模型"}</strong><span>{unsupportedEffort ? "当前接口不支持思考强度档位" : `思考 ${form.reasoning_effort}`} · 输出设置 {form.max_output_tokens.toLocaleString()} tokens</span></div><button type="button" disabled={!projectRoot} onClick={() => void refreshUsage()}>刷新统计</button></div>
-            <div className="settings-fields two"><label>单次输出上限 <small>{modelLimits?.max_output_tokens ? `模型已核实上限 ${modelLimits.max_output_tokens.toLocaleString()} tokens` : "模型上限未核实，按已配置上下文约束；服务端仍会校验"}</small><input type="number" min={1} max={outputCeiling} step={1} value={form.max_output_tokens} onChange={(event) => updateForm({ max_output_tokens: Number(event.target.value) })} /></label><label>缓存解释<input readOnly value={form.provider_kind === "deepseek" ? "按相同输入前缀自动复用" : "按服务商返回值统计"} /></label></div>
+            <div className="model-efficiency-head"><div><strong>{form.model || "未选择模型"}</strong><span>{unsupportedEffort ? "当前接口不支持思考强度档位" : `思考 ${effortLabel(form.reasoning_effort)}`} · 输出设置 {form.max_output_tokens.toLocaleString()} tokens</span></div><button type="button" disabled={!projectRoot} onClick={() => void refreshUsage()}>刷新统计</button></div>
+            <div className="settings-fields two"><label>单次输出上限 <small>{modelLimits?.max_output_tokens ? `模型已核实上限 ${modelLimits.max_output_tokens.toLocaleString()} tokens` : "模型上限未核实，按已配置上下文约束；服务端仍会校验"}</small><input type="number" min={1} max={outputCeiling} step={1} value={form.max_output_tokens} onChange={(event) => updateForm({ max_output_tokens: Number(event.target.value) })} /></label></div>
+            <details className="detail-disclosure"><summary>高级等待设置</summary><p className="form-hint">每次请求的等待上限；修改用于新任务，进行中与原任务续接沿用原设置。</p><div className="settings-fields two"><label>普通请求最长等待（秒）<input type="number" min={1} step={1} value={form.request_timeout_seconds} onChange={(event) => updateForm({ request_timeout_seconds: Number(event.target.value) })} /></label><label>规划请求最长等待（秒）<input type="number" min={1} step={1} value={form.planning_timeout_seconds} onChange={(event) => updateForm({ planning_timeout_seconds: Number(event.target.value) })} /></label></div></details>
             {limitPreviewWarning}
-            <p className="form-hint">输入扣除前，默认模型可用输出至多 {Math.min(form.max_output_tokens, outputCeiling).toLocaleString()} tokens。每次请求再取本步骤额度、输出设置、角色上下文剩余额度和已核实模型上限的较小值；完整输入包含规则与 JSON Schema。保存不会扩张正在运行任务的原配置。</p>
-            <p className="form-hint">日常使用 Coordinator + Writer + Editor；Reviewer 与 Memory Keeper 按当前任务模式参加。保存角色模型或参数不会启用角色，也不会改变正在运行的任务。角色模型 ID 必须受当前服务商支持。</p>
-            <section className="agent-tuning compact">{AGENT_TUNING_META.map((meta) => { const values = form.agent_generation[meta.id]; const roleStats = usageSummary?.by_agent_role?.[meta.id]; const budget = roleBudget(meta.id); const hit = roleStats?.prompt_cache_hit_rate; const miss = typeof hit === "number" ? 1 - hit : null; return <details key={meta.id} open={meta.id === "writer"}><summary><span><strong>{meta.label}</strong><small>{meta.note}</small></span><span>{roleStats?.calls ? `${roleStats.calls} 次 · 命中 ${typeof hit === "number" ? `${(hit * 100).toFixed(1)}%` : "未报告"}` : "暂无调用"}</span></summary><div className="agent-efficiency-grid"><div><small>输入 / 输出</small><strong>{roleStats ? `${roleStats.prompt_tokens.toLocaleString()} / ${roleStats.completion_tokens.toLocaleString()}` : "—"}</strong></div><div><small>命中 / 未命中</small><strong>{roleStats && typeof hit === "number" ? `${(hit * 100).toFixed(1)}% / ${((miss || 0) * 100).toFixed(1)}%` : "服务商未报告"}</strong></div><div><small>上下文预算</small><strong>{`${Math.round(budget.soft / 1000)}k / ${Math.round(budget.hard / 1000)}k`}</strong></div><div><small>输入扣除前输出额度</small><strong>{roleOutput(meta.id).toLocaleString()} tokens</strong></div><div><small>平均实际输出</small><strong>{roleStats?.calls ? `${Math.round(roleStats.completion_tokens / roleStats.calls).toLocaleString()} tokens` : "—"}</strong></div></div><div className="agent-tuning-grid"><label>角色模型 <small>留空继承默认模型，共用当前服务商接口和密钥</small><input list="provider-models" value={form.role_models[meta.id]} placeholder={form.model} onChange={(event) => setForm((value) => ({ ...value, role_models: { ...value.role_models, [meta.id]: event.target.value } }))} /></label><label>温度 <small>0～{temperatureCeiling}{form.provider_kind === "mimo" ? "，仅非思考请求使用" : ""}</small><input type="number" min={0} max={temperatureCeiling} step={0.05} value={values.temperature} onChange={(event) => updateAgentGeneration(meta.id, { temperature: Number(event.target.value) })} /></label><label>Top P <small>0.01～1{form.provider_kind === "mimo" ? "，仅非思考请求使用" : ""}</small><input type="number" min={0.01} max={1} step={0.01} value={values.top_p} onChange={(event) => updateAgentGeneration(meta.id, { top_p: Number(event.target.value) })} /></label><label>Top K <small>{form.provider_kind === "mimo" ? "当前接口不支持" : "接口支持时发送"}</small><input disabled={form.provider_kind === "mimo" || limitPreview?.capabilities?.top_k === false} type="number" min={1} max={200} step={1} value={values.top_k ?? ""} placeholder="自动" onChange={(event) => updateAgentGeneration(meta.id, { top_k: event.target.value === "" ? null : Number(event.target.value) })} /></label></div><button type="button" className="text-button" onClick={() => updateAgentGeneration(meta.id, DEFAULT_AGENT_GENERATION[meta.id])}>恢复该 Agent 默认值</button></details>; })}</section>
-            <p className="form-hint">温度和 Top P 影响输出取样，不改变输入缓存是否命中。缓存要靠相同前缀复用；墨流会把稳定规则放在前面，把本章任务放在末尾。未报告缓存数据的调用不会被误算成 0%。</p>
+            <section className="agent-tuning compact">{AGENT_TUNING_META.map((meta) => { const values = form.agent_generation[meta.id]; const capabilities = roleCapabilities(meta.id); const sampling = capabilities?.sampling_constraints; const temperatureRange = sampling?.temperature ?? [0, 2]; const topPRange = sampling?.top_p ?? [0, 1]; const samplingNote = capabilities?.sampling_without_reasoning_only || sampling?.thinking_temperature !== undefined ? "，仅非思考请求使用" : ""; const temperatureNote = sampling?.thinking_temperature_ignored ? "，思考时不采用" : samplingNote; const topPNote = sampling?.thinking_top_p_min !== undefined ? `，思考至少${sampling.thinking_top_p_min}；非思考固定${sampling.non_thinking_top_p}` : samplingNote; const roleStats = usageSummary?.by_agent_role?.[meta.id]; const budget = roleBudget(meta.id); const hit = roleStats?.prompt_cache_hit_rate; const miss = typeof hit === "number" ? 1 - hit : null; return <details key={meta.id}><summary><span><strong title={meta.note}>{roleLabel(meta.id)}</strong><small>{roleStats?.calls ? `本书累计 ${roleStats.calls} 次` : "按任务需要参与"}</small></span><CacheMeter calls={roleStats?.calls || 0} hitRate={hit} /></summary><div className="agent-efficiency-grid"><div><small>输入 / 输出</small><strong>{roleStats ? `${roleStats.prompt_tokens.toLocaleString()} / ${roleStats.completion_tokens.toLocaleString()}` : "—"}</strong></div><div><small>命中 / 未命中</small><strong>{roleStats && typeof hit === "number" ? `${(hit * 100).toFixed(1)}% / ${((miss || 0) * 100).toFixed(1)}%` : "服务商未报告"}</strong></div><div><small>上下文预算</small><strong>{`${Math.round(budget.soft / 1000)}k / ${Math.round(budget.hard / 1000)}k`}</strong></div><div><small>输入扣除前输出额度</small><strong>{roleOutput(meta.id).toLocaleString()} tokens</strong></div><div><small>平均实际输出</small><strong>{roleStats?.calls ? `${Math.round(roleStats.completion_tokens / roleStats.calls).toLocaleString()} tokens` : "—"}</strong></div></div><div className="agent-tuning-grid"><label>角色模型 <small>留空继承默认模型，共用当前服务商接口和密钥</small><input list="provider-models" value={form.role_models[meta.id]} placeholder={form.model} onChange={(event) => setForm((value) => ({ ...value, role_models: { ...value.role_models, [meta.id]: event.target.value } }))} />{form.role_models[meta.id] && <span className="role-model-choice">{![form.model, ...remoteModels, ...(PROVIDER_OPTIONS.find(item => item.id === form.provider_kind)?.models || [])].includes(form.role_models[meta.id]) && <small role="status">尚未在当前服务商列表确认</small>}<button type="button" className="text-button" onClick={() => setForm(value => ({ ...value, role_models: { ...value.role_models, [meta.id]: "" } }))}>继承默认模型</button></span>}</label><label>温度 <small>{capabilities?.sampling_parameters?.temperature === false ? "当前模型不采用，已保存值保留" : `${temperatureRange[0]}～${temperatureRange[1]}${temperatureNote}`}</small><input disabled={capabilities?.sampling_parameters?.temperature === false} type="number" min={temperatureRange[0]} max={temperatureRange[1]} step={0.05} value={values.temperature} onChange={(event) => updateAgentGeneration(meta.id, { temperature: Number(event.target.value) })} /></label><label>Top P <small>{capabilities?.sampling_parameters?.top_p === false ? "当前模型不采用，已保存值保留" : `${topPRange[0]}～${topPRange[1]}${topPNote}`}</small><input disabled={capabilities?.sampling_parameters?.top_p === false} type="number" min={topPRange[0]} max={topPRange[1]} step={0.01} value={values.top_p} onChange={(event) => updateAgentGeneration(meta.id, { top_p: Number(event.target.value) })} /></label><label>Top K <small>{capabilities?.sampling_parameters?.top_k === false ? "当前模型不采用，已保存值保留" : "当前模型支持时发送"}</small><input disabled={capabilities?.sampling_parameters?.top_k === false} type="number" min={1} max={200} step={1} value={values.top_k ?? ""} placeholder="自动" onChange={(event) => updateAgentGeneration(meta.id, { top_k: event.target.value === "" ? null : Number(event.target.value) })} /></label></div><button type="button" className="text-button" onClick={() => updateAgentGeneration(meta.id, DEFAULT_AGENT_GENERATION[meta.id])}>恢复该 Agent 默认值</button></details>; })}</section>
           </SettingGroup>
-          <SettingGroup title="费用估算" note="单价单位为人民币 / 百万 Token，仅用于估算，不设置消费上限。两项均大于 0 时采用手填价格；否则仅官方 DeepSeek 已知型号在价格快照有效期内使用高峰参考价，其他情况显示未知。旧设置若填写了外币单价，请先换算为人民币。"><div className="settings-fields two"><label>输入单价 / 百万 Token<input type="number" min={0} step={0.01} value={form.input_price_per_million} onChange={(event) => updateForm({ input_price_per_million: Number(event.target.value) })} /></label><label>输出单价 / 百万 Token<input type="number" min={0} step={0.01} value={form.output_price_per_million} onChange={(event) => updateForm({ output_price_per_million: Number(event.target.value) })} /></label></div></SettingGroup>
         </SettingsPane>}
-        {section === "creation" && <SettingsPane title="创作" note="预设会同时调整上下文、询问策略、审查模式和三个角色的生成参数。">
-          <div className="preset-grid">{SETTINGS_PRESETS.map((preset) => <button type="button" key={preset.id} className={activePreset === preset.id ? "active" : ""} onClick={() => applyCreationPreset(preset)}><strong>{activePreset === preset.id ? "✓ " : ""}{preset.name}</strong><span>{preset.note}</span><small>{preset.context_soft_tokens / 10000} 万常用上下文</small></button>)}</div>
-          <SettingGroup title="近期规划" note="未指定章节范围时，默认连续规划的未来章节数；已接受正文只作为衔接依据。"><label>默认近期规划章数<input type="number" min={1} max={50} step={1} value={form.planning_window_chapters} onChange={(event) => updateForm({ planning_window_chapters: Math.min(50, Math.max(1, Math.round(Number(event.target.value) || 1))) })} /></label></SettingGroup>
-          <SettingGroup title="规划正式发布" note="只影响三层规划审核通过后何时成为正式版；审核失败或候选中断始终保持原版。"><label>发布方式<select value={form.planning_publication_mode} onChange={(event) => updateForm({ planning_publication_mode: event.target.value })}><option value="auto_after_review">审核通过后自动发布</option><option value="confirm_after_review">审核通过后等我确认</option></select></label><p className="form-hint">旧版保留或删除始终另行选择；删除前还会展示准确对象并再次确认。</p></SettingGroup>
-          <div className="settings-fields two"><label>思考强度{unsupportedEffort && <small>当前接口不支持档位，保留原设置供其他接口使用</small>}<select disabled={unsupportedEffort} value={form.reasoning_effort} onChange={(event) => updateForm({ reasoning_effort: event.target.value })}>{unsupportedEffort ? <option value={form.reasoning_effort}>当前接口不支持强度档位</option> : <><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最高</option></>}</select></label><label>主动询问<select value={form.inquiry_frequency} onChange={(event) => updateForm({ inquiry_frequency: event.target.value })}><option value="low">只问必需信息</option><option value="medium">把握较低时询问</option><option value="high">重要创作分岔也询问</option><option value="ultra">有明显未知项就询问</option></select></label></div>
+        {section === "creation" && <SettingsPane title="创作" note="分别选择协作方式和创作档位，保存后用于新任务。">
+          <SettingGroup title="协作方式"><div className="preset-grid collaboration-presets">{[
+            { id: "everyday", name: "日常协作", note: "协调、写作与编辑", count: 3 },
+            { id: "adaptive", name: "按需加强", note: "按任务增加审查或记忆专项", count: 4 },
+            { id: "full_specialist", name: "全面协作", note: "编辑、连续性与记忆分工核对", count: 5 },
+          ].map(item => <button type="button" key={item.id} aria-pressed={form.collaboration_preset === item.id} className={form.collaboration_preset === item.id ? "active" : ""} onClick={() => updateForm({ collaboration_preset: item.id })}><strong>{item.name}</strong><span>{item.note}</span><small>{item.count} 个 Agent</small></button>)}</div></SettingGroup>
+          <SettingGroup title="质量与消耗" note="选择准备与核对的投入程度，保留本书写法。"><div className="preset-grid">{SETTINGS_PRESETS.map((preset) => <button type="button" key={preset.id} aria-pressed={activePreset === preset.id} className={activePreset === preset.id ? "active" : ""} onClick={() => applyCreationPreset(preset)}><strong>{preset.name}</strong><span>{preset.note}</span><small>写作 {preset.agent_context_budgets.writer.soft / 10000} 万 · 审读 {preset.agent_context_budgets.editor.soft / 10000} 万常用容量</small></button>)}<button type="button" aria-pressed={activePreset === "custom"} className={activePreset === "custom" ? "active" : ""} onClick={() => updateForm({ quality_custom_context: true })}><strong>自定义</strong><span>沿用上一档策略，只开放容量调整</span><small>不重置重试、阅读或写作策略</small></button></div></SettingGroup>
+          <SettingGroup title="近期规划" note="未指定范围时，默认向后规划的章节数。"><label>默认近期规划章数<input type="number" min={1} max={50} step={1} value={form.planning_window_chapters} onChange={(event) => updateForm({ planning_window_chapters: Math.min(50, Math.max(1, Math.round(Number(event.target.value) || 1))) })} /></label></SettingGroup>
+          <SettingGroup title="规划正式发布" note="选择规划审核通过后是否自动采用。"><label>发布方式<select value={form.planning_publication_mode} onChange={(event) => updateForm({ planning_publication_mode: event.target.value })}><option value="auto_after_review">审核通过后自动发布</option><option value="confirm_after_review">审核通过后等我确认</option></select></label><p className="form-hint">旧版保留或删除始终另行选择；删除前还会展示准确对象并再次确认。</p></SettingGroup>
+          <div className="settings-fields two"><label>思考强度{unsupportedEffort && <small>当前接口不支持档位，保留原设置供其他接口使用</small>}<select disabled={unsupportedEffort} value={form.reasoning_effort} onChange={(event) => updateForm({ reasoning_effort: event.target.value })}>{unsupportedEffort ? <option value={form.reasoning_effort}>当前接口不支持强度档位</option> : <>{["low", "medium", "high", "max"].map(value => <option key={value} value={value}>{effortLabel(value)}</option>)}</>}</select></label><label>主动询问<select value={form.inquiry_frequency} onChange={(event) => updateForm({ inquiry_frequency: event.target.value })}><option value="low">只问必需信息</option><option value="medium">把握较低时询问</option><option value="high">重要创作分岔也询问</option><option value="ultra">有明显未知项就询问</option></select></label></div>
           <SettingGroup title="章节检查"><div className="settings-fields two"><label>结尾钩子<select value={form.hook_strategy} onChange={(event) => updateForm({ hook_strategy: event.target.value })}><option value="most_chapters">大多数章节保留期待</option><option value="key_chapters">重点章节使用明确钩子</option><option value="natural_afterglow">自然余味优先</option></select></label><label>字数容差 <small>上下 {(form.chapter_length_tolerance * 100).toFixed(0)}%</small><input type="range" min={0.05} max={0.3} step={0.05} value={form.chapter_length_tolerance} onChange={(event) => updateForm({ chapter_length_tolerance: Number(event.target.value) })} /></label><label>自动通过最低审查符合度 <small>{(Math.max(0.8, form.review_min_confidence) * 100).toFixed(0)}%</small><input type="range" min={0.8} max={1} step={0.05} value={Math.max(0.8, form.review_min_confidence)} onChange={(event) => updateForm({ review_min_confidence: Number(event.target.value) })} /></label></div><p className="form-hint">默认字数±10%。自动通过须必需项无硬问题、来源证据齐全且加权符合度达到设置值（至少80%）。百分比不是正确概率；缺资料先补审，不让 Writer 为漏读改稿。</p></SettingGroup>
-          <SettingGroup title="验收确认策略" note="只改变何时取得你的授权；Editor 审查通过、正文哈希和记忆服务事务门禁始终保留。"><label>确认方式<select value={form.acceptance_confirmation_mode} onChange={(event) => updateForm({ acceptance_confirmation_mode: event.target.value })}><option value="auto_after_review">Editor 审查通过后自动验收（默认）</option><option value="batch_once">批次提交前确认一次</option><option value="per_chapter">逐章确认</option></select></label><p className="form-hint">“自动验收”只在当前版本没有硬问题且 Editor 审查通过时生效；尚未完成的审查不会伪装成通过。切换设置只影响之后的操作。</p></SettingGroup>
+          <SettingGroup title="验收确认策略" note="选择草稿审核通过后如何验收。"><label>确认方式<select value={form.acceptance_confirmation_mode} onChange={(event) => updateForm({ acceptance_confirmation_mode: event.target.value })}><option value="auto_after_review">Editor 审查通过后自动验收（默认）</option><option value="batch_once">批次提交前确认一次</option><option value="per_chapter">逐章确认</option></select></label><p className="form-hint">“自动验收”只在当前版本没有硬问题且 Editor 审查通过时生效；尚未完成的审查不会伪装成通过。切换设置只影响之后的操作。</p></SettingGroup>
           <SettingGroup title="预填续写" note="启用后，编辑停顿会调用当前 Writer 模型，因此可能产生费用。"><label className="setting-check"><input type="checkbox" checked={preferences.prefillEnabled} onChange={(event) => updatePreferences({ prefillEnabled: event.target.checked })} />允许在编辑器中手动开启灰字预填候选</label><div className="settings-fields two"><label>等待时间 <small>{preferences.prefillDelayMs} 毫秒</small><input type="range" min="300" max="3000" step="100" value={preferences.prefillDelayMs} onChange={(event) => updatePreferences({ prefillDelayMs: Number(event.target.value) })} /></label><label>候选长度<select value={preferences.prefillLength} onChange={(event) => updatePreferences({ prefillLength: event.target.value as PrefillLength })}><option value="short">短句</option><option value="medium">一小段</option><option value="long">长段落</option></select></label></div></SettingGroup>
           <SettingGroup title="智能提示词" note="输入框上方的快捷按钮根据最近对话和项目阶段提供下一步建议。"><label className="setting-check"><input type="checkbox" checked={preferences.suggestedPromptsEnabled} onChange={(event) => updatePreferences({ suggestedPromptsEnabled: event.target.checked })} />显示下一步提示词 <small>执行结束后由Coordinator结合实际结果生成建议，会计入当前任务模型用量；关闭后不生成建议</small></label></SettingGroup>
-          <SettingGroup title="对话历史" note="记录只写入项目里的 DIALOGUE.md，不保存原始思维链、API Key 或模型内部推理。"><div className="settings-fields two"><label>保存方式<select value={form.dialogue_history_mode} onChange={(event) => updateForm({ dialogue_history_mode: event.target.value })}><option value="auto">主动保存（自动写入）</option><option value="manual">被动保存（只在对话历史里手动保存）</option><option value="both">两者都有</option></select></label><label>最多保留 <small>条记录</small><input type="number" min={5} max={1000} value={form.dialogue_history_limit} onChange={(event) => updateForm({ dialogue_history_limit: Number(event.target.value) })} /></label></div><div className="settings-fields"><label>自动保存间隔 <small>每 N 轮写入一次</small><input type="number" min={1} max={50} value={form.dialogue_history_interval} disabled={form.dialogue_history_mode === "manual"} onChange={(event) => updateForm({ dialogue_history_interval: Number(event.target.value) })} /></label></div><p className="form-hint">主动保存会在满 N 轮时写入一次；“两者都有”同时开放对话历史里的手动保存。超出保留上限时只删除最旧的记录，不会改动正史。</p></SettingGroup>
+          <SettingGroup title="对话历史" note="对话保存在本书项目中。"><div className="settings-fields two"><label>保存方式<select value={form.dialogue_history_mode} onChange={(event) => updateForm({ dialogue_history_mode: event.target.value })}><option value="auto">主动保存（自动写入）</option><option value="manual">被动保存（只在对话历史里手动保存）</option><option value="both">两者都有</option></select></label><label>最多保留 <small>条记录</small><input type="number" min={5} max={1000} value={form.dialogue_history_limit} onChange={(event) => updateForm({ dialogue_history_limit: Number(event.target.value) })} /></label></div><div className="settings-fields"><label>自动保存间隔 <small>每 N 轮写入一次</small><input type="number" min={1} max={50} value={form.dialogue_history_interval} disabled={form.dialogue_history_mode === "manual"} onChange={(event) => updateForm({ dialogue_history_interval: Number(event.target.value) })} /></label></div><p className="form-hint">主动保存会在满 N 轮时写入一次；“两者都有”同时开放对话历史里的手动保存。超出保留上限时只删除最旧的记录，不会改动正史。</p></SettingGroup>
         </SettingsPane>}
         {section === "voice" && <SettingsPane title="语音" note="按用途选择已就绪的语音组件；安装完成不会自动切换。">
           <div className={`provider-status ${voiceStatus?.ready_for_output ? "ready" : "missing"}`}><strong>{voiceStatus?.message || "正在读取本地语音状态"}</strong><span>{voiceStatus?.backend ? `当前引擎：${voiceStatus.backend}` : "保存设置不会自动下载模型；依赖与模型由安装环节单独处理。"}</span></div>
-          <SettingGroup title="各功能使用的语音组件" note="Edge 在线朗读会将目标文字发送到微软服务，音频保存在本机；第三方接入没有永久免费或长期可用保证。">
+          <SettingGroup title="各功能使用的语音组件" note="Edge 会把朗读文字发送至微软，音频保存在本机。">
             <div className="settings-fields two">
               <label>语音输入<select value={voiceForm.voice_input_engine} onChange={(event) => updateVoiceForm({ voice_input_engine: event.target.value as VoiceSettings["voice_input_engine"] })}><option value="off">未选用</option><option value="local">本地 SenseVoice</option><option value="browser">浏览器实时识别</option></select></label>
               <label>对话回复朗读<select value={voiceForm.voice_dialogue_engine} onChange={(event) => updateVoiceForm({ voice_dialogue_engine: event.target.value as VoiceSettings["voice_dialogue_engine"] })}><option value="off">未选用</option><option value="edge">Edge 在线自然语音</option><option value="moss">本地 MOSS</option></select></label>
@@ -3818,36 +3816,39 @@ function SettingsDialog({ initialSection = "appearance", projectRoot, provider, 
           <SettingGroup title="默认声音与听感"><div className="settings-fields two"><label>默认声音<select value={voiceForm.voice_default_profile} onChange={(event) => updateVoiceForm({ voice_default_profile: event.target.value })}><option value="narrator_female">女声旁白</option><option value="female_bright">明快女声</option><option value="female_warm">温柔女声</option><option value="narrator_male">男声旁白</option><option value="male_calm">沉静男声</option><option value="male_firm">坚定男声</option></select></label><label>计算设备<select value={voiceForm.voice_compute_device} onChange={(event) => updateVoiceForm({ voice_compute_device: event.target.value as VoiceSettings["voice_compute_device"] })}><option value="auto">自动（MOSS 优先使用可用 CUDA，失败时显示原因）</option><option value="cpu">只用 CPU（较慢）</option><option value="cuda">NVIDIA CUDA</option></select></label><label>语速 <output>{voiceForm.voice_speed.toFixed(2)}</output><input type="range" min="0.75" max="1.35" step="0.05" value={voiceForm.voice_speed} onChange={(event) => updateVoiceForm({ voice_speed: Number(event.target.value) })} /></label><label>音量 <output>{voiceForm.voice_volume.toFixed(2)}</output><input type="range" min="0.25" max="1.5" step="0.05" value={voiceForm.voice_volume} onChange={(event) => updateVoiceForm({ voice_volume: Number(event.target.value) })} /></label><label>自然停顿 <output>{voiceForm.voice_pause_scale.toFixed(2)}</output><input type="range" min="0.6" max="1.8" step="0.1" value={voiceForm.voice_pause_scale} onChange={(event) => updateVoiceForm({ voice_pause_scale: Number(event.target.value) })} /><small>按逗号、句号、问号、换段自动留白；1.0 为自然节奏</small></label></div></SettingGroup>
           <SettingGroup title="设备偏好" note="不选择时使用 Windows 默认设备。"><div className="settings-inline-actions"><button type="button" onClick={() => void refreshVoiceDevices()}>读取可用设备</button><span>首次读取会触发系统麦克风权限提示。</span></div><div className="settings-fields two"><label>麦克风<select value={voiceForm.voice_input_device} onChange={(event) => updateVoiceForm({ voice_input_device: event.target.value })}><option value="">Windows 默认麦克风</option>{voiceDevices.filter((item) => item.kind === "audioinput").map((item, index) => <option value={item.deviceId} key={item.deviceId}>{item.label || `麦克风 ${index + 1}`}</option>)}</select></label><label>播放设备<select value={voiceForm.voice_output_device} onChange={(event) => updateVoiceForm({ voice_output_device: event.target.value })}><option value="">Windows 默认扬声器</option>{voiceDevices.filter((item) => item.kind === "audiooutput").map((item, index) => <option value={item.deviceId} key={item.deviceId}>{item.label || `扬声器 ${index + 1}`}</option>)}</select></label></div></SettingGroup>
           <p className="form-hint">朗读与语音输入是两个独立本地组件。安装都在后台进行，完成或失败会显示系统通知；已有录音、声音档案和听读结果不会被覆盖。</p>
-          <SettingGroup title="普通话语音输入" note="用于麦克风命令与聊天；浏览器实时听写不可用时自动使用本地识别。"><div className="settings-inline-actions"><button type="button" disabled={asrInstalling || voiceDeleting || Boolean(voiceStatus?.asr?.asr_ready)} onClick={() => void installAsr()}>{asrInstalling ? "安装中…" : voiceStatus?.asr?.asr_ready ? "语音输入已就绪" : voiceInstallProgress.asr?.retryable ? "重新安装语音输入" : "安装语音输入"}</button><button type="button" className="danger" disabled={voiceDeleting} onClick={() => void deleteVoiceComponent("sherpa")}>删除语音输入</button><span>{voiceStatus?.asr?.storage_size_mb ? `已占用 ${voiceStatus.asr.storage_size_mb.toFixed(1)}MB` : "预计下载约 470MB"}</span></div><VoiceInstallProgressCard value={voiceInstallProgress.asr} />{voiceStatus?.asr?.last_error && !voiceInstallProgress.asr?.summary && <p className="form-error">{voiceStatus.asr.last_error}</p>}</SettingGroup>
-          <SettingGroup title="Edge 在线语音" note="安装包已包含连接组件；语音生成在网上进行，不下载或运行本地语音模型。">
+          <SettingGroup title="普通话语音输入" note="把麦克风录音转成文字。"><div className="settings-inline-actions"><button type="button" disabled={asrInstalling || voiceDeleting || Boolean(voiceStatus?.asr?.asr_ready)} onClick={() => void installAsr()}>{asrInstalling ? "安装中…" : voiceStatus?.asr?.asr_ready ? "语音输入已就绪" : voiceInstallProgress.asr?.retryable ? "重新安装语音输入" : "安装语音输入"}</button><button type="button" className="danger" disabled={voiceDeleting} onClick={() => void deleteVoiceComponent("sherpa")}>删除语音输入</button><span>{voiceStatus?.asr?.storage_size_mb ? `已占用 ${voiceStatus.asr.storage_size_mb.toFixed(1)}MB` : "预计下载约 470MB"}</span></div><VoiceInstallProgressCard value={voiceInstallProgress.asr} />{voiceStatus?.asr?.last_error && !voiceInstallProgress.asr?.summary && <p className="form-error">{voiceStatus.asr.last_error}</p>}</SettingGroup>
+          <SettingGroup title="Edge 在线语音" note="使用在线朗读，需联网。">
             <div className="settings-inline-actions">
               <button type="button" disabled={edgeInstalling || voiceDeleting} onClick={() => void installEdge()}>{edgeInstalling ? "安装中…" : voiceStatus?.edge?.needs_update ? "更新 Edge 连接组件" : voiceStatus?.edge?.connection_ready ? "检查并更新 Edge 连接组件" : voiceInstallProgress.edge?.retryable ? "重新安装 Edge 组件" : "安装 Edge 连接组件"}</button>
               <button type="button" className="danger" disabled={voiceDeleting || !voiceStatus?.edge?.has_local_files} onClick={() => void deleteVoiceComponent("edge")}>删除 Edge 组件</button>
               <span>{voiceStatus?.edge?.storage_size_mb ? `已占用 ${voiceStatus.edge.storage_size_mb.toFixed(1)}MB` : "只下载连接组件，不下载模型"}</span>
             </div><VoiceInstallProgressCard value={voiceInstallProgress.edge} />{voiceStatus?.edge?.needs_update && <p className="form-hint">{voiceStatus.edge.compatibility_message}</p>}{voiceStatus?.edge?.last_error && !voiceInstallProgress.edge?.summary && <p className="form-error">{voiceStatus.edge.last_error}</p>}
           </SettingGroup>
-          <SettingGroup title="MOSS 标准组件（默认）" note="点击安装后在这里显示依赖、模型、完成或失败四种状态。"><div className="settings-inline-actions"><button type="button" disabled={mossInstalling || voiceDeleting || Boolean(voiceStatus?.moss?.tts_ready)} onClick={() => void installMoss()}>{mossInstalling ? "安装中…" : voiceStatus?.moss?.tts_ready ? "MOSS 已就绪" : voiceInstallProgress.moss?.retryable ? "重新安装 MOSS" : "安装 MOSS"}</button><button type="button" className="danger" disabled={voiceDeleting} onClick={() => void deleteVoiceComponent("moss")}>删除 MOSS</button><span>{voiceStatus?.moss?.storage_size_mb ? `已占用 ${voiceStatus.moss.storage_size_mb.toFixed(1)}MB` : "预计下载约 2.7GB"}</span></div><VoiceInstallProgressCard value={voiceInstallProgress.moss} />{voiceStatus?.moss?.last_error && !voiceInstallProgress.moss?.summary && <p className="form-error">{voiceStatus.moss.last_error}</p>}</SettingGroup>
-          <SettingGroup title="声音调试与资源" note="这些参数只影响本机音频生成，不修改正文或正史。"><div className="settings-fields two"><label>输出采样率<select value={voiceForm.voice_sample_rate} onChange={(event) => updateVoiceForm({ voice_sample_rate: Number(event.target.value) })}><option value={16000}>16 kHz（省空间）</option><option value={22050}>22.05 kHz</option><option value={24000}>24 kHz（推荐）</option><option value={44100}>44.1 kHz（更大文件）</option><option value={48000}>48 kHz（更大文件）</option></select></label><label>每段最多字数 <small>{voiceForm.voice_segment_chars} 字</small><input type="range" min="120" max="800" step="20" value={voiceForm.voice_segment_chars} onChange={(event) => updateVoiceForm({ voice_segment_chars: Number(event.target.value) })} /></label><label>短音频缓存 <small>{voiceForm.voice_cache_limit_mb} MB</small><input type="range" min="128" max="4096" step="128" value={voiceForm.voice_cache_limit_mb} onChange={(event) => updateVoiceForm({ voice_cache_limit_mb: Number(event.target.value) })} /></label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_debug} onChange={(event) => updateVoiceForm({ voice_debug: event.target.checked })} />开启语音调试日志 <small>只记录运行状态，不记录录音内容</small></label></div><p className="form-hint">分段越短越容易暂停和恢复，但文件数量会增加；缓存达到上限时会自动清理最早的短音频。</p></SettingGroup>
-          <SettingGroup title="语音资料保存位置" note="录音、声音档案、听读结果与已安装组件一起复制，核对后再切换。"><p>{voiceStatus?.data_root || "正在读取当前保存位置…"}</p><button type="button" disabled={voiceMoving || voiceDeleting || edgeInstalling || asrInstalling || mossInstalling} onClick={() => void moveVoiceStorage()}>{voiceMoving ? "正在迁移与核对…" : "更改保存位置"}</button><p className="form-hint">选择磁盘或父文件夹后，会新建专用语音文件夹；原目录保留，目标已有内容时不会覆盖。以后下载和安装使用新位置。</p></SettingGroup>
+          <SettingGroup title="MOSS 标准组件（默认）" note="安装进度与结果会显示在这里。"><div className="settings-inline-actions"><button type="button" disabled={mossInstalling || voiceDeleting || Boolean(voiceStatus?.moss?.tts_ready)} onClick={() => void installMoss()}>{mossInstalling ? "安装中…" : voiceStatus?.moss?.tts_ready ? "MOSS 已就绪" : voiceInstallProgress.moss?.retryable ? "重新安装 MOSS" : "安装 MOSS"}</button><button type="button" className="danger" disabled={voiceDeleting} onClick={() => void deleteVoiceComponent("moss")}>删除 MOSS</button><span>{voiceStatus?.moss?.storage_size_mb ? `已占用 ${voiceStatus.moss.storage_size_mb.toFixed(1)}MB` : "预计下载约 2.7GB"}</span></div><VoiceInstallProgressCard value={voiceInstallProgress.moss} />{voiceStatus?.moss?.last_error && !voiceInstallProgress.moss?.summary && <p className="form-error">{voiceStatus.moss.last_error}</p>}</SettingGroup>
+          <SettingGroup title="声音调试与资源" note="调整语速、音量和声音资源。"><div className="settings-fields two"><label>输出采样率<select value={voiceForm.voice_sample_rate} onChange={(event) => updateVoiceForm({ voice_sample_rate: Number(event.target.value) })}><option value={16000}>16 kHz（省空间）</option><option value={22050}>22.05 kHz</option><option value={24000}>24 kHz（推荐）</option><option value={44100}>44.1 kHz（更大文件）</option><option value={48000}>48 kHz（更大文件）</option></select></label><label>每段最多字数 <small>{voiceForm.voice_segment_chars} 字</small><input type="range" min="120" max="800" step="20" value={voiceForm.voice_segment_chars} onChange={(event) => updateVoiceForm({ voice_segment_chars: Number(event.target.value) })} /></label><label>短音频缓存 <small>{voiceForm.voice_cache_limit_mb} MB</small><input type="range" min="128" max="4096" step="128" value={voiceForm.voice_cache_limit_mb} onChange={(event) => updateVoiceForm({ voice_cache_limit_mb: Number(event.target.value) })} /></label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_debug} onChange={(event) => updateVoiceForm({ voice_debug: event.target.checked })} />开启语音调试日志 <small>只记录运行状态，不记录录音内容</small></label></div><p className="form-hint">分段越短越容易暂停和恢复，但文件数量会增加；缓存达到上限时会自动清理最早的短音频。</p></SettingGroup>
+          <SettingGroup title="语音资料保存位置" note="迁移录音、声音档案和组件，核对后切换。"><p>{voiceStatus?.data_root || "正在读取当前保存位置…"}</p><button type="button" disabled={voiceMoving || voiceDeleting || edgeInstalling || asrInstalling || mossInstalling} onClick={() => void moveVoiceStorage()}>{voiceMoving ? "正在迁移与核对…" : "更改保存位置"}</button><p className="form-hint">选择磁盘或父文件夹后，会新建专用语音文件夹；原目录保留，目标已有内容时不会覆盖。以后下载和安装使用新位置。</p></SettingGroup>
           <details className="voice-technical"><summary>组件与模型信息</summary><p>本地听写：{voiceForm.voice_input_engine === "local" ? "SenseVoice" : voiceForm.voice_input_engine === "browser" ? "浏览器听写" : "未启用"}</p><p>在线朗读连接：{voiceStatus?.edge?.version ? `Edge ${voiceStatus.edge.version}` : "尚未读取"}</p><p>组件状态：{voiceStatus?.edge?.connection_ready ? "当前协议可用" : "需要检查连接组件"}</p></details>
         </SettingsPane>}
-        {section === "context" && <SettingsPane title="上下文与检索" note="参与角色可共用一套预算，也可按职责分别设置；硬事实固定保留，普通资料按相关度压缩。">
+        {section === "context" && <SettingsPane title="上下文与检索" note="调整各角色可读取的资料容量。">
           {limitPreviewWarning}
+          {!form.quality_custom_context && form.quality_preset !== "custom" && <p className="form-hint">容量来自当前档位。<button type="button" onClick={() => updateForm({ quality_custom_context: true })}>沿用当前策略，自定义容量</button></p>}
+          <fieldset className="context-budget-fields" disabled={!form.quality_custom_context && form.quality_preset !== "custom"}>
           <div className="settings-fields"><label>预算方式<select value={form.context_budget_mode} onChange={(event) => updateForm({ context_budget_mode: event.target.value })}><option value="unified">统一：参与角色共用</option><option value="custom">自定义：按角色分别设置</option></select></label></div>
           {form.context_budget_mode === "unified" ? <div className="settings-fields two"><label>统一常用上下文<input type="number" min={1} max={Math.min(form.context_hard_tokens, modelLimits?.context_tokens ?? Infinity)} value={form.context_soft_tokens} onChange={(event) => updateForm({ context_soft_tokens: Number(event.target.value) })} /></label><label>统一最大上下文<input type="number" min={1} max={modelLimits?.context_tokens} value={form.context_hard_tokens} onChange={(event) => updateForm({ context_hard_tokens: Number(event.target.value) })} /></label></div> : <section className="agent-tuning compact">{AGENT_TUNING_META.map((meta) => { const budget = form.agent_context_budgets[meta.id]; return <details key={meta.id} open={meta.id === "writer"}><summary><span><strong>{meta.label}</strong><small>{meta.note}</small></span><span>{Math.round(budget.soft / 1000)}k / {Math.round(budget.hard / 1000)}k</span></summary><div className="agent-tuning-grid"><label>常用上下文<input type="number" min={1} max={Math.min(budget.hard, roleLimits(meta.id)?.context_tokens ?? Infinity)} value={budget.soft} onChange={(event) => updateAgentContextBudget(meta.id, { soft: Number(event.target.value) })} /></label><label>最大上下文<input type="number" min={1} max={roleLimits(meta.id)?.context_tokens} value={budget.hard} onChange={(event) => updateAgentContextBudget(meta.id, { hard: Number(event.target.value) })} /></label></div></details>; })}</section>}
-          <SettingGroup title="混合记忆检索" note="精确查询和本地 BM25 始终可用；召回数量按任务、人物、伏笔与剩余预算动态计算。"><div className="settings-fields two"><label>语义召回模型 <small>可选</small><input value={form.retrieval_embedding_model} onChange={(event) => updateForm({ retrieval_embedding_model: event.target.value })} placeholder="BAAI/bge-m3" /></label><label>精排模型 <small>可选</small><input value={form.retrieval_reranker_model} onChange={(event) => updateForm({ retrieval_reranker_model: event.target.value })} placeholder="BAAI/bge-reranker-v2-m3" /></label></div><p className="form-hint">留空不会下载模型。生成参数里的 Top K 默认也留空，只有接口支持且你明确设置时才发送。</p></SettingGroup>
+          </fieldset>
+          <SettingGroup title="混合记忆检索" note="按当前情节查找相关资料，可选本地语义模型。"><div className="settings-fields two"><label>语义召回模型 <small>可选</small><input value={form.retrieval_embedding_model} onChange={(event) => updateForm({ retrieval_embedding_model: event.target.value })} placeholder="BAAI/bge-m3" /></label><label>精排模型 <small>可选</small><input value={form.retrieval_reranker_model} onChange={(event) => updateForm({ retrieval_reranker_model: event.target.value })} placeholder="BAAI/bge-reranker-v2-m3" /></label></div><p className="form-hint">可选模型留空时，继续使用本地文字检索。</p></SettingGroup>
         </SettingsPane>}
         {section === "review" && <SettingsPane title="Editor · 审查" note="Editor 给出证据化报告，不直接改正文。">
-          <SettingGroup title="手动修改自动核对" note="默认开启。只核对实际变化的设定、正文与草稿；后台处理，有冲突才提示。关闭后暂停自动审核，已存在的问题和正史保护仍保留。"><label className="setting-check"><input type="checkbox" checked={form.manual_edit_review_enabled} onChange={event => updateForm({ manual_edit_review_enabled: event.target.checked })} />开启手动修改后台核对</label></SettingGroup>
-          <div className="settings-fields"><label>核验模式<select value={form.review_verification_mode} onChange={(event) => updateForm({ review_verification_mode: event.target.value })}><option value="evidence">基础：本地证据门禁</option><option value="assisted">增强：纠错并逐条核验</option><option value="strict">严格：争议时调用裁判</option></select></label><label>阅读体验建议<select value={form.review_experience_detail} onChange={(event) => updateForm({ review_experience_detail: event.target.value })}><option value="concise">精简：只提最重要一项</option><option value="standard">标准：优先 1～3 项</option><option value="detailed">详细：完整说明但不扩大硬门禁</option></select></label><label>本地中文 NLI <small>留空关闭</small><input value={form.review_local_nli_model} onChange={(event) => updateForm({ review_local_nli_model: event.target.value })} placeholder="本机模型路径或名称" /></label><label>争议裁判模型 <small>留空关闭</small><input value={form.review_judge_model} onChange={(event) => updateForm({ review_judge_model: event.target.value })} placeholder="当前兼容接口中的模型 ID" /></label></div><p className="form-hint">钩子的未知项、延后回应和开放问题本身不算表达不清；Editor 只阻止有证据的剧情硬冲突、知识越界和无法成立的因果。</p>
+          <SettingGroup title="手动修改自动核对" note="后台核对改动，有冲突时提醒。关闭后暂停自动核对。"><label className="setting-check"><input type="checkbox" checked={form.manual_edit_review_enabled} onChange={event => updateForm({ manual_edit_review_enabled: event.target.checked })} />开启手动修改后台核对</label></SettingGroup>
+          <div className="settings-fields"><label>核验模式<select value={form.review_verification_mode} onChange={(event) => updateForm({ review_verification_mode: event.target.value })}><option value="evidence">基础：本地证据门禁</option><option value="assisted">增强：纠错并逐条核验</option><option value="strict">严格：争议时调用裁判</option></select></label><label>阅读体验建议<select value={form.review_experience_detail} onChange={(event) => updateForm({ review_experience_detail: event.target.value })}><option value="concise">精简：只提最重要一项</option><option value="standard">标准：优先 1～3 项</option><option value="detailed">详细：完整说明但不扩大硬门禁</option></select></label><label>本地中文 NLI <small>留空关闭</small><input value={form.review_local_nli_model} onChange={(event) => updateForm({ review_local_nli_model: event.target.value })} placeholder="本机模型路径或名称" /></label><label>争议裁判模型 <small>留空关闭</small><input value={form.review_judge_model} onChange={(event) => updateForm({ review_judge_model: event.target.value })} placeholder="当前兼容接口中的模型 ID" /></label></div><p className="form-hint">审查以正文和证据为准，保留合理留白。</p>
         </SettingsPane>}
-        {section === "story_settings" && <SettingsPane title="本书设定" note="持续维护小说资料，模块和记录立即保存；正文与正史保留独立审核。"><StorySettings key={projectRoot} projectRoot={projectRoot} /></SettingsPane>}
+        {section === "story_settings" && <SettingsPane title="本书设定" note="分层管理设定，随章节维护。"><StorySettings key={projectRoot} projectRoot={projectRoot} /></SettingsPane>}
         {section === "author" && <SettingsPane title="作者习惯与记忆" note="管理长期习惯，保留每本书自己的声音。"><AuthorPreferences projectRoot={projectRoot} /></SettingsPane>}
-        {section === "advanced" && <SettingsPane title="高级" note="普通创作不需要修改这里。模型参数已归到模型页，语音参数只在语音页出现一次。">
-          <SettingGroup title="高级电脑操作" note="默认关闭。开启后每条命令仍会弹窗展示并等待你单独确认；命令使用当前 Windows 账户权限，可能读写项目目录以外的文件、联网或启动应用。"><label className="setting-check"><input type="checkbox" checked={form.powershell_enabled} onChange={(event) => updateForm({ powershell_enabled: event.target.checked })} />允许墨流提出 PowerShell 操作请求</label></SettingGroup>
+        {section === "advanced" && <SettingsPane title="高级" note="其他进阶选项。">
+          <SettingGroup title="高级电脑操作" note="默认关闭。允许提出读写文件、联网和启动应用的命令；每条执行前仍须确认。"><label className="setting-check"><input type="checkbox" checked={form.powershell_enabled} onChange={(event) => updateForm({ powershell_enabled: event.target.checked })} />允许墨流提出 PowerShell 操作请求</label></SettingGroup>
         </SettingsPane>}
       </div>
-      <footer className="settings-actions">{result && <span className="form-success">✓ {result}</span>}{error && <span className="form-error">{error}</span>}<button type="button" onClick={onClose}>关闭</button><button className="primary" type="submit" disabled={working}>{working ? "正在保存…" : "保存设置"}</button></footer>
+      <footer className="settings-actions">{result && <span className="form-success">✓ {result}</span>}{error && <span className="form-error">{error}</span>}<button type="button" onClick={onClose}>关闭</button><button className="primary" type="submit" disabled={working || !provider}>{working ? "正在保存…" : "保存设置"}</button></footer>
     </form>
   </Modal>;
 }
@@ -4034,7 +4035,7 @@ function LiveRunCard({ summary, steps = [], startedAt }: { summary?: string; ste
     : role === "writer" ? "正在处理当前创作任务…"
     : "正在理解你的想法…";
   return <article className="message assistant pending live-run-card" aria-live="polite">
-    <span className="avatar mobao-message-avatar"><MobaoAvatar mood={current?.status === "failed" ? "frustrated" : "thinking"} /></span>
+    <span className="avatar mobao-message-avatar"><MobaoAvatar animate mood={current?.status === "failed" ? "frustrated" : busyMascotMood(steps, current?.run_id || null)} /></span>
     <div>
       <p>{current?.status === "failed" ? summary || "遇到问题，正在检查能否继续。" : focus}</p>
       <ProcessDisclosure startedAt={startedAt} steps={steps} />
@@ -4063,6 +4064,7 @@ function visibleResult(result: unknown): { summary: string; details?: string; re
   const value = result as Record<string, unknown>;
   const reasoning = collectPublicSummaries(result);
   const safeDetails = readableRecord(displaySafeValue(value));
+  if (value.failure_kind === "model_connection") return { summary: `${String(value.reply || value.title)}\n${String(value.next_action || "")}`, reasoning, details: safeDetails };
   if (value.workflow_failure || value.gate || value.stop_reason) {
     return { summary: `尚未完成：${String(value.workflow_failure || value.gate || value.stop_reason)}${value.next_action ? `\n下一步：${String(value.next_action)}` : ""}`, reasoning, details: safeDetails };
   }
@@ -4079,6 +4081,12 @@ function visibleResult(result: unknown): { summary: string; details?: string; re
   if (value.status === "accepted" && value.chapter_no) {
     const warnings = Array.isArray(value.warnings) ? value.warnings.map(String).join("；") : "";
     return { summary: `第 ${String(value.chapter_no)} 章已通过审核并收进正文，相关记忆已保存。${warnings ? `另有待处理项：${warnings}` : "本次操作已完成。"}`, reasoning, details: safeDetails };
+  }
+  if (value.status === "planned") {
+    const revision = typeof value.revision_no === "number" && Number.isInteger(value.revision_no) && value.revision_no > 0 ? value.revision_no : null;
+    const range = Array.isArray(value.future_range) && value.future_range.length === 2 && value.future_range.every(item => typeof item === "number" && Number.isInteger(item) && item > 0) && value.future_range[0] <= value.future_range[1] ? value.future_range : null;
+    const chapters = range ? `，后续安排为第 ${range[0]}${range[0] === range[1] ? "" : `～${range[1]}`} 章` : "";
+    return { summary: `${revision ? `第 ${revision} 版规划已正式生效` : "章节规划已更新"}${chapters}。${revision ? "可以按当前规划继续写作。" : String(value.next_action || "")}`, reasoning, details: safeDetails };
   }
   if (value.status === "needs_input" && value.chapter_no) {
     if (value.changed && value.version) {
@@ -4147,7 +4155,7 @@ async function withDeadline<T>(request: Promise<T>, ms: number, message: string)
   finally { if (timer) clearTimeout(timer); }
 }
 function currentChapter(path?: string): number | null { const match = path?.match(/chapter_(\d+)/); return match ? Number(match[1]) : null; }
-function tabLabel(tab: Tab): string { return ({ project: "项目", editor: "正文", chapter: "章工位", review: "审查", memory: "记忆", references: "参考", listen: "听读", process: "协作台" })[tab]; }
+function tabLabel(tab: Tab): string { return ({ project: "项目", editor: "正文", chapter: "章工位", review: "审查", references: "参考", listen: "听读", process: "协作台" })[tab]; }
 function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "run.cancelled": "任务已停止", "run.waiting_user": "等待你回答", "run.waiting_condition": "等待条件", "recovery.waiting": "自动等待项目空闲", "workflow.waiting_user": "等待你回答", "workflow.waiting_condition": "已保存断点", "model.recovering": "模型步骤自修复", "run.steered": "已接收人工引导", "workflow.started": "工作流启动", "workflow.planned": "真实任务单", "workflow.completed": "工作流完成", "workflow.conflict": "正在处理分歧", "controller.routing": "理解与路由", "coordinator.model.started": "Coordinator 请求模型", "writer.started": "Writer 请求模型", "writer.completed": "Writer 完成", "editor.started": "Editor 开始审查", "reviewer.started": "开始审查", "workflow.stage": "工作流阶段", "outline.model": "Writer 生成独立大纲", "voice.moss.install.queued": "MOSS 已进入后台安装", "voice.asr.install.queued": "语音输入已进入后台安装", "voice.moss.install.progress": "MOSS 安装进度", "voice.asr.install.progress": "语音输入安装进度", "voice.moss.install.failed": "MOSS 安装失败", "voice.asr.install.failed": "语音输入安装失败", "provider.testing": "模型连接" } as Record<string, string>)[value || ""] || (value && /^[a-z_]+[.:-]/i.test(value) ? /^writer/.test(value) ? "写作处理" : /^(?:editor|reviewer|review)/.test(value) ? "审查核对" : /^memory/.test(value) ? "记忆整理" : /^coordinator|controller|session/.test(value) ? "任务协调" : "处理过程" : value) || "处理过程"; }
 function agentRoleLabel(value: string): string { return ({ coordinator: "调度", writer: "创作", editor: "编辑", reviewer: "专项审查", memory_keeper: "记忆整理", engine: "工作引擎", user: "你" } as Record<string, string>)[value] || value; }
 function operationLabel(value: string): string { return ({ "plan.generate": "生成四级规划", "plan.outline": "生成独立章节大纲", "settings.update": "修改运行设置", "chapter.write": "生成章节草稿", "chapter.review_mode": "按任务模式审查当前版本", "chapter.revise": "修订为新版本", "chapter.accept": "提交已通过版本的正史补丁", "batch.draft_loop": "逐章写作、审查与临时连续性", "batch.accept_loop": "按顺序提交通过章节", "arc.audit": "复审篇章承诺" } as Record<string, string>)[value] || value; }

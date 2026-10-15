@@ -6,6 +6,7 @@ import asyncio
 import json
 import math
 import re
+import traceback
 from uuid import uuid4
 from contextlib import AsyncExitStack
 from datetime import datetime, timezone
@@ -19,14 +20,14 @@ from .config import Settings, save_user_settings
 from .craft import AUTHOR_VOICE_CONTRACT
 from .coordinator import Coordinator, NO_ACCEPTANCE_PATTERN
 from .engine import InkFlowEngine
-from .errors import InkFlowError, ProjectBusyError, ValidationGateError
+from .errors import InkFlowError, ProjectBusyError, ValidationGateError, provider_failure_guidance
 from .planning_pipeline import PlanningNeedsAttention, load_active_planning, restore_kept_planning_publication
 from .project import InkFlowProject
 from .planning_history import kept_revisions, read_kept_part
 from .planning_cleanup import cleanup_keep, cleanup_preview
 from .prompts import MOBAO_PERSONA, COORDINATOR_RECOVERY_SYSTEM
 from .project_lock import project_write_lock, project_write_lock_sync
-from .schemas import CoordinatorRecoveryPlan, ContextPacket, ContextSection, DispatchPlan, TaskTicket, TerminalIntent
+from .schemas import ConversationReply, CoordinatorRecoveryPlan, ContextPacket, ContextSection, DispatchPlan, TaskTicket, TerminalIntent
 from .studio import StudioService
 from .conversation_scope import active_conversation, conversation_key
 from .task_settings import active_task_settings, use_task_settings
@@ -39,6 +40,9 @@ from .utils import atomic_write_text, content_hash, estimate_tokens, json_dumps,
 
 TERMINAL_ROUTER_SYSTEM = """
 你是墨流的 Coordinator（墨宝协调者）。默认创作流程由 Writer 写作、Editor 审读，正史由引擎提交；专项 Reviewer 和 Memory Keeper 是否启用只能依据当前任务模式与引擎授权，不得自行宣称已启用或代替其职责。所有模式使用同一审查契约并按责任分工。
+上下文 collaboration_selection.pending=true 表示用户已选择四人按需加强。仅在本次同一意图输出中，按任务实质选择 specialist_role：记忆梳理、证据归类或设定积累选 memory_keeper，连续性、因果和正文核对选 reviewer，并用 specialist_reason 简述职责。不要同时选择两者，不另起协调调用；只读聊天不要求生产角色。已有固定分工、恢复任务或禁止额外调用时不得重新升级或换人。
+同时需要审查和记忆时仍保持四人，按当前关键问题选择一个专项角色，Editor承担另一项既有责任；不得自动升级为五人。
+高质量策略遇到主线转折、卷末高潮、多伏笔汇合、关键立场改变或作者明确的重点，且独立小规划会改变创作选择时，可在同次路由填写planning_discussion，具体说明为何值得先商量。普通章节留空，在同次Writer准备；没有明确用户选择前不能擅自把写作改成独立规划调用。已经回答该项选择时不再提出。
 
 你的工作是理解和维护用户需求、把自然语言整理成任务单，并映射到一个已存在、不可跳过门禁的工作流。你还要在执行结果中给出一条简短、可操作的下一步建议；建议只是用户可选择的入口，不代表自动授权。你绝不能：
 - 写小说正文、续写任何段落、生成审查意见或记忆事实；
@@ -52,6 +56,9 @@ TERMINAL_ROUTER_SYSTEM = """
 - 把用户当成正在和创作伙伴聊天的人，而不是在填写工作流表单。用户不需要知道 Coordinator、Writer、Editor、记忆服务、action、verdict 或 Context Packet 等内部术语；即使只说“你再好好看看第一章，先别收进去”，也要理解为让 Editor 审查当前章且本轮禁止验收。
 - 用户可能把背景、抱怨、要求和补充断成几句，也可能重复“好吧”“你看一下”“不是这个意思”。结合最近对话保留真正目标，不要求用户改写成命令句，不照抄内部字段回话。
 - 先理解用户最终想得到什么，再选择当前可执行的第一步。不要因为用户没说“审查”“复审”“确认”等标准词就判定无法处理。
+- 结合最近原话、当前小说及唯一待办理解“这个、刚才那版、差不多、再改改”等口语和近似称呼。唯一明确的对象采用合理解释并简短说明；多个对象都可能时只问会改变执行结果的那一点，给具体可选项，不要求重新填写整张任务单。
+- 明确区分现在要做、依赖完成后才能做、用户以后才会提出的事。“先整理设定，随后我会让你写51，再批量52到55”本轮只整理设定；不能跳到最后出现的章号或把历史的“已接受”当本次验收授权。已有流程覆盖不了整个目标时，选可执行的第一步并在回复保留后续顺序。
+- 用户抱怨遗漏或不满意时先回应具体没做到的事，再给可实施的补救。可以从读者理解、人物动机、连续性或成本角度补充一条相关建议；关心要贴合当下，不固定附加安慰或催促，不把语气亲切变成擅自扩大工作。
 - 不要把“这个方案似乎可以”“如果这样改会怎样”当成立即执行；“行，就这么做”“照刚才说的改”“没问题，动手吧”都可以表示明确执行。
 - “审查通过后就收进正史”“检查没问题的话就接收”是带安全条件的明确执行命令，应使用 review_accept 且 authorization=approved；“如果没问题是不是可以收进去”是在询问可能性，仍是 discuss/proposed。
 - “先别收进去”“这次不要验收”“别自动接受”“我想先看看”都是本轮硬性禁止验收；无论保存设置是什么，都只能选择不带 accept 的动作。用户问“你们怎么配合的”是要求把交接与证据讲清楚，不是授权多做一步。
@@ -77,6 +84,8 @@ TERMINAL_ROUTER_SYSTEM = """
 - scene_draft：用户明确要试写一个场景、片段或短草稿时使用。只由 Writer 产出隔离候选，narrative_scope=scene，不覆盖章节正文，不审查、验收或入正史。
 - story_settings_manage：设定是持续维护的合集，可记录人物、场景、道具、世界等及自定义字段，不仅开书资料。由语义理解用户请求，不靠固定关键词。用户要求检查设定与规划、正文一致性，或维护现有设定、补齐已有资料中的基础记录与失败引用时，使用operation=audit，不需要先选合集或提供替换原文。只有明确创作新的设想才用record_generate；record_supplement只处理已指定的单条记录，不能拿它代替跨合集维护。setting_change.apply_corrections仅在用户明确要求处理或整改时为true；只查看时为false。由实际审查角色读取资料、提出有据修正，Coordinator不能凭自己的概括代替审查。范围已说明时直接执行，不再把原话改写成确认题。其余setting_change.operation 选择 collection_create/collection_update/collection_archive/record_generate/record_supplement/record_save/record_archive/list；可用collection_id或collection_name唯一定位，更新删除须读取当前revision作为expected_revision。用户定义name/category/template_id/instructions/fields。生成新的设定交Writer，补证纠正交当前审查或记忆所有者；你只提取目标与参数，不编写设定正文，不更改正史、不永久删除。若回答后台手动核对疑问，可用manual_decide，必须绑定上下文中的job_id与current_hash作为expected_hash，decision为keep_pending/request_revision/confirm_exception/discard_candidate，reason保留用户解释；只有具体解释可请求一次限次复核，简单同意不覆盖硬正史。不明确合集或取舍时只问必要问题；有据记录、创作假设、人物信念分别标注。
 - 用户明确要求自行分析并新增一至三类分层设定时，可使用story_settings_manage，setting_change.operation=collection_create_many、collections数组。用户要具体设定时populate_records=true，引擎在同任务内接续当前责任角色核对已有正文并保存记录；只要空模板时为false。用户已授权纠正当前书籍要求时apply_corrections=true，否则不自动改书籍约束。每项只定义name/template_id/category/instructions/fields/auto_record，分类用“上层 / 子层”表达，写清记录目标、更新时机与不要混入的内容；角色读取/写入沿现有默认权限，不自行更改权限。不能把只建空合集说成具体设定已完成。已有同名合集先读取并复用，后续用operation=audit、collection_names点名这些合集、new_record_limit限定一至三条具体记录、apply_corrections按用户授权填写，从正史提取并核对来源后保存。Coordinator负责组织结构，不能代写具体设定或自行批准。不要因用户未指定分类名称重复询问已经授权你判断的常规分类。
+- 单条设定的“核对后纠正并保存”使用record_supplement，提取collection_id、record_id及当前expected_revision，具体字段和证据由当前记忆角色核对；不要使用缺values的record_save，也不要自行编造values。record_save只复制用户原话明确给出的完整字段对象。
+- 用户明确选择将重复设定合并并将另一条留档时，使用story_settings_manage、operation=record_merge，只提取collection_id、keep_record_id、keep_expected_revision、archive_record_id、archive_expected_revision。读取两条当前记录的ID和revision确定保留与留档方向，不能仅根据修订号替用户丢掉另一条独有信息；合并内容交当前记忆责任角色核对，保存通过后引擎才留档。用户对刚才设定提问的回答沿原任务及禁止项续接，不重跑整份audit，不重复创建已成功记录。
 - story_setting_edit：用户明确要求修改书籍设定、大纲或剧情细纲时使用。document_kind 为 book、outline 或 story_detail；book 的 setting_change 只填明确要改的 BookBrief 字段；用户明确更改总字数、卷数或章节规模时，同时检查 user_rules 是否仍含旧要求，仅替换已明确被取代的部分并保留其余题材、人物与文风要求，不能只改 estimated_chapters 后继续把旧字数当硬规则；历史原话由版本记录保留，不冠以“不可改写”继续作为生效要求，大纲和细纲只填唯一原文 old_text 与替换文字 new_text。不要把“讨论怎么改”解释为执行，也不要修改已接受正文。
 - plan：近期章节安排，参考设定、独立大纲、剧情细纲与已写正文，再切分章节和字数；用户未指定范围时只展开接下来约三章。逐章场景安排属于计划，不是细纲。
 - 用户要求“理顺/修改几章的安排、别重复已发生的事”属于 plan。若随后要求“按新安排修好这些章节，检查后接收”，用 batch_draft_accept，并采用 latest_pending_plan_revision 给出的明确窗口；不得扩回旧批次更大的范围。计划任务本身不写正文。
@@ -164,12 +173,13 @@ TERMINAL_ROUTER_SYSTEM += (
 )
 
 
-_SENSITIVE_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+_SENSITIVE_PATTERN = re.compile(r"\b(?:sk|tp|ttp)-[A-Za-z0-9_-]{12,}\b")
 _EXPLICIT_COLLABORATION_MODE = re.compile(
     r"^\s*请?\s*(?:开启|使用|切换到|切换回|按|用)\s*"
-    r"(日常|审查加强|记忆加强|深度|特殊五角色|五角色)模式(?=\s|[，,：:]|审|复|检|$)"
+    r"(日常协作|按需加强|全面协作|日常|审查加强|记忆加强|深度|特殊五角色|五角色)(?:模式)?(?=\s|[，,：:]|审|复|检|$)"
 )
 _COLLABORATION_MODE_NAMES = {
+    "日常协作": "everyday", "按需加强": "adaptive", "全面协作": "full_specialist",
     "日常": "everyday",
     "审查加强": "review_boost",
     "记忆加强": "memory_boost",
@@ -285,6 +295,13 @@ _PENDING_TASK_ACTIONS = {
     "review", "write_draft", "revise_draft", "accept", "outline", "plan", "batch_repair",
 }
 
+
+def _resumable_intent(intent: TerminalIntent) -> bool:
+    return intent.action in _PENDING_TASK_ACTIONS or (intent.action == "story_settings_manage" and (
+        intent.setting_change.get("operation") in {"audit", "record_save", "record_supplement", "record_merge"}
+        or (intent.setting_change.get("operation") == "collection_create_many"
+            and intent.setting_change.get("populate_records") is True)))
+
 _FIELD_LABELS = {
     "chapter_no": "章节号",
     "end_chapter_no": "结束章节号",
@@ -303,6 +320,8 @@ _SETTING_LABELS = {
     "reasoning_effort": "思考强度",
     "inquiry_frequency": "主动询问频率",
     "hook_strategy": "章节结尾钩子",
+    "collaboration_preset": "协作方式",
+    "quality_custom_context": "自定义上下文容量",
     "chapter_length_tolerance": "章节长度容错",
     "review_min_confidence": "Editor 审查最低把握度",
     "acceptance_confirmation_mode": "验收确认方式",
@@ -318,6 +337,7 @@ _SETTING_LABELS = {
 }
 
 _SETTING_VALUE_LABELS = {
+    "collaboration_preset": {"everyday": "日常协作（3 Agent）", "adaptive": "按需加强（4 Agent）", "full_specialist": "全面协作（5 Agent）"},
     "reasoning_effort": {"low": "低", "medium": "中", "high": "高", "max": "最高"},
     "inquiry_frequency": {"low": "少问", "medium": "适中", "high": "多问", "ultra": "频繁"},
     "hook_strategy": {
@@ -347,6 +367,19 @@ class TerminalSession:
     @staticmethod
     def pending_resume(project: InkFlowProject, text: str) -> dict[str, Any] | None:
         """Share the exact resume decision with callers restoring task settings."""
+        improvement = TerminalSession._confirmed_improvement_intent(project, text)
+        if improvement is not None:
+            question = TerminalSession._pending_question(project)
+            return {"status": "waiting_user", "intent": improvement.model_dump(mode="json"),
+                    "run_id": question.get("run_id", ""), "task_id": question.get("snapshot_task_id", ""),
+                    "resume_end": len(text)}
+        question = TerminalSession._pending_question(project)
+        if question and any(card.get("id") == "complex-preparation" for card in question.get("questions", [])):
+            prepared = TerminalSession._confirmed_question_intent(text, question)
+            if prepared is not None:
+                return {"status": "waiting_user", "intent": prepared.model_dump(mode="json"),
+                    "run_id": question.get("run_id", ""), "task_id": question.get("snapshot_task_id", ""),
+                    "resume_end": len(text)}
         preference_intent = TerminalSession._confirmed_preference_intent(project, text)
         if preference_intent is not None:
             question = TerminalSession._pending_question(project)
@@ -365,7 +398,25 @@ class TerminalSession:
             # A new user revision needs a new Coordinator decision, not the
             # old task's automatic resume path.
             return None
-        if TerminalSession._pending_question(project) is not None:
+        question = TerminalSession._pending_question(project)
+        if question and question.get("intent", {}).get("action") == "story_settings_manage":
+            cards = question.get("questions") or []
+            labels = [str(item.get("label", "")).replace("（推荐）", "").strip()
+                for card in cards for item in card.get("options", []) if item.get("kind") != "other"]
+            answer = text.strip("。！! \r\n")
+            if ((len(cards) == 1 and answer in labels)
+                    or re.match(r"^(?:我来回答刚才的问题|我的回答|我选(?:择)?|(?:关于|针对)刚才的?(?:问题|选项))", answer)):
+                task_id = str(question.get("snapshot_task_id") or "")
+                run_id = str(question.get("run_id") or "")
+                if task_id and not run_id:
+                    previous_run = StudioService(project).db.latest_task_run_for_settings(task_id)
+                    run_id = str(previous_run["run_id"]) if previous_run else ""
+                if task_id and not run_id:
+                    raise ValidationGateError("这份设定选择缺少原任务运行来源，未用当前设置替换；请先查看原任务。")
+                if task_id and run_id:
+                    return {"intent": question["intent"], "task_id": task_id, "run_id": run_id,
+                            "resume_end": len(text), "route_answer": True}
+        if question is not None:
             return None
         pending = project.db.get_metadata(conversation_key("pending_creation_task"))
         match = re.match(
@@ -393,7 +444,8 @@ class TerminalSession:
         return {**pending, "resume_end": match.end()}
 
     @staticmethod
-    def _save_pending_task(project: InkFlowProject, intent: TerminalIntent, status: str) -> None:
+    def _save_pending_task(project: InkFlowProject, intent: TerminalIntent, status: str,
+                           *, response: dict[str, Any] | None = None) -> None:
         previous = project.db.get_metadata(conversation_key("pending_creation_task"))
         serialized_intent = intent.model_dump(mode="json")
         same_intent = isinstance(previous, dict) and ("intent" not in previous or previous["intent"] == serialized_intent)
@@ -403,8 +455,16 @@ class TerminalSession:
         if runtime is not None:
             identifiers.update({key: value for key in ("run_id", "task_id")
                                 if (value := getattr(runtime, key, None))})
+        checkpoint = previous.get("response_checkpoint") if same_intent else None
+        if checkpoint and checkpoint.get("task_id") != identifiers.get("task_id"):
+            checkpoint = None
+        if response is not None and intent.action == "story_settings_manage":
+            scope = active_task_settings.get()
+            checkpoint = {"response": response, "source": TerminalSession._work_source(project),
+                          "task_id": scope.task_id if scope else "", "snapshot_hash": scope.snapshot_hash if scope else ""}
         project.db.set_metadata(conversation_key("pending_creation_task"), {
             "status": status, "intent": serialized_intent, **identifiers,
+            **({"response_checkpoint": checkpoint} if checkpoint else {}),
         })
         if identifiers.get("task_id") or identifiers.get("run_id"):
             item = project.record_pending_work(kind="workflow",
@@ -543,13 +603,18 @@ class TerminalSession:
             question_id = f"pending-question-{uuid4().hex}"
             scope = active_task_settings.get()
             original_run = StudioService(project).db.latest_task_run_for_settings(scope.task_id) if scope else None
+            quality = next((card for card in response.get("questions", [])
+                if isinstance(card, dict) and card.get("id") == "chapter-improvement"), {})
+            quality_source = project.db.get_metadata(quality.get("quality_choice_key", ""), {}) if quality else {}
             project.db.set_metadata(conversation_key("pending_terminal_question"), {
                 "id": question_id,
                 "task_id": ticket.ticket_id,
                 "intent": intent.model_dump(mode="json"),
                 "questions": response.get("questions") or [],
-                "snapshot_task_id": active_task_settings.get().task_id if active_task_settings.get() else "",
-                "run_id": original_run["run_id"] if original_run and response.get("preference_run_id") else "",
+                "snapshot_task_id": quality_source.get("parent_task_id") or (scope.task_id if scope else ""),
+                "run_id": quality_source.get("parent_run_id") or (original_run["run_id"] if original_run and
+                    (quality or response.get("preference_run_id") or intent.action == "story_settings_manage"
+                     or any(card.get("id") == "complex-preparation" for card in response.get("questions", []))) else ""),
                 "preference_resolutions": response.get("preference_resolutions", []),
             })
             response["pending_question_id"] = question_id
@@ -646,7 +711,7 @@ class TerminalSession:
                 "gate": "检测到疑似 API Key。为避免写入 Trace 或项目文件，已拒绝处理该输入。",
             }
         explicit_mode = _EXPLICIT_COLLABORATION_MODE.match(text)
-        requested_mode = new_task_mode(_COLLABORATION_MODE_NAMES[explicit_mode.group(1)]) if explicit_mode else None
+        requested_mode = _COLLABORATION_MODE_NAMES[explicit_mode.group(1)] if explicit_mode else None
         if active_task_settings.get() is None:
             task_db = StudioService(project).db
             pending = self.pending_resume(project, text)
@@ -663,7 +728,7 @@ class TerminalSession:
                 f"terminal-{uuid4().hex}", novel_id=project.project_id,
                 settings=self.engine.settings, workspace_root=project.root,
                 resume_run_id=resume_run_id or None,
-                collaboration_mode=requested_mode if resume_run_id else requested_mode or "everyday",
+                collaboration_mode=requested_mode,
             )
             with use_task_settings(scope):
                 previous_engine = self.engine
@@ -677,7 +742,7 @@ class TerminalSession:
                     self.engine = previous_engine
         if explicit_mode:
             task_scope = active_task_settings.get()
-            if task_scope.collaboration_mode != requested_mode:
+            if not task_scope.matches_collaboration_request(requested_mode):
                 return {
                     "session": "墨流终端会话",
                     "gate": "协作模式必须在任务开始时固定配置快照；请另起任务选择该模式。",
@@ -685,13 +750,25 @@ class TerminalSession:
         if text.lower() in {"/exit", "exit", "退出", "结束"}:
             return {"session": "墨流终端会话", "ended": True, "message": "会话已结束。"}
 
+        quality_answer = self._improvement_answer(project, text)
+        if quality_answer:
+            key, decision = quality_answer
+            async with project_write_lock(project.root):
+                stored = project.db.get_metadata(key, {})
+                scope = active_task_settings.get()
+                chapter_no = stored.get("chapter_no")
+                chapter = project.db.get_chapter(chapter_no) if type(chapter_no) is int else None
+                if (not scope or stored.get("parent_task_id") != scope.task_id or not chapter
+                        or chapter["status"] != "draft" or stored.get("phase") != "offered"
+                        or stored.get("decision") not in {"pending", decision}
+                        or stored.get("source") != self.engine._revision_source_fingerprint(project, chapter_no)):
+                    return {"status": "waiting_condition", "gate": "这张修改选择的正文、来源或任务已经变化；未按旧建议改稿，请先核对当前版本。"}
+                project.db.set_metadata(key, {**stored, "decision": decision})
+
         shortcut = self._quick_response(project, text)
         if shortcut is not None:
-            reply = (
-                "已返回墨流使用说明（无需模型调用）。"
-                if shortcut.get("help")
-                else "已返回当前项目状态（无需模型调用）。"
-            )
+            reply = str(shortcut.get("reply") or ("已返回墨流使用说明（无需模型调用）。"
+                if shortcut.get("help") else "已返回当前项目状态（无需模型调用）。"))
             self._append_dialogue_entry(project, text, reply, "本地快速回答")
             return shortcut
 
@@ -714,7 +791,7 @@ class TerminalSession:
                                         visible_reason="查看当前待办和实际续接条件")
         if local_work is not None and local_work.action == "pending_work":
             scope = active_task_settings.get()
-            ticket, plan = Coordinator(project).compile(local_work, collaboration_mode=scope.collaboration_mode,
+            ticket, plan = Coordinator(project).compile(local_work, collaboration_mode=scope.effective_collaboration_mode,
                                                        task_snapshot_hash=scope.snapshot_hash)
             result = await self._dispatch(project.root, local_work, ticket, plan)
             async with project_write_lock(project.root):
@@ -737,7 +814,7 @@ class TerminalSession:
                 if isinstance(item, dict) and item.get("status") == "pending" and item.get("id")
             } if isinstance(queued_updates, list) else set()
             packet = self._build_packet(project, text)
-            proposal_basis = self._work_source(project)
+            proposal_basis = {} if packet.task == "日常交流" else self._work_source(project)
             packet_path = trace.run_dir / "context-packet.md"
             atomic_write_text(packet_path, packet.to_markdown())
             trace.record(
@@ -747,7 +824,7 @@ class TerminalSession:
                 metadata={"estimated_tokens": packet.estimated_tokens, "sections": [item.key for item in packet.sections]},
             )
             pending = self.pending_resume(project, text)
-            if pending is not None:
+            if pending is not None and not pending.get("route_answer"):
                 saved_intent = TerminalIntent.model_validate(pending["intent"])
                 # A normal user often resumes a task and adds one short writing
                 # preference in the same sentence. Preserve the saved range and
@@ -810,10 +887,7 @@ class TerminalSession:
                     if emit:
                         await emit({"type": "coordinator.model.started", "stage": "controller.routing", "role": "coordinator", "model": self.engine.settings.model, "summary": "墨宝正在理解你的要求"})
                     trace.record_model_started("controller.routing", model=self.engine.settings.model, agent_role="coordinator", max_tokens=1600, thinking=False)
-                    route_result = await self.engine.provider.generate_json(
-                        system_prompt=TERMINAL_ROUTER_SYSTEM, user_prompt=packet.to_model_prompt(),
-                        output_model=TerminalIntent, effort="low", max_tokens=1600, thinking=False, agent_role="coordinator",
-                    )
+                    route_result = await self._route_packet(packet)
             steering_messages = await consume_steering() if consume_steering else []
             if steering_messages:
                 async with project_write_lock(project.root):
@@ -837,15 +911,7 @@ class TerminalSession:
                     timeout_seconds=self.engine.settings.request_timeout_seconds,
                     thinking=False,
                 )
-                route_result = await self.engine.provider.generate_json(
-                    system_prompt=TERMINAL_ROUTER_SYSTEM,
-                    user_prompt=packet.to_model_prompt(),
-                    output_model=TerminalIntent,
-                    effort="low",
-                    max_tokens=1600,
-                    thinking=False,
-                    agent_role="coordinator",
-                )
+                route_result = await self._route_packet(packet)
             # A local continuation saves routing calls, but must not discard concrete feedback.
             feedback_routing = (re.search(r"写法|文风|风格|表达|口气|对白|标点|段落|病句|措辞|协作习惯", text)
                 and re.search(r"满意|喜欢|生硬|机械|不自然|没做好|没改好|太重复|默认|以后|长期|记住|跨书|每本书", text))
@@ -877,6 +943,13 @@ class TerminalSession:
                 except Exception as exc:
                     trace.record("coordinator.preference_feedback", "not_run", "后台偏好核对未完成，原任务按既有授权继续",
                         details=str(exc), public=False)
+            if packet.task == "日常交流" and route_result.data.action == "chat":
+                reply = route_result.data.conversation_reply
+                self._append_dialogue_entry(project, text, reply, "日常交流")
+                trace.record("session.chat", "completed", "已回应当前话题", metadata={"model": route_result.model, "usage": route_result.usage})
+                trace.finish(status="completed", summary="日常交流已回复")
+                return {"status": "completed", "reply": reply, "suggested_prompts": [],
+                        "session": {"route": "chat", "trace_id": trace.run_id, "model": route_result.model}}
             raw_intent = self._coerce_settings_intent(text, route_result.data)
             from .preferences import capture_observations
             captured_preferences = capture_observations(project.db, raw_intent.preference_observations,
@@ -945,6 +1018,13 @@ class TerminalSession:
                     if related_id:
                         raw_intent = raw_intent.model_copy(update={"related_task_id": str(related_id)})
             raw_intent = Coordinator.normalize_intent(raw_intent, text, previous_intent=previous_intent)
+            if pending and pending.get("route_answer") and raw_intent.action == "story_settings_manage":
+                previous = TerminalIntent.model_validate(pending["intent"])
+                question = self._pending_question(project)
+                raw_intent = raw_intent.model_copy(update={"response_kind": "question_answer",
+                    "pending_question_id": question["id"], "related_task_id": question.get("task_id"),
+                    "forbidden_actions": list(dict.fromkeys([*previous.forbidden_actions, *raw_intent.forbidden_actions])),
+                    "preserve_constraints": list(dict.fromkeys([*previous.preserve_constraints, *raw_intent.preserve_constraints]))})
             if (pending is None and raw_intent.action in {"batch_draft", "batch_draft_accept", "batch_repair", "batch_accept"}
                     and raw_intent.batch_id and raw_intent.batch_id not in text):
                 raw_intent = raw_intent.model_copy(update={"batch_id": None})
@@ -974,6 +1054,28 @@ class TerminalSession:
                             "selection": "single", "options": options + [{"id": "preference-other", "label": "其他", "kind": "other"}]}]}
                 else:
                     batch_scopes.enter_context(use_preference_decisions(preference_decisions))
+            if (routing_response is None and self.engine.settings.quality_preset == "quality"
+                    and intent.planning_discussion.strip() and intent.response_kind != "question_answer"
+                    and intent.authorization == "approved" and intent.action in {
+                        "write_draft", "write_review", "write_review_accept", "batch_draft", "batch_draft_accept", "continue_run"}):
+                routing_response = {"status": "waiting_user", "needs_clarification": True,
+                    "reply": "本次有一个会影响写法的规划选择，先和你商量。",
+                    "questions": [{"id": "complex-preparation", "header": "写前商量",
+                        "preparation_chapter": intent.chapter_no or project.db.latest_accepted_chapter_no() + 1,
+                        "preparation_source": self.engine._writer_source_fingerprint(project,
+                            intent.chapter_no or project.db.latest_accepted_chapter_no() + 1),
+                        "question": intent.planning_discussion, "why_it_matters": "保留原章节范围和配置；只在你选择后安排额外独立规划。",
+                        "selection": "single", "options": [
+                            {"id": "q1-run", "label": "按现有规划直接写作", "description": "准备与正文同次完成，不额外生成小规划。", "kind": "choice"},
+                            {"id": "q1-discuss", "label": "先讨论本章小规划", "description": "先商量具体选择，本次不开始写作或独立规划。", "kind": "choice"},
+                            {"id": "q1-other", "label": "其他", "kind": "other"}]}]}
+            if intent.response_kind == "question_answer" and intent.planning_discussion:
+                previous = self._pending_question(project)
+                cards = previous.get("questions", []) if previous else []
+                if (len(cards) == 1 and cards[0].get("id") == "complex-preparation"
+                        and cards[0].get("preparation_source") != self.engine._writer_source_fingerprint(project,
+                            int(cards[0].get("preparation_chapter") or 1))):
+                    routing_response = {"status": "waiting_condition", "gate": "商量期间小说或规划已经变化，请先按当前版本重新确认写作依据。"}
             if (routing_response is None and intent.authorization == "approved"
                     and intent.action in {"batch_draft", "batch_draft_accept", "batch_repair", "batch_accept"}):
                 # Routing belongs to this conversation. Production belongs to the
@@ -1015,9 +1117,16 @@ class TerminalSession:
                         resolution="提出优化之后来源已变化，须按当前版本重新安排。")
                     raise ValidationGateError("优化任务的来源已变化，请重新查看待处理工作，按当前版本安排。")
             task_scope = active_task_settings.get()
+            trace.record("session.intent", "completed", "已保存本次操作参数用于内部诊断",
+                metadata={"intent": intent.model_dump(mode="json"),
+                          "task_settings": task_scope.public_summary() if task_scope else None}, public=False)
+            from .studio import bind_active_collaboration
+            task_scope = bind_active_collaboration(project, intent.action, specialist=intent.specialist_role,
+                reason=intent.specialist_reason, forbidden_actions=[*intent.forbidden_actions,
+                    *(["extra_calls"] if re.search(r"(?:不要|禁止|不允许|无需).{0,10}额外.{0,8}(?:调用|模型)", text) else [])]) or task_scope
             ticket, dispatch_plan = Coordinator(project).compile(
                 intent,
-                collaboration_mode=task_scope.collaboration_mode if task_scope else "everyday",
+                collaboration_mode=task_scope.effective_collaboration_mode if task_scope else "everyday",
                 task_snapshot_hash=task_scope.snapshot_hash if task_scope else None,
             )
             Coordinator.validate(dispatch_plan, ticket)
@@ -1079,7 +1188,7 @@ class TerminalSession:
                 # 闲聊不进工作流：路由模型已按墨宝口吻写出完整回复，这里只兜底空回复。
                 response: dict[str, Any] = {
                     "reply": intent.conversation_reply.strip()
-                    or "我在呢。想聊点什么，或者继续你的故事都可以。"
+                    or "我在呢，你慢慢说。"
                 }
             elif intent.action == "ideate":
                 # Writer 灵感分身：零依据构思不做证据核验，产出提案不入正史。
@@ -1090,7 +1199,7 @@ class TerminalSession:
                 else:
                     response = await self.engine.brainstorm(project.root, text, packet)
             else:
-                if intent.authorization == "approved" and intent.action in _PENDING_TASK_ACTIONS:
+                if intent.authorization == "approved" and _resumable_intent(intent):
                     async with project_write_lock(project.root):
                         self._save_pending_task(project, intent, "running")
                 async def tracked_steering() -> list[str]:
@@ -1100,13 +1209,44 @@ class TerminalSession:
                             self._remember_user_updates(project, updates, ticket.ticket_id)
                     return updates
 
-                response = await self._dispatch(
-                    project.root, intent, ticket, dispatch_plan,
-                    packet=packet,
-                    consume_steering=tracked_steering if consume_steering else None,
-                )
-                response = await self._recover_failed_workflow(project, intent, ticket, dispatch_plan, response, trace)
+                checkpoint = pending.get("response_checkpoint") if pending and not pending.get("route_answer") else None
+                if checkpoint and intent.action == "story_settings_manage":
+                    scope = active_task_settings.get()
+                    if (not scope or checkpoint.get("task_id") != scope.task_id
+                            or checkpoint.get("snapshot_hash") != scope.snapshot_hash
+                            or checkpoint.get("source") != self._work_source(project)
+                            or intent.operation_instruction != pending["intent"].get("operation_instruction", "")
+                            or intent.setting_change != pending["intent"].get("setting_change", {})):
+                        raise ValidationGateError("原设定结果的任务配置或来源已经变化，未重复调用记忆角色；请先核对原结果与当前资料。")
+                    response = json.loads(json_dumps(checkpoint["response"]))
+                    trace.record("session.result_reuse", "completed", "复用原设定维护结果，只继续后台收尾，不重复模型核对")
+                else:
+                    response = await self._dispatch(
+                        project.root, intent, ticket, dispatch_plan,
+                        packet=packet,
+                        consume_steering=tracked_steering if consume_steering else None,
+                    )
+                if intent.action == "story_settings_manage":
+                    scope = active_task_settings.get()
+                    trace.record("session.result_checkpoint", workflow_result_status(response), "设定维护实际返回结果已留档",
+                        metadata={"response": response, "source": self._work_source(project),
+                            "task_settings": scope.public_summary() if scope else None}, public=False)
                 self._planning_question(response)
+                stack = [response]
+                while stack:
+                    value = stack.pop()
+                    if isinstance(value, dict):
+                        cards = value.get("questions", [])
+                        if any(isinstance(card, dict) and card.get("id") == "chapter-improvement" for card in cards):
+                            response.update(status="waiting_user", needs_clarification=True, questions=cards)
+                            resume = {"write_review": "revise_review", "write_review_accept": "review_accept",
+                                "revise_review_accept": "review_accept"}.get(intent.action, intent.action)
+                            intent = intent.model_copy(update={"action": resume, "review_before_revision": True})
+                            break
+                        stack.extend(item for item in value.values() if isinstance(item, (dict, list)))
+                    elif isinstance(value, list):
+                        stack.extend(value)
+                response = await self._recover_failed_workflow(project, intent, ticket, dispatch_plan, response, trace)
                 stack = [response]
                 review_conflicts = []
                 while stack:
@@ -1136,13 +1276,13 @@ class TerminalSession:
                         questions=[{"id": "preference-conflict", "header": "习惯取舍", "question": question["reason"],
                             "why_it_matters": "保留当前稿件与原任务配置，仅核对冲突偏好的本次使用。",
                             "selection": "single", "options": options + [{"id": "preference-other", "label": "其他", "kind": "other"}]}])
-                if intent.authorization == "approved" and intent.action in _PENDING_TASK_ACTIONS:
+                if intent.authorization == "approved" and _resumable_intent(intent):
                     async with project_write_lock(project.root):
                         outcome = workflow_result_status(response)
                         pending_status = "completed" if outcome == "completed" else (
                             "waiting_user" if outcome == "waiting_user" else "interrupted"
                         )
-                        self._save_pending_task(project, intent, pending_status)
+                        self._save_pending_task(project, intent, pending_status, response=response)
             if intent.authorization == "approved" and dispatch_plan.steps:
                 async with project_write_lock(project.root):
                     project.db.resolve_collaboration_thread(ticket.ticket_id)
@@ -1209,12 +1349,18 @@ class TerminalSession:
             outcome = workflow_result_status(response)
             runtime = active_runtime.get()
             if runtime:
-                for work in project.pending_work():
-                    if work["kind"] == "workflow" and work.get("run_id") == runtime.run_id:
-                        project.update_pending_work(work["id"], resolution=failure or response.get("next_action", ""),
-                            progress={"status": outcome, "action": intent.action,
-                                      "steps": [{"step": step.get("step"), "status": workflow_result_status(step),
-                                                 "reason": workflow_failure_reason(step)} for step in response.get("steps", [])]})
+                try:
+                    async with project_write_lock(project.root):
+                        for work in project.pending_work():
+                            if work["kind"] == "workflow" and work.get("run_id") == runtime.run_id:
+                                project.update_pending_work(work["id"], resolution=failure or response.get("next_action", ""),
+                                    progress={"status": outcome, "action": intent.action,
+                                              "steps": [{"step": step.get("step"), "status": workflow_result_status(step),
+                                                         "reason": workflow_failure_reason(step)} for step in response.get("steps", [])]})
+                except Exception as exc:
+                    response.setdefault("warnings", []).append("本次实际处理结果已返回，后台待办进度尚未同步；请查看原结果，无需重新生成。")
+                    trace.record("session.pending_sync", "warning", "后台待办进度尚未同步，保留实际处理结果",
+                        details=traceback.format_exc(), metadata={"actual_status": outcome}, public=False)
             trace.record("session.dispatch", outcome, failure or "受限工作流已返回结果")
             trace.finish(status=outcome, summary=failure or "终端自然语言请求处理完成")
             payload = {
@@ -1238,7 +1384,9 @@ class TerminalSession:
             }
             payload["status"] = outcome
             payload["pending_work"] = project.pending_work()
-            if include_suggestions and not response.get("questions") and not set(intent.forbidden_actions) & {"extra_calls", "extra_model_calls"}:
+            if intent.action == "chat":
+                payload["suggested_prompts"] = []
+            elif include_suggestions and not response.get("questions") and not set(intent.forbidden_actions) & {"extra_calls", "extra_model_calls"}:
                 suggestions = await self._suggest_after_result(project, intent, response, trace)
                 payload["suggested_prompts"] = suggestions
                 if suggestions:
@@ -1257,10 +1405,12 @@ class TerminalSession:
             trace.finish(status="cancelled", summary="终端任务已停止，已有项目内容保留")
             raise
         except ProjectBusyError as exc:
+            trace.record("session.lock_diagnostic", "waiting_condition", "项目写锁调用栈诊断",
+                details=traceback.format_exc(), public=False)
             # A competing project's writer is a temporary condition, not a
             # failed novel. Do not replay the entire natural-language request:
             # earlier steps may already have persisted their own results.
-            if intent.authorization == "approved" and intent.action in _PENDING_TASK_ACTIONS:
+            if intent.authorization == "approved" and _resumable_intent(intent):
                 async with project_write_lock(project.root):
                     self._save_pending_task(project, intent, "waiting_condition")
             trace.record("session", "waiting_condition", "项目写入暂时被其他任务占用", str(exc))
@@ -1269,14 +1419,16 @@ class TerminalSession:
                 "session": {"trace_id": trace.run_id, "trace_path": str(trace.trace_path)},
                 "status": "waiting_condition",
                 "reply": str(exc),
-                "next_action": "待占用任务结束后先核对已保存的章节和审查，再续接未完成步骤；不会自动重发整条对话。",
+                "next_action": ("待占用解除后，核对本次设定检查的保存进度，再继续原设定维护任务。"
+                    if intent.action == "story_settings_manage"
+                    else "待占用任务结束后先核对已保存的章节和审查，再续接未完成步骤；不会自动重发整条对话。"),
             }
         except PlanningNeedsAttention as exc:
             planning_response = {"step": exc.recovery_node or "planning.dependencies", "gate": str(exc),
                 "status": "waiting_condition", "error_type": type(exc).__name__, "next_action": exc.next_action,
                 "recovery_node": exc.recovery_node, "recovery_attempts": exc.recovery_attempts,
                 "recovery_exhausted": exc.recovery_exhausted}
-            if intent.authorization == "approved" and intent.action in _PENDING_TASK_ACTIONS:
+            if intent.authorization == "approved" and _resumable_intent(intent):
                 async with project_write_lock(project.root):
                     self._save_pending_task(project, intent, "waiting_condition")
             if intent.pending_work_id:
@@ -1296,7 +1448,7 @@ class TerminalSession:
             self._append_dialogue_entry(project, text, str(exc), "规划保留，低风险多节点补救按实际结果续接")
             trace.record("session", planning_outcome, "规划依赖与协调恢复结果已记录", str(exc))
             trace.finish(status=planning_outcome, summary=str(exc))
-            if planning_outcome == "completed" and intent.action in _PENDING_TASK_ACTIONS:
+            if planning_outcome == "completed" and _resumable_intent(intent):
                 self._save_pending_task(project, intent, "completed")
             return planning_response | {
                 "session": {"trace_id": trace.run_id, "trace_path": str(trace.trace_path)},
@@ -1304,6 +1456,7 @@ class TerminalSession:
                 "next_action": planning_response.get("next_action") or exc.next_action,
             }
         except InkFlowError as exc:
+            connection = provider_failure_guidance(str(exc))
             failure_response = {"step": exc.recovery_node or getattr(locals().get("intent"), "action", "workflow"),
                 "gate": str(exc), "status": "waiting_condition", "error_type": type(exc).__name__,
                 "recovery_node": exc.recovery_node, "recovery_attempts": exc.recovery_attempts,
@@ -1319,23 +1472,30 @@ class TerminalSession:
                             project.update_pending_work(work["id"], resolution=str(exc), reason=str(exc))
             except Exception as recovery_exc:
                 trace.record("session.recovery", "waiting_condition", "无法更新失败任务状态", str(recovery_exc))
-            if "ticket" in locals() and "dispatch_plan" in locals():
+            if not connection and "ticket" in locals() and "dispatch_plan" in locals():
                 try:
                     failure_response = await self._recover_failed_workflow(project, intent, ticket, dispatch_plan, failure_response, trace)
-                    if workflow_result_status(failure_response) == "completed" and intent.action in _PENDING_TASK_ACTIONS:
+                    if workflow_result_status(failure_response) == "completed" and _resumable_intent(intent):
                         self._save_pending_task(project, intent, "completed")
                 except Exception as recovery_exc:
                     failure_response["recovery_error"] = str(recovery_exc)
             recovery_outcome = workflow_result_status(failure_response)
             self._append_dialogue_entry(project, text,
-                "已从受影响节点恢复，实际产物通过原任务门禁。" if recovery_outcome == "completed" else str(exc),
+                "已从受影响节点恢复，实际产物通过原任务门禁。" if recovery_outcome == "completed" else connection["message"] if connection else str(exc),
                 "多节点恢复已核验" if recovery_outcome == "completed" else "任务未完成，已有内容保留")
             trace.record("session", recovery_outcome, "故障节点与恢复结果已记录", str(exc))
             trace.finish(status=recovery_outcome, summary="原任务按实际恢复结果保留进度")
+            if connection:
+                return failure_response | {"failure_kind": "model_connection", "reply": connection["message"],
+                    "next_action": connection["next_action"], "title": connection["title"],
+                    "session": {"trace_id": trace.run_id, "trace_path": str(trace.trace_path)}}
             return failure_response | {
                 "session": {"trace_id": trace.run_id, "trace_path": str(trace.trace_path)},
                 "status": recovery_outcome,
-                "next_action": failure_response.get("next_action") or "查看待处理工作的具体原因、正文和报告版本，再从受影响节点继续。",
+                "next_action": failure_response.get("next_action") or (
+                    "查看本次设定检查说明，核对指出的合集、记录或依据缺口；处理后继续原设定维护任务。"
+                    if intent.action == "story_settings_manage"
+                    else "查看待处理工作的具体原因、正文和报告版本，再从受影响节点继续。"),
             }
         except Exception as exc:
             try:
@@ -1415,9 +1575,9 @@ class TerminalSession:
         outcome = workflow_result_status(response)
         if intent.action == "pending_work" or outcome not in {"failed", "waiting_condition"} or response.get("questions"):
             return response
-        if intent.action == "story_settings_manage" and intent.setting_change.get("operation") == "audit":
+        if intent.action == "story_settings_manage" and intent.setting_change.get("operation") in {"audit", "record_save", "record_supplement", "record_merge"}:
             return response | {"coordinator_recovery": {"status": "not_run",
-                "reason": "设定引用在原责任节点有界补核；保留已保存条目，不用外围诊断重跑整份审查。"}}
+                "reason": "设定维护在原责任节点处理；保留已保存条目，不用外围诊断重跑审查或生成。"}}
         if intent.action in {"plan", "plan_next_arc", "outline", "redesign_story", "planning_publish_reviewed"}:
             return response | {"coordinator_recovery": {"status": "not_run",
                 "reason": "规划候选须在原规划节点定点修订；正文复审不能修复规划，未增加外围模型调用。"}}
@@ -1480,6 +1640,9 @@ class TerminalSession:
             packet.sections.append(ContextSection(key="FAILURE", title="原任务多节点故障与恢复记录",
                 content=json_dumps(case), hard=True, cache_scope="request"))
             prompt = packet.to_model_prompt()
+            packet.estimated_tokens = estimate_tokens(prompt)
+            self.engine._context_builder(project, "coordinator")._publish_context_status(
+                packet, packet.estimated_tokens, role="coordinator")
             needed = estimate_tokens(prompt + COORDINATOR_RECOVERY_SYSTEM) + 1800
             if (runtime.calls >= runtime.max_calls or (runtime.max_tokens is not None and runtime.tokens + needed > runtime.max_tokens)
                     or estimate_tokens(prompt) > self.engine.settings.context_budget_for("coordinator")[1]):
@@ -1536,7 +1699,7 @@ class TerminalSession:
                                 if not row or (number < (intent.chapter_no or boundary) and row["status"] != "accepted"):
                                     raise ValidationGateError("依赖复核只能读取已有且边界可信的正文，不能生成缺失章。")
                         new_ticket, new_dispatch = Coordinator(project).compile(action,
-                            collaboration_mode=scope.collaboration_mode, task_snapshot_hash=scope.snapshot_hash)
+                            collaboration_mode=scope.effective_collaboration_mode, task_snapshot_hash=scope.snapshot_hash)
                         Coordinator.validate(new_dispatch, new_ticket)
                         result = await self._dispatch(project.root, action, new_ticket, new_dispatch)
                     status = workflow_result_status(result)
@@ -1622,6 +1785,12 @@ class TerminalSession:
         """Avoid a paid model routing call for unambiguous read-only requests."""
 
         normalized = re.sub(r"\s+", "", text).lower()
+        question = normalized.strip("。！？?!，,")
+        if re.fullmatch(r"(?:请问|告诉我)?(?:你|墨宝)(?:现在|目前|当前)?(?:用的|使用的|使用|用|是)?(?:什么|哪个|哪种|哪款)(?:ai|大语言|大)?模型(?:啊|呀|呢|吗)?", question):
+            model = self.engine.settings.model_for("coordinator")
+            return {"status": "completed", "session": {"route": "model_info", "cost": "无需模型调用"},
+                    "reply": f"我是墨宝，这段对话当前配置使用的模型是 {model}。",
+                    "model": model}
         if normalized in {"状态", "项目状态", "当前状态", "当前进度", "进度"}:
             return {
                 "session": {"route": "status", "cost": "无需模型调用"},
@@ -1656,6 +1825,14 @@ class TerminalSession:
         prose, and states whether it should be accepted does not.
         """
 
+        # A later chapter range is not the current step of a settings/plan task.
+        maintenance = re.search(r"(?:整理|核对|检查|修正|补齐|维护)[^。！？；\n]{0,30}(?:设定|写作要求)", text)
+        prose = re.search(r"(?:写|续写|生成|完成)\s*(?:第?\s*\d+|正文|章节|草稿)", text)
+        if maintenance and (prose is None or maintenance.start() < prose.start()):
+            return None
+        if re.search(r"(?:随后|之后|以后|稍后)[^。！？；\n]{0,15}(?:我会|再让|再请)", text):
+            return None
+
         from_to_matches = self._operative_range_matches(text, _CHAPTER_FROM_TO_PATTERN)
         range_matches = from_to_matches or self._operative_range_matches(text, _CHAPTER_RANGE_PATTERN)
         # "接着写到20章" is a complete goal when the active project's next
@@ -1678,6 +1855,9 @@ class TerminalSession:
         else:
             return None
         if start_chapter < 1 or end_chapter <= start_chapter:
+            return None
+        earlier_step = re.search(r"先[^。！？；\n]{0,12}(?:写|完成)第?\s*(\d+)\s*章", text)
+        if earlier_step and int(earlier_step.group(1)) < start_chapter:
             return None
 
         if re.search(r"^(?:墨宝[，,\s]*)?(?:现在|请|本次|这次)?[，,\s]*(?:只|仅)(?:补审|复审|核对|审查|审核)", text) and re.search(r"现有|已有|当前", text) and re.search(r"批次|这批", text):
@@ -1819,7 +1999,8 @@ class TerminalSession:
             return None
         if re.search(r"(?:不写|别写|不要写|先别写|暂不写|不能写|不会写)[^。！？\n]{0,20}第\s*\d+\s*章", text):
             return None
-        if _CHAPTER_FROM_TO_PATTERN.search(text) or _CHAPTER_RANGE_PATTERN.search(text):
+        if (TerminalSession._operative_range_matches(text, _CHAPTER_FROM_TO_PATTERN)
+                or TerminalSession._operative_range_matches(text, _CHAPTER_RANGE_PATTERN)):
             return None
         matches = list(re.finditer(r"(?<![改重续])(?:续写|写|创作)(?:完|好)?第\s*(\d+)\s*章", text))
         if len(matches) != 1 or not re.search(r"请|接着|继续|开始|现在|直接|帮我|给我|写完|创作", text):
@@ -1887,6 +2068,37 @@ class TerminalSession:
             "related_task_id": pending.get("task_id"), "user_message": text.strip()})
 
     @staticmethod
+    def _improvement_answer(project: InkFlowProject, text: str) -> tuple[str, str] | None:
+        pending = TerminalSession._pending_question(project)
+        cards = pending.get("questions", []) if pending else []
+        if len(cards) != 1 or not isinstance(cards[0], dict) or cards[0].get("id") != "chapter-improvement":
+            return None
+        card = cards[0]
+        for option in card.get("options", []):
+            if option.get("id") not in {"improve-approve", "improve-keep"}:
+                continue
+            label = option["label"]
+            expected = (f"我来回答刚才的问题：\n1. {card['question']}\n我的回答：{label}\n"
+                "请结合这些答案继续理解原来的目标；如果此前已经明确要求执行且信息足够，就继续原任务，否则先总结你理解到的方案。")
+            if text.strip() in {label, expected}:
+                return str(card.get("quality_choice_key") or ""), "approve" if option["id"] == "improve-approve" else "keep"
+        return None
+
+    @staticmethod
+    def _confirmed_improvement_intent(project: InkFlowProject, text: str) -> TerminalIntent | None:
+        if TerminalSession._improvement_answer(project, text) is None:
+            return None
+        pending = TerminalSession._pending_question(project)
+        try:
+            original = TerminalIntent.model_validate(pending["intent"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return original.model_copy(update={"response_kind": "question_answer",
+            "pending_question_id": pending["id"], "related_task_id": pending.get("task_id"),
+            "authorization": "approved", "authorization_source": "current_request",
+            "clarification_question": "", "clarification_questions": [], "conversation_reply": ""})
+
+    @staticmethod
     def _confirmed_question_intent(text: str, pending_question: dict[str, Any] | None) -> TerminalIntent | None:
         """Reuse one fixed workflow choice; free-form answers still need routing."""
         if not pending_question or not pending_question.get("id"):
@@ -1929,7 +2141,9 @@ class TerminalSession:
             "response_kind": "question_answer", "pending_question_id": pending_question["id"],
             "related_task_id": pending_question.get("task_id"),
             "clarification_question": "", "clarification_questions": [],
-            "conversation_reply": "继续讨论原来的目标，本轮不执行。" if choice == "q1-discuss" else "",
+            "conversation_reply": ((f"我们先商量：{card['question']} 你最想保留的人物变化或剧情结果是什么？本轮先不写正文。"
+                if card.get("id") == "complex-preparation" else "继续讨论原来的目标，本轮不执行。")
+                if choice == "q1-discuss" else ""),
         })
 
     @staticmethod
@@ -2406,6 +2620,7 @@ class TerminalSession:
             "chapter_length_tolerance", "review_min_confidence", "acceptance_confirmation_mode",
             "planning_publication_mode",
             "planning_window_chapters",
+            "collaboration_preset", "quality_preset", "quality_custom_context",
             "context_budget_mode", "context_soft_tokens", "context_hard_tokens",
             "voice_auto_read", "voice_output_enabled", "voice_input_enabled",
             "agent_generation",
@@ -2453,6 +2668,12 @@ class TerminalSession:
                     clean[key] = str(value)
                 elif key == "context_budget_mode" and str(value) in {"unified", "custom"}:
                     clean[key] = str(value)
+                elif key == "collaboration_preset" and value in {"everyday", "adaptive", "full_specialist"}:
+                    clean[key] = value
+                elif key == "quality_preset" and value in {"economy", "balanced", "quality", "custom"}:
+                    clean[key] = value
+                elif key == "quality_custom_context" and type(value) is bool:
+                    clean[key] = value
                 elif key == "agent_generation" and isinstance(value, dict):
                     generation: dict[str, dict[str, float | int | None]] = {}
                     for role, raw in value.items():
@@ -2562,7 +2783,11 @@ class TerminalSession:
             prefix = re.split(r"[。！？；\n，,]", message[:match.start()])[-1]
             suffix = re.split(r"[。！？；\n，,]", message[match.end():], maxsplit=1)[0]
             protected_after = re.match(r"\s*(?:的)?(?:正史|已接受正文|正文|原稿)?\s*(?:保持不动|保持原样|不动|不改|不要改|不重写|不要重写|仅作参考)", suffix)
-            if not protected_after and not re.search(r"(?:保留|保护|不(?:再)?(?:重写|修改|改动|覆盖)|不要(?:重写|修改|改动|覆盖))[^。！？；\n，,]*$", prefix):
+            completed_plan = re.match(
+                r"\s*(?:的)?(?:近期规划|章节规划|规划|大纲|卷细纲|细纲|章节卡)"
+                r"\s*(?:已经|已|刚刚|刚)?(?:正式)?(?:采用|生效|完成|发布|通过)", suffix,
+            )
+            if not protected_after and not completed_plan and not re.search(r"(?:保留|保护|不(?:再)?(?:重写|修改|改动|覆盖|生成|续写|创作|写)|不要(?:重写|修改|改动|覆盖|生成|续写|创作|写))[^。！？；\n，,]*$", prefix):
                 matches.append(match)
         return matches
 
@@ -2600,11 +2825,16 @@ class TerminalSession:
         if re.search(r"(?:继续|接着|往下|一路|一直)[^。！？；\n]{0,16}(?:写|续写|创作|完成)(?:到|至)第?\s*\d+\s*章", message):
             # A lone number is the destination, not a request to start there.
             return None, None
-        number_match = _CHAPTER_NUMBER_PATTERN.search(message)
-        if number_match:
-            chapter_no = int(number_match.group(1))
-            if chapter_no >= 1:
-                return chapter_no, None
+        # Numbers inside an excluded reference range must not re-enter as a
+        # single target and override Coordinator's interpretation.
+        raw_ranges = [*_CHAPTER_FROM_TO_PATTERN.finditer(message), *_CHAPTER_RANGE_PATTERN.finditer(message)]
+        chapter_numbers = {
+            int(match.group(1)) for match in TerminalSession._operative_range_matches(message, _CHAPTER_NUMBER_PATTERN)
+            if not any(span.start() <= match.start() < span.end() for span in raw_ranges)
+            and int(match.group(1)) >= 1
+        }
+        if len(chapter_numbers) == 1:
+            return chapter_numbers.pop(), None
         return None, None
 
     def _unique_chapter_reference(self, project: InkFlowProject, action: str) -> int | None:
@@ -2875,9 +3105,54 @@ class TerminalSession:
                 "settings": StorySettingsService(project).source_fingerprint(),
                 "preferences": content_hash(preference_prompt(project.db))}
 
+    async def _route_packet(self, packet: ContextPacket) -> ProviderResult[TerminalIntent]:
+        if packet.task != "日常交流":
+            return await self.engine.provider.generate_json(system_prompt=TERMINAL_ROUTER_SYSTEM,
+                user_prompt=packet.to_model_prompt(), output_model=TerminalIntent, effort="low",
+                max_tokens=1600, thinking=False, agent_role="coordinator")
+        result = await self.engine.provider.generate_json(
+            system_prompt=(MOBAO_PERSONA + "\n本次是日常交流。直接回应用户当前话题和情绪，允许日常知识问答、玩笑与不同角度的建议。"
+                "不主动转向小说，不添加工作安排、写作邀请或任务完成提示。只返回reply。"
+                "当前配置仅用于说明使用的模型；不要编造实时信息或宣称执行了操作。"),
+            user_prompt=packet.to_model_prompt(), output_model=ConversationReply, effort="low",
+            max_tokens=1600, thinking=False, agent_role="coordinator")
+        return ProviderResult(data=TerminalIntent(action="chat", authorization="none", confidence="high",
+            conversation_reply=result.data.reply, visible_reason="回应这次日常交流"), model=result.model,
+            response_id=result.response_id, reasoning_content=None, usage=result.usage, agent_role="coordinator")
+
+    @staticmethod
+    def _casual_message(project: InkFlowProject, message: str) -> bool:
+        if re.search(r"小说|故事|剧情|章节|正文|草稿|伏笔|人物|主角|配角|设定|大纲|细纲|规划|审查|审读|审核|正史|验收|写|生成|修改|修订|检查|优化|删除|移除|保存|操作|运行|打开|导入|导出|执行|再做|文风|待办|待处理|工作流|批次|布局|面板|设置|密钥|api|模型|记忆|接着|继续|上次|刚才|刚刚|按.{0,8}(?:做|来|执行)|第.{0,8}章", message, re.I):
+            return False
+        if re.fullmatch(r"[\s，,。！？?!]*(?:好|好的|可以|行|是|不是|对|不对|同意|不同意|第一[个项]|第二[个项]|1|2)[\s，,。！？?!]*", message):
+            return False
+        pending = TerminalSession._pending_question(project)
+        if pending:
+            return False  # Free answers need the original question and scope.
+        if re.search(r"这个|这些|那个|那些|这样|那样|就用|照做|弄好|弄一下|处理一下", message):
+            return False
+        return bool(re.search(r"^(?:你好|您好|嗨|哈喽|早上好|早安|晚上好|晚安|谢谢|多谢)|心情|开心|难过|焦虑|低落|有点累|今天.{0,8}累|吃饭|午饭|晚饭|睡觉|睡不着|天气|为什么|是什么|怎么回事", message))
+
     def _build_packet(self, project: InkFlowProject, message: str) -> ContextPacket:
+        if self._casual_message(project, message):
+            packet = ContextPacket(project_id=project.project_id, chapter_no=1, task="日常交流", estimated_tokens=0,
+                sections=[ContextSection(key="A", title="这次想说的话", content=message, hard=True),
+                    ContextSection(key="MODEL", title="当前对话模型", content=self.engine.settings.model_for("coordinator"), hard=True),
+                    ContextSection(key="F", title="最近对话，仅供理解话题", content=self._recent_dialogue(project, limit=3, char_limit=4000) or "暂无前文")])
+            packet.estimated_tokens = estimate_tokens(packet.to_model_prompt())
+            _, hard_limit = self.engine.settings.context_budget_for("coordinator")
+            if packet.estimated_tokens + self.engine.settings.effective_output_tokens(1600, "coordinator") > hard_limit:
+                raise ValidationGateError("这次对话超过当前协调角色容量，请缩短本条消息后继续。")
+            self.engine._context_builder(project, "coordinator")._publish_context_status(packet, packet.estimated_tokens, role="coordinator")
+            return packet
         brief = project.db.get_brief()
         status = self.engine.status(project.root)
+        scope = active_task_settings.get()
+        status["collaboration_selection"] = {
+            "preset": scope.settings.collaboration_preset if scope else self.engine.settings.collaboration_preset,
+            "pending": bool(scope and scope.collaboration_pending),
+            "mode": scope.effective_collaboration_mode if scope else "everyday",
+        }
         status["recovery_learning"] = project.db.learning_guidance(role="coordinator")
         status["pending_work"] = [{key: item.get(key) for key in
             ("id", "kind", "reason", "status", "next_action", "chapter_no", "source", "intent", "progress", "resolution")}
@@ -2968,6 +3243,7 @@ class TerminalSession:
             ],
             "settings_boundary": "用户明确要求时，可以通过 Novel Engine 修改白名单设置；执行后必须返回旧值、新值和下一步建议。",
             "inquiry_frequency": self.engine.settings.inquiry_frequency,
+            "quality_strategy": self.engine.settings.quality_preset,
             "preference_learning_enabled": project.db.get_metadata("learning_settings", {}).get("enabled", True),
             "inquiry_policy": {
                 "low": "只追问缺少的执行条件和真实歧义",
@@ -3023,7 +3299,7 @@ class TerminalSession:
             content=StorySettingsService(project).context(actor="coordinator", max_chars=14000), hard=False))
         sections.append(preference_section(project.db))
         for section in sections:
-            section.cache_scope = {"B": "book", "D": "global", "E": "global", "A": "request", "C": "request"}.get(section.key, section.cache_scope)
+            section.cache_scope = {"B": "book", "D": "global", "E": "global", "SET": "canon", "A": "request", "C": "request"}.get(section.key, section.cache_scope)
         packet = ContextPacket(
             project_id=project.project_id,
             chapter_no=1,
@@ -3043,6 +3319,9 @@ class TerminalSession:
                         break
         if packet.estimated_tokens > hard_limit:
             raise ValidationGateError("Coordinator 的硬上下文超过自定义上限，请提高该 Agent 的最大上下文预算。")
+        packet.estimated_tokens = estimate_tokens(packet.to_model_prompt())
+        self.engine._context_builder(project, "coordinator")._publish_context_status(
+            packet, packet.estimated_tokens, role="coordinator")
         return packet
 
     @staticmethod
@@ -3239,18 +3518,22 @@ class TerminalSession:
             scope = StudioService(project).db.prepare_task_settings(
                 f"dispatch-{uuid4().hex}", novel_id=project.project_id,
                 settings=self.engine.settings, workspace_root=project.root,
-                collaboration_mode=dispatch_plan.collaboration_mode if dispatch_plan else "everyday",
+                collaboration_mode=dispatch_plan.collaboration_mode if dispatch_plan else None,
             )
             with use_task_settings(scope):
                 return await self._dispatch(
                     root, intent, ticket, dispatch_plan,
                     packet=packet, consume_steering=consume_steering,
                 )
+        from .studio import bind_active_collaboration
+        bind_active_collaboration(InkFlowProject(root, recover_on_open=False), intent.action,
+            specialist=intent.specialist_role, reason=intent.specialist_reason,
+            forbidden_actions=intent.forbidden_actions)
         if ticket is None or dispatch_plan is None:
             task_scope = active_task_settings.get()
             ticket, dispatch_plan = Coordinator(InkFlowProject(root, recover_on_open=False)).compile(
                 intent,
-                collaboration_mode=task_scope.collaboration_mode if task_scope else "everyday",
+                collaboration_mode=task_scope.effective_collaboration_mode if task_scope else "everyday",
                 task_snapshot_hash=task_scope.snapshot_hash if task_scope else None,
             )
         Coordinator.validate(dispatch_plan, ticket)
@@ -3258,7 +3541,7 @@ class TerminalSession:
             raise InkFlowError("任务计划与实际工作流不一致，已停止执行。")
         task_scope = active_task_settings.get()
         if task_scope is not None and (
-            dispatch_plan.collaboration_mode != task_scope.collaboration_mode
+            dispatch_plan.collaboration_mode != task_scope.effective_collaboration_mode
             or dispatch_plan.task_snapshot_hash != task_scope.snapshot_hash
         ):
             raise InkFlowError("工作流计划与本次任务快照不一致，已停止执行。")
@@ -3422,10 +3705,13 @@ class TerminalSession:
             result = await self.engine.manage_story_settings(root, change=intent.setting_change,
                 instruction=intent.operation_instruction or intent.user_message,
                 conversation_context="\n".join(section.content for section in (packet.sections if packet else []) if section.key == "F"),
-                allow_evidence_repair=not bool(set(intent.forbidden_actions) & {"extra_calls", "extra_model_calls"}))
+                allow_evidence_repair=not bool(set(intent.forbidden_actions) & {"extra_calls", "extra_model_calls"}),
+                coordinator_proposal=True, user_message=intent.user_message)
             response = {"result": result}
+            if result.get("summary"):
+                response["reply"] = result["summary"]
             if result.get("reason"):
-                response["reply"] = str(result["reason"])
+                response["reply"] = str(result.get("summary") or result["reason"])
                 if result.get("status") == "needs_input":
                     from .schemas import ClarificationQuestion, ClarificationOption
                     targets = result.get("records", result.get("collections", []))
@@ -3437,16 +3723,9 @@ class TerminalSession:
                         why_it_matters="明确本次处理对象后继续原任务；已有资料不变。") ]})
                     response.update(needs_clarification=True, status="waiting_user", questions=self._question_cards(choices))
             if intent.setting_change.get("operation") == "audit" or result.get("adopted_settings") is not None:
-                lines = [result["summary"], *result.get("findings", [])]
-                coverage = result.get("coverage", {})
-                chapters = coverage.get("canonical_chapters", [])
-                if chapters:
-                    lines.append("正文对照范围：第 " + "、".join(map(str, chapters)) + " 章，另参考现有正史记录；未逐章审查全书正文。")
-                for collection in coverage.get("settings", []):
-                    count = len(collection.get("selected_record_ids", []))
-                    lines.append(f"{collection['name']}：开始时读取 {count} 条，本次保存 {collection.get('adopted_record_count', 0)} 条，当前共有 {collection.get('stored_record_count', count)} 条记录。")
-                lines.extend(result.get("needs_choice", []))
-                response["reply"] = "\n\n".join(lines)
+                response["reply"] = result["summary"]
+                if result.get("pending_settings"):
+                    response["next_action"] = "展开本次设定检查，查看尚未保存的具体条目与原因；已有通过记录无需重复处理。"
                 if result.get("questions"):
                     from .schemas import ClarificationQuestion
                     choices = intent.model_copy(update={"clarification_questions": [
@@ -3486,6 +3765,9 @@ class TerminalSession:
             )}
         if intent.action == "settings_update":
             patch = self._sanitize_settings_patch(intent.settings_patch)
+            if "quality_preset" in patch:
+                return {"status": "needs_input", "reply": "请在设置中的“质量与消耗”选择节省、平衡、高质量或自定义；完整预设需要一并应用其参数，本次没有只改标签冒充已应用。",
+                        "next_action": "打开设置 → 质量与消耗，选择所需预设。"}
             if not patch:
                 return {"gate": "我还没有识别出可执行的设置项。请说清要改哪项，例如“把章节长度容错改为 30%”。"}
             before = Settings.from_env(root)
@@ -4008,6 +4290,10 @@ class TerminalSession:
     def _reuse_current_pass_review(self, project: InkFlowProject, chapter_no: int) -> dict[str, Any] | None:
         """Return a safe handoff when the current draft already has a pass report."""
 
+        scope = active_task_settings.get()
+        choice = project.db.get_metadata(self.engine._chapter_improvement_key(scope.task_id, chapter_no)) if scope else None
+        if choice and choice.get("phase") in {"offered", "reserved"}:
+            return None  # The approved edit or interrupted attempt must re-enter its bound node.
         report = self.engine.current_pass_review(project, chapter_no)
         return {"step": "engine.review_mode", "result": report} if report is not None else None
 
@@ -4040,6 +4326,10 @@ class TerminalSession:
         reviewed: dict[str, Any],
     ) -> dict[str, Any]:
         report = reviewed.get("result", {})
+        if report.get("questions") or report.get("status") in {"waiting_user", "needs_input"}:
+            return {"steps": steps, "status": report.get("status", "waiting_user"),
+                    "questions": report.get("questions", []), "needs_clarification": bool(report.get("questions")),
+                    "chapter_no": chapter_no, "reason": report.get("reason", "先完成当前版本的选择。")}
         if report.get("verdict") != "pass":
             steps.append(
                 {

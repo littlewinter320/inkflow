@@ -103,12 +103,14 @@ def notes_prompt(notes: dict[str, Any]) -> str:
             + json_dumps(notes))
 
 
-def approved_notes(project: Any, chapter_no: int) -> dict[str, Any]:
+def approved_notes(project: Any, chapter_no: int, *, provisional_content: str | None = None) -> dict[str, Any]:
     """Only an accepted chapter's matching pass report can expose a future-intent reference."""
     chapter = project.db.get_chapter(chapter_no)
     record = project.db.latest_review_record(chapter_no)
     notes = version_notes(project, chapter_no)
-    if (not chapter or chapter["status"] != "accepted" or not record or not notes
+    provisional = bool(chapter and chapter["status"] == "draft" and provisional_content
+                       and content_hash(provisional_content) == chapter["content_hash"])
+    if (not chapter or (chapter["status"] != "accepted" and not provisional) or not record or not notes
             or record["chapter_version"] != chapter["version"]
             or record["report"].verdict != "pass" or record["report"].source_hash != chapter["content_hash"]
             or record["report"].writer_notes_hash != notes_hash(notes)):
@@ -122,20 +124,26 @@ def approved_notes(project: Any, chapter_no: int) -> dict[str, Any]:
             notes = {**notes, "hook_note": {**notes.get("hook_note", {}), **HookNote.model_validate(corrected).model_dump(mode="json")}}
             notes["clarification_artifact_id"] = reply.get("artifact_id")
             break
-    return {**notes, "authority": "仅作未来意图参考；事实读正史，主线读当前规划，旧设想可调整"}
+    return {**notes, "authority": "本批次已核草稿的交接参考，尚非正史" if provisional else
+            "已接受章的创作交接参考；事实读正史，主线读当前规划，旧设想可调整"}
 
 
-def recent_approved_notes(project: Any, chapter_no: int) -> list[dict[str, Any]]:
-    recent = sorted((row for row in project.db.accepted_chapters() if row["chapter_no"] < chapter_no),
-                    key=lambda row: row["chapter_no"], reverse=True)[:3]
+def recent_approved_notes(project: Any, chapter_no: int, provisional_chapters: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    provisional = {int(row["chapter_no"]): row for row in provisional_chapters or []
+                   if int(row["chapter_no"]) < chapter_no and isinstance(row.get("memory_patch"), dict)}
+    recent = sorted({row["chapter_no"] for row in project.db.accepted_chapters() if row["chapter_no"] < chapter_no}
+                    | set(provisional), reverse=True)[:3]
     result = []
-    for row in reversed(recent):
-        notes = approved_notes(project, row["chapter_no"])
+    for number in reversed(recent):
+        notes = approved_notes(project, number, provisional_content=provisional.get(number, {}).get("content"))
         if not notes:
             continue
         hook = notes.get("hook_note", {})
-        result.append({"chapter_no": row["chapter_no"], "content_hash": notes["content_hash"],
+        result.append({"chapter_no": number, "content_hash": notes["content_hash"],
             "authority": notes["authority"],
+            "important_decisions": [str(item)[:240] for item in hook.get("decision_summary", [])[:4]],
+            "fact_candidates_to_check": [str(item)[:240] for item in hook.get("new_fact_candidates", [])[:4]],
+            "thread_changes_to_check": [str(item)[:240] for item in hook.get("thread_changes", [])[:4]],
             "reader_expectation": str(hook.get("reader_expectation") or "")[:160],
             "intentionally_withheld": str(hook.get("intentionally_withheld") or "")[:160],
             "planned_followup": str(hook.get("planned_followup") or "")[:160],

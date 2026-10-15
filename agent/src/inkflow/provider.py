@@ -17,7 +17,7 @@ from .config import Settings
 from .errors import ConfigurationError, ProviderError
 from .utils import content_hash, strip_json_fence, estimate_tokens
 from .runtime import active_runtime, ensure_run_runtime
-from .model_usage import ModelAttempt, normalized_usage
+from .model_usage import ModelAttempt, aggregate_usage, normalized_usage
 from .role_protocol import normalize_role, roles_for_mode
 from .task_settings import active_task_settings
 
@@ -67,7 +67,9 @@ def _model_role(role: str | None) -> str | None:
                      else normalize_role(role) if role is not None else None)
     except (TypeError, ValueError) as exc:
         raise ProviderError("模型调用须使用当前正式 Agent 角色。") from exc
-    if scope is not None and canonical is not None and canonical not in roles_for_mode(scope.collaboration_mode):
+    if scope is not None and scope.collaboration_pending and canonical != "coordinator":
+        raise ProviderError("四人协作尚未固定专项分工，生产调用未开始；请先完成原任务协调路由。")
+    if scope is not None and canonical is not None and canonical not in roles_for_mode(scope.effective_collaboration_mode):
         raise ProviderError("当前协作模式未启用该模型角色；引擎服务不能作为 Agent 调用。")
     return canonical
 
@@ -108,6 +110,100 @@ def _json_system_prompt(system_prompt: str, output_model: type[T]) -> str:
     schema_prompt = json.dumps(_generation_schema(output_model), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return (system_prompt.rstrip() + "\n\n你必须只输出一个合法 JSON 对象，不能使用 Markdown 代码围栏。"
         + "输出必须满足以下 JSON Schema：\n" + schema_prompt)
+
+
+class _MimoPermanentStreamError(ProviderError):
+    """A terminal refusal or explicit request error must not become a format retry."""
+
+
+def _mimo_permanent_stream_error(error: Any) -> bool:
+    if not isinstance(error, dict):
+        return False
+    if any(str(error.get(key, "")) in {"400", "401", "402", "403", "404", "422"}
+           for key in ("status", "status_code", "http_status")):
+        return True
+    codes = {str(error.get(key, "")).strip().casefold() for key in ("code", "type")}
+    if codes & {"invalid_api_key", "authentication_error", "invalid_authentication", "permission_denied",
+                "insufficient_quota", "insufficient_balance", "account_balance_insufficient",
+                "invalid_request_error", "invalid_parameter", "invalid_parameters", "invalid_argument",
+                "model_not_found", "unsupported_parameter"}:
+        return True
+    message = str(error.get("message") or "").strip().casefold()
+    return message.startswith(("invalid api key", "insufficient account balance", "invalid parameter"))
+
+
+async def _mimo_stream_response(client: httpx.AsyncClient, url: str, *, headers: dict[str, str],
+                                payload: dict[str, Any]) -> httpx.Response:
+    """Collect MiMo SSE into the existing completion contract within one attempt."""
+    async with client.stream("POST", url, headers=headers, json=payload) as response:
+        if response.status_code >= 400 or "application/json" in response.headers.get("content-type", "").lower():
+            await response.aread()
+            return response
+        body: dict[str, Any] = {}
+        content, reasoning = [], []
+        finish_reason = None
+
+        def consume(data: str) -> bool:
+            nonlocal finish_reason
+            if data.strip() == "[DONE]":
+                return True
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError as exc:
+                raise httpx.RemoteProtocolError("MiMo 流式响应包含无效片段，未采用不完整内容。") from exc
+            if isinstance(chunk, dict) and chunk.get("error"):
+                if _mimo_permanent_stream_error(chunk["error"]):
+                    message = _safe_error_message(httpx.Response(200, json=chunk))
+                    raise _MimoPermanentStreamError(f"小米 MiMo 流式响应返回请求错误：{message}")
+                raise httpx.RemoteProtocolError("MiMo 流式响应未正常返回，未采用不完整内容。")
+            if not isinstance(chunk, dict):
+                raise httpx.RemoteProtocolError("MiMo 流式响应未正常返回，未采用不完整内容。")
+            for key in ("id", "model"):
+                if chunk.get(key):
+                    body[key] = chunk[key]
+            if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
+                body["usage"] = chunk["usage"]
+            choices = chunk.get("choices") or []
+            if not isinstance(choices, list):
+                raise httpx.RemoteProtocolError("MiMo 流式响应的结构不完整。")
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    raise httpx.RemoteProtocolError("MiMo 流式响应的结构不完整。")
+                if choice.get("index", 0) != 0:
+                    continue
+                delta = choice.get("delta") or {}
+                if not isinstance(delta, dict):
+                    raise httpx.RemoteProtocolError("MiMo 流式响应的结构不完整。")
+                for key, target in (("content", content), ("reasoning_content", reasoning)):
+                    value = delta.get(key)
+                    if value is not None:
+                        if not isinstance(value, str):
+                            raise httpx.RemoteProtocolError("MiMo 流式响应包含不支持的文本片段。")
+                        target.append(value)
+                if choice.get("finish_reason") is not None:
+                    finish_reason = choice["finish_reason"]
+            return False
+
+        event_lines = []
+        async for line in response.aiter_lines():
+            if not line:
+                if event_lines:
+                    done = consume("\n".join(event_lines))
+                    event_lines = []
+                    if done:
+                        break
+            elif line.startswith("data:"):
+                event_lines.append(line[5:].lstrip(" "))
+        if event_lines:
+            consume("\n".join(event_lines))
+        if not isinstance(finish_reason, str) or not finish_reason:
+            raise httpx.RemoteProtocolError("MiMo 流式响应在完成前中断，未采用不完整内容。")
+        if finish_reason not in {"stop", "length"}:
+            raise _MimoPermanentStreamError("小米 MiMo 未正常完成本次文本输出，未采用模型结果；请查看服务状态后处理当前步骤。")
+        body["choices"] = [{"index": 0, "finish_reason": finish_reason,
+                            "message": {"role": "assistant", "content": "".join(content),
+                                        "reasoning_content": "".join(reasoning) or None}}]
+        return httpx.Response(response.status_code, json=body, request=response.request)
 
 
 @dataclass(slots=True)
@@ -155,15 +251,12 @@ class DeepSeekProvider:
             "provider": kind,
             "protocol": "openai_compatible",
             "json_mode": kind != "ollama",
-            "reasoning_effort": not self.settings.is_mimo and kind in {"deepseek", "openai"},
             "thinking": self.settings.is_mimo or self.settings.is_deepseek,
-            "sampling_constraints": ({"temperature": [0, 1.5], "top_p": [0.01, 1],
-                "thinking_temperature": 1.0, "thinking_top_p": 0.95} if self.settings.is_mimo else {}),
-            "top_k": False,
             "balance": self.settings.is_deepseek and not self.settings.is_mimo,
             "api_key_required": kind != "ollama",
             "context_hard_tokens": self.settings.context_hard_tokens,
             "max_output_tokens": self.settings.max_output_tokens,
+            **self.settings.parameter_capabilities(),
         }
 
     async def list_models(self) -> list[str]:
@@ -246,7 +339,8 @@ class DeepSeekProvider:
         requested_max_tokens = self.settings.effective_output_tokens(max_tokens, agent_role, model_override,
             estimate_tokens(json.dumps([{"role": "system", "content": system},
                                        {"role": "user", "content": user_prompt}], ensure_ascii=False)))
-        token_parameter = "max_completion_tokens" if self.settings.is_mimo else "max_tokens"
+        capabilities = self.settings.parameter_capabilities(model_override)
+        token_parameter = "max_completion_tokens" if capabilities["max_completion_tokens"] else "max_tokens"
         payload: dict[str, Any] = {
             "model": model_override or self.settings.model,
             "messages": [
@@ -276,23 +370,30 @@ class DeepSeekProvider:
                 f"{output_model.__name__}:v1"
             )
         generation = _generation_settings(self.settings, agent_role)
-        if self.settings.is_mimo and generation and (
-            not 0 <= generation["temperature"] <= 1.5 or not 0.01 <= generation["top_p"] <= 1
-        ):
-            raise ConfigurationError("MiMo 温度必须在 0～1.5、Top P 在 0.01～1 之间；请调整当前角色设置，尚未发送请求。")
+        if agent_role and (problems := self.settings.generation_problems(agent_role, model_override)):
+            raise ConfigurationError("；".join(problems) + "；请调整当前角色设置，尚未发送请求。")
         if generation:
-            payload["temperature"] = generation["temperature"]
-            payload["top_p"] = generation["top_p"]
-            if generation["top_k"] is not None and not self.settings.is_mimo:
+            for name in ("temperature", "top_p"):
+                if capabilities["sampling_parameters"][name] and not (thinking and capabilities["sampling_without_reasoning_only"]):
+                    payload[name] = generation[name]
+            if generation["top_k"] is not None and capabilities["top_k"]:
                 payload["top_k"] = generation["top_k"]
         if self.settings.is_mimo:
+            payload["stream"] = True
             payload["thinking"] = {"type": "enabled" if thinking else "disabled"}
             if thinking:
                 payload.update(temperature=1.0, top_p=0.95)
         elif self.settings.is_deepseek:
             payload["thinking"] = {"type": "enabled" if thinking else "disabled"}
-        if thinking and self.settings.is_deepseek and not self.settings.is_mimo:
-            payload["reasoning_effort"] = effort or self.settings.reasoning_effort
+            sampling = capabilities["sampling_constraints"]
+            if "thinking_top_p_min" in sampling:
+                payload["top_p"] = max(sampling["thinking_top_p_min"], generation.get("top_p", 1.0)) if thinking else sampling["non_thinking_top_p"]
+                if thinking and sampling.get("thinking_temperature_ignored"):
+                    payload.pop("temperature", None)
+        if capabilities["reasoning_effort"] and (thinking or not self.settings.is_deepseek):
+            selected_effort = effort or self.settings.reasoning_effort
+            payload["reasoning_effort"] = (capabilities["reasoning_effort_map"].get(selected_effort, selected_effort)
+                if thinking else capabilities["non_thinking_effort"])
         url = f"{self.settings.base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         if not api_key:
@@ -301,9 +402,9 @@ class DeepSeekProvider:
         last_error: Exception | None = None
         recovery_events: list[dict[str, Any]] = []
         attempt_usage: list[dict[str, Any]] = []
-        reported_usage: dict[str, int] = {}
         request_id = uuid4().hex
-        for attempt in range(3):
+        attempts = 2 if self.settings.quality_preset == "economy" else 3
+        for attempt in range(attempts):
             runtime = active_runtime.get()
             serialized_input = json.dumps(payload["messages"], ensure_ascii=False)
             requested_max_tokens = self.settings.effective_output_tokens(
@@ -327,6 +428,9 @@ class DeepSeekProvider:
                 input_estimate=estimate_tokens(serialized_input), max_output_tokens=requested_max_tokens,
                 input_bound=len(serialized_input.encode("utf-8")) + 1024,
                 task_id=runtime.task_id if runtime else "")
+            attempt_record = {"attempt": attempt + 1, "thinking": payload.get("thinking"),
+                              "request_sent": False, "usage": {}}
+            attempt_usage.append(attempt_record)
             retry_kind = "format"
             retry_delay = 0.0
             try:
@@ -334,8 +438,10 @@ class DeepSeekProvider:
                 async with _model_request_slot(self.settings):
                     async with httpx.AsyncClient(timeout=request_timeout) as client:
                         accounting.mark_request_sent()
+                        attempt_record["request_sent"] = True
                         response = await asyncio.wait_for(
-                            client.post(url, headers=headers, json=payload),
+                            _mimo_stream_response(client, url, headers=headers, payload=payload)
+                            if self.settings.is_mimo else client.post(url, headers=headers, json=payload),
                             timeout=request_timeout,
                         )
                 if response.status_code >= 400:
@@ -363,16 +469,9 @@ class DeepSeekProvider:
                 body = response.json()
                 usage = dict(body.get("usage") or {})
                 accounting.settle(usage)
-                attempt_usage.append({
-                    "attempt": attempt + 1,
-                    "thinking": payload.get("thinking"),
-                    "usage": usage,
-                })
+                attempt_record["usage"] = usage
                 if runtime:
                     runtime.settle(reserved, usage)
-                for key, value in usage.items():
-                    if isinstance(value, int) and not isinstance(value, bool):
-                        reported_usage[key] = reported_usage.get(key, 0) + value
                 choice = body["choices"][0]
                 message = choice["message"]
                 content = message.get("content") or ""
@@ -396,9 +495,9 @@ class DeepSeekProvider:
                     model=str(body.get("model") or model_override or self.settings.model),
                     response_id=body.get("id"),
                     reasoning_content=message.get("reasoning_content"),
-                    usage={**usage, **reported_usage, "attempt_usage": attempt_usage,
+                    usage=aggregate_usage({**usage, "attempt_usage": attempt_usage,
                            "cache_prefix_diagnostic": prefix_diagnostic,
-                           **({"recovery_events": recovery_events} if recovery_events else {})},
+                           **({"recovery_events": recovery_events} if recovery_events else {})}),
                     agent_role=agent_role,
                 )
             except asyncio.CancelledError:
@@ -418,6 +517,8 @@ class DeepSeekProvider:
                 validation_errors = [{"location": ".".join(map(str, item["loc"])), "type": item["type"], "message": item["msg"][:500]}
                     for item in exc.errors(include_input=False, include_url=False)[:8]] if isinstance(exc, ValidationError) else []
                 last_error = exc
+                if isinstance(exc, _MimoPermanentStreamError):
+                    retry_kind = "permanent"
                 if retry_kind == "permanent":
                     exc.recovery_node = "provider.request"
                     exc.recovery_attempts = attempt
@@ -426,7 +527,7 @@ class DeepSeekProvider:
                 if isinstance(exc, (httpx.HTTPError, asyncio.TimeoutError)):
                     retry_kind = "transport"
                     retry_delay = float(2 ** attempt)
-                if attempt < 2:
+                if attempt + 1 < attempts:
                     recovery_events.append({
                         "attempt": attempt + 1,
                         "kind": retry_kind,
@@ -439,7 +540,7 @@ class DeepSeekProvider:
                         problem = "网络或限流" if retry_kind == "transport" else "输出格式"
                         runtime.publish({
                             "type": "model.recovering",
-                            "summary": f"模型请求遇到{problem}问题，正在第 {attempt + 2}/3 次尝试；不重做已保存的正文或提交。",
+                            "summary": f"模型请求遇到{problem}问题，正在第 {attempt + 2}/{attempts} 次尝试；不重做已保存的正文或提交。",
                             "metadata": {"kind": retry_kind, "attempt": attempt + 2, "error_type": type(exc).__name__,
                                          **({"validation_errors": validation_errors} if validation_errors else {})},
                         })
@@ -456,6 +557,15 @@ class DeepSeekProvider:
                     if self.settings.is_mimo:
                         payload.update(temperature=generation.get("temperature", 1.0),
                                        top_p=generation.get("top_p", 0.95))
+                    elif self.settings.is_deepseek and "non_thinking_top_p" in capabilities["sampling_constraints"]:
+                        payload.update(temperature=generation.get("temperature", 1.0),
+                            top_p=capabilities["sampling_constraints"]["non_thinking_top_p"])
+                    elif capabilities["reasoning_effort"] and not self.settings.is_deepseek:
+                        payload["reasoning_effort"] = capabilities["non_thinking_effort"]
+                        if capabilities["sampling_without_reasoning_only"]:
+                            for name in ("temperature", "top_p"):
+                                if name in generation and capabilities["sampling_parameters"][name]:
+                                    payload[name] = generation[name]
                     payload[token_parameter] = requested_max_tokens
                     payload["messages"][-1]["content"] = (
                         dynamic_prompt
@@ -476,7 +586,7 @@ class DeepSeekProvider:
             reason = "未能建立到模型服务的连接，本步还没有收到模型结果。请检查网络、代理或服务可用性；连接恢复后续接当前步骤。"
         else:
             reason = str(last_error).strip() or type(last_error).__name__
-        exhausted = ProviderError(f"模型请求经过 3 次限次自恢复仍未完成：{reason}")
+        exhausted = ProviderError(f"模型请求经过 {attempts} 次限次自恢复仍未完成：{reason}")
         exhausted.recovery_node = "provider.request"
         exhausted.recovery_attempts = attempt
         exhausted.recovery_exhausted = True
@@ -494,12 +604,11 @@ class AnthropicProvider:
             "provider": "anthropic",
             "protocol": "anthropic_messages",
             "json_mode": False,
-            "reasoning_effort": False,
-            "top_k": True,
             "balance": False,
             "api_key_required": True,
             "context_hard_tokens": self.settings.context_hard_tokens,
             "max_output_tokens": self.settings.max_output_tokens,
+            **self.settings.parameter_capabilities(),
         }
 
     def _headers(self) -> dict[str, str]:
@@ -547,6 +656,9 @@ class AnthropicProvider:
             _generation_schema(output_model), ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         generation = _generation_settings(self.settings, agent_role)
+        capabilities = self.settings.parameter_capabilities(model_override)
+        if agent_role and (problems := self.settings.generation_problems(agent_role, model_override)):
+            raise ConfigurationError("；".join(problems) + "；请调整当前角色设置，尚未发送请求。")
         payload: dict[str, Any] = {
             "model": model_override or self.settings.model,
             "system": system_prompt.rstrip() + "\n\n只输出满足下列 JSON Schema 的 JSON 对象，不要使用 Markdown：\n" + schema_prompt,
@@ -554,16 +666,18 @@ class AnthropicProvider:
             "max_tokens": self.settings.effective_output_tokens(max_tokens, agent_role, model_override),
         }
         if generation:
-            payload["temperature"] = generation.get("temperature")
-            payload["top_p"] = generation.get("top_p")
-            if generation.get("top_k") is not None:
+            for name in ("temperature", "top_p"):
+                if capabilities["sampling_parameters"][name]:
+                    payload[name] = generation[name]
+            if generation.get("top_k") is not None and capabilities["top_k"]:
                 payload["top_k"] = generation["top_k"]
         request_timeout = timeout_seconds or self.settings.request_timeout_seconds
         runtime = active_runtime.get()
         serialized_input = json.dumps({"system": payload["system"], "messages": payload["messages"]}, ensure_ascii=False)
         request_id = uuid4().hex
         recovery_events: list[dict[str, Any]] = []
-        for attempt in range(3):
+        attempts = 2 if self.settings.quality_preset == "economy" else 3
+        for attempt in range(attempts):
             payload["max_tokens"] = self.settings.effective_output_tokens(
                 max_tokens, agent_role, model_override, estimate_tokens(serialized_input))
             reserved = runtime.reserve(
@@ -588,7 +702,7 @@ class AnthropicProvider:
                             client.post(f"{self.settings.base_url}/v1/messages", headers=self._headers(), json=payload),
                             timeout=request_timeout,
                         )
-                if response.status_code == 429 and attempt < 2:
+                if response.status_code == 429 and attempt + 1 < attempts:
                     accounting.failure = "HTTP_429"
                     recovery_events.append({
                         "attempt": attempt + 1,
@@ -600,7 +714,7 @@ class AnthropicProvider:
                     if runtime:
                         runtime.publish({
                             "type": "model.recovering",
-                            "summary": f"模型请求遇到供应商限流，正在第 {attempt + 2}/3 次尝试。",
+                            "summary": f"模型请求遇到供应商限流，正在第 {attempt + 2}/{attempts} 次尝试。",
                             "metadata": {"kind": "transport", "attempt": attempt + 2, "error_type": "HTTP_429"},
                         })
                     await asyncio.sleep(_retry_after_seconds(response, attempt))
@@ -651,7 +765,7 @@ class AnthropicProvider:
                 raise failure from exc
             finally:
                 accounting.finish()
-        exhausted = ProviderError("Anthropic 模型请求经过 3 次限流重试仍未完成。")
+        exhausted = ProviderError(f"Anthropic 模型请求经过 {attempts} 次限流重试仍未完成。")
         exhausted.recovery_node = "provider.request"
         exhausted.recovery_attempts = attempt
         exhausted.recovery_exhausted = True

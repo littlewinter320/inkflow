@@ -133,7 +133,8 @@ def test_setting_audit_reads_real_material_then_uses_existing_edit_review(tmp_pa
     assert project.db.current_facts() == []
 
 
-def test_accepted_chapter_adopts_editor_reference_once(tmp_path):
+@pytest.mark.parametrize("actor,include_writer", [("editor", False), ("editor", True), ("reviewer", False)])
+def test_accepted_chapter_adopts_editor_reference_once(tmp_path, actor, include_writer):
     from inkflow.story_settings import StorySettingsService
     from inkflow.writer_notes import version_notes, notes_hash
     from inkflow.schemas import ReviewReport, MemoryPatch
@@ -144,18 +145,27 @@ def test_accepted_chapter_adopts_editor_reference_once(tmp_path):
     proposal = SettingRecordProposal(collection_id=collection["collection_id"], title="已核条目",
         values={"description": "此前已核对的事实。"}, epistemic_status="objective",
         evidence_refs=[{"source_kind": "draft", "chapter_no": 10, "quote": "此前已核对的事实。"}])
+    if include_writer:
+        project.db.save_agent_artifact(artifact_type="writer_hook_note", run_id="writer-test",
+            role="writer", chapter_no=10, chapter_version=chapter["version"], status="current",
+            data={"content_hash": chapter["content_hash"], "setting_updates": [proposal.model_copy(
+                update={"epistemic_status": "hypothesis"}).model_dump(mode="json")]})
     artifact = project.db.save_agent_artifact(artifact_type="mode_check_candidate", run_id="audit-test",
-        role="editor", chapter_no=10, chapter_version=chapter["version"], dimension="everyday", status="verified",
+        role=actor, chapter_no=10, chapter_version=chapter["version"], dimension="everyday", status="verified",
         data={"source_hash": chapter["content_hash"], "story_fingerprint": "story", "snapshot_hash": "snapshot",
-              "output": {"verdict": "pass", "setting_updates": [proposal.model_dump(mode="json")]}})
+              "output": {"verdict": "pass", "confidence": 1, "summary": "按当前正文核对附件", "setting_updates": [proposal.model_dump(mode="json")]}})
     report = ReviewReport(verdict="pass", confidence=1, summary="正文及参考候选通过",
         source_hash=chapter["content_hash"], writer_notes_hash=notes_hash(version_notes(project, 10)))
     review = {"chapter_version": chapter["version"], "report": report,
         "mode_bundle": {"mode": "everyday", "story_fingerprint": "story", "snapshot_hash": "snapshot",
-                        "candidate_artifact_ids": {"editor": artifact["artifact_id"]}}}
+                        "candidate_artifact_ids": {actor: artifact["artifact_id"]}}}
     engine = InkFlowEngine(ScriptedProvider([]), Settings())
     patch = MemoryPatch(chapter_no=10, chapter_summary="已核事实")
     first = engine._adopt_setting_proposals(project, 10, chapter["version"], patch, review)
+    if actor != "editor":
+        assert not first["record_ids"] and not first["warnings"] and first["deferred_candidates"]
+        assert service.records(collection["collection_id"]) == []
+        return
     assert len(first["record_ids"]) == 1 and not first["warnings"]
     record = service.records(collection["collection_id"])[0]
     assert record["evidence_refs"][0]["source_kind"] == "canonical"
@@ -164,6 +174,108 @@ def test_accepted_chapter_adopts_editor_reference_once(tmp_path):
     assert first == second
     assert len(service.records(collection["collection_id"])) == 1
     assert service.records(collection["collection_id"])[0]["revision"] == record["revision"]
+
+
+def test_required_rules_readback_and_world_classification(tmp_path):
+    import json
+    from inkflow.story_settings import book_requirement_collection, setting_classification_issues
+    from inkflow.schemas import ContextPacket, ContextSection, ModeCheckOutput, ContextUseAudit, SettingUseCheck
+    from inkflow.review_verifier import mode_output_model, setting_review_gaps
+    from pydantic import ValidationError
+    project = project_fixture(tmp_path)
+    brief = project.db.get_brief().model_copy(update={"user_rules": ["只写普通人", "保留日常对白"]})
+    collection = book_requirement_collection(brief, "只写普通人\n保留日常对白")
+    records = collection["records"]
+    packet = ContextPacket(project_id=project.project_id, chapter_no=11, task="核对本书要求", estimated_tokens=0,
+        sections=[ContextSection(key="CSET", title="必读要求", content=json.dumps({"collections": [collection]}),
+            hard=True, source_ids=[r["record_id"] for r in records])])
+    checks = [SettingUseCheck(record_id=r["record_id"], record_revision=1, disposition="not_applicable",
+        setting_quote=r["values"]["requirement"], reason="本次仅核对未涉及该要求的材料") for r in records]
+    output = ModeCheckOutput(verdict="pass", confidence=1, summary="逐项读取", context_use_audit=ContextUseAudit(setting_checks=checks))
+    assert not setting_review_gaps(output, "本次材料", packet)
+    model = mode_output_model(packet, primary=True)
+    model.model_validate(output.model_dump())
+    with pytest.raises(ValidationError):
+        model.model_validate(output.model_copy(update={"context_use_audit": ContextUseAudit(setting_checks=checks[:1])}).model_dump())
+    assert setting_classification_issues({"template_id": "world"}, {"changes": "第一卷15章，单章约2900字。"})
+    assert not setting_classification_issues({"template_id": "world"}, {"changes": "城里开始拆迁，登记制度发生变化。"})
+    assert not setting_classification_issues({"template_id": "constraint"}, {"changes": "第一卷15章，单章约2900字。"})
+
+
+def test_role_context_counts_use_project_and_request_limit(tmp_path):
+    from inkflow.context_status import role_context_status
+    from inkflow.model_usage import UsageLedger
+    from inkflow.utils import utc_now
+    path = tmp_path / "usage.sqlite"
+    ledger = UsageLedger(path)
+    settings = Settings(model="local-test", context_soft_tokens=10000, context_hard_tokens=20000)
+    attempt = ledger.begin(settings, request_id="context-test", model="local-test", role="writer",
+        input_estimate=800, max_output_tokens=1000, input_bound=2000)
+    ledger.settle(attempt, {"prompt_tokens": 1000, "completion_tokens": 100})
+    with ledger._connect() as db:
+        db.execute("UPDATE model_attempts SET novel_id=?,outcome='completed',started_at=? WHERE attempt_id=?", ("this-book", utc_now(), attempt))
+    roles, error = role_context_status(settings, "this-book", path)
+    writer = next(r for r in roles if r["role"] == "writer")
+    assert not error and writer["input_kind"] == "reported" and writer["input_tokens"] == 1000
+    assert writer["used_percent"] == 5 and writer["remaining_tokens"] == 19000
+    assert writer["limit_source"] == "request_snapshot"
+    with ledger._connect() as db:
+        db.execute("UPDATE model_attempts SET diagnostic_json='{}' WHERE attempt_id=?", (attempt,))
+    historical, _ = role_context_status(settings, "this-book", path)
+    old = next(r for r in historical if r["role"] == "writer")
+    assert old["input_tokens"] == 1000 and old["used_percent"] is None and old["remaining_tokens"] is None
+    other, _ = role_context_status(settings, "other-book", path)
+    assert all(r["input_tokens"] is None and r["request_state"] == "not_called" for r in other)
+    path.write_bytes(b"broken local record")
+    broken, error = role_context_status(settings, "this-book", path)
+    assert error and all(r["input_tokens"] is None and r["request_state"] == "unknown" for r in broken)
+
+
+def test_context_material_snapshot_keeps_role_and_rejects_changed_source(tmp_path):
+    from inkflow.context import ContextBuilder
+    from inkflow.context_status import read_context_material
+    from inkflow.schemas import ContextPacket, ContextSection
+    from inkflow.errors import ProjectError
+    import json
+    project = project_fixture(tmp_path)
+    builder = ContextBuilder(project)
+    packet = ContextPacket(project_id=project.project_id, chapter_no=11, task="写作", estimated_tokens=10,
+        sections=[ContextSection(key="B", title="正史", content="可信的原文", source_ids=["chapter:00010"])])
+    builder._publish_context_status(packet, 10, role="writer")
+    first = json.loads((project.internal / "context-status-writer.json").read_text(encoding="utf-8"))
+    summary = json.loads((project.internal / "context-status-writer-summary.json").read_text(encoding="utf-8"))
+    assert summary["packet_hash"] == first["packet_hash"] and "material_contents" not in summary
+    args = dict(role="writer", section_key="B", updated_at=first["updated_at"], packet_hash=first["packet_hash"])
+    assert read_context_material(project, **args)["content"] == "可信的原文"
+    packet.sections[0].content = "更新后的原文"
+    builder._publish_context_status(packet, 10, role="writer")
+    with pytest.raises(ProjectError):
+        read_context_material(project, **args)
+
+    (project.internal / "context-status-writer.json").write_text("[]", encoding="utf-8")
+    with pytest.raises(ProjectError):
+        read_context_material(project, **args)
+
+
+def test_writer_handoff_is_available_to_next_batch_chapter_only_after_review(tmp_path):
+    from inkflow.writer_notes import version_notes, notes_hash, recent_approved_notes
+    from inkflow.schemas import ReviewReport
+    project = project_fixture(tmp_path)
+    chapter = project.db.get_chapter(10)
+    project.db.save_agent_artifact(artifact_type="writer_hook_note", run_id="handoff", role="writer", chapter_no=10,
+        chapter_version=chapter["version"], status="current", data={"content_hash": chapter["content_hash"],
+            "decision_summary": ["选择先找见证人"], "thread_changes": ["旧线索得到回应"], "new_fact_candidates": ["取得新回执"]})
+    assert recent_approved_notes(project, 11) == []
+    project.db.save_review(10, chapter["version"], ReviewReport(verdict="pass", confidence=1, summary="核对通过",
+        source_hash=chapter["content_hash"], writer_notes_hash=notes_hash(version_notes(project, 10))), "reviews/handoff.md")
+    assert recent_approved_notes(project, 11)[0]["important_decisions"] == ["选择先找见证人"]
+    with project.db.connect() as db:
+        db.execute("UPDATE chapters SET status='draft' WHERE chapter_no=10")
+        db.commit()
+    assert recent_approved_notes(project, 11) == []
+    draft = {"chapter_no": 10, "content": (project.root / chapter["path"]).read_text(encoding="utf-8"), "memory_patch": {"chapter_summary": "已核摘要"}}
+    assert recent_approved_notes(project, 11, [draft])[0]["thread_changes_to_check"] == ["旧线索得到回应"]
+    assert recent_approved_notes(project, 11, [{**draft, "content": "变化后的正文"}]) == []
 
 
 def test_setting_page_reads_the_same_versioned_review(tmp_path):

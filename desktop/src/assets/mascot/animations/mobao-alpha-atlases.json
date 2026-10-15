@@ -4,63 +4,63 @@
     "frames": 60,
     "columns": 8,
     "rows": 8,
-    "fps": 12,
-    "duration": 5.0
+    "fps": 16,
+    "duration": 3.75
   },
   "idle": {
     "file": "mobao-alpha-idle.atlas.png",
     "frames": 80,
     "columns": 8,
     "rows": 10,
-    "fps": 12,
-    "duration": 6.666666666666667
+    "fps": 16,
+    "duration": 5.0
   },
   "thinking": {
     "file": "mobao-alpha-thinking.atlas.png",
     "frames": 60,
     "columns": 8,
     "rows": 8,
-    "fps": 12,
-    "duration": 5.0
+    "fps": 16,
+    "duration": 3.75
   },
   "writing": {
     "file": "mobao-alpha-writing.atlas.png",
     "frames": 80,
     "columns": 8,
     "rows": 10,
-    "fps": 12,
-    "duration": 6.666666666666667
+    "fps": 16,
+    "duration": 5.0
   },
   "reviewing": {
     "file": "mobao-alpha-reviewing.atlas.png",
     "frames": 80,
     "columns": 8,
     "rows": 10,
-    "fps": 12,
-    "duration": 6.666666666666667
+    "fps": 16,
+    "duration": 5.0
   },
   "move": {
     "file": "mobao-alpha-move.atlas.png",
     "frames": 40,
     "columns": 8,
     "rows": 5,
-    "fps": 12,
-    "duration": 3.3333333333333335
+    "fps": 16,
+    "duration": 2.5
   },
   "tap-result": {
     "file": "mobao-alpha-tap-result.atlas.png",
     "frames": 30,
     "columns": 8,
     "rows": 4,
-    "fps": 12,
-    "duration": 2.5
+    "fps": 16,
+    "duration": 1.875
   },
   "point-result": {
     "file": "mobao-alpha-point-result.atlas.png",
     "frames": 40,
     "columns": 8,
     "rows": 5,
-    "fps": 12,
-    "duration": 3.3333333333333335
+    "fps": 16,
+    "duration": 2.5
   }
 }

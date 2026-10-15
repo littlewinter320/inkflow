@@ -7,6 +7,7 @@ import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
+from dataclasses import replace
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Iterator
@@ -21,7 +22,17 @@ from .task_settings import (
 )
 from .utils import atomic_write_text, content_hash, effective_character_count, json_dumps, utc_now
 from .writer_notes import approved_notes, notes_hash, version_notes
-from .role_protocol import new_task_mode
+from .role_protocol import new_task_mode, specialist_for_action, READ_ONLY_COLLABORATION_ACTIONS
+
+
+def bind_active_collaboration(project: InkFlowProject, action: str, *, specialist: str | None = None,
+                              reason: str = "", forbidden_actions: list[str] | None = None) -> TaskSettingsScope | None:
+    scope = active_task_settings.get()
+    if scope is not None and scope.collaboration_selection_required:
+        scope = StudioService(project).db.bind_task_collaboration(scope, action=action,
+            specialist=specialist, reason=reason, forbidden_actions=forbidden_actions)
+        active_task_settings.set(scope)
+    return scope
 
 
 STUDIO_SCHEMA = """
@@ -607,6 +618,51 @@ class StudioDatabase:
                 raise TaskSettingsError("任务配置快照与存储索引不一致。")
         return snapshot
 
+    @staticmethod
+    def _collaboration_record(scope: TaskSettingsScope, *, mode: str | None = None,
+                              action: str = "", reason: str = "") -> dict[str, Any]:
+        record = {"task_id": scope.task_id, "snapshot_hash": scope.snapshot_hash, "novel_id": scope.novel_id,
+                  "status": "bound" if mode else "pending", "mode": mode, "action": action, "reason": reason[:300]}
+        record["record_hash"] = content_hash(json_dumps(record, indent=None))
+        return record
+
+    def _restore_collaboration(self, connection, scope: TaskSettingsScope) -> TaskSettingsScope:
+        if not scope.collaboration_selection_required:
+            return scope
+        row = connection.execute("SELECT value_json FROM studio_metadata WHERE key=?",
+                                 (f"task_collaboration:{scope.task_id}",)).fetchone()
+        try:
+            data = json.loads(row["value_json"]) if row else None
+            expected = self._collaboration_record(scope, mode=data["mode"], action=data["action"], reason=data["reason"]) if data else None
+            if data is None or data != expected or data["mode"] not in {None, "everyday", "review_boost", "memory_boost"}:
+                raise ValueError("invalid collaboration binding")
+        except (ValueError, TypeError, KeyError) as exc:
+            raise TaskSettingsError("原任务的四人分工记录缺失或损坏，未使用当前设置重新选择。") from exc
+        return replace(scope, resolved_collaboration_mode=data["mode"])
+
+    def bind_task_collaboration(self, scope: TaskSettingsScope, *, action: str,
+                                specialist: str | None = None, reason: str = "",
+                                forbidden_actions: list[str] | None = None) -> TaskSettingsScope:
+        """Freeze one existing task's assignment without changing its snapshot or budget."""
+        if not scope.collaboration_selection_required:
+            return scope
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self._restore_collaboration(connection, scope)
+            if not current.collaboration_pending or action in READ_ONLY_COLLABORATION_ACTIONS:
+                return current
+            if specialist not in {None, "reviewer", "memory_keeper"}:
+                raise TaskSettingsError("四人分工只能选择 Reviewer 或 Memory Keeper。")
+            limited = bool(set(forbidden_actions or []) & {"extra_calls", "extra_model_calls", "specialist_review"})
+            role = specialist or specialist_for_action(action)
+            mode = "everyday" if limited else "memory_boost" if role == "memory_keeper" else "review_boost"
+            record = self._collaboration_record(scope, mode=mode, action=action,
+                reason="当前任务禁止额外调用，仅沿用基础分工。" if limited else reason or f"按明确的 {action} 任务职责选择 {role}。")
+            connection.execute("UPDATE studio_metadata SET value_json=?,updated_at=? WHERE key=?",
+                (json_dumps(record, indent=None), utc_now(), f"task_collaboration:{scope.task_id}"))
+            connection.commit()
+            return replace(scope, resolved_collaboration_mode=mode)
+
     def prepare_batch_settings(
         self,
         *,
@@ -634,16 +690,18 @@ class StudioDatabase:
                 scope = restore_task_settings(snapshot, novel_id=novel_id, workspace_root=root)
                 if type(reference.get("schema_version")) is not int or adapt_task_reference(reference) != scope.public_summary():
                     raise TaskSettingsError("批次配置引用与原快照不一致，未恢复执行。")
-                return scope
+                return self._restore_collaboration(connection, scope)
             if not isinstance(settings, Settings):
                 raise TaskSettingsError("新批次或旧版批次缺少可固定的当前配置。")
             if settings.workspace_root is not None and settings.workspace_root.resolve() != root:
                 raise TaskSettingsError("批次配置工作区与当前小说不一致。")
             parent = active_task_settings.get()
             inherit_mode = parent is not None and parent.novel_id == novel_id and not legacy
+            if inherit_mode and parent.collaboration_pending:
+                raise TaskSettingsError("新批次须先固定原任务的四人分工，不能丢弃原语义后重新选择。")
             snapshot = capture_task_settings(
                 settings, novel_id=novel_id, source="legacy_recovery" if legacy else "task_start",
-                collaboration_mode=parent.collaboration_mode if inherit_mode else "everyday",
+                collaboration_mode=parent.effective_collaboration_mode if inherit_mode else None,
             )
             scope = restore_task_settings(snapshot, novel_id=novel_id, workspace_root=root)
             connection.execute(
@@ -651,6 +709,9 @@ class StudioDatabase:
                    (task_id,novel_id,snapshot_hash,snapshot_json,captured_at,source) VALUES (?,?,?,?,?,?)""",
                 (scope.task_id, novel_id, scope.snapshot_hash, json_dumps(snapshot), scope.captured_at, scope.source),
             )
+            if scope.collaboration_selection_required:
+                connection.execute("INSERT INTO studio_metadata(key,value_json,updated_at) VALUES (?,?,?)",
+                    (f"task_collaboration:{scope.task_id}", json_dumps(self._collaboration_record(scope), indent=None), utc_now()))
             connection.commit()
             return scope
 
@@ -679,8 +740,7 @@ class StudioDatabase:
         root = Path(workspace_root).resolve() if workspace_root is not None else self.path.resolve().parent.parent
 
         def requested_mode_matches(scope: TaskSettingsScope) -> TaskSettingsScope:
-            requested_mode = new_task_mode(collaboration_mode) if collaboration_mode is not None else None
-            if requested_mode is not None and requested_mode != scope.collaboration_mode:
+            if collaboration_mode is not None and not scope.matches_collaboration_request(collaboration_mode):
                 raise TaskSettingsError("恢复任务不能切换协作模式；请新建任务并明确选择模式。")
             return scope
 
@@ -701,7 +761,8 @@ class StudioDatabase:
                     if previous is None or previous["task_id"] != current["task_id"]:
                         raise TaskSettingsError("此运行已经绑定其他任务配置，不能重新指定恢复来源。")
                 snapshot = self._task_settings_record(current, novel_id)
-                return requested_mode_matches(restore_task_settings(snapshot, novel_id=novel_id, workspace_root=root))
+                return requested_mode_matches(self._restore_collaboration(connection,
+                    restore_task_settings(snapshot, novel_id=novel_id, workspace_root=root)))
 
             source = "task_start"
             previous = None
@@ -741,11 +802,14 @@ class StudioDatabase:
                     raise TaskSettingsError("当前配置的工作区与小说任务不一致。")
                 snapshot = capture_task_settings(
                     current_settings, novel_id=novel_id, source=source,
-                    collaboration_mode=collaboration_mode if collaboration_mode is not None else "everyday",
+                    collaboration_mode=collaboration_mode,
                 )
 
             # Validate before either insertion; a failure leaves no partial link.
-            scope = requested_mode_matches(restore_task_settings(snapshot, novel_id=novel_id, workspace_root=root))
+            scope = restore_task_settings(snapshot, novel_id=novel_id, workspace_root=root)
+            if previous is not None:
+                scope = self._restore_collaboration(connection, scope)
+            scope = requested_mode_matches(scope)
             if previous is None:
                 connection.execute(
                     """INSERT INTO task_settings_snapshots
@@ -754,6 +818,10 @@ class StudioDatabase:
                 )
                 if resume_run_id is not None:
                     connection.execute("INSERT INTO task_run_settings(run_id,task_id) VALUES (?,?)", (resume_run_id, scope.task_id))
+                if scope.collaboration_selection_required:
+                    connection.execute("INSERT INTO studio_metadata(key,value_json,updated_at) VALUES (?,?,?)",
+                        (f"task_collaboration:{scope.task_id}", json_dumps(self._collaboration_record(scope), indent=None), utc_now()))
+            scope = self._restore_collaboration(connection, scope)
             connection.execute("INSERT INTO task_run_settings(run_id,task_id) VALUES (?,?)", (run_id, scope.task_id))
             connection.commit()
             return scope
@@ -934,8 +1002,6 @@ class StudioDatabase:
                 (owner_id,),
             ).fetchall()
             interrupted = [row for row in rows if _owner_process_alive(row["owner_id"]) is False]
-            if not interrupted:
-                return 0
 
             def guarded_write(row: sqlite3.Row) -> bool:
                 try:
@@ -970,7 +1036,38 @@ class StudioDatabase:
                 ],
             )
             connection.commit()
-            return len(interrupted)
+            interrupted_runs = {row["run_id"] for row in connection.execute(
+                "SELECT run_id FROM task_runs WHERE status='interrupted' AND error_code='engine_process_exited'"
+            ).fetchall()}
+        self._reconcile_interrupted_pending_work(interrupted_runs)
+        return len(interrupted)
+
+    def _reconcile_interrupted_pending_work(self, run_ids: set[str]) -> None:
+        project_db = self.path.parent / "inkflow.db"
+        if not run_ids or not project_db.is_file():
+            return
+        try:
+            with project_write_lock_sync(self.path.parent.parent, timeout=0.25):
+                with sqlite3.connect(project_db) as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    rows = connection.execute("SELECT key,value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
+                    for key, value in rows:
+                        try:
+                            item = json.loads(value)
+                        except (TypeError, json.JSONDecodeError):
+                            continue
+                        if (not isinstance(item, dict) or item.get("status") != "running"
+                                or item.get("run_id") not in run_ids):
+                            continue
+                        now = utc_now()
+                        item = {**item, "status": "interrupted", "updated_at": now,
+                            "interruption": {"run_id": item["run_id"], "reason": "原本地引擎进程已退出，先核对已有成果及保存断点。", "at": now}}
+                        connection.execute("UPDATE metadata SET value_json=?,updated_at=? WHERE key=? AND value_json=?",
+                            (json_dumps(item), now, key, value))
+                    connection.commit()
+        except (ProjectError, sqlite3.OperationalError):
+            # Task interruption is durable; a later refresh retries only this short bookkeeping sync.
+            pass
 
     def get_task(self, run_id: str) -> dict[str, Any]:
         with self.connect() as connection:

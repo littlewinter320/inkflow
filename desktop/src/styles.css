@@ -1208,13 +1208,28 @@ pre { white-space: pre-wrap; word-break: break-word; }
 .record-summary { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.65; }
 
 .chapter-tree-groups { padding-left: 7px; }
-.mobao-companion { position: fixed; width: 76px; height: 76px; z-index: 38; transition: left 3.3s ease-in-out, top 3.3s ease-in-out; }
+.mobao-companion { position: fixed; left: 0; top: 0; width: 76px; height: 76px; z-index: 38; will-change: transform; transition-property: transform; transition-timing-function: cubic-bezier(.22, 0, .35, 1); }
 .mobao-companion[data-dragging="true"] { transition: none; }
 .mobao-companion-body { width: 76px; height: 76px; border: 0; padding: 0; background: transparent !important; cursor: grab; touch-action: none; }
 .mobao-companion-body > .mobao { width: 100%; height: 100%; }
-.mobao-companion-return { position: absolute; right: -4px; top: -6px; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 50%; background: var(--panel-2); opacity: 0; font-size: 13px; }
-.mobao-companion:hover .mobao-companion-return, .mobao-companion:focus-within .mobao-companion-return { opacity: .8; }
-.mascot-conversation[role="button"] { cursor: grab; }
+.mobao-companion[data-dragging="true"] .mobao-companion-body { cursor: grabbing; }
+.mobao-companion-tools { position: absolute; right: -6px; top: -12px; display: flex; gap: 3px; opacity: 0; pointer-events: none; }
+.mobao-companion-tools button { width: 24px; height: 24px; padding: 0; border-radius: 50%; background: var(--panel-2); font-size: 13px; }
+.mobao-companion:hover .mobao-companion-tools, .mobao-companion:focus-within .mobao-companion-tools { opacity: 1; pointer-events: auto; }
+.mobao-result-card { position: absolute; top: 75px; right: 0; white-space: nowrap; }
+.mobao-result-card button { padding: 5px 10px; border: 1px solid var(--amber, #ad8244); border-radius: 20px; background: var(--panel-2); box-shadow: 0 4px 14px #0004; font-size: 12px; }
+.mobao-companion[data-flight="true"] .mobao-companion-body { filter: drop-shadow(0 2px 4px #e8a13d35); }
+.mobao-sparks { position: absolute; inset: 0; pointer-events: none; }
+.mobao-sparks i { position: absolute; left: 48%; top: 64%; width: 4px; height: 4px; border-radius: 50%; background: #e9ad51; animation: mobao-spark 650ms ease-out both; }
+.mobao-sparks i:nth-child(1) { --spark-x: -20px; --spark-y: -15px; }
+.mobao-sparks i:nth-child(2) { --spark-x: 19px; --spark-y: -22px; background: #f4cd7a; }
+.mobao-sparks i:nth-child(3) { --spark-x: 27px; --spark-y: 5px; background: #766058; }
+.mobao-sparks i:nth-child(4) { --spark-x: -15px; --spark-y: 14px; background: #8c7567; }
+@keyframes mobao-spark { from { opacity: .85; transform: translate(0, 0) scale(1); } to { opacity: 0; transform: translate(var(--spark-x), var(--spark-y)) scale(.3); } }
+.mobao[data-paused="true"] *, .mobao-companion[data-paused="true"] * { animation-play-state: paused !important; }
+.mascot-conversation[role="button"] { cursor: grab; touch-action: none; }
+@media (prefers-reduced-motion: reduce) { .mobao-sparks { display: none; } .mobao-companion { transition: none; } .mobao * { animation: none !important; } }
 
 .message .avatar.mobao-message-avatar { border: 0; background: transparent; width: 32px; height: 32px; }
 .mobao-message-avatar img { width: 100%; height: 100%; object-fit: contain; }
+.mobao-message-avatar .mobao-avatar { width: 100%; height: 100%; }

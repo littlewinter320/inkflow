@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable
 from pydantic import ValidationError
 
 from . import __version__
-from .config import Settings, adapt_settings, api_key_status, save_api_key_to_keyring, save_user_settings
+from .config import PROVIDER_KINDS, Settings, adapt_settings, api_key_status, mimo_endpoint_for_key, save_api_key_to_keyring, save_user_settings
 from .coordinator import Coordinator
 from .craft import AUTHOR_VOICE_CONTRACT
 from .engine import InkFlowEngine
@@ -30,11 +30,11 @@ from .references import ReferenceService
 from .role_protocol import ACTIVE_COLLABORATION_MODES, adapt_role, new_task_mode, normalize_role, roles_for_mode
 from .schemas import BookBrief, CollaborationReply, ContextPacket, ContextSection, MemoryPatch, ModeCheckOutput, NovelIdeaBundle, NovelIdeaCandidate, PrefillSuggestion, PromptOptimization, ProviderProbe, ReviewReport, SuggestedPrompt, TerminalIntent, WriterDirectionSet
 from .review_verifier import verify_review
-from .studio import StudioDatabase, StudioService, chapter_retry_state, text_statistics
+from .studio import StudioDatabase, StudioService, bind_active_collaboration, chapter_retry_state, text_statistics
 from .terminal_session import TerminalSession
 from .trace import TraceRecorder, recent_trace_runs
 from .runtime import RunRuntime, active_runtime
-from .model_usage import UsageLedger
+from .model_usage import UsageLedger, normalized_usage, usage_attempts
 from .planning_cleanup import cleanup_apply, cleanup_keep, cleanup_preview
 from .conversation_scope import active_conversation, conversation_id, conversation_key
 from .task_settings import active_task_settings, capture_task_settings, restore_task_settings, use_task_settings
@@ -46,13 +46,14 @@ EventSink = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 _COLLABORATION_MODES = {
-    "everyday", "review_boost", "memory_boost", "deep", "full_specialist",
+    "everyday", "adaptive", "review_boost", "memory_boost", "deep", "full_specialist",
 }
 _EXPLICIT_MODE_PREFIX = re.compile(
     r"^\s*请?\s*(?:开启|使用|切换到|切换回|按|用)\s*"
-    r"(日常|审查加强|记忆加强|深度|特殊五角色|五角色)模式(?=\s|[，,：:]|审|复|检|$)"
+    r"(日常协作|按需加强|全面协作|日常|审查加强|记忆加强|深度|特殊五角色|五角色)(?:模式)?(?=\s|[，,：:]|审|复|检|$)"
 )
 _SPOKEN_MODES = {
+    "日常协作": "everyday", "按需加强": "adaptive", "全面协作": "full_specialist",
     "日常": "everyday",
     "审查加强": "review_boost",
     "记忆加强": "memory_boost",
@@ -64,6 +65,8 @@ _SPOKEN_MODES = {
 
 def _requested_task_mode(method: str, params: dict[str, Any]) -> str | None:
     """Choose a mode only from an explicit request, never from risk keywords."""
+    if method in {"project.ideate", "prompt.optimize", "provider.test"}:
+        return "everyday"  # Auxiliary output contracts do not start chapter collaboration.
     if method not in {"conversation.send", "workflow.run"}:
         return None
     raw_mode = params.get("collaboration_mode")
@@ -76,7 +79,7 @@ def _requested_task_mode(method: str, params: dict[str, Any]) -> str | None:
     mode = str(raw_mode or "everyday")
     if mode not in _COLLABORATION_MODES:
         raise InkFlowError("未知协作模式；没有启动专项模型调用。")
-    return new_task_mode(mode)
+    return "adaptive" if mode == "adaptive" else new_task_mode(mode)
 
 
 def _task_rows_with_history(project: InkFlowProject, limit: int, instance_id: str) -> list[dict[str, Any]]:
@@ -316,7 +319,7 @@ class InkFlowAppService:
             if method in {"project.ideate", "prompt.optimize", "provider.test"}:
                 root = Path(str(params.get("project_root") or params.get("workspace_root") or Path.cwd())).resolve()
                 settings = Settings.from_env(root)
-                snapshot = capture_task_settings(settings, novel_id=f"aux-{uuid.uuid4().hex}")
+                snapshot = capture_task_settings(settings, novel_id=f"aux-{uuid.uuid4().hex}", collaboration_mode="everyday")
                 scope = restore_task_settings(
                     snapshot, novel_id=snapshot["novel_id"], workspace_root=root,
                 )
@@ -325,7 +328,7 @@ class InkFlowAppService:
                 scope = StudioService(project).db.prepare_task_settings(
                     f"app-{uuid.uuid4().hex}", novel_id=project.project_id,
                     settings=lambda: Settings.from_env(project.root), workspace_root=project.root,
-                    collaboration_mode=_requested_task_mode(method, params) or "everyday",
+                    collaboration_mode=_requested_task_mode(method, params),
                 )
             with use_task_settings(scope):
                 return await self.dispatch(method, params, emit, consume_steering)
@@ -416,6 +419,9 @@ class InkFlowAppService:
                 preview = Settings.from_mapping({**{key: getattr(settings, key) for key in names},
                     **{key: params[key] for key in names if key in params}, "max_output_tokens": 1})
                 settings = replace(settings, **{key: getattr(preview, key) for key in names})
+                if settings.provider_kind == "mimo":
+                    settings = replace(settings, base_url=mimo_endpoint_for_key(
+                        settings.base_url, settings.get_api_key() or ""))
             return {
                 **api_key_status(settings.provider_kind),
                 "provider_kind": settings.provider_kind,
@@ -427,15 +433,21 @@ class InkFlowAppService:
                 "context_budget_mode": settings.context_budget_mode,
                 "agent_context_budgets": settings.agent_context_budgets,
                 "max_output_tokens": settings.max_output_tokens,
+                "request_timeout_seconds": settings.request_timeout_seconds,
+                "planning_timeout_seconds": settings.planning_timeout_seconds,
                 "model_limits": settings.model_limits(),
                 "effective_output_tokens": settings.effective_output_tokens(settings.max_output_tokens),
                 "role_output_limits": {role: {"model": settings.model_for(role),
                     "model_limits": settings.model_limits(settings.model_for(role)),
+                    "capabilities": settings.parameter_capabilities(settings.model_for(role)),
                     "context_tokens": settings.context_budget_for(role)[1],
                     "max_output_tokens": settings.effective_output_tokens(settings.max_output_tokens, role)}
                     for role in settings.agent_generation},
                 "inquiry_frequency": settings.inquiry_frequency,
                 "hook_strategy": settings.hook_strategy,
+                "quality_preset": settings.quality_preset,
+                "quality_custom_context": settings.quality_custom_context,
+                "collaboration_preset": settings.collaboration_preset,
                 "chapter_length_tolerance": settings.chapter_length_tolerance,
                 "review_min_confidence": settings.review_min_confidence,
                 "acceptance_confirmation_mode": settings.acceptance_confirmation_mode,
@@ -461,6 +473,14 @@ class InkFlowAppService:
                 **settings.role_settings_view(),
                 "role_settings_warnings": list(settings.role_settings_warnings),
             }
+        if method == "provider.key":
+            provider_kind = str(params.get("provider_kind") or Settings.from_env().provider_kind).lower()
+            if provider_kind not in PROVIDER_KINDS:
+                raise ConfigurationError("请选择有效的模型服务商。")
+            if params.get("reveal") is True:
+                # Only this explicit local action returns the credential; no task or trace is created.
+                return {"api_key": await asyncio.to_thread(Settings(provider_kind=provider_kind).get_api_key)}
+            return await asyncio.to_thread(api_key_status, provider_kind)
         if method == "provider.configure":
             settings_params = adapt_settings(params)
             provider_kind = str(params.get("provider_kind") or Settings.from_env().provider_kind).lower()
@@ -480,8 +500,13 @@ class InkFlowAppService:
                     "context_budget_mode",
                     "agent_context_budgets",
                     "max_output_tokens",
+                    "request_timeout_seconds",
+                    "planning_timeout_seconds",
                     "inquiry_frequency",
                     "hook_strategy",
+                    "quality_preset",
+                    "quality_custom_context",
+                    "collaboration_preset",
                     "chapter_length_tolerance",
                     "review_min_confidence",
                     "acceptance_confirmation_mode",
@@ -515,6 +540,9 @@ class InkFlowAppService:
                     or settings_params[name] not in (None, "")
                 )
             }
+            if provider_kind == "mimo" and key:
+                allowed["base_url"] = mimo_endpoint_for_key(
+                    str(allowed.get("base_url") or Settings.from_env().base_url), key)
             # Reject invalid imports before touching shared provider credentials.
             await asyncio.to_thread(save_user_settings, allowed, validate_only=True)
             if key:
@@ -526,7 +554,9 @@ class InkFlowAppService:
                         if not worker.done():
                             worker.cancel()
             current = await asyncio.to_thread(Settings.from_env, params.get("workspace_root"))
-            return {"configured": True, **api_key_status(current.provider_kind), **allowed}
+            return {"configured": True, **api_key_status(current.provider_kind),
+                    **{name: getattr(current, name) for name in allowed},
+                    "provider_kind": current.provider_kind, "base_url": current.base_url, "model": current.model}
         if method == "provider.capabilities":
             settings = Settings.from_env(params.get("workspace_root"))
             return create_provider(settings).capabilities()
@@ -535,7 +565,7 @@ class InkFlowAppService:
             return {"models": await create_provider(settings).list_models()}
         if method == "provider.test":
             settings = active_task_settings.get().settings
-            await emit({"type": "provider.testing", "summary": "正在验证密钥、接口与模型名称"})
+            await emit({"type": "provider.testing", "summary": "正在验证生成接口是否可用"})
             result = await create_provider(settings).generate_json(
                 system_prompt="你只负责返回 API 连通性检查结果。",
                 user_prompt=(
@@ -937,11 +967,27 @@ class InkFlowAppService:
 
             return await asyncio.to_thread(read_overview)
 
+        if method in {"context.status", "context.details"}:
+            from .context_status import read_context_status, read_context_material
+            root = self._validated_project_root(params)
+            def read_capacity():
+                from types import SimpleNamespace
+                manifest = json.loads((root / ".inkflow" / "project.json").read_text(encoding="utf-8"))
+                project_view = SimpleNamespace(root=root, internal=root / ".inkflow", project_id=manifest["project_id"])
+                if method == "context.details":
+                    return read_context_material(project_view, role=str(params.get("role") or ""),
+                        section_key=str(params.get("section_key") or ""), updated_at=str(params.get("updated_at") or ""),
+                        packet_hash=str(params.get("packet_hash") or ""))
+                return read_context_status(project_view, Settings.from_env(root))
+            return await asyncio.to_thread(read_capacity)
+
         # Project construction may perform recovery under a synchronous write
         # lock.  Keep that wait off the asyncio event loop so a concurrent
         # Writer/Editor task can make progress and release its own lock.
         project = await asyncio.to_thread(self._project, params)
         studio = StudioService(project)
+        if method not in {"conversation.send", "workflow.run", "collaboration.reply", "manual_edits.review"}:
+            bind_active_collaboration(project, method)
         if method.startswith("manual_edits."):
             from .manual_edits import ManualEditsService
             manual = ManualEditsService(project)
@@ -1055,43 +1101,6 @@ class InkFlowAppService:
             return {"status": "completed", "pending_work": project.pending_work(),
                     "rejected_work": [work for work in project.pending_work(include_rejected=True) if work["status"] == "rejected"],
                     "reply": "决定已保存。已有成果和必要门禁保持原状。"}
-        if method == "context.status":
-            settings = Settings.from_env(project.root)
-            status_path = project.internal / "context-status.json"
-            if status_path.is_file():
-                try:
-                    value = json.loads(status_path.read_text(encoding="utf-8"))
-                    if isinstance(value, dict):
-                        saved_project_id = str(value.get("project_id") or "")
-                        if saved_project_id in {"", project.project_id}:
-                            saved_revision = str(value.get("source_revision") or "")
-                            current_revision = project_source_revision(project.root, project.internal)
-                            if saved_revision and saved_revision != current_revision:
-                                return {
-                                    **value,
-                                    "status": "stale",
-                                    "stale": True,
-                                    "stale_reason": "项目资料已经变化，下一次 Writer、Editor 审查或修订任务会重新编译 Context Packet。",
-                                    "current_source_revision": current_revision,
-                                }
-                            return value
-                except (OSError, json.JSONDecodeError):
-                    pass
-            return {
-                "status": "idle",
-                "estimated_tokens": 0,
-                "before_compression_tokens": 0,
-                "previous_updated_at": "",
-                "previous_estimated_tokens": None,
-                "change_since_previous_tokens": None,
-                "soft_limit_tokens": settings.context_budget_for("writer")[0],
-                "hard_limit_tokens": settings.context_budget_for("writer")[1],
-                "hard_usage_percent": 0,
-                "compression_applied": False,
-                "hard_sections": [],
-                "compressible_sections": [],
-                "warnings": [],
-            }
         if method == "context.pins.list":
             chapter_no = int(params["chapter_no"]) if params.get("chapter_no") is not None else None
             return {"pins": studio.db.list_context_pins(chapter_no)}
@@ -1545,6 +1554,8 @@ class InkFlowAppService:
                 return {"thread": thread, "status": "waiting_condition", "reply": "此议题没有可定位的待答内容。",
                         "next_action": "请在对话中点名原任务和具体问题；不会猜测角色或新增模型调用。"}
             recipient = normalize_role(str(params.get("recipient_role") or pending["recipient_role"]))
+            bind_active_collaboration(project, "collaboration.reply",
+                specialist=recipient if recipient in {"reviewer", "memory_keeper"} else None)
             role_boundaries = {
                 "writer": "只回答规划、写作或修订问题，不审批，不提交正史。",
                 "editor": "只解释当前模式内的综合审查，不直接修改正文或提交正史。",
@@ -1553,7 +1564,7 @@ class InkFlowAppService:
                 "coordinator": "只澄清目标、依赖和分工，不写正文、不审批、不提交正史。",
             }
             scope = active_task_settings.get()
-            if scope is None or recipient not in roles_for_mode(scope.collaboration_mode):
+            if scope is None or recipient not in roles_for_mode(scope.effective_collaboration_mode):
                 raise ValueError("只能向当前任务模式已启用的角色请求回复，不能借协作议题扩权。")
             allowed_evidence = {str(ref) for item in scoped for ref in item.get("evidence_refs", [])}
             discussion_content = json.dumps({"thread": thread, "messages": scoped, "question": params.get("question", "")}, ensure_ascii=False)
@@ -1655,7 +1666,7 @@ class InkFlowAppService:
             task_scope = active_task_settings.get()
             if requested_mode and (
                 task_scope is None
-                or task_scope.collaboration_mode != requested_mode
+                or not task_scope.matches_collaboration_request(requested_mode)
             ):
                 raise InkFlowError("专项模式必须先绑定本次任务快照，不能临时切换。")
             message = str(params.get("message") or "").strip()
@@ -1804,7 +1815,7 @@ class InkFlowAppService:
         task_scope = active_task_settings.get()
         if requested_mode and (
             task_scope is None
-            or task_scope.collaboration_mode != requested_mode
+            or not task_scope.matches_collaboration_request(requested_mode)
         ):
             raise InkFlowError("专项模式必须先绑定本次任务快照，不能临时切换。")
         settings = engine.settings
@@ -1872,9 +1883,11 @@ class InkFlowAppService:
                 visible_reason=f"按用户当前操作执行{action}工作流。",
             )
             task_scope = active_task_settings.get()
+            task_scope = bind_active_collaboration(project, workflow_action,
+                forbidden_actions=intent.forbidden_actions) or task_scope
             ticket, dispatch_plan = Coordinator(project).compile(
                 intent,
-                collaboration_mode=task_scope.collaboration_mode if task_scope else "everyday",
+                collaboration_mode=task_scope.effective_collaboration_mode if task_scope else "everyday",
                 task_snapshot_hash=task_scope.snapshot_hash if task_scope else None,
             )
             Coordinator.validate(dispatch_plan, ticket)
@@ -1968,7 +1981,7 @@ class InkFlowAppService:
             )
             result = await engine.review_chapter_mode(
                 project.root, int(params["chapter_no"]),
-                mode=task_scope.collaboration_mode if task_scope else "everyday",
+                mode=task_scope.effective_collaboration_mode if task_scope else "everyday",
                 instruction=str(params.get("instruction") or ""),
             )
             if settings.acceptance_confirmation_mode == "auto_after_review" and result.get("verdict") == "pass":
@@ -2095,9 +2108,9 @@ class InkFlowAppService:
             acceptance_confirmation_mode=settings.acceptance_confirmation_mode,
             visible_reason="按用户当前点击生成仅用于本地声音克隆的朗读稿。",
         )
-        scope = active_task_settings.get()
+        scope = bind_active_collaboration(project, "voice_clone_script")
         ticket, dispatch_plan = Coordinator(project).compile(
-            intent, collaboration_mode=scope.collaboration_mode if scope else "everyday",
+            intent, collaboration_mode=scope.effective_collaboration_mode if scope else "everyday",
             task_snapshot_hash=scope.snapshot_hash if scope else None,
         )
         await emit(
@@ -2268,6 +2281,8 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
             "calls": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
+            "input_unknown_calls": 0,
+            "output_unknown_calls": 0,
             "prompt_cache_hit_tokens": 0,
             "prompt_cache_miss_tokens": 0,
             "cache_reported_calls": 0,
@@ -2301,28 +2316,27 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
             # Keep repair/retry stages separate; an agent-wide average hides their cost.
             stage_key = f"{metadata.get('model') or 'unknown'}:{role}:{event.get('stage') or 'unknown'}"
             stage_bucket = by_stage.setdefault(stage_key, empty_bucket())
-            prompt = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
-            completion = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
-            prompt_details = usage.get("prompt_tokens_details") or {}
-            hit_reported = "prompt_cache_hit_tokens" in usage or (
-                isinstance(prompt_details, dict) and "cached_tokens" in prompt_details
-            )
-            miss_reported = "prompt_cache_miss_tokens" in usage
-            cache_hit = int(
-                usage.get("prompt_cache_hit_tokens", prompt_details.get("cached_tokens", 0)) or 0
-            ) if isinstance(prompt_details, dict) else int(usage.get("prompt_cache_hit_tokens", 0) or 0)
-            cache_miss = int(usage.get("prompt_cache_miss_tokens", 0) or 0) if miss_reported else max(0, prompt - cache_hit)
-            for target in (overall, bucket, stage_bucket):
-                target["calls"] += 1
-                target["prompt_tokens"] += prompt
-                target["completion_tokens"] += completion
-                if hit_reported or miss_reported:
-                    target["cache_reported_calls"] += 1
-                    target["prompt_cache_hit_tokens"] += cache_hit
-                    target["prompt_cache_miss_tokens"] += cache_miss
-                else:
-                    target["cache_unknown_calls"] += 1
-                    target["cache_unknown_prompt_tokens"] += prompt
+            for attempt in usage_attempts(usage):
+                counts = normalized_usage(attempt)
+                prompt, completion = counts["input_tokens"], counts["output_tokens"]
+                cache_hit, cache_miss = counts["cache_hit_tokens"], counts["uncached_input_tokens"]
+                for target in (overall, bucket, stage_bucket):
+                    target["calls"] += 1
+                    if prompt is None:
+                        target["input_unknown_calls"] += 1
+                    else:
+                        target["prompt_tokens"] += prompt
+                    if completion is None:
+                        target["output_unknown_calls"] += 1
+                    else:
+                        target["completion_tokens"] += completion
+                    if prompt is not None and cache_hit is not None and cache_miss is not None:
+                        target["cache_reported_calls"] += 1
+                        target["prompt_cache_hit_tokens"] += cache_hit
+                        target["prompt_cache_miss_tokens"] += cache_miss
+                    else:
+                        target["cache_unknown_calls"] += 1
+                        target["cache_unknown_prompt_tokens"] += prompt if prompt is not None else 0
 
     def public_bucket(bucket: dict[str, int]) -> dict[str, Any]:
         cache_total = bucket["prompt_cache_hit_tokens"] + bucket["prompt_cache_miss_tokens"]
@@ -2333,10 +2347,10 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
             if cache_total else None,
             "prompt_cache_miss_rate": round(bucket["prompt_cache_miss_tokens"] / cache_total, 4)
             if cache_total else None,
-            "average_prompt_tokens": round(bucket["prompt_tokens"] / bucket["calls"])
-            if bucket["calls"] else 0,
-            "average_completion_tokens": round(bucket["completion_tokens"] / bucket["calls"])
-            if bucket["calls"] else 0,
+            "average_prompt_tokens": round(bucket["prompt_tokens"] / (bucket["calls"] - bucket["input_unknown_calls"]))
+            if bucket["calls"] > bucket["input_unknown_calls"] else None,
+            "average_completion_tokens": round(bucket["completion_tokens"] / (bucket["calls"] - bucket["output_unknown_calls"]))
+            if bucket["calls"] > bucket["output_unknown_calls"] else None,
         }
 
     usage = public_bucket(overall)
@@ -2379,7 +2393,8 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
         "by_agent_role": {role: public_bucket(bucket) for role, bucket in by_agent_role.items()},
         "by_stage": {stage: public_bucket(bucket) for stage, bucket in by_stage.items()},
         "recent_deepseek_cache": recent_deepseek_cache,
-        "estimated_cost": round(estimated_cost, 6),
+        "estimated_cost": round(estimated_cost, 6)
+        if not (overall["input_unknown_calls"] or overall["output_unknown_calls"]) else None,
         "currency": "CNY",
         "pricing_configured": settings.input_price_per_million > 0 or settings.output_price_per_million > 0,
         "accounting": accounting,
@@ -2966,7 +2981,7 @@ class JsonLineServer:
                 error["record_warning"] = record_warning
                 error["impact"] = f"{error.get('impact', '')} {record_warning}".strip()
             await self.write({"jsonrpc": "2.0", "id": request_id, "error": error})
-            public_events.put_nowait({"type": "run.failed", "method": method, "summary": str(exc)[:500]})
+            public_events.put_nowait({"type": "run.failed", "method": method, "summary": error["message"]})
         finally:
             if self.steering_messages.get(run_id) or self.steering_delivered.get(run_id):
                 await self._defer_unapplied_steering(run_id)
@@ -3169,11 +3184,25 @@ def _visible_result_summary(result: Any) -> str:
             return "；".join(str(item) for item in result["settings_change_summary"])[:300]
         if result.get("settings_updated"):
             return f"已修改 {len(result['settings_updated'])} 项设置。"
+        if result.get("status") == "planned":
+            revision = result.get("revision_no")
+            published = type(revision) is int and revision > 0
+            future = result.get("future_range")
+            chapters = ""
+            if (isinstance(future, list) and len(future) == 2
+                    and all(type(number) is int and number > 0 for number in future) and future[0] <= future[1]):
+                span = str(future[0]) if future[0] == future[1] else f"{future[0]}～{future[1]}"
+                chapters = f"，后续安排为第 {span} 章"
+            title = f"第 {revision} 版规划已正式生效" if published else "章节规划已更新"
+            action = "可以按当前规划继续写作。" if published else str(result.get("next_action") or "")
+            return f"{title}{chapters}。{action}"[:300]
         for key in ("reply", "help", "gate", "message", "summary", "next_action"):
             if result.get(key):
                 return str(result[key])[:300]
         if result.get("result") and isinstance(result["result"], dict):
             nested = result["result"]
+            if nested.get("status") == "planned":
+                return _visible_result_summary(nested)
             for key in ("summary", "message", "status", "outline_path"):
                 if nested.get(key):
                     return str(nested[key])[:300]

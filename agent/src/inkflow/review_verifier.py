@@ -199,6 +199,8 @@ def setting_review_gaps(output: Any, content: str, packet: ContextPacket) -> lis
             gaps.append(f"设定《{record['title']}》仍待核对：{check.reason}")
         if record.get("status") in {"stale_evidence", "configuration_changed"} and check.disposition == "compatible":
             gaps.append(f"设定《{record['title']}》来源已变化，不能沿用旧的通过结论")
+        if record.get("classification_issues") and check.disposition == "compatible":
+            gaps.append(f"设定《{record['title']}》存在归类问题：" + "；".join(record["classification_issues"]))
     gaps.extend(f"尚未核对设定《{record['title']}》的本章适用性" for key, record in records.items() if key not in seen)
     for collection in payload.get("coverage", []):
         gaps.extend(f"用户约定《{item['title']}》未装入：{item['reason']}" for item in collection.get("omitted", []) if item.get("required"))

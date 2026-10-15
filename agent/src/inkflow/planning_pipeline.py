@@ -811,7 +811,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         raise ValidationGateError("规划起点必须是当前最后一章已接受正文；不会改写或跳过正史。")
     trace = TraceRecorder(project.root, "planning-v2", engine.settings.trace_level)
     scope = active_task_settings.get()
-    review_role = "reviewer" if scope and scope.collaboration_mode in {"review_boost", "full_specialist"} else "editor"
+    review_role = "reviewer" if scope and scope.effective_collaboration_mode in {"review_boost", "full_specialist"} else "editor"
     book = _read(project.root / "BOOK.md")
     state = _read(project.root / "STATE.md")
     from .story_settings import StorySettingsService
@@ -966,7 +966,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
     resume_basis = {
         **scope_constraints,
         "snapshot_hash": scope.snapshot_hash if scope else "",
-        "collaboration_mode": scope.collaboration_mode if scope else "",
+        "collaboration_mode": scope.effective_collaboration_mode if scope else "",
         "review_role": review_role,
         "canon_hash": frozen,
         "settings_source_hash": settings_fingerprint,
@@ -1678,7 +1678,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 "detail_path": str(project.root / "STORY_DETAIL.md"), "plan_path": str(project.root / "RECENT_PLAN.md"),
                 "trace_id": trace.run_id, "cleanup_candidates": cleanup,
                 "pending_history_choice": False,
-                "next_action": f"第 {manifest['revision_no']} 版规划已正式生效；请在项目中心选择保留或删除被替换的旧版。"}
+                "next_action": "当前规划已生效，可以按本次安排继续写作。"}
     except asyncio.CancelledError:
         trace.record("planning-v2", "cancelled", "已停止；本阶段候选保留，未发布未审核结果")
         trace.finish(status="cancelled", summary="规划已停止，现有正史不变")

@@ -109,6 +109,49 @@ def normalized_usage(usage: dict[str, Any], *, anthropic: bool = False) -> dict[
             "cache_write_tokens": write, "uncached_input_tokens": miss}
 
 
+def usage_attempts(usage: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read attempts before aggregate fields; old retry totals mixed nested counts."""
+    attempts = usage.get("attempt_usage")
+    if not isinstance(attempts, list) or not attempts:
+        return [usage]
+    raw = [item.get("usage") if isinstance(item, dict) else None for item in attempts]
+    result = [item if isinstance(item, dict) else {} for item in raw]
+    represented = {item.get("attempt") for item in attempts
+                   if isinstance(item, dict) and type(item.get("attempt")) is int}
+    # Older traces omitted transport failures from attempt_usage, but retained
+    # their numbered recovery events. Their unreported consumption stays unknown.
+    for event in usage.get("recovery_events") or []:
+        number = event.get("attempt") if isinstance(event, dict) else None
+        if type(number) is int and number > 0 and number not in represented:
+            result.append({})
+            represented.add(number)
+    return result
+
+
+def aggregate_usage(usage: dict[str, Any]) -> dict[str, Any]:
+    """Aggregate only complete counts, retaining untouched per-attempt evidence."""
+    attempts = usage_attempts(usage)
+    counts = [normalized_usage(item) for item in attempts]
+
+    def complete_sum(key: str) -> int | None:
+        values = [item[key] for item in counts]
+        return sum(values) if all(value is not None for value in values) else None
+
+    prompt = complete_sum("input_tokens")
+    output = complete_sum("output_tokens")
+    hit = complete_sum("cache_hit_tokens")
+    miss = complete_sum("uncached_input_tokens")
+    details = usage.get("prompt_tokens_details")
+    result = {**usage, "prompt_tokens": prompt, "completion_tokens": output,
+              "total_tokens": prompt + output if prompt is not None and output is not None else None,
+              "prompt_cache_hit_tokens": hit, "prompt_cache_miss_tokens": miss,
+              "prompt_tokens_details": {**(details if isinstance(details, dict) else {}), "cached_tokens": hit}}
+    for alias, value in (("input_tokens", prompt), ("output_tokens", output)):
+        if alias in result:
+            result[alias] = value
+    return result
+
+
 def _cost_micros(counts: dict[str, int | None], price: dict[str, Any]) -> int | None:
     prompt, output = counts["input_tokens"], counts["output_tokens"]
     if prompt is None or output is None or price["kind"] == "unknown":
@@ -189,7 +232,10 @@ class UsageLedger:
                  prompt_family, utc_now(),
                  input_estimate, max_output_tokens, json.dumps(price), pending_cost))
             safe = {key: str(value) for key, value in (diagnostic or {}).items() if key in {
-                "system_contract_hash", "user_prefix_4096_hash", "materials_hash", "quality_hash", "stage"}}
+                "system_contract_hash", "user_prefix_4096_hash", "reference_prefix_hash", "materials_hash", "quality_hash", "stage"}}
+            safe["context_limit_tokens"] = settings.context_budget_for(
+                role if role in {"coordinator", "writer", "editor", "reviewer", "memory_keeper"} else None,
+                model_override=model)[1]
             db.execute("UPDATE model_attempts SET diagnostic_json=? WHERE attempt_id=?", (json.dumps(safe), attempt_id))
         return attempt_id
 
@@ -327,7 +373,13 @@ class UsageLedger:
             groups.setdefault((str(row["prompt_family"]), *key), []).append(row)
         comparisons = []
         writers = [row for row in reversed(rows) if row["role"] == "writer"]
-        for before, after in zip(writers, writers[1:]):
+        previous_by_family = {}
+        for after in writers:
+            family = str(after.get("prompt_family") or "")
+            before = previous_by_family.get(family)
+            previous_by_family[family] = after
+            if before is None or not family or family == "legacy/unknown":
+                continue
             b, a = before["diagnostic"], after["diagnostic"]
             same = before["prompt_family"] == after["prompt_family"] and all(
                 a.get(name) and a.get(name) == b.get(name) for name in
@@ -340,6 +392,8 @@ class UsageLedger:
                 "observed_decline": None if None in rates else rates[1] < rates[0],
                 "system_changed": a.get("system_contract_hash") != b.get("system_contract_hash"),
                 "early_prefix_changed": a.get("user_prefix_4096_hash") != b.get("user_prefix_4096_hash"),
+                "reference_prefix_changed": (a["reference_prefix_hash"] != b["reference_prefix_hash"]
+                    if a.get("reference_prefix_hash") and b.get("reference_prefix_hash") else None),
                 "materials_changed": a.get("materials_hash") != b.get("materials_hash"),
                 "quality_changed": a.get("quality_hash") != b.get("quality_hash"),
                 "conclusion": "同材料与质量范围的实际缓存变化，仍需核查合格产物" if same and None not in rates else
@@ -439,7 +493,7 @@ class ModelAttempt:
                     "ledger_available": self.ledger is not None,
                     "request_sent": self.request_sent,
                     "diagnostic": {key: str(value) for key, value in self.fields.get("diagnostic", {}).items()
-                                   if key in {"system_contract_hash", "user_prefix_4096_hash", "materials_hash", "quality_hash", "stage"}}}
+                                   if key in {"system_contract_hash", "user_prefix_4096_hash", "reference_prefix_hash", "materials_hash", "quality_hash", "stage"}}}
         if self.ledger:
             try:
                 self.ledger.finish(self.attempt_id, self.outcome, self.failure, duration_ms=duration_ms,

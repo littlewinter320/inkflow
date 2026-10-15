@@ -323,7 +323,8 @@ class ManualEditsService:
         try:
             scope = self.studio.db.prepare_task_settings(run_id, novel_id=self.project.project_id,
                 settings=lambda: engine.settings, workspace_root=self.project.root,
-                collaboration_mode=None if job.get("task_id") else original_scope.collaboration_mode if original_scope else "everyday")
+                collaboration_mode=None if job.get("task_id") or not original_scope or original_scope.collaboration_pending
+                    else original_scope.effective_collaboration_mode)
         except Exception as exc:
             async with project_write_lock(self.project.root):
                 jobs = self.jobs()
@@ -333,6 +334,9 @@ class ManualEditsService:
             raise
         token = active_task_settings.set(scope)
         try:
+            from .studio import bind_active_collaboration
+            scope = bind_active_collaboration(self.project, "manual_edits.review",
+                specialist="memory_keeper" if job["kind"] == "setting_record" else "reviewer") or scope
             if engine.settings.to_mapping() != scope.settings.to_mapping():
                 from .engine import InkFlowEngine
                 from .provider import create_provider
@@ -372,7 +376,7 @@ class ManualEditsService:
             if job["kind"] == "setting_record":
                 from .story_settings import StorySettingsService
                 scope = active_task_settings.get()
-                owners = check_owners_for_mode(scope.collaboration_mode if scope else "everyday")
+                owners = check_owners_for_mode(scope.effective_collaboration_mode if scope else "everyday")
                 role = owners["memory"] if job["kind"] == "setting_record" else owners.get("general") or owners.get("logic_continuity")
                 canonical_role = role
                 record_id = job["relative_path"].split(":", 1)[1]
@@ -406,7 +410,7 @@ class ManualEditsService:
                            "text": (self.project.db.canonical_chapter_content(int(ch["chapter_no"])) or "")[:10000]}
                           for ch in accepted[-3:]]
                 scope = active_task_settings.get()
-                owners = check_owners_for_mode(scope.collaboration_mode if scope else "everyday")
+                owners = check_owners_for_mode(scope.effective_collaboration_mode if scope else "everyday")
                 role = owners["memory"] if job["kind"] == "setting_record" else owners.get("general") or owners.get("logic_continuity")
                 canonical_role = role
                 sources = json.dumps({"book":self.project.db.get_brief().model_dump(mode="json"),
@@ -462,7 +466,7 @@ class ManualEditsService:
                 if estimate_tokens(packet.to_model_prompt()+content)>max(1000,engine.settings.context_budget_for(role)[1]-5000):
                     raise ValidationGateError("手动候选与核对来源超过当前上下文预算，请拆分需要核对的修改范围。")
                 scope = active_task_settings.get()
-                owners = check_owners_for_mode(scope.collaboration_mode if scope else "everyday")
+                owners = check_owners_for_mode(scope.effective_collaboration_mode if scope else "everyday")
                 role = owners["memory"] if job["kind"] == "setting_record" else owners.get("general") or owners.get("logic_continuity")
                 result = await engine.provider.generate_json(system_prompt=(
                     "你审核用户手动变更。设定是可调整假设与证据参考，不是正史；合理新增、人物信念和谎言不算硬矛盾。"

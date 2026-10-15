@@ -13,6 +13,10 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
+class ConversationReply(StrictModel):
+    reply: str = Field(min_length=1, max_length=1500)
+
+
 class UnifiedRoleModel(StrictModel):
     """Consume old role tags at input; serialized contracts contain only canonical roles."""
 
@@ -1535,6 +1539,9 @@ class TerminalIntent(StrictModel):
     """Coordinator 的受限路由输出；不能发明工作流、写正文或强制验收。"""
 
     action: TerminalAction
+    specialist_role: Literal["reviewer", "memory_keeper"] | None = None
+    specialist_reason: str = Field(default="", max_length=300)
+    planning_discussion: str = Field(default="", max_length=400)
     preference_conflicts: list[PreferenceConflict] = Field(default_factory=list, max_length=3)
     preference_observations: list[PreferenceObservation] = Field(default_factory=list, max_length=3)
     outline_level: Literal["story", "detail"] = "story"

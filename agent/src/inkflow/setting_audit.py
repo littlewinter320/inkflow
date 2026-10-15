@@ -1,4 +1,4 @@
-"""On-demand settings diagnosis through the existing editor and versioned edit service."""
+"""On-demand settings diagnosis through the current memory owner and versioned edit service."""
 from __future__ import annotations
 
 from .errors import ProjectError, ProviderError, ValidationGateError
@@ -30,8 +30,8 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
     from .manual_edits import ManualEditsService
     from .trace import TraceRecorder
     scope = active_task_settings.get()
-    owners = check_owners_for_mode(scope.collaboration_mode if scope else "everyday")
-    role = owners.get("general") or owners.get("logic_continuity")
+    owners = check_owners_for_mode(scope.effective_collaboration_mode if scope else "everyday")
+    role = owners["memory"]
     service = StorySettingsService(project)
     brief = project.db.get_brief()
     latest = project.db.latest_accepted_chapter_no()
@@ -61,8 +61,10 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
     payload = service.context_payload(chapter_no=latest + 1, actor=role,
         max_chars=min(64000, max(1000, engine.settings.context_budget_for(role)[1] // 8)))
     if collection_names is not None:
-        if not isinstance(collection_names, list) or not 1 <= len(collection_names) <= 3 or any(not isinstance(name, str) for name in collection_names):
-            raise ValidationGateError("请点名一至三份需要建立记录的设定。")
+        if (not isinstance(collection_names, list) or not collection_names
+                or any(not isinstance(name, str) or not name.strip() for name in collection_names)):
+            raise ValidationGateError("请点名需要核对的设定合集，名称不能为空。")
+        collection_names = list(dict.fromkeys(name.strip() for name in collection_names))
         targets = [item for item in payload["collections"] if item["name"] in collection_names]
         if len(targets) != len(set(collection_names)):
             raise ValidationGateError("指定设定没有全部装入本次核对，未把未读取的合集当作空设定。")
@@ -77,7 +79,8 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
         "范围说明": "正文只读取所列章节和有界正史记录；不可声称逐章审完全部小说。",
         "补充来源": {"近期对话·用户": sources["近期对话·用户"]},
         "用户目标": instruction, "新增具体记录上限": new_record_limit,
-        "新增说明": "只为本次点名的设定建立有明确追踪目标和当前来源的记录；每份最多一条，不把空模板算作完成。" if collection_names else "按实际问题提出必要记录。"})
+        "新增说明": ("本轮新增记录不超过所列上限，每个指定合集最多新增一条；已有对象的核对纠正沿record_id与修订号更新，不占新增额度。"
+                    if new_record_limit is not None else "按实际问题维护指定范围内的必要记录，同一合集可有多个有来源的对象；不把空模板算作完成。")})
     record_capacity = min(8, 2 * sum(bool(item.get("recording_allowed")) for item in payload["collections"]))
     requested_output = 4096 + record_capacity * 1000 + min(4000, 2 * estimate_tokens(json_dumps(brief.user_rules)))
     output_budget = engine.settings.effective_output_tokens(requested_output, role)
@@ -99,7 +102,7 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
             "实际需要选择时同时填写questions，复用结构化提问卡，每题2至4个具体options及description，最多一个recommended；不列只有其他的空选项卡。"
             "需要用户取舍的条目不能同时放入rule_corrections；无关疑问不能阻止其他有明确依据的修正。"
             "已有设定合集缺记录时，判断所给已接受正文中是否有值得持续追踪的对象；在setting_updates同次返回必要的首次建档或补充，每条有canonical来源章号和连续原句，epistemic_status用objective/belief/rumor。只提取已有文字，不凭空创造、不补满未知字段；已有同一对象复用record_id与expected_revision。没有有用资料就明确空缺。"
-            "世界基础设定中的明确用户边界可从BOOK.md原句整理，epistemic_status=user_constraint、source_kind=planning、path=BOOK.md；用户约定不是已经发生的情节，不推测未写出的世界细节。"
+            "先检查字段归类：章数、卷数、字数和文风属于写作要求，不放入世界变化；世界变化只记录故事内已经发生的变化。发现归类问题时沿原条目修订号提出清空错误字段的候选，有据内容转到已有约束合集；没有相应合集则保留在书籍要求，不伪造世界内容。世界内法律、制度与能力边界必须说明适用范围、来源和例外，不推测未提及的法律条文。世界基础设定中的明确故事边界可从BOOK.md原句整理，epistemic_status=user_constraint、source_kind=planning、path=BOOK.md；用户约定不是已经发生的情节，不推测未写出的世界细节。"
             "基础合集不要求所有字段填满：年代未说明，不代表已有背景、前提与边界都无法记录。缺什么字段就留空，只把有明确原句的部分保存。已有同名条目必须用其record_id和revision补充，不能当空合集再创建。"
             "summary和findings用自然中文解释具体问题和证据，不输出内部编号或长路径；不声称未执行的修改已完成。"),
             user_prompt=prompt + "\n报告保持精简：summary不超过400字，findings只列需处理的问题，不逐项复述正常情节。设定候选只填有用字段，每字段一两句，每条最多两处200字以内的连续原句；相同对象合并，不写重复长报告。",
@@ -130,15 +133,17 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
         candidates = list(report.setting_updates)
         if collection_names or new_record_limit:
             allowed = {item["collection_id"] for item in payload["collections"]}
-            selected, seen_collections = [], set()
+            selected, seen_new_collections = [], set()
+            new_count = 0
             for candidate in candidates:
                 if candidate.collection_id not in allowed:
                     continue
-                if collection_names and candidate.collection_id in seen_collections:
-                    continue
-                if new_record_limit and len(selected) >= new_record_limit:
-                    continue
-                selected.append(candidate); seen_collections.add(candidate.collection_id)
+                if not candidate.record_id:
+                    if new_record_limit and (new_count >= new_record_limit or candidate.collection_id in seen_new_collections):
+                        continue
+                    new_count += 1
+                    seen_new_collections.add(candidate.collection_id)
+                selected.append(candidate)
             if len(selected) != len(candidates):
                 trace.record("settings.scope", "completed", "仅采用本次指定分类与数量内的候选，其他输出留在原报告，不扩大记录范围。",
                              metadata={"returned": len(candidates), "selected": len(selected)})
@@ -242,20 +247,27 @@ async def audit_story_settings(engine, project, *, instruction, apply_correction
             status = "needs_evidence"
         if report.needs_choice or report.questions:
             status = "needs_input"
-        summary = report.summary
+        # The model's narrative is a review opinion, not proof of execution or coverage.
+        summary = f"本次核对了 {len(payload['collections'])} 个设定合集，读取 {len(canon)} 章正文及当前书籍资料。"
         if changes:
-            summary += "\n" + ("已同步过期的书籍要求，并核对了当前规划。" if (changes.get("verification") or {}).get("status") == "passed" else "书籍要求已保存修订，仍需完成其与当前规划的核对。")
+            summary += ("已同步并核对书籍要求。" if (changes.get("verification") or {}).get("status") == "passed" else "书籍要求已保存修订，核对尚未完成。")
         elif report.rule_corrections:
-            summary += "\n" + ("当前书籍要求已经与这份建议一致，没有重复保存或增加版本。" if rules_unchanged else "已找到需要同步的要求，本次尚未写回。")
+            summary += ("书籍要求与建议一致，无需重复保存。" if rules_unchanged else "书籍要求的同步建议尚未写回。")
         if adopted:
-            summary += "\n已核对可用的设定：" + "、".join(item["title"] for item in adopted) + "；每条都有来源、原句和版本。"
+            changed = sum(item["changed"] for item in adopted)
+            summary += f"已保存并核对 {changed} 条设定。" if changed else "已有设定核对结果仍然有效，无需重复保存。"
+        elif not apply_corrections:
+            summary += "本次只检查，未写入设定。"
         if pending:
-            summary += "\n" + "；".join(pending)
+            summary += f"另有 {len(pending)} 项尚未完成。"
+        choices = len(report.questions) or len(report.needs_choice)
+        if choices:
+            summary += f"有 {choices} 项需要你选择。"
         for item in payload["coverage"]:
             item["stored_record_count"] = len(service.records(item["collection_id"]))
             item["adopted_record_count"] = sum(record["collection_id"] == item["collection_id"] and record["changed"] for record in adopted)
         trace.finish(summary=summary)
-        return {"status": status, "summary": summary, "findings": report.findings,
+        return {"status": status, "summary": summary, "model_summary": report.summary, "findings": report.findings,
                 "needs_choice": report.needs_choice, "changes": changes, "adopted_settings": adopted, "pending_settings": pending,
                 "questions": [question.model_dump(mode="json") for question in report.questions],
                 "coverage": {"documents": list(sources), "canonical_chapters": canon,

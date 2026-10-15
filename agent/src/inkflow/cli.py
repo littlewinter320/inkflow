@@ -19,7 +19,7 @@ from .schemas import BookBrief
 from .terminal_session import TerminalSession
 from .runtime import ensure_run_runtime
 from .project import InkFlowProject
-from .studio import StudioService
+from .studio import StudioService, bind_active_collaboration
 from .task_settings import active_task_settings, use_task_settings
 
 
@@ -185,7 +185,9 @@ def _write(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _review(args: argparse.Namespace) -> dict[str, Any]:
-    return asyncio.run(_engine(args.root).review_chapter_mode(args.root, args.chapter, mode="everyday"))
+    scope = active_task_settings.get()
+    return asyncio.run(_engine(args.root).review_chapter_mode(args.root, args.chapter,
+        mode=scope.effective_collaboration_mode if scope else "everyday"))
 
 
 def _revise(args: argparse.Namespace) -> dict[str, Any]:
@@ -333,6 +335,7 @@ def main() -> None:
                         settings=lambda: Settings.from_env(project.root), workspace_root=project.root,
                     )
                     task_scopes.enter_context(use_task_settings(scope))
+                    bind_active_collaboration(project, args.command)
                 result = args.handler(args)
                 if isinstance(result, dict) and runtime.calls:
                     result = {**result, "runtime_usage": runtime.snapshot()}

@@ -249,6 +249,7 @@ class ContextBuilder:
         reranker_model: str = "",
         hook_strategy: str = "most_chapters",
         review_experience_detail: str = "standard",
+        quality_preset: str = "custom",
         actor: str = "writer",
         output_reserve_tokens: int = 32_000,
     ):
@@ -266,6 +267,7 @@ class ContextBuilder:
         )
         self.hook_strategy = hook_strategy
         self.review_experience_detail = review_experience_detail
+        self.quality_preset = quality_preset
 
     def build(
         self,
@@ -420,6 +422,7 @@ class ContextBuilder:
             chapter_no=chapter_no,
             chapter_version=int(chapter["version"]) if chapter else None,
         )
+        reading_candidates = list(retrieval_hits)
         current_material_in_query = bool(mode in {"review", "revise"} and protected_input.strip())
         query_input = {"mode": mode, "actor": self.actor, "chapter_no": chapter_no,
             "chapter_version": int(chapter["version"]) if chapter else None,
@@ -464,6 +467,8 @@ class ContextBuilder:
         selected_hits = []
         writer_reference_tokens = 0
         writer_reference_budget = min(12_000, max(4_000, self.soft_token_limit // 8))
+        if self.quality_preset == "economy":
+            writer_reference_budget = min(writer_reference_budget, 6_000)
         writer_reference_omissions = []
         preference_tokens = estimate_tokens(_voice_preferences_content(voice_preferences))
         for item in retrieval_hits:
@@ -503,13 +508,16 @@ class ContextBuilder:
 
         craft_guides = select_craft_guides(task=task, genre=brief.genre, card=card, limit=1)
         plan_view = _plan_for_model(bundle, card)
-        from .story_settings import StorySettingsService
+        from .story_settings import StorySettingsService, book_requirement_collection
         setting_payload = StorySettingsService(self.project).context_payload(chapter_no=chapter_no, query=task, actor=self.actor,
             max_chars=min(64000, max(1000, self.hard_token_limit // 8)))
+        requirements = book_requirement_collection(brief, (self.project.root / "BOOK.md").read_text(encoding="utf-8"))
+        if requirements["records"]:
+            setting_payload["collections"].insert(0, requirements)
         setting_context = json.dumps(setting_payload, ensure_ascii=False)
         sections = [
             ContextSection(key="A", title="当前任务与用户要求", content=task, hard=True),
-            ContextSection(key="CSET", title="用户定制设定：创作假设与证据参考（非正史）",
+            ContextSection(key="CSET", title="本书必读要求与设定参考（非正史）",
                            content=setting_context, hard=True, cache_scope="canon" if stable_batch_order else "chapter",
                            source_ids=[record["record_id"] for collection in setting_payload["collections"] for record in collection["records"]]),
             *outline_sections(self.project.root, chapter_no, chapter_no),
@@ -594,8 +602,8 @@ class ContextBuilder:
                 cache_scope="chapter",
             ),
             ContextSection(
-                key="WN", title="近期已接受章的创作意图参考（非正史）",
-                content=json_dumps(recent_approved_notes(self.project, chapter_no)),
+                key="WN", title="近期章节的重要决定与伏笔交接（候选与意图不等于正史）",
+                content=json_dumps(recent_approved_notes(self.project, chapter_no, provisional_chapters)),
                 source_ids=[], cache_scope="chapter",
             ),
             ContextSection(
@@ -615,7 +623,7 @@ class ContextBuilder:
                 title="最近已接受章节与批次临时草稿",
                 content="\n\n".join(recent_parts) or "尚无前章。",
                 source_ids=recent_ids,
-                hard=bool(set(named_numbers) & loaded_numbers),
+                hard=bool(set(named_numbers) & loaded_numbers) or (self.quality_preset == "quality" and mode == "draft"),
                 cache_scope="chapter",
             ),
             *cited_chapters,
@@ -761,6 +769,9 @@ class ContextBuilder:
             )
         thread_recovery = self._thread_history_context(thread_state, sections,
             boundary=chapter_no - 1, protected_input=protected_input)
+        if self.quality_preset == "quality" and mode == "draft" and self.actor == "writer":
+            self.retriever.last_diagnostics["quality_reading"] = self._quality_reading(
+                reading_candidates, sections, chapter_no=chapter_no, protected_input=protected_input)
         source_gaps = self.retriever.last_diagnostics.get("source_gaps", [])
         for gap in source_gaps:
             if gap.get("kind") != "chapter_summary" or any(gap.get(key) is None
@@ -811,6 +822,9 @@ class ContextBuilder:
                 content=json_dumps([{key: item.get(key) for key in
                     ("id", "kind", "status", "reason", "next_action", "progress", "source", "resolution")}
                     for item in pending]), hard=True, cache_scope="chapter"))
+        if self._quality_guidance():
+            sections.append(ContextSection(key="Q", title="本次创作策略", content=self._quality_guidance(),
+                hard=True, cache_scope="chapter", source_ids=[f"quality:{self.quality_preset}"]))
         packet = ContextPacket(
             project_id=self.project.project_id,
             chapter_no=chapter_no,
@@ -898,6 +912,61 @@ class ContextBuilder:
         database.set_metadata("preference.selection", selection)
         database.set_metadata(f"preference.selection:{chapter_no}:{mode}:{self.actor}", selection)
         return packet
+
+    def _quality_guidance(self) -> str:
+        strategy = {
+            "economy": "节省：优先已有明确方向和本章直接依据，以场景行动推进，避免无任务需要的多案扩写与重复总结。资料缺口只定位补读，不因省调用猜事实；不缩短用户要求的篇幅。",
+            "quality": "高质量：更细致地对照相关前史、人物动机与因果后果，检查叙述视角、指代和信息揭示时机；在同次交稿中完善自然对白与场景转折。增加精度不等于堆形容词、拉长篇幅或固定再写多稿。",
+        }.get(self.quality_preset)
+        return ("\n\n本次创作策略：" + strategy + "所有档位遵循当前明确要求、本书设定和已确认基础写法；不以档位名称代替证据，不改变审查底线、责任角色或修订次数。") if strategy else ""
+
+    def _quality_reading(self, hits: list[dict], sections: list[ContextSection], *,
+                         chapter_no: int, protected_input: str = "") -> list[dict]:
+        """Expand ranked relevant prose using the existing shared supplement allowance."""
+        loaded = {source for section in sections if section.key == "E" or section.key.startswith(("E-cited-", "TH-source-"))
+                  for source in section.source_ids}
+        supplemental = [section for section in sections if section.key == "F" or section.key.startswith("TH-source-")]
+        budget = min(max(0, SOURCE_RECOVERY_TOKEN_LIMIT - sum(estimate_tokens(s.content) for s in supplemental)),
+                     max(0, self.hard_token_limit - estimate_tokens(protected_input)
+                         - sum(estimate_tokens(s.content) for s in sections) - 4096))
+        slots = max(0, 6 - sum(s.key.startswith("TH-source-") for s in sections))
+        reads, seen = [], set()
+        for hit in hits:
+            if hit.get("source_type") not in {"canon_source", "chapter_summary", "canon_fact", "canon_thread"}:
+                continue
+            number = hit.get("chapter_no")
+            if not isinstance(number, int) or not 0 < number < chapter_no or number in seen:
+                continue
+            seen.add(number)
+            source_id = f"chapter:{number:05d}"
+            record = {"chapter_no": number, "source_id": source_id, "via": hit["source_id"]}
+            if source_id in loaded:
+                reads.append({**record, "state": "already_in_context"})
+                continue
+            if not slots:
+                reads.append({**record, "state": "omitted", "reason": "本次补读来源已满"})
+                continue
+            try:
+                source = self.retriever._accepted_source(number, before_chapter=chapter_no)
+                identity = hit.get("resolved_source") or hit
+                if hit["source_type"] in {"canon_source", "chapter_summary"} and (
+                    identity.get("version") != source["version"] or identity.get("source_hash") != source["content_hash"]
+                ):
+                    raise ValueError("关联来源版本发生变化，请重新读取当前依据。")
+            except (ValueError, OSError, UnicodeError) as exc:
+                # Selected canonical evidence must not silently turn into invented history.
+                raise ValidationGateError(f"高质量写前读取第 {number} 章未完成：{exc}") from exc
+            tokens = estimate_tokens(source["content"])
+            if tokens > budget:
+                reads.append({**record, "state": "excerpt_only", "reason": "完整原文超过剩余补读容量"})
+                continue
+            sections.append(ContextSection(key=f"QR-{number}", title=f"情节关联原文：第 {number} 章",
+                content=source["content"], source_ids=[source_id], hard=True, cache_scope="chapter"))
+            slots -= 1
+            budget -= tokens
+            reads.append({**record, "state": "canonical_source_loaded", "version": source["version"],
+                          "source_hash": source["content_hash"], "estimated_tokens": tokens})
+        return reads
 
     def _recovery_guidance(self, chapter_no: int) -> list[ContextSection]:
         guidance = self.project.db.learning_guidance(chapter_no=chapter_no, role=self.actor)
@@ -1309,17 +1378,18 @@ class ContextBuilder:
         *,
         has_protected_input: bool = False,
         protected_input: str = "",
-        role: str = "planner",
+        role: str = "writer",
     ) -> None:
         soft_sections = [item for item in packet.sections if not item.hard]
         hard_sections = [item for item in packet.sections if item.hard]
         ratio = packet.estimated_tokens / max(1, self.hard_token_limit)
         status = "safe" if ratio < 0.7 else "watch" if ratio < 0.9 else "near_limit"
         status_path = self.project.internal / "context-status.json"
+        role_path = self.project.internal / f"context-status-{role}.json"
         previous: dict[str, Any] = {}
         try:
-            raw_previous = json.loads(status_path.read_text(encoding="utf-8"))
-            if isinstance(raw_previous, dict) and raw_previous.get("project_id") in {None, "", self.project.project_id}:
+            raw_previous = json.loads((role_path if role_path.is_file() else status_path).read_text(encoding="utf-8"))
+            if isinstance(raw_previous, dict) and raw_previous.get("project_id") in {None, "", self.project.project_id} and raw_previous.get("actor") == role:
                 previous = raw_previous
         except (OSError, json.JSONDecodeError):
             previous = {}
@@ -1349,10 +1419,12 @@ class ContextBuilder:
         prefix_history[role] = prefix_hashes
         payload = {
             "project_id": self.project.project_id,
+            "packet_hash": content_hash(packet.to_model_prompt() + content_hash(protected_input)),
             "source_revision": project_source_revision(self.project.root, self.project.internal),
             "updated_at": updated_at,
             "chapter_no": packet.chapter_no,
             "actor": role,
+            "record_kind": "compiled_materials",
             "task": packet.task,
             "estimated_tokens": packet.estimated_tokens,
             "input_budget_scope": "to_model_prompt编译资料及调用者protected_input；Provider另核系统契约、Schema、追加指令和输出预算。",
@@ -1403,12 +1475,16 @@ class ContextBuilder:
                 {
                     "key": item.key,
                     "title": item.title,
-                    "estimated_tokens": estimate_tokens(item.content),
+                    "estimated_tokens": estimate_tokens(item.model_content()),
                     "hard": item.hard,
                     "source_count": len(item.source_ids),
+                    "changed": next((old.get("content_hash") != content_hash(item.model_content()) for old in previous.get("budget_allocation", []) if old.get("key") == item.key), True),
+                    "content_hash": content_hash(item.model_content()),
                 }
                 for item in packet.sections
-            ],
+            ] + ([{"key": "INPUT", "title": "本次正文与交接说明", "estimated_tokens": estimate_tokens(protected_input),
+                "hard": True, "source_count": 1, "content_hash": content_hash(protected_input),
+                "changed": previous.get("protected_input_hash") != content_hash(protected_input)}] if protected_input else []),
             "retrieval_diagnostics": self.retriever.last_diagnostics,
             "cache_prefix": {
                 "role": role,
@@ -1422,6 +1498,13 @@ class ContextBuilder:
             "warnings": packet.warnings,
         }
         atomic_write_text(status_path, json_dumps(payload))
+        atomic_write_text(role_path, json_dumps({**payload, "material_contents": [
+            {"key": item.key, "title": item.title, "content": item.model_content()} for item in packet.sections]
+            + ([{"key": "INPUT", "title": "本次正文与交接说明", "content": protected_input}] if protected_input else [])}))
+        atomic_write_text(self.project.internal / f"context-status-{role}-summary.json", json_dumps({
+            key: payload[key] for key in ("project_id", "actor", "updated_at", "packet_hash", "chapter_no",
+                "estimated_tokens", "change_since_previous_tokens", "budget_allocation", "record_kind",
+                "configured_hard_limit_tokens", "hard_limit_tokens", "output_reserve_tokens")}))
 
 
 def _fact_for_model(item: dict[str, Any]) -> dict[str, Any]:
