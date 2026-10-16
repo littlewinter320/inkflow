@@ -44,6 +44,7 @@ _WRITER_SYSTEM += """\n近期规划要让前章行动造成后章的新选择或
 _EDITOR_SYSTEM += """\n事实共存不等于任务完成。另从窗口起点到终点比较人物目标、障碍、实际选择与后果；当用户明确要求突破重复，而连续数章只是换人问话、看通知、回铺整理且没有推进目标或改变局面时，可判 revise，并引用这些章节的原句说明重复模式及最小重组范围。不要要求每章都有高潮，也不要因为单章安静就否决慢热叙事。"""
 _EDITOR_SYSTEM += """\n若判 pass，summary 要说清窗口收尾相比起点发生了什么由人物行动造成的局面变化或代价。单纯多得一条消息、又记了一张纸、把材料换地方藏，不自动等于任务要求的剧情推进；人物仍可保持谨慎，关键是谨慎带来新关系、新阻力或新的可执行选择。找不到这种变化而用户明确要打破重复时，应判 revise 并指出最小受影响章节段，不要用“线索逐步增多”代替实际后果。"""
 _EDITOR_SYSTEM += """\n交卷前专门核对全篇关键物件与人物的终态：同一物件若写成仍失踪/不归还，又写成主角拿到或被人放回，须解释是否确为不同物件，否则判 revise；“最后一次出现”若在不同卷重复，也须判 revise 并引用前后原句。不能只审核每段局部合理性。"""
+_EDITOR_SYSTEM += """\n区分已完成状态的回述与再次首次发生：“已经写上”等状态表述不能仅凭叙述所在时段推断成刚发生。须引用实际重复行动或排他的发生时间；普通拿取、携带、收纳的省略仍按前述共存规则判断。修订意见只要求改变有据问题及必要衔接，不能为了单处问题重写整层。"""
 
 
 class PlanningNeedsAttention(ValidationGateError):
@@ -526,7 +527,7 @@ def synchronize_v2_projection(project: InkFlowProject) -> bool:
     record = project.root / "planning" / "history" / f"revision-{archive_id}.json"
     atomic_write_text(record, json.dumps({
         "run_id": archive_id, "revision_no": 0, "superseded_by_revision": manifest.get("revision_no") or 1,
-        "created_at": utc_now(), "status": "pending", "previous_run_id": None,
+        "created_at": utc_now(), "status": "kept", "previous_run_id": None,
         "files": [{"source": "旧版数据库规划", "path": str(archive.relative_to(project.root)),
                    "content_hash": content_hash(_read(archive))}],
     }, ensure_ascii=False, indent=2))
@@ -708,7 +709,7 @@ def restore_kept_planning_publication(root: str | Path, revision_no: int) -> dic
                                           "superseded_by_revision": new_revision,
                                           "previous_run_id": current_manifest["trace_id"],
                                           "previous_manifest": current_manifest,
-                                          "created_at": now, "status": "pending", "files": files},
+                                          "created_at": now, "status": "kept", "files": files},
                                          ensure_ascii=False, indent=2))
             atomic_write_text(project.root / "planning/cleanup-suggestions.json", json.dumps(
                 {"generated_at": now, "candidates": _cleanup_suggestions(project)},
@@ -748,10 +749,15 @@ def restore_kept_planning_publication(root: str | Path, revision_no: int) -> dic
 
 async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int, end: int,
                                   instruction: str, focus: str = "",
-                                  approved_run_id: str = "") -> dict[str, Any]:
+                                  approved_run_id: str = "", total_chapters: int | None = None,
+                                  volume_count: int | None = None) -> dict[str, Any]:
     """Complete an authorized planning chain, resuming only the failed stage on retry."""
     if end <= anchor or not instruction.strip():
         raise ValidationGateError("请说清以哪一章正史为锚点、要规划到第几章，以及后续剧情方向。")
+    if total_chapters is not None and (type(total_chapters) is not int or total_chapters < end):
+        raise ValidationGateError("全书总章数必须是整数且覆盖本次近期规划范围。")
+    if volume_count is not None and (type(volume_count) is not int or not 1 <= volume_count <= 20):
+        raise ValidationGateError("规划卷数必须是1至20的整数。")
     project = InkFlowProject(root)
     recovery_path = project.root / "planning/publication-recovery.json"
     continuing = bool(re.search(r"继续|恢复|重试|断点|续修", instruction))
@@ -805,7 +811,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         raise ValidationGateError("规划起点必须是当前最后一章已接受正文；不会改写或跳过正史。")
     trace = TraceRecorder(project.root, "planning-v2", engine.settings.trace_level)
     scope = active_task_settings.get()
-    review_role = "reviewer" if scope and scope.collaboration_mode in {"review_boost", "full_specialist"} else "editor"
+    review_role = "reviewer" if scope and scope.effective_collaboration_mode in {"review_boost", "full_specialist"} else "editor"
     book = _read(project.root / "BOOK.md")
     state = _read(project.root / "STATE.md")
     from .story_settings import StorySettingsService
@@ -909,6 +915,10 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
     preserved_candidates: dict[str, Any] = {}
     preserved_outline: BookOutlineV2 | None = None
     new_window = False
+    focus_range = re.search(
+        r"(?<!不)(?<!别)(?<!勿)(?:只|仅)?(?:需|要)?(?:改|调整|修|修正|校正|重排|重构|重新规划|重新安排|梳理|优化)(?:当前|现行|生效)?第\s*(\d+)\s*(?:到|至|～|~|—|-)\s*(\d+)\s*章",
+        instruction,
+    )
     if focus in {"volume-detail", "outline"}:
         active = load_active_planning(project)
         if active is None or end != active[3].chapters[-1].chapter_no or anchor != active[3].anchor_chapter:
@@ -922,22 +932,25 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             preserved_candidates["volume-detail"] = active[2]
     if focus == "chapter-window":
         active = load_active_planning(project)
+        next_volume = next((volume for volume in active[1].volumes
+                            if volume.chapter_start <= anchor + 1 <= volume.chapter_end), None) if active else None
+        reanchored_window = bool(active and anchor == project.db.latest_accepted_chapter_no()
+                                 and anchor > active[3].anchor_chapter
+                                 and end == active[3].chapters[-1].chapter_no)
         new_window = bool(active and anchor == project.db.latest_accepted_chapter_no()
                           and anchor >= active[0].get("accepted_anchor", 0)
                           and end > active[3].chapters[-1].chapter_no
-                          and end <= active[2].chapter_end)
-        if active is None or (not new_window and (active[0].get("accepted_anchor") != anchor
+                          and next_volume is not None and end <= next_volume.chapter_end)
+        if active is None or (not new_window and not reanchored_window and (active[0].get("accepted_anchor") != anchor
                                                     or active[0].get("chapter_window") != [anchor, end])):
             raise ValidationGateError("当前三层规划的锚点或范围已变化；请先核对受影响章节，不会改写旧稿。")
         manifest, active_outline, active_detail, _active_window = active
+        if new_window and next_volume.volume_no != active_detail.volume_no:
+            active_detail = None
         source_run = project.root / ".inkflow" / "runs" / str(manifest["trace_id"])
         if not new_window:
             active_source_run = source_run
             previous_run = source_run
-    focus_range = re.search(
-        r"(?<!不)(?<!别)(?<!勿)(?:只|仅)?(?:需|要)?(?:改|调整|修|修正|校正|重排|重构|重新规划|重新安排|梳理|优化)(?:当前|现行|生效)?第\s*(\d+)\s*(?:到|至|～|~|—|-)\s*(\d+)\s*章",
-        instruction,
-    )
     focus_single = re.search(r"(?<!不)(?<!别)(?<!勿)(?:只|仅)?(?:需|要)?(?:改|调整|修|修正|校正|重排|重构|重新规划|重新安排|梳理|优化)(?:当前|现行|生效)?第\s*(\d+)\s*章", instruction)
     focus_chapters = (set(range(anchor + 1, end + 1)) if new_window else
                       set(range(int(focus_range.group(1)), int(focus_range.group(2)) + 1))
@@ -948,9 +961,12 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
     if focus == "chapter-window" and (not focus_chapters or min(focus_chapters) <= anchor or max(focus_chapters) > end):
         raise ValidationGateError("请指出要修订的未来章节范围；已接受正文和其他规划不会被猜测改动。")
     requested_instruction = instruction
+    scope_constraints = {key: value for key, value in {"total_chapters": total_chapters,
+                         "volume_count": volume_count}.items() if value is not None}
     resume_basis = {
+        **scope_constraints,
         "snapshot_hash": scope.snapshot_hash if scope else "",
-        "collaboration_mode": scope.collaboration_mode if scope else "",
+        "collaboration_mode": scope.effective_collaboration_mode if scope else "",
         "review_role": review_role,
         "canon_hash": frozen,
         "settings_source_hash": settings_fingerprint,
@@ -972,7 +988,8 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 or json.loads(_read(approved_dir / "resume-base.json")) != resume_basis):
             raise ValidationGateError("待确认规划的来源、范围或生效版本已变化，不能直接采用旧候选。")
         for stage in ("outline", "volume-detail", "chapter-window"):
-            required = ("candidate.json",) if ((focus == "chapter-window" and stage != "chapter-window")
+            required = ("candidate.json",) if ((focus == "chapter-window" and
+                                               (stage == "outline" or stage == "volume-detail" and active_detail is not None))
                                               or (focus == "volume-detail" and stage == "outline")) else ("candidate.json", "review.json")
             for suffix in required:
                 name = f"{stage}-{suffix}"
@@ -1142,10 +1159,10 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             if not focus_chapters.issubset(revised):
                 raise ValidationGateError("修订候选缺少目标章节，原规划保持不变。")
             resumed_candidate = resumed_candidate.model_copy(update={
-                "anchor_chapter": original.anchor_chapter,
-                "anchor_summary": original.anchor_summary,
+                "anchor_chapter": anchor,
+                "anchor_summary": resumed_candidate.anchor_summary if anchor != original.anchor_chapter else original.anchor_summary,
                 "chapters": [revised[item.chapter_no] if item.chapter_no in focus_chapters else item
-                             for item in original.chapters],
+                             for item in original.chapters if item.chapter_no > anchor],
             })
             previous_candidate = _stage_text(resumed_candidate)
             prior_review_path = previous_run / "chapter-window-review.json" if previous_run else None
@@ -1220,13 +1237,18 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                     if not focus_chapters.issubset(changed):
                         raise ValidationGateError("Writer 未返回完整目标章节修订，原规划保持不变。")
                     candidate = candidate.model_copy(update={
-                        "anchor_chapter": original.anchor_chapter,
-                        "anchor_summary": original.anchor_summary,
+                        "anchor_chapter": anchor,
+                        "anchor_summary": candidate.anchor_summary if anchor != original.anchor_chapter else original.anchor_summary,
                         "chapters": [changed[item.chapter_no] if item.chapter_no in focus_chapters else item
-                                     for item in original.chapters],
+                                     for item in original.chapters if item.chapter_no > anchor],
                     })
                 previous_candidate = _stage_text(candidate)
             atomic_write_text(candidate_path, candidate.model_dump_json(indent=2))
+            if stage == "outline" and ((total_chapters is not None and candidate.volumes[-1].chapter_end != total_chapters)
+                                       or (volume_count is not None and len(candidate.volumes) != volume_count)):
+                feedback = f"本次用户明确的规模必须保持：{json.dumps(scope_constraints, ensure_ascii=False)}；请在当前候选上修正卷级范围，不改正史。"
+                trace.record("outline.scope", "needs_revision", "候选规模不符合用户确认范围，尚未进入审核或发布")
+                continue
             if stage == "chapter-window" and stage not in preserved_candidates and resumed_candidate is None:
                 if any(not all((item.goal, item.obstacle, item.decision, item.consequence, item.scenes))
                        for item in candidate.chapters):
@@ -1434,9 +1456,13 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                     "已保留单层候选和当前正式版；请确认是否同时修订受影响下游，原请求不会自动扩大。")
             feedback = (f"【审核对整体推进的观察，仅下列逐字证据作为阻断依据】\n{review.summary}\n"
                         f"【已定位的需修问题】\n{findings}\n"
+                        f"【审核的具体修订要求，只采用有据且在授权范围内的部分】\n{review.repair_instruction}\n"
                         "只处理上面有原句依据的问题，并顺读前后章节确认因果；"
                         "未定位的附加建议不是硬要求。若重复动作跨越整个目标窗口，可重组这些章节，"
                         "不要只替换几句收尾；其他已成立的事实保持原样。")
+        if stage == "outline" and ((total_chapters is not None and candidate.volumes[-1].chapter_end != total_chapters)
+                                   or (volume_count is not None and len(candidate.volumes) != volume_count)):
+            raise ValidationGateError("两次定向补救后全书规模仍不符合用户确认范围，候选保留，未发布。")
         leading_issue = review.evidence[0].finding if review.evidence else review.summary
         raise PlanningNeedsAttention(
             f"{stage} 两轮定向修订后仍未通过独立审核；当前具体问题：{leading_issue}"
@@ -1449,7 +1475,8 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
 
     try:
         outline_task = (f"重设计全书大纲约5000～25000字，必须有主线、背景设定、重要场景、人物变化、主要高潮、大致结局和连续的卷级方向。"
-                        f"前 {anchor} 章已经发生，不得更改；后续卷数与总章数可随剧情合理调整。第一卷包含第1～{anchor}章，后续每卷至少10章。body 不写逐章计划。")
+                        f"前 {anchor} 章已经发生，不得更改；已接受正文可能跨多个卷，不能把它们强行合成第一卷。用户明确卷数和总章数时必须保持，未指定才可合理调整；每卷至少10章。body 不写逐章计划。"
+                        f"\n本次代码核验的明确规模：{json.dumps(scope_constraints, ensure_ascii=False)}")
         if focus == "outline" and preserved_outline is not None:
             outline_task = ("只修改生效全书大纲，保留既有卷号与各卷起止章，不改正史；"
                             "下游细纲和近期规划本轮只做必要相容性审核，不自动重写。\n生效大纲："
@@ -1464,8 +1491,11 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 and [(v.volume_no, v.chapter_start, v.chapter_end) for v in outline.volumes]
                 != [(v.volume_no, v.chapter_start, v.chapter_end) for v in preserved_outline.volumes]):
             raise PlanningNeedsAttention("单独大纲修改改变了卷边界，候选保留但未发布。", "请确认是否扩大为完整三层重设计。")
-        if (active_outline is None and focus != "outline" and outline.volumes[0].chapter_end != anchor) or len(outline.volumes) < 2:
-            raise ValidationGateError("大纲没有保留已接受第一卷边界并规划后续卷；候选未发布。")
+        if len(outline.volumes) < 2:
+            raise ValidationGateError("大纲缺少后续卷级方向；候选未发布。")
+        if ((total_chapters is not None and outline.volumes[-1].chapter_end != total_chapters)
+                or (volume_count is not None and len(outline.volumes) != volume_count)):
+            raise ValidationGateError("全书候选规模与用户确认范围不同，未发布。")
         outline_text = _render_outline(outline)
         volume = next((item for item in outline.volumes if item.chapter_start <= anchor + 1 <= item.chapter_end), None)
         if volume is None or end > volume.chapter_end:
@@ -1509,13 +1539,15 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                         raise PlanningNeedsAttention("审核期间生效规划已变化，候选保留但不能请求采用。",
                                                      "先核对新旧版本，再从受影响层续接。")
                 project.db.set_metadata("pending_planning_publication", {
+                    **scope_constraints,
                     "run_id": trace.run_id, "anchor": anchor, "end": end,
                     "instruction": requested_instruction, "focus": focus,
                     "source_manifest_hash": active_start_hashes["planning/active-v2.json"],
                     "artifact_hashes": {f"{stage}-{suffix}": content_hash(_read(
                         trace.run_dir / f"{stage}-{suffix}"))
                         for stage in ("outline", "volume-detail", "chapter-window")
-                        for suffix in (("candidate.json",) if ((focus == "chapter-window" and stage != "chapter-window")
+                        for suffix in (("candidate.json",) if ((focus == "chapter-window" and
+                                                               (stage == "outline" or stage == "volume-detail" and active_detail is not None))
                                                                or (focus == "volume-detail" and stage == "outline"))
                                        else ("candidate.json", "review.json"))},
                 })
@@ -1594,7 +1626,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                     "run_id": trace.run_id, "revision_no": manifest["revision_no"] - 1,
                     "superseded_by_revision": manifest["revision_no"],
                     "previous_run_id": previous_manifest.get("trace_id"), "previous_manifest": previous_manifest,
-                    "created_at": manifest["published_at"], "status": "pending", "files": superseded_files,
+                    "created_at": manifest["published_at"], "status": "kept", "files": superseded_files,
                 }, ensure_ascii=False, indent=2)
             contents["planning/active-v2.json"] = json.dumps(manifest, ensure_ascii=False, indent=2)
             if scope:
@@ -1625,7 +1657,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 "bundle": v2_execution_bundle(project, manifest, outline, detail, plan).model_dump(mode="json"),
                 "old_plans": old_plan_rows, "prior_brief": prior_brief.model_dump(mode="json"),
                 "brief": revised_brief.model_dump(mode="json"), "source_hashes": active_start_hashes,
-                "focus": focus, "approved_run_id": approved_run_id, "history_choice": bool(superseded_files),
+                "focus": focus, "approved_run_id": approved_run_id, "history_choice": False,
             }
             recovery_record = {"status": "prepared", "attempts": 0, "stage": "prepared", "payload": payload,
                                "payload_hash": content_hash(json.dumps(payload, ensure_ascii=False, sort_keys=True))}
@@ -1645,8 +1677,8 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 "volume_no": volume.volume_no, "outline_path": str(project.root / "OUTLINE.md"),
                 "detail_path": str(project.root / "STORY_DETAIL.md"), "plan_path": str(project.root / "RECENT_PLAN.md"),
                 "trace_id": trace.run_id, "cleanup_candidates": cleanup,
-                "pending_history_choice": bool(superseded_files),
-                "next_action": f"第 {manifest['revision_no']} 版规划已正式生效；请在项目中心选择保留或删除被替换的旧版。"}
+                "pending_history_choice": False,
+                "next_action": "当前规划已生效，可以按本次安排继续写作。"}
     except asyncio.CancelledError:
         trace.record("planning-v2", "cancelled", "已停止；本阶段候选保留，未发布未审核结果")
         trace.finish(status="cancelled", summary="规划已停止，现有正史不变")

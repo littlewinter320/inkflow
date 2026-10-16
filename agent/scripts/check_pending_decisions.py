@@ -62,6 +62,15 @@ def check():
         project.db.set_metadata("pending_plan_revision:1",{"status":"awaiting_review","instruction":"只核对当前章节卡"})
         pending=next(x for x in project.pending_work() if x["id"]==diagnostic["id"])
         assert not pending["can_process"] and "规划复审" in pending["next_action"]
+        assert pending["parent_id"] == next(x["id"] for x in project.pending_work() if x["kind"] == "plan_revision")
+        assert next(x for x in project.pending_work() if x["kind"] == "plan_revision")["intent"]["review_before_revision"]
+        source_work=project.record_pending_work(kind="context_source",reason="旧请求点名来源不足",next_action="补充原请求依据",
+            source={"chapter_no":1,"boundary_chapter":1},status="waiting_condition")
+        project.decide_pending_work(source_work["id"],decision="reject",reason="当前批次已使用核验后的临时来源，不再安排旧请求资料补充")
+        assert not any(item["id"]==source_work["id"] for item in project.pending_work())
+        assert project.db.get_chapter(1)["status"]=="draft" and any(item["id"]==diagnostic["id"] for item in project.pending_work())
+        linked=next(x for x in project.pending_work() if x["id"]==task["id"])
+        assert linked["parent_id"] == pending["parent_id"] and linked["processing_attempts"]==2
         print("Pending decisions/progress checks passed: rejection history, restore without resetting attempts, required gates, obsolete target handoff, written versus accepted.")
 
 

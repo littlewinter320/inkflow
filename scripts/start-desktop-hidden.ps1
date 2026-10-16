@@ -12,6 +12,10 @@ New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
 $inkflowPrograms = [Environment]::GetFolderPath('Programs')
 $inkflowIcon = Join-Path $desktopRoot 'resources\icon.ico'
 $inkflowElectron = Join-Path $desktopRoot 'node_modules\electron\dist\electron.exe'
+$desktopVersion = (Get-Content -LiteralPath (Join-Path $desktopRoot 'package.json') -Raw | ConvertFrom-Json).version
+$electronVersion = (Get-Content -LiteralPath (Join-Path $desktopRoot 'node_modules\electron\package.json') -Raw | ConvertFrom-Json).version
+$iconHash = (Get-FileHash -LiteralPath $inkflowIcon -Algorithm SHA256).Hash.ToLowerInvariant().Substring(0,12)
+$inkflowBrandedElectron = "D:\墨流\cache\desktop-runtime\$electronVersion-$desktopVersion-$iconHash\墨流 InkFlow.exe"
 $inkflowNativeLauncher = & (Join-Path $PSScriptRoot 'build-development-launcher.ps1')
 $inkflowShortcutPath = Join-Path $inkflowPrograms '墨流（本地开发）.lnk'
 if ((Test-Path -LiteralPath $inkflowPrograms) -and (Test-Path -LiteralPath $inkflowIcon)) {
@@ -146,13 +150,12 @@ function Get-DescendantProcessIds([int]$RootProcessId, [object[]]$Processes) {
 try {
     $node = (Get-Command node.exe -ErrorAction Stop).Source
     $nodeRoot = Split-Path -Parent $node
-    $npmCli = Join-Path $nodeRoot 'node_modules\npm\bin\npm-cli.js'
-    if (-not (Test-Path -LiteralPath $npmCli)) {
-        throw "npm CLI not found next to node.exe: $npmCli"
-    }
+    $devScript = Join-Path $desktopRoot 'scripts\dev.mjs'
+    $desktopBin = Join-Path $desktopRoot 'node_modules\.bin'
+    $env:Path = "$desktopBin;$nodeRoot;$windowsSystem32;$env:Path"
     $process = Start-Process `
         -FilePath $node `
-        -ArgumentList @("`"$npmCli`"", 'run', 'dev') `
+        -ArgumentList @("`"$devScript`"") `
         -WorkingDirectory $desktopRoot `
         -WindowStyle Hidden `
         -RedirectStandardOutput $stdout `
@@ -166,9 +169,9 @@ try {
     return
 }
 
-# Confirm a visible main window from this exact npm launch, not an old log line
+# Confirm a visible main window from this exact development launch, not an old log line
 # or another Electron process. Vite, TypeScript and Electron remain hidden.
-$startupTimeoutSeconds = 90
+$startupTimeoutSeconds = 30
 $deadline = (Get-Date).AddSeconds($startupTimeoutSeconds)
 $ready = $false
 $failure = ''
@@ -180,12 +183,13 @@ while ((Get-Date) -lt $deadline) {
         break
     }
 
-    $snapshot = @(Get-CimInstance Win32_Process -Filter "Name='electron.exe' OR Name='node.exe' OR Name='cmd.exe'" -ErrorAction SilentlyContinue)
+    $snapshot = @(Get-CimInstance Win32_Process -Filter "Name='electron.exe' OR Name='墨流 InkFlow.exe' OR Name='node.exe' OR Name='cmd.exe'" -ErrorAction SilentlyContinue)
     if ($snapshot.Count -gt 0) {
         $descendants = Get-DescendantProcessIds -RootProcessId $process.Id -Processes $snapshot
         $mainWindows = @($snapshot | Where-Object {
             $descendants.ContainsKey([int]$_.ProcessId) -and
-            [string]::Equals([string]$_.ExecutablePath, $inkflowElectron, [StringComparison]::OrdinalIgnoreCase) -and
+            ([string]::Equals([string]$_.ExecutablePath, $inkflowElectron, [StringComparison]::OrdinalIgnoreCase) -or
+             [string]::Equals([string]$_.ExecutablePath, $inkflowBrandedElectron, [StringComparison]::OrdinalIgnoreCase)) -and
             [string]$_.CommandLine -notmatch '(?:^|\s)--type='
         })
         foreach ($candidate in $mainWindows) {

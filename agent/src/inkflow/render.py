@@ -197,6 +197,9 @@ def render_review(chapter_no: int, report: ReviewReport, code_metrics: dict[str,
         "",
         report.summary,
         "",
+        *(["## 微改建议", "", *[
+            f"- 原句：{item.target_excerpt}\n  - 建议替换：{item.replacement}\n  - 原因：{item.reason}"
+            for item in report.copyedits], ""] if report.copyedits else []),
         *(["## 本任务偏好取舍", "", *[
             f"- {item['status']} · {item.get('selected_id') or '等待选择或核对'}：{item['reason']}\n  - 来源：{'、'.join(item['preference_ids'])}\n  - 原句：{' / '.join(item['source_quotes'])}"
             for item in report.preference_decisions], ""] if report.preference_decisions else []),

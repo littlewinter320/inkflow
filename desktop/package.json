@@ -8,7 +8,7 @@
   "scripts": {
     "dev:live": "cross-env INKFLOW_LIVE_RELOAD=1 npm run dev",
     "dev": "node scripts/dev.mjs",
-    "dev:services": "concurrently -k \"vite --port %INKFLOW_DEV_PORT%\" \"wait-on tcp:%INKFLOW_DEV_PORT% file:dist-electron/main.js && cross-env VITE_DEV_SERVER_URL=http://localhost:%INKFLOW_DEV_PORT% electron .\"",
+    "dev:services": "concurrently -k \"vite --port %INKFLOW_DEV_PORT%\" \"wait-on tcp:%INKFLOW_DEV_PORT% file:dist-electron/main.js && cross-env VITE_DEV_SERVER_URL=http://localhost:%INKFLOW_DEV_PORT% \\\"%INKFLOW_DEV_EXECUTABLE%\\\" .\"",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.electron.json --noEmit",
     "build:web": "vite build",
     "build:electron": "tsc -p tsconfig.electron.json",
@@ -40,6 +40,7 @@
   "build": {
     "appId": "cn.inkflow.desktop",
     "productName": "墨流 InkFlow",
+    "executableName": "墨流 InkFlow",
     "artifactName": "InkFlow-Setup-${version}.${ext}",
     "compression": "maximum",
     "electronLanguages": [

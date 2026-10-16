@@ -9,7 +9,7 @@ from typing import Literal
 from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 from .errors import ValidationGateError
-from .project_lock import project_write_lock_sync, _pid_alive
+from .project_lock import project_write_lock, project_write_lock_sync, _pid_alive
 from .studio import StudioService
 from .utils import SOURCE_RECOVERY_TOKEN_LIMIT, content_hash, utc_now
 
@@ -72,9 +72,54 @@ class ManualEditsService:
         return value if isinstance(value, dict) else {}
 
     def status(self):
-        jobs = sorted(self.jobs().values(), key=lambda item: item["updated_at"], reverse=True)
+        from .utils import source_display_name
+        self.reconcile_setting_reviews()
+        jobs = [{**item, "display_name": source_display_name(self.project, item["relative_path"])}
+                for item in sorted(self.jobs().values(), key=lambda item: item["updated_at"], reverse=True)]
         return {"jobs": jobs, "issues": [item for item in jobs if item["status"] in
                 {"awaiting_confirmation", "needs_evidence", "failed", "revision_requested"}]}
+
+    def reconcile_setting_reviews(self):
+        """A current, verified successor retires its old setting-review job."""
+        from .errors import ProjectBusyError
+        try:
+            self._reconcile_setting_reviews()
+        except ProjectBusyError:
+            # This is optional read-side maintenance. A concurrent write must
+            # not prevent viewing the board or starting an unrelated request.
+            return
+
+    def _reconcile_setting_reviews(self):
+        from .story_settings import StorySettingsService
+        with project_write_lock_sync(self.project.root, timeout=0):
+            jobs = self.jobs()
+            candidates = [job for job in jobs.values() if job.get("kind") == "setting_record"
+                and job.get("applied") and type(job.get("record_revision")) is int
+                and job.get("status") in {"pending", "awaiting_confirmation", "needs_evidence", "failed", "revision_requested", "paused"}]
+            if not candidates:
+                return
+            service = StorySettingsService(self.project)
+            records = {"story-setting:" + record["record_id"]: (record, collection)
+                for collection in service.list_collections() for record in collection["records"]}
+            changed, cache = False, {}
+            for job in candidates:
+                pair = records.get(job["relative_path"])
+                if not pair:
+                    continue
+                record, collection = pair
+                if (record["revision"] <= job["record_revision"] or record["status"] != "verified_reference"
+                        or record.get("review", {}).get("decision") != "verified_reference"):
+                    continue
+                live = service._context_record(record, collection, None, cache)
+                if not live or live["status"] != "verified_reference":
+                    continue
+                jobs[job["job_id"]] = {**job, "status": "superseded", "updated_at": utc_now(),
+                    "summary": "这份设定已有更新版本完成核对，旧候选待办已收尾。",
+                    "resolution": {"type": "verified_setting_successor", "record_id": record["record_id"],
+                        "record_revision": record["revision"], "previous_record_revision": job["record_revision"]}}
+                changed = True
+            if changed:
+                self.project.db.set_metadata("manual_edit_jobs", jobs)
 
     def enqueue(self, relative_path, content, *, previous_hash="", kind="document", chapter_no=None, applied=True, record_revision=None):
         relative_path = str(relative_path).replace("\\", "/")
@@ -200,6 +245,9 @@ class ManualEditsService:
         self.project.db.set_metadata("manual_edit_jobs", jobs)
 
     def collection_changed(self, previous, current):
+        from .story_settings import collection_requires_recheck
+        if previous and not collection_requires_recheck(current, previous["revision"]):
+            return
         if not previous or not current.get("changed") or not any(previous.get(key) != current.get(key)
                 for key in ("instructions", "fields", "read_roles", "write_roles")):
             return
@@ -259,7 +307,7 @@ class ManualEditsService:
         if not job:
             raise ValidationGateError("找不到这次手动编辑。")
         if resume and job["status"] == "failed" and int(job.get("attempts", 0)) < 2:
-            with project_write_lock_sync(self.project.root):
+            async with project_write_lock(self.project.root):
                 jobs = self.jobs()
                 current = jobs.get(job_id)
                 if current and current["status"] == "failed" and current["current_hash"] == job["current_hash"]:
@@ -275,9 +323,10 @@ class ManualEditsService:
         try:
             scope = self.studio.db.prepare_task_settings(run_id, novel_id=self.project.project_id,
                 settings=lambda: engine.settings, workspace_root=self.project.root,
-                collaboration_mode=None if job.get("task_id") else original_scope.collaboration_mode if original_scope else "everyday")
+                collaboration_mode=None if job.get("task_id") or not original_scope or original_scope.collaboration_pending
+                    else original_scope.effective_collaboration_mode)
         except Exception as exc:
-            with project_write_lock_sync(self.project.root):
+            async with project_write_lock(self.project.root):
                 jobs = self.jobs()
                 if jobs.get(job_id, {}).get("status") == "pending":
                     jobs[job_id] = {**jobs[job_id], "status": "failed", "summary": "配置断点无法恢复：" + str(exc)[:1500], "updated_at": utc_now()}
@@ -285,6 +334,9 @@ class ManualEditsService:
             raise
         token = active_task_settings.set(scope)
         try:
+            from .studio import bind_active_collaboration
+            scope = bind_active_collaboration(self.project, "manual_edits.review",
+                specialist="memory_keeper" if job["kind"] == "setting_record" else "reviewer") or scope
             if engine.settings.to_mapping() != scope.settings.to_mapping():
                 from .engine import InkFlowEngine
                 from .provider import create_provider
@@ -304,7 +356,7 @@ class ManualEditsService:
             return job
         if not engine.settings.manual_edit_review_enabled:
             return {**job, "auto_review_disabled": True}
-        with project_write_lock_sync(self.project.root):
+        async with project_write_lock(self.project.root):
             jobs = self.jobs()
             job = jobs[job_id]
             if job["status"] != "pending":
@@ -324,7 +376,7 @@ class ManualEditsService:
             if job["kind"] == "setting_record":
                 from .story_settings import StorySettingsService
                 scope = active_task_settings.get()
-                owners = check_owners_for_mode(scope.collaboration_mode if scope else "everyday")
+                owners = check_owners_for_mode(scope.effective_collaboration_mode if scope else "everyday")
                 role = owners["memory"] if job["kind"] == "setting_record" else owners.get("general") or owners.get("logic_continuity")
                 canonical_role = role
                 record_id = job["relative_path"].split(":", 1)[1]
@@ -333,6 +385,9 @@ class ManualEditsService:
                 record = next((item for item in (collection or {}).get("records", []) if item["record_id"] == record_id), None)
                 if not record or record["revision"] != job["record_revision"]:
                     raise ValidationGateError("设定记录在核对开始前已变化，未发送旧候选。")
+                from .story_settings import has_setting_content
+                if not has_setting_content(record.get("values")):
+                    raise ValidationGateError("这条设定还没有具体内容，请先填写；没有调用模型审查空条目。")
                 if canonical_role not in collection["read_roles"]:
                     raise ValidationGateError("当前审核角色没有读取这份设定的权限；请明确调整权限或选择已启用的审核职责。")
             if job["kind"] != "setting_record":
@@ -355,20 +410,20 @@ class ManualEditsService:
                            "text": (self.project.db.canonical_chapter_content(int(ch["chapter_no"])) or "")[:10000]}
                           for ch in accepted[-3:]]
                 scope = active_task_settings.get()
-                owners = check_owners_for_mode(scope.collaboration_mode if scope else "everyday")
+                owners = check_owners_for_mode(scope.effective_collaboration_mode if scope else "everyday")
                 role = owners["memory"] if job["kind"] == "setting_record" else owners.get("general") or owners.get("logic_continuity")
                 canonical_role = role
                 sources = json.dumps({"book":self.project.db.get_brief().model_dump(mode="json"),
                     "facts":self.project.db.current_facts()[:128],"threads":self.project.db.open_threads()[:64],
                     "recent_canon":recent},ensure_ascii=False)
-                packet = ContextPacket(project_id=self.project.project_id,chapter_no=boundary,task="手动修改核对",
+                packet = ContextPacket(cache_policy=engine.settings.prompt_cache_policy,project_id=self.project.project_id,chapter_no=boundary,task="手动修改核对",
                     sections=[ContextSection(key="CANON",title="公开正史与用户约定",content=sources,hard=True),
                         ContextSection(key="SET",title="设定合集：非正史",
                         content=StorySettingsService(self.project).context(chapter_no=boundary,actor=canonical_role),hard=False)],
                     estimated_tokens=0)
                 plan_bundle = self.project.db.get_current_plan_bundle()
                 plan_text = plan_bundle.model_dump_json() if plan_bundle else ""
-                planning_required = job["kind"] == "setting_document" and bool(plan_bundle)
+                planning_required = job["kind"] in {"setting_document", "setting_record"} and bool(plan_bundle)
                 structural_gap = planning_required and (job["relative_path"] in {"PLAN.md", "RECENT_PLAN.md"}
                     or (job["relative_path"] in {"OUTLINE.md", "STORY_DETAIL.md"}
                         and (self.project.root / "planning" / "active-v2.json").is_file()))
@@ -411,7 +466,7 @@ class ManualEditsService:
                 if estimate_tokens(packet.to_model_prompt()+content)>max(1000,engine.settings.context_budget_for(role)[1]-5000):
                     raise ValidationGateError("手动候选与核对来源超过当前上下文预算，请拆分需要核对的修改范围。")
                 scope = active_task_settings.get()
-                owners = check_owners_for_mode(scope.collaboration_mode if scope else "everyday")
+                owners = check_owners_for_mode(scope.effective_collaboration_mode if scope else "everyday")
                 role = owners["memory"] if job["kind"] == "setting_record" else owners.get("general") or owners.get("logic_continuity")
                 result = await engine.provider.generate_json(system_prompt=(
                     "你审核用户手动变更。设定是可调整假设与证据参考，不是正史；合理新增、人物信念和谎言不算硬矛盾。"
@@ -451,7 +506,7 @@ class ManualEditsService:
                 summary = report.summary
                 if planning_gap:
                     summary += "；当前规划仍须按这份修改核对或重新发布，旧章节卡未自动更新。"
-            with project_write_lock_sync(self.project.root):
+            async with project_write_lock(self.project.root):
                 jobs = self.jobs()
                 current = jobs.get(job_id)
                 visible_valid = True
@@ -504,7 +559,7 @@ class ManualEditsService:
                 self.project.db.set_metadata("manual_edit_jobs",jobs)
                 return jobs[job_id]
         except (Exception, asyncio.CancelledError) as exc:
-            with project_write_lock_sync(self.project.root):
+            async with project_write_lock(self.project.root):
                 jobs=self.jobs()
                 current=jobs.get(job_id)
                 if current and current["status"]=="reviewing":
@@ -585,6 +640,8 @@ class ManualEditsService:
             return
         for job in self.jobs().values():
             setting_hard = job["kind"]=="setting_record" and any(issue.get("hard_conflict") for issue in job.get("issues",[]) if isinstance(issue,dict))
-            relevant=job["kind"]=="setting_document" or setting_hard or (job.get("chapter_no") and int(job["chapter_no"])<=chapter_no)
+            relevant=job["kind"]=="setting_document" or setting_hard or (job["kind"]!="setting_record" and job.get("chapter_no") and int(job["chapter_no"])<=chapter_no)
             if relevant and job["status"] in {"pending","reviewing","awaiting_confirmation","needs_evidence","failed","revision_requested"}:
-                raise ValidationGateError(f"手动修改仍待核对：{job['relative_path']}。原文件和正史已保留，请查看后台核对窗口。")
+                from .utils import source_display_name
+                name = source_display_name(self.project, job["relative_path"])
+                raise ValidationGateError(f"{name}的改动还需要核对。请在“修改核对”查看具体疑点，处理后从当前步骤继续。")

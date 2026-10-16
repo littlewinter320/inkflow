@@ -14,12 +14,14 @@ from mcp.types import ToolAnnotations
 from . import __version__
 from .config import Settings
 from .engine import InkFlowEngine
+from .errors import ProjectError
 from .project import InkFlowProject
 from .project_lock import project_write_lock, project_write_lock_sync
 from .provider import create_provider
 from .references import ReferenceService
 from .schemas import BookBrief
 from .studio import StudioService
+from .utils import content_hash
 
 
 mcp = FastMCP("墨流 InkFlow", log_level="WARNING")
@@ -433,12 +435,19 @@ def novel_file_write(
     content: str,
     overwrite: bool = True,
     project_root: str | None = None,
+    expected_hash: str | None = None,
 ) -> dict[str, Any]:
-    """在小说工作区内创建或覆盖用户文件。"""
+    """安全保存文字文档并同步版本；已接受正文只建立未应用修改提案。"""
 
     project = InkFlowProject(_root(project_root))
-    path = project.write_file(relative_path, content, overwrite=overwrite)
-    return {"path": str(path), "characters": len(content)}
+    with project_write_lock_sync(project.root):
+        path = project.resolve_user_path(relative_path)
+        if path.exists() and not overwrite:
+            raise ProjectError("文件已经存在；本次没有覆盖。")
+        result = StudioService(project).save_document(
+            relative_path, content, expected_hash=expected_hash, source="mcp_editor",
+        )
+        return {**result, "path": str(path), "characters": len(content)}
 
 
 @mcp.tool(annotations=RECOVERY_WRITE)
@@ -446,10 +455,19 @@ def novel_file_delete(
     relative_path: str,
     permanent: bool = False,
     project_root: str | None = None,
+    expected_hash: str | None = None,
 ) -> dict[str, Any]:
-    """删除项目内文件；默认移动到可恢复的 .inkflow/trash。"""
+    """将单个未变的文字文档移入回收区并同步草稿状态；不删除正史或整目录。"""
 
-    return InkFlowProject(_root(project_root)).delete_file(relative_path, permanent=permanent)
+    if permanent:
+        raise ProjectError("通用文件入口不执行永久删除。旧规划副本请从专用清理入口逐项选择并确认。")
+    project = InkFlowProject(_root(project_root))
+    with project_write_lock_sync(project.root):
+        path = project.resolve_user_path(relative_path)
+        if not path.is_file():
+            raise ProjectError("这里只能删除单个文字文档，不能删除小说目录。")
+        digest = expected_hash if expected_hash is not None else content_hash(path.read_text(encoding="utf-8"))
+        return StudioService(project).delete_document(relative_path, expected_hash=digest)
 
 
 @mcp.tool(annotations=RECOVERY_WRITE)

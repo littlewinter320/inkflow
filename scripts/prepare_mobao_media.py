@@ -1,4 +1,4 @@
-"""Prepare Mobao videos and twelve-frame sheets, preserving original sources on D:.
+"""Prepare Mobao videos and animation sheets, preserving original sources on D:.
 
 Developer-only: installed rembg/ONNX/OpenCV; no new application dependency.
 Model must already exist in --model-cache. See MOBAO_MEDIA_2026-10-11.md.
@@ -28,9 +28,9 @@ CLIPS = (
     ("轻点窗口入口.mp4", "tap-result", 1.5, False),
 )
 SHEETS = {
-    "waiting-user": ("exec-3c0def88-dbd0-4685-87ba-775d60b45a4f.png", True),
-    "pause-exhausted": ("exec-7477f192-3ad1-4604-86a8-40ae6cd2908e.png", False),
-    "show-summary": ("exec-8a3f392a-24f9-49b0-9d29-299483076ac7.png", False),
+    "waiting-user": ("exec-7caa71ce-82d8-4cb4-8230-7a7edfc25317.png", True, 6, 6),
+    "pause-exhausted": ("exec-c75dd4db-f944-4acf-a874-d61384fb4f74.png", False, 6, 5),
+    "show-summary": ("exec-386d2b29-171c-4b44-b216-78a3db206e12.png", False, 6, 6),
 }
 
 def archived_copy(source: Path, destination: Path) -> None:
@@ -115,7 +115,7 @@ def transparent_frame(rgb: np.ndarray, semantic: np.ndarray, *, scene: str) -> n
 
 def encode(frames: list[np.ndarray], stem: Path, ffmpeg: Path, fps: int) -> int:
     stem.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(frames[len(frames)//2]).save(str(stem) + ".poster.png", optimize=True)
+    Image.fromarray(frames[0]).save(str(stem) + ".poster.png", optimize=True)
     subprocess.run([
         str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo",
         "-pixel_format", "rgba", "-video_size", f"{SIZE}x{SIZE}", "-framerate", str(fps),
@@ -187,33 +187,34 @@ def prepare(source: Path, name: str, duration: float, loop: bool, output: Path,
             "alpha": True, "decoded_frames": len(frames), "loop": loop, "bytes": size,
             "method": "ISNet anime semantic seeds + OpenCV GrabCut, per-frame"}
 
-def prepare_sheet(source: Path, name: str, loop: bool, output: Path, ffmpeg: Path, archive: Path) -> dict:
+def prepare_sheet(source: Path, name: str, loop: bool, output: Path, ffmpeg: Path, archive: Path, columns: int, rows: int) -> dict:
     sheet = Image.open(source).convert("RGBA")
     width, height = sheet.size
-    assert width % 4 == 0 and height % 3 == 0
-    cell_width, cell_height = width//4, height//3
+    count = columns * rows
+    assert count >= 12 and columns > 1 and rows > 1
     cells, bounds = [], []
-    for index in range(12):
-        cell = np.array(sheet.crop(((index%4)*cell_width, (index//4)*cell_height,
-                                   (index%4+1)*cell_width, (index//4+1)*cell_height)))
+    for index in range(count):
+        column, row = index % columns, index // columns
+        cell = np.array(sheet.crop((round(column * width / columns), round(row * height / rows),
+                                   round((column + 1) * width / columns), round((row + 1) * height / rows))))
         binary = np.uint8(cell[:, :, 3] > 16)
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        component_count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
         keep = np.zeros(binary.shape, bool)
-        for component in range(1, count):
+        for component in range(1, component_count):
             if stats[component, cv2.CC_STAT_AREA] >= 18:
                 keep |= labels == component
         cell[~keep] = 0
         image = Image.fromarray(cell)
         bounds.append(image.getbbox())
         cells.append(image)
-    assert all(bounds), "All twelve frames must contain the character."
+    assert all(bounds), "Every frame must contain the character."
     left, top = min(box[0] for box in bounds), min(box[1] for box in bounds)
     right, bottom = max(box[2] for box in bounds), max(box[3] for box in bounds)
     crop = (left, top, right, bottom)
-    scale = (SIZE-40)/max(right-left, bottom-top)
+    scale = (SIZE-64)/max(right-left, bottom-top)
     target = (round((right-left)*scale), round((bottom-top)*scale))
     frames = []
-    atlas = Image.new("RGBA", (SIZE*4, SIZE*3))
+    atlas = Image.new("RGBA", (SIZE*columns, SIZE*rows))
     frame_directory = output / f"mobao-clean-{name}-frames"
     frame_directory.mkdir(parents=True, exist_ok=True)
     for index, cell in enumerate(cells):
@@ -222,20 +223,20 @@ def prepare_sheet(source: Path, name: str, loop: bool, output: Path, ffmpeg: Pat
         frame.alpha_composite(normalized, ((SIZE-target[0])//2, (SIZE-target[1])//2))
         frame.save(frame_directory / f"frame-{index+1:02d}.png", optimize=True)
         frames.append(np.asarray(frame))
-        atlas.alpha_composite(frame, ((index%4)*SIZE, (index//4)*SIZE))
-    assert len({hashlib.sha256(frame.tobytes()).hexdigest() for frame in frames}) == 12, "Twelve distinct drawings required."
-    assert all(frame[:10, :, 3].max() == 0 and frame[-10:, :, 3].max() == 0 for frame in frames)
+        atlas.alpha_composite(frame, ((index%columns)*SIZE, (index//columns)*SIZE))
+    assert len({hashlib.sha256(frame.tobytes()).hexdigest() for frame in frames}) == count, "Distinct drawings required, not repeated encoded frames."
+    assert all(frame[:16, :, 3].max() == 0 and frame[-16:, :, 3].max() == 0
+               and frame[:, :16, 3].max() == 0 and frame[:, -16:, 3].max() == 0 for frame in frames)
     stem = output / f"mobao-clean-{name}"
     # Runtime fallback is normally an 80px mascot; detailed 384px frames remain
     # available separately without inflating the sheet's first-load transfer.
-    atlas.resize((SIZE*2, SIZE*3//2), Image.Resampling.LANCZOS).save(str(stem) + ".sheet.png", optimize=True)
-    video_frames = [frame for frame in frames for _ in range(5)]
-    size = encode(video_frames, stem, ffmpeg, FPS)
+    atlas.resize((SIZE*columns//2, SIZE*rows//2), Image.Resampling.LANCZOS).save(str(stem) + ".sheet.png", optimize=True)
+    size = encode(frames, stem, ffmpeg, FPS)
     montage(frames, archive / f"{name}-light-dark.png")
     return {"source": source.name, "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-            "action": name, "drawn_frames": 12, "sheet_grid": [4, 3], "duration": 3.0,
-            "size": [SIZE, SIZE], "fps": FPS, "drawn_fps": 4, "alpha": True, "loop": loop,
-            "decoded_frames": len(video_frames), "bytes": size,
+            "action": name, "drawn_frames": count, "sheet_grid": [columns, rows], "duration": count/FPS,
+            "size": [SIZE, SIZE], "fps": FPS, "drawn_fps": FPS, "alpha": True, "loop": loop,
+            "decoded_frames": count, "bytes": size,
             "method": "image_gen reference edit; common crop, scale and RGBA cells"}
 
 def main() -> None:
@@ -243,7 +244,7 @@ def main() -> None:
     parser.add_argument("source", type=Path)
     parser.add_argument("--archive", type=Path, default=Path("D:/墨流/media-source/mobao-20261011"))
     parser.add_argument("--model-cache", type=Path, default=Path("D:/墨流/media-models"))
-    parser.add_argument("--mood", choices=[clip[1] for clip in CLIPS])
+    parser.add_argument("--mood", choices=[clip[1] for clip in CLIPS] + list(SHEETS))
     parser.add_argument("--generated-sheets", type=Path)
     parser.add_argument("--sheets-only", action="store_true")
     arguments = parser.parse_args()
@@ -273,12 +274,20 @@ def main() -> None:
             results.append(result)
             print(f"{name}: {result['duration']:.3f}s, {result['bytes']} bytes, alpha preserved", flush=True)
     if arguments.generated_sheets:
-        for name, (filename, loop) in SHEETS.items():
+        for name, (filename, loop, columns, rows) in SHEETS.items():
+            if arguments.mood and name != arguments.mood:
+                continue
             source = arguments.generated_sheets / filename
             archived_copy(source, arguments.archive / "generated-originals" / filename)
-            result = prepare_sheet(source, name, loop, output, ffmpeg, arguments.archive)
+            staged = arguments.archive / "prepared" / name
+            result = prepare_sheet(source, name, loop, staged, ffmpeg, arguments.archive, columns, rows)
+            for path in staged.rglob("*"):
+                if path.is_file():
+                    target = output / path.relative_to(staged)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, target)
             results.append(result)
-            print(f"{name}: 12 distinct drawn frames, {result['bytes']} bytes", flush=True)
+            print(f"{name}: {result['drawn_frames']} distinct drawn frames at {result['drawn_fps']} fps, {result['bytes']} bytes", flush=True)
     manifest = arguments.archive / "conversion-manifest.json"
     previous = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else []
     results = [item for item in previous if item["action"] not in {result["action"] for result in results}] + results

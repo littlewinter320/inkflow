@@ -55,6 +55,8 @@ def recent_trace_runs(project_root: str | Path, limit: int = 12) -> list[dict[st
             except json.JSONDecodeError:
                 continue
             metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+            if metadata.get("internal"):
+                continue
             marker = event.pop("role_protocol_version", None)
             metadata = _canonical_role_metadata(metadata, legacy=type(marker) is int and marker == 1)
             if metadata.get("canonical_agent_role"):
@@ -155,6 +157,7 @@ class TraceRecorder:
         summary: str,
         details: str = "",
         metadata: dict[str, Any] | None = None,
+        *, public: bool = True,
     ) -> None:
         event = TraceEvent(
             timestamp=utc_now(),
@@ -162,14 +165,14 @@ class TraceRecorder:
             status=status,
             summary=summary,
             details=details,
-            metadata=_canonical_role_metadata(metadata or {}),
+            metadata=_canonical_role_metadata({**(metadata or {}), **({"internal": True} if not public else {})}),
         )
         self.events.append(event)
         with self.events_path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(asdict(event), ensure_ascii=False) + "\n")
         self._render()
         runtime = active_runtime.get()
-        if runtime and not stage.endswith("provider_reasoning"):
+        if runtime and public and not event.metadata.get("internal") and not stage.endswith("provider_reasoning"):
             runtime.publish({"type": "workflow.stage", "trace_id": self.run_id,
                              "stage": stage, "status": status, "summary": summary,
                              "details": details, "role": event.metadata.get("agent_role", ""),
@@ -195,12 +198,17 @@ class TraceRecorder:
             },
         )
 
-    def record_model(self, stage: str, result: ProviderResult[Any], decision_summary: str) -> None:
+    def record_model(self, stage: str, result: ProviderResult[Any], decision_summary: str, *, public: bool = True) -> None:
         metadata = {
             "model": result.model,
             "response_id": result.response_id,
             "usage": result.usage,
         }
+        public_summary = getattr(result.data, "public_reasoning_summary", [])
+        if public_summary:
+            metadata["public_reasoning_summary"] = public_summary
+        if isinstance(getattr(result.data, "summary", None), str):
+            metadata["decision_summary"] = result.data.summary
         if self.trace_level == "full":
             ordinal = 1 + sum(event.stage == stage and event.status == "completed" for event in self.events)
             output_path = self.run_dir / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', stage)}.{ordinal}.output.json"
@@ -222,14 +230,16 @@ class TraceRecorder:
             self.record(
                 f"{stage}.recovery", "completed", str(recovery.get("strategy", "请求已自动恢复")),
                 metadata={**recovery, "agent_role": metadata.get("agent_role", "")},
+                public=public,
             )
-        self.record(stage, "completed", decision_summary, metadata=json.loads(json_dumps(metadata)))
+        self.record(stage, "completed", decision_summary, metadata=json.loads(json_dumps(metadata)), public=public)
         if self.trace_level == "full" and result.reasoning_content:
             self.record(
                 f"{stage}.provider_reasoning",
                 "info",
                 "模型已完成内部推理；原始思维链不写入项目",
                 metadata={"reasoning_characters": len(result.reasoning_content)},
+                public=False,
             )
 
     def record_model_started(
@@ -258,6 +268,19 @@ class TraceRecorder:
             metadata["timeout_seconds"] = float(timeout_seconds)
         if thinking is not None:
             metadata["thinking"] = bool(thinking)
+        from .task_settings import active_task_settings
+        scope = active_task_settings.get()
+        if scope is not None:
+            from .provider import _request_wait_policy
+            policy_role = "editor" if agent_role in {"reviewer_verifier", "reviewer_judge"} else agent_role
+            effective_thinking = scope.settings.thinking_for(policy_role, True if thinking is None else thinking)
+            metadata["thinking"] = effective_thinking
+            # This is the purpose budget; the Provider still clips the actual
+            # payload against its complete input and frozen user/model limits.
+            metadata["max_tokens"] = scope.settings.generation_output_budget(policy_role, max_tokens, effective_thinking)
+            wait_policy = _request_wait_policy(scope.settings, policy_role, timeout_seconds)
+            metadata.update(wait_policy)
+            metadata["timeout_seconds"] = wait_policy["request_timeout_seconds"]
         self.record(stage, "started", "已提交模型请求，等待结构化结果", metadata=metadata)
 
     def record_model_failed(

@@ -718,6 +718,11 @@ async function reviewChapter(context: vscode.ExtensionContext): Promise<void> {
   const root = requireProject();
   const editor = vscode.window.activeTextEditor;
   if (!root || !editor) return;
+  const relative = path.relative(root, editor.document.uri.fsPath).replace(/\\/g, "/");
+  if (editor.document.uri.scheme !== "file" || !/^chapters\/chapter_\d{5}(?:\.draft)?\.md$/.test(relative)) {
+    void vscode.window.showInformationMessage("请打开当前墨流项目的章节后再审查，其他作品的同章号不会代替本章。");
+    return;
+  }
   const chapter = chapterNumber(editor.document.uri.fsPath);
   if (!chapter) { void vscode.window.showInformationMessage("当前文件不是墨流章节。"); return; }
   const result = await withProgress(`审查角色正在检查第 ${chapter} 章`, (token) => requestEngine(context, "workflow.run", { project_root: root, action: "review", chapter_no: chapter }, token));

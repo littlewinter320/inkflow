@@ -17,8 +17,9 @@ from typing import Any, Awaitable, Callable
 from pydantic import ValidationError
 
 from . import __version__
-from .config import Settings, adapt_settings, api_key_status, save_api_key_to_keyring, save_user_settings
+from .config import PROVIDER_KINDS, Settings, adapt_settings, api_key_status, mimo_endpoint_for_key, save_api_key_to_keyring, save_user_settings
 from .coordinator import Coordinator
+from .craft import AUTHOR_VOICE_CONTRACT
 from .engine import InkFlowEngine
 from .errors import ConfigurationError, InkFlowError, ProjectBusyError, ProjectError, ProviderError
 from .learning import LearningService
@@ -29,11 +30,11 @@ from .references import ReferenceService
 from .role_protocol import ACTIVE_COLLABORATION_MODES, adapt_role, new_task_mode, normalize_role, roles_for_mode
 from .schemas import BookBrief, CollaborationReply, ContextPacket, ContextSection, MemoryPatch, ModeCheckOutput, NovelIdeaBundle, NovelIdeaCandidate, PrefillSuggestion, PromptOptimization, ProviderProbe, ReviewReport, SuggestedPrompt, TerminalIntent, WriterDirectionSet
 from .review_verifier import verify_review
-from .studio import StudioDatabase, StudioService, chapter_retry_state, text_statistics
-from .terminal_session import TerminalSession
+from .studio import StudioDatabase, StudioService, bind_active_collaboration, chapter_retry_state, text_statistics
+from .terminal_session import TerminalSession, _suggestions_forbidden
 from .trace import TraceRecorder, recent_trace_runs
 from .runtime import RunRuntime, active_runtime
-from .model_usage import UsageLedger
+from .model_usage import UsageLedger, normalized_usage, usage_attempts
 from .planning_cleanup import cleanup_apply, cleanup_keep, cleanup_preview
 from .conversation_scope import active_conversation, conversation_id, conversation_key
 from .task_settings import active_task_settings, capture_task_settings, restore_task_settings, use_task_settings
@@ -45,13 +46,14 @@ EventSink = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 _COLLABORATION_MODES = {
-    "everyday", "review_boost", "memory_boost", "deep", "full_specialist",
+    "everyday", "adaptive", "review_boost", "memory_boost", "deep", "full_specialist",
 }
 _EXPLICIT_MODE_PREFIX = re.compile(
     r"^\s*请?\s*(?:开启|使用|切换到|切换回|按|用)\s*"
-    r"(日常|审查加强|记忆加强|深度|特殊五角色|五角色)模式(?=\s|[，,：:]|审|复|检|$)"
+    r"(日常协作|按需加强|全面协作|日常|审查加强|记忆加强|深度|特殊五角色|五角色)(?:模式)?(?=\s|[，,：:]|审|复|检|$)"
 )
 _SPOKEN_MODES = {
+    "日常协作": "everyday", "按需加强": "adaptive", "全面协作": "full_specialist",
     "日常": "everyday",
     "审查加强": "review_boost",
     "记忆加强": "memory_boost",
@@ -63,6 +65,8 @@ _SPOKEN_MODES = {
 
 def _requested_task_mode(method: str, params: dict[str, Any]) -> str | None:
     """Choose a mode only from an explicit request, never from risk keywords."""
+    if method in {"project.ideate", "prompt.optimize", "provider.test"}:
+        return "everyday"  # Auxiliary output contracts do not start chapter collaboration.
     if method not in {"conversation.send", "workflow.run"}:
         return None
     raw_mode = params.get("collaboration_mode")
@@ -75,7 +79,7 @@ def _requested_task_mode(method: str, params: dict[str, Any]) -> str | None:
     mode = str(raw_mode or "everyday")
     if mode not in _COLLABORATION_MODES:
         raise InkFlowError("未知协作模式；没有启动专项模型调用。")
-    return new_task_mode(mode)
+    return "adaptive" if mode == "adaptive" else new_task_mode(mode)
 
 
 def _task_rows_with_history(project: InkFlowProject, limit: int, instance_id: str) -> list[dict[str, Any]]:
@@ -91,7 +95,8 @@ def _task_rows_with_history(project: InkFlowProject, limit: int, instance_id: st
         work_rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
     completed_tasks = {item["source"]["task_id"]: item for row in work_rows
                        if (item := json.loads(row["value_json"])).get("kind") == "workflow"
-                       and item.get("status") == "completed" and item.get("progress", {}).get("status") == "completed"
+                       and item.get("status") == "completed" and (item.get("progress", {}).get("status") == "completed"
+                           or isinstance(item.get("resolution"), dict) and item["resolution"].get("chapters"))
                        and item.get("source", {}).get("task_id")}
     pending = project.db.get_metadata(conversation_key("pending_creation_task"))
     if isinstance(pending, dict) and pending.get("status") == "running" and pending.get("run_id"):
@@ -261,17 +266,25 @@ class InkFlowAppService:
         from .config import Settings
         from .manual_edits import ManualEditsService
         from .runtime import RunRuntime
-        settings = Settings.from_env(project.root)
         key = str(project.root)
-        if not settings.manual_edit_review_enabled or (key in self._manual_workers and not self._manual_workers[key].done()):
-            return
-        if any(task["status"] == "running" for task in StudioService(project).db.list_tasks(100)):
-            return
-        if not any(item["status"] == "pending" for item in ManualEditsService(project).jobs().values()):
+        if key in self._manual_workers and not self._manual_workers[key].done():
             return
         async def work():
-            scope = StudioService(project).db.prepare_task_settings(f"manual-run-{uuid.uuid4().hex}",
-                novel_id=project.project_id, settings=settings, workspace_root=project.root)
+            def prepare():
+                settings = Settings.from_env(project.root)
+                if not settings.manual_edit_review_enabled:
+                    return None
+                if any(task["status"] == "running" for task in StudioService(project).db.list_tasks(100)):
+                    return None
+                if not any(item["status"] == "pending" for item in ManualEditsService(project).jobs().values()):
+                    return None
+                return StudioService(project).db.prepare_task_settings(f"manual-run-{uuid.uuid4().hex}",
+                    novel_id=project.project_id, settings=settings, workspace_root=project.root)
+            # Settings snapshots may wait for a project lock. Keep that wait
+            # off the RPC event loop so a finished foreground request can reply.
+            scope = await asyncio.to_thread(prepare)
+            if scope is None:
+                return
             settings_token = active_task_settings.set(scope)
             runtime_token = active_runtime.set(RunRuntime(publish=lambda event: None,task_id=scope.task_id,run_id=scope.task_id))
             conversation_token = active_conversation.set("manual-review")
@@ -300,11 +313,13 @@ class InkFlowAppService:
         emit: EventSink,
         consume_steering: Callable[[], Awaitable[list[str]]] | None = None,
     ) -> Any:
+        if method.startswith("voice.") and self.voice.migrating and method != "voice.status":
+            raise ValueError("语音资料正在迁移，请完成后再录音或朗读。小说写作可以继续。")
         if method in _TASK_SETTINGS_METHODS and active_task_settings.get() is None:
             if method in {"project.ideate", "prompt.optimize", "provider.test"}:
                 root = Path(str(params.get("project_root") or params.get("workspace_root") or Path.cwd())).resolve()
                 settings = Settings.from_env(root)
-                snapshot = capture_task_settings(settings, novel_id=f"aux-{uuid.uuid4().hex}")
+                snapshot = capture_task_settings(settings, novel_id=f"aux-{uuid.uuid4().hex}", collaboration_mode="everyday")
                 scope = restore_task_settings(
                     snapshot, novel_id=snapshot["novel_id"], workspace_root=root,
                 )
@@ -313,7 +328,7 @@ class InkFlowAppService:
                 scope = StudioService(project).db.prepare_task_settings(
                     f"app-{uuid.uuid4().hex}", novel_id=project.project_id,
                     settings=lambda: Settings.from_env(project.root), workspace_root=project.root,
-                    collaboration_mode=_requested_task_mode(method, params) or "everyday",
+                    collaboration_mode=_requested_task_mode(method, params),
                 )
             with use_task_settings(scope):
                 return await self.dispatch(method, params, emit, consume_steering)
@@ -360,7 +375,9 @@ class InkFlowAppService:
                 return {"learning_enabled": params["enabled"]}
             with (author_connection() if level == "author" else preference_db.connect()) as connection:
                 if action == "list":
-                    return {"preferences": list_items(connection, active_only=False, level=level)}
+                    from .craft import AUTHOR_STYLE_DEFAULT
+                    return {"preferences": list_items(connection, active_only=False, level=level),
+                            "style_default": AUTHOR_STYLE_DEFAULT}
                 if action == "history":
                     return {"events": history(connection, str(params.get("preference_id", "")))}
                 if action == "save":
@@ -402,26 +419,37 @@ class InkFlowAppService:
                 preview = Settings.from_mapping({**{key: getattr(settings, key) for key in names},
                     **{key: params[key] for key in names if key in params}, "max_output_tokens": 1})
                 settings = replace(settings, **{key: getattr(preview, key) for key in names})
+                if settings.provider_kind == "mimo":
+                    settings = replace(settings, base_url=mimo_endpoint_for_key(
+                        settings.base_url, settings.get_api_key() or ""))
             return {
                 **api_key_status(settings.provider_kind),
                 "provider_kind": settings.provider_kind,
                 "base_url": settings.base_url,
                 "model": settings.model,
+                "cache_policy": settings.prompt_cache_policy,
                 "reasoning_effort": settings.reasoning_effort,
                 "context_soft_tokens": settings.context_soft_tokens,
                 "context_hard_tokens": settings.context_hard_tokens,
                 "context_budget_mode": settings.context_budget_mode,
                 "agent_context_budgets": settings.agent_context_budgets,
                 "max_output_tokens": settings.max_output_tokens,
+                "request_timeout_seconds": settings.request_timeout_seconds,
+                "planning_timeout_seconds": settings.planning_timeout_seconds,
+                "writer_task_attempt_limit": settings.writer_task_attempt_limit,
                 "model_limits": settings.model_limits(),
                 "effective_output_tokens": settings.effective_output_tokens(settings.max_output_tokens),
                 "role_output_limits": {role: {"model": settings.model_for(role),
                     "model_limits": settings.model_limits(settings.model_for(role)),
+                    "capabilities": settings.parameter_capabilities(settings.model_for(role)),
                     "context_tokens": settings.context_budget_for(role)[1],
                     "max_output_tokens": settings.effective_output_tokens(settings.max_output_tokens, role)}
                     for role in settings.agent_generation},
                 "inquiry_frequency": settings.inquiry_frequency,
                 "hook_strategy": settings.hook_strategy,
+                "quality_preset": settings.quality_preset,
+                "quality_custom_context": settings.quality_custom_context,
+                "collaboration_preset": settings.collaboration_preset,
                 "chapter_length_tolerance": settings.chapter_length_tolerance,
                 "review_min_confidence": settings.review_min_confidence,
                 "acceptance_confirmation_mode": settings.acceptance_confirmation_mode,
@@ -447,6 +475,14 @@ class InkFlowAppService:
                 **settings.role_settings_view(),
                 "role_settings_warnings": list(settings.role_settings_warnings),
             }
+        if method == "provider.key":
+            provider_kind = str(params.get("provider_kind") or Settings.from_env().provider_kind).lower()
+            if provider_kind not in PROVIDER_KINDS:
+                raise ConfigurationError("请选择有效的模型服务商。")
+            if params.get("reveal") is True:
+                # Only this explicit local action returns the credential; no task or trace is created.
+                return {"api_key": await asyncio.to_thread(Settings(provider_kind=provider_kind).get_api_key)}
+            return await asyncio.to_thread(api_key_status, provider_kind)
         if method == "provider.configure":
             settings_params = adapt_settings(params)
             provider_kind = str(params.get("provider_kind") or Settings.from_env().provider_kind).lower()
@@ -466,8 +502,14 @@ class InkFlowAppService:
                     "context_budget_mode",
                     "agent_context_budgets",
                     "max_output_tokens",
+                    "request_timeout_seconds",
+                    "planning_timeout_seconds",
+                    "writer_task_attempt_limit",
                     "inquiry_frequency",
                     "hook_strategy",
+                    "quality_preset",
+                    "quality_custom_context",
+                    "collaboration_preset",
                     "chapter_length_tolerance",
                     "review_min_confidence",
                     "acceptance_confirmation_mode",
@@ -492,6 +534,7 @@ class InkFlowAppService:
                 if name in settings_params
                 and (
                     name in {
+                        "writer_task_attempt_limit",
                         "review_local_nli_model",
                         "review_judge_model",
                         "retrieval_embedding_model",
@@ -501,6 +544,9 @@ class InkFlowAppService:
                     or settings_params[name] not in (None, "")
                 )
             }
+            if provider_kind == "mimo" and key:
+                allowed["base_url"] = mimo_endpoint_for_key(
+                    str(allowed.get("base_url") or Settings.from_env().base_url), key)
             # Reject invalid imports before touching shared provider credentials.
             await asyncio.to_thread(save_user_settings, allowed, validate_only=True)
             if key:
@@ -512,7 +558,9 @@ class InkFlowAppService:
                         if not worker.done():
                             worker.cancel()
             current = await asyncio.to_thread(Settings.from_env, params.get("workspace_root"))
-            return {"configured": True, **api_key_status(current.provider_kind), **allowed}
+            return {"configured": True, **api_key_status(current.provider_kind),
+                    **{name: getattr(current, name) for name in allowed},
+                    "provider_kind": current.provider_kind, "base_url": current.base_url, "model": current.model}
         if method == "provider.capabilities":
             settings = Settings.from_env(params.get("workspace_root"))
             return create_provider(settings).capabilities()
@@ -521,7 +569,7 @@ class InkFlowAppService:
             return {"models": await create_provider(settings).list_models()}
         if method == "provider.test":
             settings = active_task_settings.get().settings
-            await emit({"type": "provider.testing", "summary": "正在验证密钥、接口与模型名称"})
+            await emit({"type": "provider.testing", "summary": "正在验证生成接口是否可用"})
             result = await create_provider(settings).generate_json(
                 system_prompt="你只负责返回 API 连通性检查结果。",
                 user_prompt=(
@@ -542,11 +590,15 @@ class InkFlowAppService:
                 "public_reasoning_summary": result.data.public_reasoning_summary,
             }
         if method == "voice.status":
+            if params.get("input_only") is True:
+                self.voice.prepare_input()
+            if params.get("input_only") is not True and not self.voice.migrating:
+                self.voice.schedule_edge_update_check()
             # Directory-size checks and optional package discovery can touch a
             # large local model tree. Keep them off the asyncio event loop so
             # a settings click cannot freeze the desktop while status refreshes.
             return await asyncio.to_thread(
-                self.voice.status,
+                self.voice.input_status if params.get("input_only") is True else self.voice.status,
                 params.get("workspace_root") or params.get("project_root"),
             )
         if method == "voice.settings.get":
@@ -554,6 +606,20 @@ class InkFlowAppService:
                 self.voice.settings,
                 params.get("workspace_root") or params.get("project_root"),
             )
+        if method == "voice.storage.move":
+            if params.get("confirmation") != "move_voice_storage":
+                raise ValueError("更改语音位置前需要确认目标文件夹。")
+            voice = self.voice
+            tasks = list(voice._jobs.values()) + [voice._edge_install_task, voice._moss_install_task, voice._sherpa_install_task, voice._edge_update_task, voice._asr_prepare_task]
+            locks = [voice._short_lock, voice._long_lock, voice._inference_lock, voice._asr_lock]
+            if any(task and not task.done() for task in tasks) or any(lock and lock.locked() for lock in locks):
+                raise ValueError("请等正在进行的录音识别、朗读或组件更新结束，再更改保存位置。")
+            voice.migrating = True
+            try:
+                self.voice = await asyncio.to_thread(voice.copy_storage, str(params.get("destination") or ""))
+                return {"status": self.voice.status(), "settings": self.voice.settings(), "message": "语音资料已复制、核对并切换到新位置；原目录保留，可检查后自行清理。"}
+            finally:
+                voice.migrating = False
         if method == "voice.settings.configure":
             updates = {name: params[name] for name in VOICE_SETTING_NAMES if name in params}
             return await asyncio.to_thread(
@@ -611,6 +677,7 @@ class InkFlowAppService:
                 ),
                 user_prompt=f"请优化下面这条提示词。\n\n--- 原提示词 ---\n{prompt}",
                 output_model=PromptOptimization,
+                agent_role="coordinator",
                 effort="low",
                 max_tokens=1800,
                 thinking=False,
@@ -623,13 +690,24 @@ class InkFlowAppService:
                 "source_method": "critique_then_synthesize",
             }
         if method == "assistant.suggest":
-            # This route is called automatically on project/message changes.
-            # Suggestions are optional UI aids, not a reason to spend writing
-            # budget or transmit recent conversations in the background.
-            project = self._try_project(params.get("workspace_root") or params.get("project_root"))
+            project = None
+            if params.get("workspace_root") or params.get("project_root"):
+                try:
+                    project = await asyncio.to_thread(self._project, params)
+                except Exception:
+                    pass  # Suggestions are a read-only convenience, not a recovery trigger.
+            from .conversation_scope import conversation_key
+            saved = project.db.get_metadata(conversation_key("next_step_suggestions"), {}) if project else {}
+            valid = bool(project and saved.get("basis") == TerminalSession._suggestion_basis(project))
+            pending = project.db.get_metadata(conversation_key("pending_creation_task"), {}) if project else {}
+            if valid and isinstance(pending, dict) and pending.get("intent"):
+                try:
+                    valid = not _suggestions_forbidden(TerminalIntent.model_validate(pending["intent"]))
+                except (ValueError, TypeError):
+                    valid = False
             return {
-                "suggestions": _local_suggested_prompts(project),
-                "model": "", "fallback": False, "source": "local",
+                "suggestions": saved.get("suggestions", []) if valid else [],
+                "model": "", "fallback": False, "source": "coordinator" if valid else "none",
             }
         if method == "project.ideate":
             from .preferences import preference_prompt
@@ -887,6 +965,8 @@ class InkFlowAppService:
 
             def read_overview() -> dict[str, Any]:
                 project = InkFlowProject(root, recover_on_open=False)
+                engine = self._engine(root)
+                project.reconcile_pending_work(current_pass=lambda number: engine.current_pass_review(project, number))
                 return {
                     "threads": project.db.list_collaboration_threads(),
                     "messages": project.db.list_collaboration_messages(active_only=False, limit=int(params.get("limit", 80))),
@@ -902,11 +982,27 @@ class InkFlowAppService:
 
             return await asyncio.to_thread(read_overview)
 
+        if method in {"context.status", "context.details"}:
+            from .context_status import read_context_status, read_context_material
+            root = self._validated_project_root(params)
+            def read_capacity():
+                from types import SimpleNamespace
+                manifest = json.loads((root / ".inkflow" / "project.json").read_text(encoding="utf-8"))
+                project_view = SimpleNamespace(root=root, internal=root / ".inkflow", project_id=manifest["project_id"])
+                if method == "context.details":
+                    return read_context_material(project_view, role=str(params.get("role") or ""),
+                        section_key=str(params.get("section_key") or ""), updated_at=str(params.get("updated_at") or ""),
+                        packet_hash=str(params.get("packet_hash") or ""))
+                return read_context_status(project_view, Settings.from_env(root))
+            return await asyncio.to_thread(read_capacity)
+
         # Project construction may perform recovery under a synchronous write
         # lock.  Keep that wait off the asyncio event loop so a concurrent
         # Writer/Editor task can make progress and release its own lock.
         project = await asyncio.to_thread(self._project, params)
         studio = StudioService(project)
+        if method not in {"conversation.send", "workflow.run", "collaboration.reply", "manual_edits.review"}:
+            bind_active_collaboration(project, method)
         if method.startswith("manual_edits."):
             from .manual_edits import ManualEditsService
             manual = ManualEditsService(project)
@@ -929,11 +1025,11 @@ class InkFlowAppService:
             if method == "story_settings.templates":
                 return {"templates": service.templates()}
             if method == "story_settings.list":
-                return {"collections": service.list_collections(include_archived=bool(params.get("include_archived")))}
+                return {"collections": service.list_collections(include_archived=bool(params.get("include_archived")), include_review_links=True)}
             if method == "story_settings.records":
                 return {"records": service.records(str(params["collection_id"]),include_archived=bool(params.get("include_archived")))}
             if method == "story_settings.save":
-                allowed = {"collection_id","template_id","name","category","instructions","fields","read_roles","write_roles","expected_revision"}
+                allowed = {"collection_id","template_id","name","category","instructions","fields","read_roles","write_roles","expected_revision","auto_record"}
                 old = next((item for item in service.list_collections()
                     if item["collection_id"] == params.get("collection_id")), None)
                 result = await asyncio.to_thread(service.save_collection, **{key:params[key] for key in allowed if key in params})
@@ -1020,43 +1116,6 @@ class InkFlowAppService:
             return {"status": "completed", "pending_work": project.pending_work(),
                     "rejected_work": [work for work in project.pending_work(include_rejected=True) if work["status"] == "rejected"],
                     "reply": "决定已保存。已有成果和必要门禁保持原状。"}
-        if method == "context.status":
-            settings = Settings.from_env(project.root)
-            status_path = project.internal / "context-status.json"
-            if status_path.is_file():
-                try:
-                    value = json.loads(status_path.read_text(encoding="utf-8"))
-                    if isinstance(value, dict):
-                        saved_project_id = str(value.get("project_id") or "")
-                        if saved_project_id in {"", project.project_id}:
-                            saved_revision = str(value.get("source_revision") or "")
-                            current_revision = project_source_revision(project.root, project.internal)
-                            if saved_revision and saved_revision != current_revision:
-                                return {
-                                    **value,
-                                    "status": "stale",
-                                    "stale": True,
-                                    "stale_reason": "项目资料已经变化，下一次 Writer、Editor 审查或修订任务会重新编译 Context Packet。",
-                                    "current_source_revision": current_revision,
-                                }
-                            return value
-                except (OSError, json.JSONDecodeError):
-                    pass
-            return {
-                "status": "idle",
-                "estimated_tokens": 0,
-                "before_compression_tokens": 0,
-                "previous_updated_at": "",
-                "previous_estimated_tokens": None,
-                "change_since_previous_tokens": None,
-                "soft_limit_tokens": settings.context_budget_for("writer")[0],
-                "hard_limit_tokens": settings.context_budget_for("writer")[1],
-                "hard_usage_percent": 0,
-                "compression_applied": False,
-                "hard_sections": [],
-                "compressible_sections": [],
-                "warnings": [],
-            }
         if method == "context.pins.list":
             chapter_no = int(params["chapter_no"]) if params.get("chapter_no") is not None else None
             return {"pins": studio.db.list_context_pins(chapter_no)}
@@ -1107,10 +1166,16 @@ class InkFlowAppService:
             }
         if method == "document.prefill":
             relative_path = str(params.get("relative_path") or "")
-            chapter_match = re.search(r"chapter_(\d+)\.draft\.md$", relative_path)
+            path = project.resolve_user_path(relative_path)
+            relative_path = path.relative_to(project.root).as_posix()
+            chapter_match = re.fullmatch(r"chapters/chapter_(\d{5})\.draft\.md", relative_path)
             if not chapter_match:
                 raise ValueError("预填续写只用于章节草稿")
             chapter_no = int(chapter_match.group(1))
+            chapter = project.db.get_chapter(chapter_no)
+            if (not chapter or chapter["status"] != "draft" or chapter["path"] != relative_path
+                    or not path.is_file() or content_hash(path.read_text(encoding="utf-8")) != chapter["content_hash"]):
+                raise ValueError("这份草稿已经变更或不再是当前版本，请重新打开后再使用预填。")
             content = str(params.get("content") or "")
             cursor_offset = int(params.get("cursor_offset", len(content)))
             if cursor_offset < 0 or cursor_offset > len(content):
@@ -1123,9 +1188,11 @@ class InkFlowAppService:
             length_limit = {"short": 80, "medium": 240, "long": 600}.get(length, 240)
             before = content[max(0, cursor_offset - 6_000):cursor_offset]
             after = content[cursor_offset:cursor_offset + 2_000]
-            settings = self._engine(project.root).settings
+            engine = self._engine(project.root)
+            settings = engine.settings
+            source_fingerprint = engine._planning_source_fingerprint(project, chapter_no, chapter_no)
             prefill_trace = TraceRecorder(project.root, "prefill", settings.trace_level)
-            packet = self._engine(project.root)._context_builder(project, "writer").build(
+            packet = engine._context_builder(project, "writer").build(
                 chapter_no, "在光标处生成一段可选续写；不得保存、审查或提交正史。", mode="draft"
             )
             packet.sections.append(ContextSection(
@@ -1134,18 +1201,30 @@ class InkFlowAppService:
                 source_ids=[f"draft:{chapter_no}:{current_hash}"],
             ))
             packet.estimated_tokens = estimate_tokens(packet.to_model_prompt())
+            system_prompt = (
+                "你是墨流的 Writer，只生成编辑器光标处可插入的正文候选。保持人物、时态、视角和声线连续；"
+                "不要解释，不要重复光标前后的文字，不要修改文件，不要提交正史。\n\n"
+                + AUTHOR_VOICE_CONTRACT
+            )
+            output_budget = settings.effective_output_tokens(1_200, "writer")
+            if estimate_tokens(system_prompt + packet.to_model_prompt()) + output_budget > settings.context_budget_for("writer")[1]:
+                raise ValueError("当前草稿附近文字与写作资料超过预填容量，请缩小参考范围后再试。")
             result = await create_provider(settings).generate_json(
-                system_prompt=(
-                    "你是墨流的 Writer，只生成编辑器光标处可插入的正文候选。保持人物、时态、视角和声线连续；"
-                    "不要解释，不要重复光标前后的文字，不要修改文件，不要提交正史。"
-                ),
+                system_prompt=system_prompt,
                 user_prompt=packet.to_model_prompt(),
                 output_model=PrefillSuggestion,
-                max_tokens=min(1_200, settings.max_output_tokens),
+                max_tokens=output_budget,
                 thinking=False,
                 agent_role="writer",
             )
             prefill_trace.record_model("writer.prefill", result, "Writer 已生成未落盘的光标候选")
+            current = project.db.get_chapter(chapter_no)
+            if (not current or current["status"] != "draft" or current["version"] != chapter["version"]
+                    or current["content_hash"] != chapter["content_hash"] or current["path"] != relative_path
+                    or not path.is_file() or content_hash(path.read_text(encoding="utf-8")) != chapter["content_hash"]
+                    or source_fingerprint != engine._planning_source_fingerprint(project, chapter_no, chapter_no)):
+                prefill_trace.finish(status="waiting_condition", summary="预填期间正文或参考来源更新，旧候选未采用")
+                raise ValueError("预填期间正文、设定或规划已经更新，旧候选未采用；请在当前草稿上继续。")
             prefill_trace.finish(summary="预填候选已返回；未修改文件")
             return {
                 **result.data.model_dump(),
@@ -1266,6 +1345,8 @@ class InkFlowAppService:
             dimensions = list(params.get("dimensions") or ["continuity", "character", "narrative", "style"])
             allowed_dimensions = {"continuity", "character", "narrative", "style"}
             dimensions = [item for item in dimensions if item in allowed_dimensions][:4]
+            if not dimensions:
+                raise ValueError("请至少选择连续性、人物、叙事或表达中的一个审查方向；本次没有发送空审查。")
             packet = self._engine(project.root)._context_builder(project, "editor").build(
                 chapter_no, "多维审查当前正文", mode="review", protected_input=content
             )
@@ -1488,6 +1569,8 @@ class InkFlowAppService:
                 return {"thread": thread, "status": "waiting_condition", "reply": "此议题没有可定位的待答内容。",
                         "next_action": "请在对话中点名原任务和具体问题；不会猜测角色或新增模型调用。"}
             recipient = normalize_role(str(params.get("recipient_role") or pending["recipient_role"]))
+            bind_active_collaboration(project, "collaboration.reply",
+                specialist=recipient if recipient in {"reviewer", "memory_keeper"} else None)
             role_boundaries = {
                 "writer": "只回答规划、写作或修订问题，不审批，不提交正史。",
                 "editor": "只解释当前模式内的综合审查，不直接修改正文或提交正史。",
@@ -1496,12 +1579,13 @@ class InkFlowAppService:
                 "coordinator": "只澄清目标、依赖和分工，不写正文、不审批、不提交正史。",
             }
             scope = active_task_settings.get()
-            if scope is None or recipient not in roles_for_mode(scope.collaboration_mode):
+            if scope is None or recipient not in roles_for_mode(scope.effective_collaboration_mode):
                 raise ValueError("只能向当前任务模式已启用的角色请求回复，不能借协作议题扩权。")
             allowed_evidence = {str(ref) for item in scoped for ref in item.get("evidence_refs", [])}
             discussion_content = json.dumps({"thread": thread, "messages": scoped, "question": params.get("question", "")}, ensure_ascii=False)
             discussion_packet = ContextPacket(
                 project_id=project.root.name,
+                cache_policy=scope.settings.prompt_cache_policy,
                 chapter_no=int(thread.get("chapter_no") or 0),
                 task=f"回答结构化协作议题：{thread['topic']}",
                 sections=[ContextSection(key="A", title="议题、版本与证据", content=discussion_content, source_ids=sorted(allowed_evidence), hard=True)],
@@ -1564,7 +1648,10 @@ class InkFlowAppService:
             saved = project.db.get_metadata("learning_settings", {})
             return {"enabled": saved.get("enabled", True) is not False}
         if method == "learning.settings.update":
-            value = {"enabled": bool(params.get("enabled", True))}
+            enabled = params.get("enabled", True)
+            if type(enabled) is not bool:
+                raise ValueError("学习开关必须明确为开启或关闭，文字不能代替开关。")
+            value = {"enabled": enabled}
             with project_write_lock_sync(project.root):
                 project.db.set_metadata("learning_settings", value)
             return value
@@ -1595,7 +1682,7 @@ class InkFlowAppService:
             task_scope = active_task_settings.get()
             if requested_mode and (
                 task_scope is None
-                or task_scope.collaboration_mode != requested_mode
+                or not task_scope.matches_collaboration_request(requested_mode)
             ):
                 raise InkFlowError("专项模式必须先绑定本次任务快照，不能临时切换。")
             message = str(params.get("message") or "").strip()
@@ -1610,6 +1697,7 @@ class InkFlowAppService:
                 consume_steering=consume_steering,
                 emit=emit,
                 opened_project=project,
+                include_suggestions=params.get("include_suggestions", True) is True,
             )
             self._schedule_manual_reviews(project)
             session_result = result.get("session") if isinstance(result, dict) else None
@@ -1743,7 +1831,7 @@ class InkFlowAppService:
         task_scope = active_task_settings.get()
         if requested_mode and (
             task_scope is None
-            or task_scope.collaboration_mode != requested_mode
+            or not task_scope.matches_collaboration_request(requested_mode)
         ):
             raise InkFlowError("专项模式必须先绑定本次任务快照，不能临时切换。")
         settings = engine.settings
@@ -1811,9 +1899,11 @@ class InkFlowAppService:
                 visible_reason=f"按用户当前操作执行{action}工作流。",
             )
             task_scope = active_task_settings.get()
+            task_scope = bind_active_collaboration(project, workflow_action,
+                forbidden_actions=intent.forbidden_actions) or task_scope
             ticket, dispatch_plan = Coordinator(project).compile(
                 intent,
-                collaboration_mode=task_scope.collaboration_mode if task_scope else "everyday",
+                collaboration_mode=task_scope.effective_collaboration_mode if task_scope else "everyday",
                 task_snapshot_hash=task_scope.snapshot_hash if task_scope else None,
             )
             Coordinator.validate(dispatch_plan, ticket)
@@ -1907,7 +1997,7 @@ class InkFlowAppService:
             )
             result = await engine.review_chapter_mode(
                 project.root, int(params["chapter_no"]),
-                mode=task_scope.collaboration_mode if task_scope else "everyday",
+                mode=task_scope.effective_collaboration_mode if task_scope else "everyday",
                 instruction=str(params.get("instruction") or ""),
             )
             if settings.acceptance_confirmation_mode == "auto_after_review" and result.get("verdict") == "pass":
@@ -2005,10 +2095,15 @@ class InkFlowAppService:
                     result["reply"] = acceptance["reply"]
                     if acceptance.get("post_commit_status") == "waiting_condition":
                         result["next_action"] = acceptance.get("next_action", "继续原任务，仅恢复未完成投影与本地收尾。")
-        if isinstance(result, dict) and not workflow_failure_reason(result):
-            recommendation = _workflow_next_step(action, result)
-            if recommendation:
-                result = {**result, "next_step": recommendation}
+        if isinstance(result, dict) and params.get("include_suggestions", True) is True:
+            trace = TraceRecorder(project.root, "next-step-guide", engine.settings.trace_level)
+            intent = TerminalIntent(action="discuss", visible_reason="解释实际工作流结果并建议下一步",
+                requested_outcome=str(params.get("instruction") or "") + f" 本次已执行{action}，请据实际结果建议。")
+            suggestions = await TerminalSession(engine)._suggest_after_result(project, intent, result, trace)
+            result = {**result, "suggested_prompts": suggestions}
+            if suggestions:
+                result["next_step"] = suggestions[0]
+            trace.finish(summary="下一步引导已处理")
         await emit({"type": f"workflow.{workflow_result_status(result)}", "action": action, "summary": _visible_result_summary(result)})
         return result
 
@@ -2029,9 +2124,9 @@ class InkFlowAppService:
             acceptance_confirmation_mode=settings.acceptance_confirmation_mode,
             visible_reason="按用户当前点击生成仅用于本地声音克隆的朗读稿。",
         )
-        scope = active_task_settings.get()
+        scope = bind_active_collaboration(project, "voice_clone_script")
         ticket, dispatch_plan = Coordinator(project).compile(
-            intent, collaboration_mode=scope.collaboration_mode if scope else "everyday",
+            intent, collaboration_mode=scope.effective_collaboration_mode if scope else "everyday",
             task_snapshot_hash=scope.snapshot_hash if scope else None,
         )
         await emit(
@@ -2202,6 +2297,8 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
             "calls": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
+            "input_unknown_calls": 0,
+            "output_unknown_calls": 0,
             "prompt_cache_hit_tokens": 0,
             "prompt_cache_miss_tokens": 0,
             "cache_reported_calls": 0,
@@ -2235,28 +2332,27 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
             # Keep repair/retry stages separate; an agent-wide average hides their cost.
             stage_key = f"{metadata.get('model') or 'unknown'}:{role}:{event.get('stage') or 'unknown'}"
             stage_bucket = by_stage.setdefault(stage_key, empty_bucket())
-            prompt = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
-            completion = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
-            prompt_details = usage.get("prompt_tokens_details") or {}
-            hit_reported = "prompt_cache_hit_tokens" in usage or (
-                isinstance(prompt_details, dict) and "cached_tokens" in prompt_details
-            )
-            miss_reported = "prompt_cache_miss_tokens" in usage
-            cache_hit = int(
-                usage.get("prompt_cache_hit_tokens", prompt_details.get("cached_tokens", 0)) or 0
-            ) if isinstance(prompt_details, dict) else int(usage.get("prompt_cache_hit_tokens", 0) or 0)
-            cache_miss = int(usage.get("prompt_cache_miss_tokens", 0) or 0) if miss_reported else max(0, prompt - cache_hit)
-            for target in (overall, bucket, stage_bucket):
-                target["calls"] += 1
-                target["prompt_tokens"] += prompt
-                target["completion_tokens"] += completion
-                if hit_reported or miss_reported:
-                    target["cache_reported_calls"] += 1
-                    target["prompt_cache_hit_tokens"] += cache_hit
-                    target["prompt_cache_miss_tokens"] += cache_miss
-                else:
-                    target["cache_unknown_calls"] += 1
-                    target["cache_unknown_prompt_tokens"] += prompt
+            for attempt in usage_attempts(usage):
+                counts = normalized_usage(attempt)
+                prompt, completion = counts["input_tokens"], counts["output_tokens"]
+                cache_hit, cache_miss = counts["cache_hit_tokens"], counts["uncached_input_tokens"]
+                for target in (overall, bucket, stage_bucket):
+                    target["calls"] += 1
+                    if prompt is None:
+                        target["input_unknown_calls"] += 1
+                    else:
+                        target["prompt_tokens"] += prompt
+                    if completion is None:
+                        target["output_unknown_calls"] += 1
+                    else:
+                        target["completion_tokens"] += completion
+                    if prompt is not None and cache_hit is not None and cache_miss is not None:
+                        target["cache_reported_calls"] += 1
+                        target["prompt_cache_hit_tokens"] += cache_hit
+                        target["prompt_cache_miss_tokens"] += cache_miss
+                    else:
+                        target["cache_unknown_calls"] += 1
+                        target["cache_unknown_prompt_tokens"] += prompt if prompt is not None else 0
 
     def public_bucket(bucket: dict[str, int]) -> dict[str, Any]:
         cache_total = bucket["prompt_cache_hit_tokens"] + bucket["prompt_cache_miss_tokens"]
@@ -2267,10 +2363,10 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
             if cache_total else None,
             "prompt_cache_miss_rate": round(bucket["prompt_cache_miss_tokens"] / cache_total, 4)
             if cache_total else None,
-            "average_prompt_tokens": round(bucket["prompt_tokens"] / bucket["calls"])
-            if bucket["calls"] else 0,
-            "average_completion_tokens": round(bucket["completion_tokens"] / bucket["calls"])
-            if bucket["calls"] else 0,
+            "average_prompt_tokens": round(bucket["prompt_tokens"] / (bucket["calls"] - bucket["input_unknown_calls"]))
+            if bucket["calls"] > bucket["input_unknown_calls"] else None,
+            "average_completion_tokens": round(bucket["completion_tokens"] / (bucket["calls"] - bucket["output_unknown_calls"]))
+            if bucket["calls"] > bucket["output_unknown_calls"] else None,
         }
 
     usage = public_bucket(overall)
@@ -2280,6 +2376,7 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
     ) / 1_000_000
     try:
         ledger = UsageLedger()
+        current_model_cache = ledger.cache_observations(getattr(project, "project_id", ""), settings)
         accounting = {"available": True, "project": ledger.summary(getattr(project, "project_id", "")),
                       "all_projects": ledger.summary()}
         qualified_task_products: dict[str, int] = {}
@@ -2308,12 +2405,16 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
     except (OSError, sqlite3.Error):
         accounting = {"available": False, "warning": "本地用量账本暂不可读，金额未知；不影响查看或编辑正文。"}
         recent_deepseek_cache = None
+        current_model_cache = {"available": False, "by_agent_role": {}, "history_groups": [],
+                               "warning": "当前接口的缓存统计暂不可读；历史记录保留。"}
     return {
         **usage,
         "by_agent_role": {role: public_bucket(bucket) for role, bucket in by_agent_role.items()},
         "by_stage": {stage: public_bucket(bucket) for stage, bucket in by_stage.items()},
         "recent_deepseek_cache": recent_deepseek_cache,
-        "estimated_cost": round(estimated_cost, 6),
+        "current_model_cache": current_model_cache,
+        "estimated_cost": round(estimated_cost, 6)
+        if not (overall["input_unknown_calls"] or overall["output_unknown_calls"]) else None,
         "currency": "CNY",
         "pricing_configured": settings.input_price_per_million > 0 or settings.output_price_per_million > 0,
         "accounting": accounting,
@@ -2547,6 +2648,7 @@ class JsonLineServer:
         selected_conversation = conversation_id(params.get("conversation_id"))
         conversation_token = active_conversation.set(selected_conversation)
         last_public_event: dict[str, Any] = {}
+        last_operation: dict[str, Any] = {"method": method}
 
         async def emit(event: dict[str, Any]) -> None:
             event = {**event, "conversation_id": selected_conversation}
@@ -2557,6 +2659,16 @@ class JsonLineServer:
                 await self._bind_applied_steering_revision(run_id, event["task_ticket"])
             last_public_event.clear()
             last_public_event.update(event)
+            stage = str(event.get("stage") or "")
+            event_type = str(event.get("type") or "")
+            if (event_type == "workflow.stage" and stage not in {"run", "long_run"}) or event_type.startswith(("writer.", "editor.", "reviewer.", "outline.", "planning.", "provider.", "voice.")):
+                if not event_type.endswith((".delta", ".token")):
+                    last_operation["stage"] = stage or event_type
+                    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+                    chapter = event.get("chapter_no") or metadata.get("chapter_no")
+                    match = re.search(r"第\s*(\d+)\s*章", str(event.get("summary") or ""))
+                    if chapter or match:
+                        last_operation["chapter_no"] = chapter or int(match.group(1))
             await self.write(
                 {
                     "jsonrpc": "2.0",
@@ -2765,18 +2877,20 @@ class JsonLineServer:
             failure = workflow_failure_reason(result)
             failure_guidance = None
             if outcome == "failed" and failure and isinstance(result, dict):
-                result = {**result, "workflow_failure": failure}
-                failure_guidance = _error_payload(InkFlowError(failure))
+                failure_guidance = _error_payload(InkFlowError(failure), last_operation)
+                result = {**result, "workflow_failure": failure_guidance["message"],
+                    "next_action": "；".join(action["label"] for action in failure_guidance["actions"]),
+                    "failure_guidance": failure_guidance}
             record_warning = persist_outcome(
                 outcome,
                 summary=_visible_result_summary(result),
-                error_message=failure if failure_guidance is not None else "",
+                error_message=failure_guidance["message"] if failure_guidance is not None else "",
                 error_code="workflow_result" if failure_guidance is not None else None,
                 retry_allowed=False if failure_guidance is not None else None,
             )
             if task_db is not None and params.get("project_root"):
                 try:
-                    self.service._schedule_manual_reviews(InkFlowProject(params["project_root"], recover_on_open=False))
+                    self.service._schedule_manual_reviews(project)
                 except Exception as exc:
                     # Auxiliary scheduling cannot revoke a durable foreground result.
                     warning = "后台手动核对尚未安排，请在核对窗口查看或重试：" + str(exc)[:1000]
@@ -2859,14 +2973,14 @@ class JsonLineServer:
                 "waiting_condition", summary=str(exc), error_message=str(exc),
                 error_code=type(exc).__name__, retry_allowed=False,
             )
-            error = _error_payload(exc)
+            error = _error_payload(exc, last_operation)
             if record_warning:
                 error["record_warning"] = record_warning
                 error["impact"] = f"{error.get('impact', '')} {record_warning}".strip()
             await self.write({"jsonrpc": "2.0", "id": request_id, "error": error})
             public_events.put_nowait({"type": "run.waiting_condition", "method": method, "summary": str(exc)})
         except Exception as exc:
-            error = _error_payload(exc)
+            error = _error_payload(exc, last_operation)
             action_labels = [
                 str(action.get("label") or "").strip()
                 for action in error.get("actions", [])
@@ -2875,8 +2989,6 @@ class JsonLineServer:
             durable_error = "\n".join(
                 line for line in (
                     str(error.get("message") or str(exc)),
-                    f"影响：{error.get('impact')}" if error.get("impact") else "",
-                    f"已保留：{error.get('preserved')}" if error.get("preserved") else "",
                     f"下一步：{'；'.join(action_labels)}" if action_labels else "",
                 ) if line
             )
@@ -2889,7 +3001,7 @@ class JsonLineServer:
                 error["record_warning"] = record_warning
                 error["impact"] = f"{error.get('impact', '')} {record_warning}".strip()
             await self.write({"jsonrpc": "2.0", "id": request_id, "error": error})
-            public_events.put_nowait({"type": "run.failed", "method": method, "summary": str(exc)[:500]})
+            public_events.put_nowait({"type": "run.failed", "method": method, "summary": error["message"]})
         finally:
             if self.steering_messages.get(run_id) or self.steering_delivered.get(run_id):
                 await self._defer_unapplied_steering(run_id)
@@ -3092,52 +3204,29 @@ def _visible_result_summary(result: Any) -> str:
             return "；".join(str(item) for item in result["settings_change_summary"])[:300]
         if result.get("settings_updated"):
             return f"已修改 {len(result['settings_updated'])} 项设置。"
+        if result.get("status") == "planned":
+            revision = result.get("revision_no")
+            published = type(revision) is int and revision > 0
+            future = result.get("future_range")
+            chapters = ""
+            if (isinstance(future, list) and len(future) == 2
+                    and all(type(number) is int and number > 0 for number in future) and future[0] <= future[1]):
+                span = str(future[0]) if future[0] == future[1] else f"{future[0]}～{future[1]}"
+                chapters = f"，后续安排为第 {span} 章"
+            title = f"第 {revision} 版规划已正式生效" if published else "章节规划已更新"
+            action = "可以按当前规划继续写作。" if published else str(result.get("next_action") or "")
+            return f"{title}{chapters}。{action}"[:300]
         for key in ("reply", "help", "gate", "message", "summary", "next_action"):
             if result.get(key):
                 return str(result[key])[:300]
         if result.get("result") and isinstance(result["result"], dict):
             nested = result["result"]
+            if nested.get("status") == "planned":
+                return _visible_result_summary(nested)
             for key in ("summary", "message", "status", "outline_path"):
                 if nested.get(key):
                     return str(nested[key])[:300]
     return "工作流返回了可查看结果。"
-
-
-def _workflow_next_step(action: str, result: dict[str, Any]) -> dict[str, str] | None:
-    """给桌面按钮触发的固定工作流也提供同一套用户可控引导。"""
-
-    acceptance = result.get("automatic_acceptance") or result
-    if (isinstance(acceptance, dict) and acceptance.get("status") == "accepted"
-            and (acceptance.get("post_commit_status") == "waiting_condition" or acceptance.get("projection_status") == "pending")):
-        return {"label": "恢复接受收尾", "reason": "正史与记忆已入库；按原任务断点恢复尚未完成的投影或本地收尾，不重复接受。",
-                "prompt": f"查看第 {acceptance.get('chapter_no', '')} 章接受收尾的绑定待处理事项，仅从原任务未完成节点恢复。"}
-    if action == "review" and result.get("automatic_acceptance"):
-        return {"label": "继续下一章", "reason": "本次审查已通过且当前设置已自动验收，可以继续安排下一章。", "prompt": "推荐下一章安排"}
-    if action == "review":
-        if result.get("verdict") == "pass":
-            return {"label": "查看审查报告", "reason": "本次审查已通过；是否入正史仍按接受授权和引擎门禁决定。", "prompt": "打开当前审查报告"}
-        if result.get("verdict") == "unknown":
-            return {"label": "补足审查依据", "reason": "本次审查资料不足，先核对缺失来源，不改动已保存草稿。", "prompt": "查看当前审查缺口"}
-        return {"label": "查看需修问题", "reason": "先核对审查指出的原文问题，再决定定向修订。", "prompt": "打开当前审查报告"}
-    if action == "batch_draft" and result.get("authorization_source") in {"batch_preapproval", "settings_auto_accept"}:
-        return {"label": "查看已提交批次", "reason": "本批次已按当前确认策略处理，先查看提交结果再继续。", "prompt": "查看当前项目状态"}
-
-    suggestions = {
-        "plan": ("查看章节规划", "先核对章节卡，再决定从哪一章开始写。", "查看当前规划"),
-        "outline": ("从大纲开始写", "独立大纲已保存，选择起点后再生成草稿。", "根据大纲生成草稿"),
-        "write": ("审查当前章节", "草稿已生成，下一步按当前模式检查这一版本。", "审查当前章"),
-        "revise": ("重新审查", "修订产生了新版本，旧报告不能替代新版本审查。", "重新审查当前章"),
-        "accept": ("继续下一章", "当前章节已经完成正史提交，可以继续安排下一章。", "推荐下一章安排"),
-        "batch_draft": ("查看批次进度", "批量草稿仍在临时区，先查看逐章结果再决定是否验收。", "查看批次进度"),
-        "batch_accept": ("安排后续章节", "批次提交完成，可以继续规划或生成下一段。", "推荐后续章节安排"),
-        "arc_audit": ("查看复审报告", "跨章复审只生成报告，先查看风险与规划差异。", "打开篇章复审报告"),
-        "checkpoint_create": ("继续创作", "检查点已经保存，接下来可以继续写作。", "推荐下一步"),
-    }
-    item = suggestions.get(action)
-    if not item:
-        return None
-    label, reason, prompt = item
-    return {"label": label, "reason": reason, "prompt": prompt}
 
 
 def _batch_resume_params(project: InkFlowProject, manifest: dict[str, Any], source_run: dict[str, Any] | None) -> dict[str, Any]:
@@ -3173,6 +3262,16 @@ def _list_batch_summaries(project: InkFlowProject) -> list[dict[str, Any]]:
     if not folder.is_dir():
         return []
     db = StudioService(project).db
+    with project.db.connect() as connection:
+        current_chapters = [dict(row) for row in connection.execute("SELECT * FROM chapters")]
+    for chapter in current_chapters:
+        body = chapter.get("content_text")
+        if not isinstance(body, str) or content_hash(body) != chapter["content_hash"]:
+            try:
+                body = project.resolve_user_path(chapter["path"]).read_text(encoding="utf-8")
+            except (OSError, ValueError, ProjectError):
+                body = None
+        chapter["source_valid"] = isinstance(body, str) and content_hash(body) == chapter["content_hash"]
     result: list[dict[str, Any]] = []
     for path in sorted(folder.glob("batch-*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:30]:
         try:
@@ -3198,9 +3297,21 @@ def _list_batch_summaries(project: InkFlowProject) -> list[dict[str, Any]]:
                     _batch_resume_params(project, value, source_run)
                 except (InkFlowError, ValueError, TypeError):
                     resumable = False
+            first, last = int(value["start_chapter_no"]), int(value["end_chapter_no"])
+            targets = [chapter for chapter in current_chapters if first <= chapter["chapter_no"] <= last]
+            current_complete = (last >= first and len(targets) == last - first + 1
+                and all(chapter["source_valid"] for chapter in targets))
+            history_reason = ""
+            if current_complete and not (source_run and source_run.get("status") == "running"):
+                if all(chapter["status"] == "accepted" for chapter in targets):
+                    history_reason = "当前范围已全部进入正史；这次原始批次的失败和来源只保留历史，不再安排补写。"
+                elif not projected["chapters"] and not resumable and status in {"failed", "interrupted", "needs_revision"}:
+                    history_reason = "这次批次没有保存正文，当前范围已有其他来源的正文；原错误留历史，必要审核从当前章节待办处理。"
             result.append({
                 **projected,
                 "status": status,
+                "historical": bool(history_reason),
+                "history_reason": history_reason,
                 "run_id": value.get("last_run_id"),
                 "resume_available": resumable,
                 "start_chapter_no": value.get("start_chapter_no"),
@@ -3310,9 +3421,9 @@ def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
     """只记录恢复任务所需的小参数，不复制正文、API Key 或模型输出。"""
 
     allowed_by_method = {
-        "conversation.send": {"message", "collaboration_mode"},
+        "conversation.send": {"message", "collaboration_mode", "include_suggestions"},
         "workflow.run": {
-            "action",
+            "include_suggestions", "action",
             "chapter_no",
             "start_chapter_no",
             "end_chapter_no",
@@ -3374,7 +3485,7 @@ def _should_track_task(method: str, params: dict[str, Any]) -> bool:
     }
 
 
-def _error_payload(exc: Exception) -> dict[str, Any]:
+def _error_payload(exc: Exception, operation: dict[str, Any] | None = None) -> dict[str, Any]:
     message = str(exc) or "墨流遇到未知错误。"
     normalized = message.casefold()
     http_match = re.search(r"\bHTTP\s+(\d{3})\b", message, re.IGNORECASE)
@@ -3383,79 +3494,77 @@ def _error_payload(exc: Exception) -> dict[str, Any]:
         "code": exc.__class__.__name__,
         "title": "本次操作未完成",
         "message": message,
-        "impact": "本次操作已停止。",
-        "preserved": "已经保存的正文、版本和正史保持当前状态。",
-        "actions": [{"id": "open_process", "label": "查看协作台最后阶段"}],
+        "actions": [{"id": "open_process", "label": "在任务记录查看出错步骤和诊断详情"}],
         "retryable": False,
     }
     if isinstance(exc, ProjectBusyError):
         payload.update(
             title="项目写入暂时繁忙",
-            impact="当前写入步骤未获得项目写锁；已保存的正文和审查不会被撤回或自动重做。",
-            actions=[{"id": "open_process", "label": "查看正在执行的任务与已保存成果"}],
+            message="另一个操作正在写入本项目，这一步还不能同时写入。请等待该操作结束，再从当前步骤继续；无需重新生成前面的章节。",
+            actions=[{"id": "open_process", "label": "查看哪个任务正在写入"}],
             retryable=False,
         )
-        return payload
-    if isinstance(exc, ValidationError):
+    elif isinstance(exc, KeyError):
+        payload.update(title="任务衔接出现程序错误",
+            message="审查结果已经返回，但墨流读取暂停原因时出错了。这是任务衔接的程序问题，需要修复结果读取后从本章审查继续。" if exc.args == ("stop_reason",) else "墨流读取任务结果时缺少必要的状态字段，无法确定下一步。这是程序衔接问题，需要先修复结果读取，再续接出错步骤。")
+    elif isinstance(exc, ValidationError):
         issues = exc.errors(include_input=False)
-        brief = "；".join(
-            f"{'.'.join(map(str, item.get('loc') or ())) or '结果'}：{item.get('msg') or item.get('type')}"
-            for item in issues[:3]
-        )
+        names = {"memory_patch": "记忆更新", "evidence_refs": "附加证据", "evidence": "证据原文", "quote": "引用原文", "source_comparisons": "规划对照", "assessments": "审查依据", "chapter_no": "章号", "hook_note": "创作说明", "content": "正文", "max_output_tokens": "单次输出上限", "context_window": "上下文容量"}
+        parts = list(dict.fromkeys(next((names[key] for key in reversed(item.get("loc") or ()) if key in names), "必要的结果内容") for item in issues))
         payload.update(
             code="validation_error",
             title="输入或模型输出不完整",
-            message=f"输入或模型输出格式不完整：{brief}" if brief else "输入或模型输出格式不完整。",
-            impact="当前步骤没有通过格式门禁，因此没有继续写入后续结果。",
-            actions=[{"id": "retry", "label": "补齐输入或重试当前步骤"}],
+            message=f"这一步收到的{'、'.join(parts[:3])}不完整或格式不正确，共有 {len(issues)} 处需要核对，因此还不能用于后续处理。",
+            actions=[{"id": "open_process", "label": "展开格式问题，核对输入和本步返回结果"}],
             retryable=False,
             details=[
                 {key: item.get(key) for key in ("type", "loc", "msg")}
                 for item in issues
             ],
         )
-        return payload
-    if http_status in {401, 403}:
+    elif "@quote:" in message:
+        count = len(set(re.findall(r"@quote:\d+", message)))
+        payload.update(title="审查引用还没有核对完成",
+            message=f"审查结果中有 {count} 条引用还没有还原成可核对的原文，所以相关记忆暂时不能入正史。需要核对引用解析与来源，再继续本章审查；这不代表正文已经被判定有矛盾。",
+            actions=[{"id": "open_chapter_review", "label": "查看本章尚未定位的引用和补读记录"}])
+    elif http_status in {401, 403}:
         payload.update(
-            title="模型认证失败", impact="当前模型步骤没有完成；已保存成果不受影响。",
+            title="模型认证失败", message="服务商没有接受当前密钥（401）。请核对所选服务商和密钥是否对应，以及密钥是否仍有效。" if http_status == 401 else "服务商拒绝了当前请求（403）。请核对账号是否有该模型的使用权限，以及服务商是否限制了当前访问。",
             actions=[{"id": "open_settings", "label": "检查模型密钥与服务权限"}], retryable=False,
         )
     elif http_status in {408, 429, 500, 502, 503, 504}:
         payload.update(
             title="模型服务暂时不可用" if http_status != 429 else "模型服务暂时限流",
-            impact="已在当前模型步骤内限次重试；没有重做已保存的正文或提交。",
+            message="请求过于频繁，服务商暂时拒绝继续处理（429）。请等限流解除后续接本步，并检查并发上限是否符合该服务商的限制。" if http_status == 429 else f"服务商没有及时或正常返回结果（{http_status}）。请先核对原任务状态，服务恢复后只续接未完成的步骤。",
             actions=[{"id": "open_process", "label": "查看最后阶段"},
                      {"id": "retry", "label": "恢复后续接未完成步骤"}],
             retryable=True,
         )
     elif http_status == 402:
         payload.update(
-            title="模型服务余额或计费状态需要处理", impact="服务商拒绝了当前模型请求；本地成果保留。",
+            title="模型服务余额或计费状态需要处理", message="服务商因账户计费问题拒绝请求（402）。请核对余额、额度和付款状态，处理后续接本步。",
             actions=[{"id": "open_settings", "label": "检查服务商账户与模型配置"}], retryable=False,
         )
     elif http_status == 413:
         payload.update(
-            title="模型输入超过接口限制", impact="当前请求未完成；正文和硬约束不会被自动删除。",
+            title="模型输入超过接口限制", message="这次发送的内容超过接口允许的大小（413）。请核对该模型的上下文容量与请求大小限制，调整资料预算后再继续本步。",
             actions=[{"id": "open_context", "label": "查看上下文占用"}], retryable=False,
         )
     elif http_status in {400, 404, 422}:
         payload.update(
-            title="模型请求参数或格式不兼容", impact="当前模型步骤没有完成；不建议原样反复发送。",
+            title="模型请求参数或格式不兼容", message="服务商找不到请求的模型或接口（404）。请核对模型名称与接口地址是否属于同一服务商。" if http_status == 404 else f"服务商无法接受这次请求的参数或内容格式（{http_status}）。请对照接口错误详情调整配置，原样重发通常不能解决。",
             actions=[{"id": "open_settings", "label": "检查模型与接口配置"},
                      {"id": "open_process", "label": "查看接口错误详情"}], retryable=False,
         )
     elif any(word in normalized for word in ("api key", "密钥", "模型接口", "服务商")):
         payload.update(
             title="模型配置需要处理",
-            impact="当前模型任务没有完成。",
             actions=[{"id": "open_settings", "label": "打开模型设置"}],
             retryable=False,
         )
     elif any(word in normalized for word in ("版本", "哈希", "正文已变化", "重新审查")):
         payload.update(
             title="版本门禁已阻止继续",
-            impact="旧审查或旧正文不能用于提交当前版本。",
-            preserved="当前草稿版本仍然保留。",
             actions=[{"id": "open_chapter_review", "label": "打开当前章重新审查"}],
             retryable=False,
         )
@@ -3464,21 +3573,19 @@ def _error_payload(exc: Exception) -> dict[str, Any]:
     ):
         payload.update(
             title="当前章节缺少规划约束",
-            impact="Writer 没有可靠章节卡，写作步骤没有启动。",
             actions=[{"id": "open_planning", "label": "生成或补齐篇章规划"}],
             retryable=False,
         )
     elif any(word in normalized for word in ("上下文容量", "最大上下文", "soft token", "hard token")):
         payload.update(
             title="上下文容量不足",
-            impact="墨流保留了硬正史和用户要求，并停止本次模型调用。",
             actions=[{"id": "open_context", "label": "查看上下文占用"}],
             retryable=False,
         )
     elif "finish_reason=length" in normalized or "空 json 内容" in normalized:
         payload.update(
             title="模型输出被截断或没有正文",
-            impact="当前模型步骤未形成完整结果；已保存的正文与正史保持不变。",
+            message="模型在结果写完之前就达到单次输出上限，返回内容无法完整解析。请检查该模型实际支持的输出上限和本步预算，再从这个步骤继续。" if "finish_reason=length" in normalized else "模型没有返回可解析的结果内容。请查看本步返回记录，核对接口格式及服务状态后再继续。",
             actions=[{"id": "open_process", "label": "查看本次输出与重试记录"},
                      {"id": "open_settings", "label": "检查单次输出上限"}],
             retryable=False,
@@ -3491,7 +3598,7 @@ def _error_payload(exc: Exception) -> dict[str, Any]:
     ):
         payload.update(
             title="模型调用没有正常返回",
-            impact="当前远程步骤未完成。",
+            message="连接在完整结果返回前中断或超时，墨流无法确认本步结果。请先核对任务状态和网络，再续接未完成步骤，避免重复生成。",
             actions=[
                 {"id": "open_process", "label": "先查看任务状态"},
                 {"id": "retry", "label": "确认后重试"},
@@ -3501,19 +3608,34 @@ def _error_payload(exc: Exception) -> dict[str, Any]:
     elif isinstance(exc, sqlite3.Error):
         payload.update(
             title="本地任务记录暂时不可用",
-            impact="当前步骤未能可靠记录状态；已保存文件不自动撤回，也不重发模型请求。",
+            message="本地数据库未能完成这次状态读写，所以墨流无法可靠判断该步骤是否完成。请先核对任务记录与对应文件，再恢复处理，避免重复提交。",
             actions=[{"id": "open_process", "label": "核对原任务和当前文件"}],
             retryable=False,
         )
     elif isinstance(exc, OSError):
         payload.update(
             title="本地文件或进程访问失败",
-            impact="当前步骤未完成；请检查文件是否仍存在、被其他程序占用或无写入权限。",
-            actions=[{"id": "open_process", "label": "查看失败位置与已保存成果"}],
+            message="系统不允许访问这一步需要的文件或进程。请检查目录权限、文件占用及安全软件的拦截记录。" if isinstance(exc, PermissionError) else "这一步需要的本地文件或程序不存在。请检查应用资源是否完整，以及项目文件是否被移动。" if isinstance(exc, FileNotFoundError) else "系统无法完成这一步的文件或进程操作。请在诊断中核对失败位置，检查文件占用、目录权限及磁盘状态。",
+            actions=[{"id": "open_process", "label": "查看失败位置和系统错误详情"}],
+            retryable=False,
+        )
+    elif isinstance(exc, NameError):
+        payload.update(
+            title="任务衔接出了程序错误",
+            message="审核结果已经返回，但墨流整理引用时没有正确取得当前章号。需要修复引用整理步骤，再续接本章审核。" if exc.name == "chapter_no" else "程序执行这一步时读取了尚未建立的内部信息。需要修复本步的信息传递，再从断点继续。",
+            actions=[{"id": "open_process", "label": "查看出错步骤与恢复条件"}],
             retryable=False,
         )
     elif isinstance(exc, InkFlowError):
         payload["retryable"] = False
+    else:
+        payload["message"] = "墨流处理任务时遇到了程序异常，当前记录还不足以确定具体原因。请展开本次诊断定位出错步骤，修复后从该步骤继续。"
+    operation = operation or {}
+    stage = str(operation.get("stage") or operation.get("method") or "")
+    step = "审查与记忆核对" if any(key in stage for key in ("review", "mode.", "editor", "memory")) else "规划" if any(key in stage for key in ("plan", "outline")) else "写作" if any(key in stage for key in ("writer", "draft")) else ""
+    chapter = operation.get("chapter_no")
+    if step:
+        payload["message"] = f"{f'第 {chapter} 章的' if chapter else ''}{step}在这一步暂停。\n{payload['message']}"
     if os.getenv("INKFLOW_DEBUG") == "1" and not isinstance(exc, ValidationError):
         payload["details"] = traceback.format_exc(limit=5)
     return payload

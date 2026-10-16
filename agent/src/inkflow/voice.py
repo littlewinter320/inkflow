@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import gc
 import hashlib
 import importlib
@@ -50,6 +51,7 @@ VOICE_SETTING_NAMES = (
     "voice_segment_chars",
     "voice_cache_limit_mb",
     "voice_debug",
+    "voice_data_dir",
 )
 VOICE_JOB_CONFIG_SETTINGS = (
     "voice_novel_engine", "voice_text_engine", "voice_compute_device", "voice_debug",
@@ -58,7 +60,7 @@ VOICE_JOB_CONFIG_SETTINGS = (
     "voice_sample_rate", "voice_segment_chars",
 )
 
-EDGE_REQUIREMENTS = ("edge-tts>=7.2.8,<8",)
+EDGE_REQUIREMENTS = ("edge-tts>=7.3.1,<8",)
 MOSS_TTS_MODEL_ID = "MOSS-TTS-Nano-100M-ONNX"
 MOSS_CODEC_MODEL_ID = "MOSS-Audio-Tokenizer-Nano-ONNX"
 MOSS_TTS_REPO_ID = "OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX"
@@ -216,6 +218,12 @@ def _completed_voice_segment_count(segments: list[dict[str, Any]]) -> int:
 
 
 def _voice_root() -> Path:
+    configured = Settings.from_env().voice_data_dir
+    if configured:
+        target = Path(configured).expanduser()
+        if not target.is_absolute() or target.parent == target:
+            raise ValueError("语音保存位置须为磁盘内的专用文件夹，不能使用整个磁盘。")
+        return target
     local = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA")
     if local:
         return Path(local) / "InkFlow" / "voice"
@@ -314,13 +322,14 @@ def _safe_extract_tar(archive_path: Path, destination: Path) -> None:
 class VoiceRuntime:
     """本地普通话语音运行时。它是确定性服务，不是第五个 AI Agent。"""
 
-    def __init__(self) -> None:
-        self.root = _voice_root()
+    def __init__(self, data_root: Path | None = None) -> None:
+        self.root = data_root or _voice_root()
+        self.migrating = False
         self.profiles_dir = self.root / "profiles"
         self.projects_dir = self.root / "projects"
         self.jobs_dir = self.root / "jobs"
         self.short_cache_dir = self.root / "cache" / "short"
-        component_root = Path(os.getenv("INKFLOW_VOICE_COMPONENT_ROOT") or ("D:/墨流/voice" if os.name == "nt" and Path("D:/").exists() else str(self.root)))
+        component_root = Path(str(self.root) if data_root or Settings.from_env().voice_data_dir else os.getenv("INKFLOW_VOICE_COMPONENT_ROOT") or ("D:/墨流/voice" if os.name == "nt" and Path("D:/").exists() else str(self.root)))
         self.edge_root = component_root / "edge"
         self.edge_packages_dir = self.edge_root / "packages"
         self.edge_state_path = self.edge_root / "install.json"
@@ -348,8 +357,11 @@ class VoiceRuntime:
         self._short_lock: asyncio.Lock | None = None
         self._long_lock: asyncio.Lock | None = None
         self._inference_lock: asyncio.Lock | None = None
+        self._asr_lock: asyncio.Lock | None = None
         self._edge_install_lock: asyncio.Lock | None = None
         self._edge_install_task: asyncio.Task[dict[str, Any]] | None = None
+        self._edge_update_task: asyncio.Task[None] | None = None
+        self.edge_update_path = self.edge_root / "update-check.json"
         self._moss_install_lock: asyncio.Lock | None = None
         self._moss_install_task: asyncio.Task[dict[str, Any]] | None = None
         self._sherpa_install_lock: asyncio.Lock | None = None
@@ -361,6 +373,7 @@ class VoiceRuntime:
         }
         self._moss_tts_models: dict[str, Any] = {}
         self._sherpa_asr_models: dict[str, Any] = {}
+        self._asr_prepare_task: asyncio.Task[None] | None = None
         self._activate_optional_packages()
         self._mark_interrupted_jobs()
 
@@ -368,8 +381,63 @@ class VoiceRuntime:
         current = Settings.from_env(workspace_root)
         return {name: getattr(current, name) for name in VOICE_SETTING_NAMES}
 
+    def copy_storage(self, destination: str) -> "VoiceRuntime":
+        old_root = self.root.resolve()
+        target = Path(destination).expanduser()
+        if not target.is_absolute() or target.parent == target:
+            raise ValueError("请选择磁盘内的专用语音文件夹。")
+        target = target.resolve()
+        roots = [(old_root, target)]
+        for name in ("edge", "moss", "sherpa"):
+            source = getattr(self, f"{name}_root").resolve()
+            if not source.is_relative_to(old_root):
+                roots.append((source, target / name))
+        if any(target == source or target.is_relative_to(source) or source.is_relative_to(target) for source, _ in roots):
+            raise ValueError("新位置不能与当前语音目录互相包含，请选择另一处专用文件夹。")
+        if target.exists():
+            raise ValueError("新语音文件夹已经存在，未覆盖其中的内容。请另选保存位置。")
+        files = []
+        for source, folder in roots:
+            if not source.exists():
+                continue
+            for item in source.rglob("*"):
+                if item.is_symlink() or not item.resolve().is_relative_to(source):
+                    raise ValueError("语音目录含外部链接，未迁移；请先检查这些链接。")
+                if item.is_file():
+                    files.append((item, folder / item.relative_to(source)))
+        if shutil.disk_usage(target.parent).free < sum(item.stat().st_size for item, _ in files) + 64 * 1024 * 1024:
+            raise ValueError("新磁盘空间不足，尚未更改语音保存位置。")
+        staging = Path(tempfile.mkdtemp(prefix=".inkflow-voice-", dir=target.parent))
+        def digest(item):
+            with item.open("rb") as stream:
+                return hashlib.file_digest(stream, "sha256").digest()
+        for source, final in files:
+            copied = staging / final.relative_to(target)
+            copied.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, copied)
+            if digest(source) != digest(copied):
+                raise ValueError("复制内容核对未通过，仍使用原目录；新位置保留未完成副本供检查。")
+        def relocate(value):
+            if isinstance(value, dict): return {key: relocate(item) for key, item in value.items()}
+            if isinstance(value, list): return [relocate(item) for item in value]
+            if isinstance(value, str) and Path(value).is_absolute():
+                for source, final in sorted(roots, key=lambda pair: len(str(pair[0])), reverse=True):
+                    path = Path(value).resolve()
+                    if path.is_relative_to(source): return str(final / path.relative_to(source))
+            return value
+        metadata_files = [*staging.joinpath("profiles").glob("*.json"), *staging.joinpath("jobs").glob("*/job.json"), *staging.joinpath("projects").glob("*/roles.json")]
+        for metadata in metadata_files:
+            value = json.loads(metadata.read_text(encoding="utf-8-sig"))
+            _atomic_json(metadata, relocate(value))
+        staging.replace(target)
+        replacement = VoiceRuntime(data_root=target)
+        for job in replacement.jobs_dir.glob("*/job.json"):
+            replacement._write_playlist(_read_json(job))
+        save_user_settings({"voice_data_dir": str(target)})
+        return replacement
+
     def configure(self, updates: dict[str, Any], workspace_root: str | Path | None = None) -> dict[str, Any]:
-        allowed = {name: updates[name] for name in VOICE_SETTING_NAMES if name in updates}
+        allowed = {name: updates[name] for name in VOICE_SETTING_NAMES if name in updates and name != "voice_data_dir"}
         if allowed:
             # Validate and persist the complete normalized value in one atomic write.
             save_user_settings(allowed)
@@ -402,7 +470,7 @@ class VoiceRuntime:
         edge = self._edge_status(packages)
         asr = self._sherpa_status(packages)
         backend = settings.voice_dialogue_engine
-        output_ready = packages["edge_tts"] if backend == "edge" else bool(moss["tts_ready"]) if backend == "moss" else False
+        output_ready = edge["connection_ready"] if backend == "edge" else bool(moss["tts_ready"]) if backend == "moss" else False
         return {
             "enabled": settings.voice_enabled,
             "ready_for_input": settings.voice_input_engine == "browser" or settings.voice_input_engine == "local" and bool(asr["asr_ready"]),
@@ -421,7 +489,7 @@ class VoiceRuntime:
                 "tts": bool(self._moss_tts_models),
             },
             "message": (
-                "当前对话朗读已就绪。" if output_ready else "请先为对话朗读选择已就绪的语音组件。"
+                "当前对话朗读已就绪。" if output_ready else edge["compatibility_message"] if backend == "edge" and edge["needs_update"] else "请先为对话朗读选择已就绪的语音组件。"
             ),
         }
 
@@ -431,13 +499,32 @@ class VoiceRuntime:
             if package_dir.is_dir() and package_path not in sys.path:
                 sys.path.insert(0, package_path)
 
-    def _edge_status(self, packages: dict[str, bool] | None = None) -> dict[str, Any]:
+    def _edge_status(self, packages: dict[str, bool] | None = None, *, include_storage: bool = True) -> dict[str, Any]:
         ready = bool((packages or {}).get("edge_tts", _package_available("edge_tts")))
+        version, compatible = "", False
+        if ready:
+            try:
+                version = str(importlib.import_module("edge_tts.version").__version__)
+                protocol = str(importlib.import_module("edge_tts.constants").SEC_MS_GEC_VERSION)
+                compatible = tuple(int(part) for part in version.split(".")[:3]) >= (7, 3, 1) and int(protocol.split("-", 1)[0]) >= 2
+            except (ImportError, AttributeError, ValueError, OSError):
+                pass
         state = _read_json(self.edge_state_path)
+        update = _read_json(self.edge_update_path)
+        latest = str(update.get("latest_version") or "")
+        version_parts = lambda value: tuple(int(part) for part in value.split(".")) if re.fullmatch(r"\d+\.\d+\.\d+", value) else ()
+        update_available = bool(version_parts(version) and version_parts(latest) > version_parts(version))
+        supported_update = update_available and version_parts(latest)[0] == 7
         return {
             "installed": ready,
+            "connection_ready": ready and compatible,
+            "version": version,
+            "needs_update": ready and (not compatible or supported_update),
+            "latest_version": latest,
+            "update_available": update_available,
+            "compatibility_message": "在线朗读的连接组件使用旧协议，需要更新后再朗读。请在语音设置点击更新 Edge 组件。" if ready and not compatible else f"在线朗读连接组件有新版 {latest}，可以更新。" if supported_update else "连接组件有跨版本更新，请先检查墨流应用更新以确认兼容性。" if update_available else "",
             "packages_dir": str(self.edge_packages_dir),
-            "storage_size_mb": round(_directory_size(self.edge_root) / 1024 / 1024, 1),
+            "storage_size_mb": round(_directory_size(self.edge_root) / 1024 / 1024, 1) if include_storage else 0,
             "has_local_files": self._component_has_local_files(self.edge_root),
             "installing": bool(self._edge_install_task and not self._edge_install_task.done()),
             "python_available": bool(self._python_command()),
@@ -450,7 +537,57 @@ class VoiceRuntime:
             "retryable": bool(state.get("retryable", False)),
         }
 
-    def _sherpa_status(self, packages: dict[str, bool] | None = None) -> dict[str, Any]:
+    def schedule_edge_update_check(self) -> None:
+        if self._edge_update_task is None or self._edge_update_task.done():
+            self._edge_update_task = asyncio.create_task(self._check_edge_update())
+
+    async def _check_edge_update(self, *, after_failure: bool = False) -> None:
+        if not _package_available("edge_tts"):
+            return
+        previous = _read_json(self.edge_update_path)
+        try:
+            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(str(previous.get("checked_at") or ""))).total_seconds()
+        except ValueError:
+            elapsed = float("inf")
+        if elapsed < (900 if after_failure else 86400):
+            return
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=6, follow_redirects=False) as client:
+                response = await client.get("https://pypi.org/pypi/edge-tts/json")
+                response.raise_for_status()
+                if len(response.content) > 1024 * 1024:
+                    raise ValueError("版本资料超过读取上限")
+                latest = str(response.json()["info"]["version"])
+                if not re.fullmatch(r"\d+\.\d+\.\d+", latest):
+                    raise ValueError("未取得正式版本号")
+            _atomic_json(self.edge_update_path, {"checked_at": _now(), "latest_version": latest})
+        except Exception:
+            # A failed version lookup must not disable an otherwise working connector.
+            _atomic_json(self.edge_update_path, {**previous, "checked_at": _now(), "check_failed": True})
+
+    def input_status(self, workspace_root: str | Path | None = None) -> dict[str, Any]:
+        self._activate_optional_packages()
+        settings = Settings.from_env(workspace_root)
+        asr = self._sherpa_status(include_storage=False)
+        return {"ready_for_input": settings.voice_input_engine == "browser" or bool(asr["asr_ready"]), "asr": asr}
+
+    def prepare_input(self) -> None:
+        settings = Settings.from_env()
+        if settings.voice_input_engine != "local" or not settings.voice_enabled or not settings.voice_input_enabled:
+            return
+        if self._asr_prepare_task is None or self._asr_prepare_task.done():
+            async def warm():
+                if self._asr_lock is None:
+                    self._asr_lock = asyncio.Lock()
+                async with self._asr_lock:
+                    try:
+                        await asyncio.to_thread(self._sherpa_asr_recognizer_sync, settings)
+                    except Exception:
+                        pass  # The real decode retains its own bounded recovery and error feedback.
+            self._asr_prepare_task = asyncio.create_task(warm())
+
+    def _sherpa_status(self, packages: dict[str, bool] | None = None, *, include_storage: bool = True) -> dict[str, Any]:
         package_ready = bool((packages or {}).get("sherpa_onnx", _package_available("sherpa_onnx")))
         asr_model = self._sherpa_asr_model_path()
         state = _read_json(self.sherpa_state_path)
@@ -459,8 +596,8 @@ class VoiceRuntime:
             "asr_ready": package_ready and _package_available("soundfile") and asr_model is not None,
             "asr_model": str(asr_model) if asr_model else "",
             "model_root": str(self.sherpa_asr_dir),
-            "model_size_mb": round(_directory_size(self.sherpa_asr_dir) / 1024 / 1024, 1),
-            "storage_size_mb": round(_directory_size(self.sherpa_root) / 1024 / 1024, 1),
+            "model_size_mb": round(_directory_size(self.sherpa_asr_dir) / 1024 / 1024, 1) if include_storage else 0,
+            "storage_size_mb": round(_directory_size(self.sherpa_root) / 1024 / 1024, 1) if include_storage else 0,
             "has_local_files": self._component_has_local_files(self.sherpa_root),
             "estimated_download_mb": 230,
             "estimated_dependency_download_mb": 240,
@@ -814,16 +951,16 @@ class VoiceRuntime:
         if self._edge_install_task and not self._edge_install_task.done():
             return {**self.status(), "queued": False, "message": "Edge 在线语音组件已在后台安装。"}
         self._install_cancel_events["edge"].clear()
-        self._edge_install_task = asyncio.create_task(self._background_install("edge", self._install_edge_impl, emit))
+        self._edge_install_task = asyncio.create_task(self._background_install("edge", functools.partial(self._install_edge_impl, refresh=True), emit))
         await emit({"type": "voice.edge.install.queued", "component": "edge", "status": "installing", "stage": "queued", "progress": 0, "summary": "Edge 在线语音连接组件已进入后台安装。"})
         return {**self.status(), "queued": True, "message": "Edge 在线语音连接组件已进入后台安装；不会自动选为朗读引擎。"}
 
-    async def _install_edge_impl(self, emit: VoiceEventSink) -> dict[str, Any]:
+    async def _install_edge_impl(self, emit: VoiceEventSink, *, refresh: bool = False) -> dict[str, Any]:
         if self._edge_install_lock is None:
             self._edge_install_lock = asyncio.Lock()
         async with self._edge_install_lock:
             self._activate_optional_packages()
-            if not _package_available("edge_tts"):
+            if refresh or not self._edge_status(include_storage=False)["connection_ready"]:
                 command = self._python_command()
                 if not command:
                     raise RuntimeError("没有找到可用的 Python。请设置 INKFLOW_PYTHON 指向 python.exe。")
@@ -833,15 +970,21 @@ class VoiceRuntime:
                     state_path=self.edge_state_path, command=command,
                     requirements=EDGE_REQUIREMENTS, estimated_mb=40, emit=emit,
                 )
-                if self.edge_packages_dir.exists():
-                    previous = self.edge_root / "packages-previous"
-                    if previous.exists():
-                        shutil.rmtree(previous, ignore_errors=True)
-                    self.edge_packages_dir.replace(previous)
-                staging.replace(self.edge_packages_dir)
-                importlib.invalidate_caches()
-                self._activate_optional_packages()
-            if not _package_available("edge_tts"):
+                if self._inference_lock is None:
+                    self._inference_lock = asyncio.Lock()
+                async with self._inference_lock:
+                    if self.edge_packages_dir.exists():
+                        previous = self.edge_root / "packages-previous"
+                        if previous.exists():
+                            shutil.rmtree(previous, ignore_errors=True)
+                        self.edge_packages_dir.replace(previous)
+                    staging.replace(self.edge_packages_dir)
+                    for name in list(sys.modules):
+                        if name == "edge_tts" or name.startswith("edge_tts."):
+                            del sys.modules[name]
+                    importlib.invalidate_caches()
+                    self._activate_optional_packages()
+            if not self._edge_status(include_storage=False)["connection_ready"]:
                 raise RuntimeError("Edge 在线语音连接组件安装后仍无法加载，请查看安装记录。")
             await self._publish_install_progress(
                 component="edge", state_path=self.edge_state_path, emit=emit,
@@ -923,6 +1066,10 @@ class VoiceRuntime:
             )
             if not self._sherpa_status()["asr_ready"]:
                 raise RuntimeError("普通话识别组件不完整：依赖或模型文件仍不可用。")
+            # Preparing input should also select the installed engine. Keep
+            # explicit feature switches and an existing browser choice intact.
+            if self.settings()["voice_input_engine"] == "off":
+                await asyncio.to_thread(self.configure, {"voice_input_engine": "local"})
             await self._publish_install_progress(
                 component="asr",
                 state_path=self.sherpa_state_path,
@@ -1078,8 +1225,8 @@ class VoiceRuntime:
             raise ValueError("只支持删除 Edge、MOSS 或本地普通话识别组件。")
         if confirmation != confirmations[component]:
             raise ValueError("删除前需要确认；只会删除语音组件文件，不会删除录音和声音档案。")
-        if self._inference_lock is not None and self._inference_lock.locked():
-            raise ValueError("当前有朗读任务正在使用语音模型，请先暂停或取消任务后再删除。")
+        if (self._inference_lock is not None and self._inference_lock.locked()) or (self._asr_lock is not None and self._asr_lock.locked()):
+            raise ValueError("当前有听写或朗读任务正在使用语音模型，请先结束相关任务后再删除。")
         task = {
             "edge": self._edge_install_task,
             "moss": self._moss_install_task,
@@ -1216,7 +1363,7 @@ class VoiceRuntime:
         name = str(params.get("name") or "我的声音").strip()[:40]
         reference_text = str(params.get("reference_text") or "").strip()
         if not reference_text:
-            raise ValueError("当前版本已移除 sherpa 语音输入；请先让 Writer 生成朗读稿，并填写与录音一致的原文。")
+            raise ValueError("请填写这段录音实际说出的文字，或先生成一份朗读稿再照稿录音；声音档案需要录音与原文对应。")
         if len(re.sub(r"\s+", "", reference_text)) > 400:
             raise ValueError("声音克隆参考朗读稿最多 400 字；请使用 Writer 生成的朗读稿或截短后重试。")
         profile_id = f"clone-{uuid.uuid4().hex}"
@@ -1318,11 +1465,11 @@ class VoiceRuntime:
         source = Path(audio_path).resolve()
         if not source.is_file() or source.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
             raise ValueError("音频文件不存在或格式不受支持。")
-        if not self._sherpa_status()["asr_ready"]:
+        if not self._sherpa_status(include_storage=False)["asr_ready"]:
             raise RuntimeError("本地普通话识别尚未准备好，请在设置的语音页后台安装识别组件。")
-        if self._inference_lock is None:
-            self._inference_lock = asyncio.Lock()
-        async with self._inference_lock:
+        if self._asr_lock is None:
+            self._asr_lock = asyncio.Lock()
+        async with self._asr_lock:
             try:
                 return await asyncio.to_thread(self._transcribe_sherpa_sync, source, settings)
             except Exception as first_error:
@@ -1632,14 +1779,13 @@ class VoiceRuntime:
                 return profile
         raise ValueError(f"声音角色不存在：{profile_id}")
 
-    def _transcribe_sherpa_sync(self, source: Path, settings: Settings) -> str:
+    def _sherpa_asr_recognizer_sync(self, settings: Settings):
         if not _package_available("sherpa_onnx") or not _package_available("soundfile"):
             raise RuntimeError("sherpa-onnx 或 soundfile 尚未安装。")
         model_path = self._sherpa_asr_model_path()
         if model_path is None:
             raise RuntimeError("普通话识别模型尚未下载，请在语音设置中安装本地识别组件。")
         import sherpa_onnx
-        import soundfile as sf
 
         cache_key = f"sherpa:{model_path}:{settings.voice_compute_device}:{settings.voice_debug}"
         recognizer = self._sherpa_asr_models.get(cache_key)
@@ -1653,6 +1799,7 @@ class VoiceRuntime:
                         language="zh",
                         use_itn=True,
                         provider=provider,
+                        num_threads=max(1, min(4, os.cpu_count() or 1)),
                         debug=settings.voice_debug,
                     )
                 except Exception:
@@ -1666,9 +1813,15 @@ class VoiceRuntime:
                     language="zh",
                     use_itn=True,
                     provider=provider,
+                    num_threads=max(1, min(4, os.cpu_count() or 1)),
                     debug=settings.voice_debug,
                 )
             self._sherpa_asr_models[cache_key] = recognizer
+        return recognizer
+
+    def _transcribe_sherpa_sync(self, source: Path, settings: Settings) -> str:
+        recognizer = self._sherpa_asr_recognizer_sync(settings)
+        import soundfile as sf
         audio, sample_rate = sf.read(str(source), dtype="float32", always_2d=True)
         samples = audio[:, 0]
         stream = recognizer.create_stream()
@@ -1688,8 +1841,7 @@ class VoiceRuntime:
             text = raw
         # 去掉 <|yue|>、<|NEUTRAL|>、<|Speech|> 之类的内联标记，只留自然语言。
         text = re.sub(r"<\|[^|]*\|>", "", text).strip()
-        if not text:
-            raise RuntimeError("没有识别到清晰的普通话内容，请更换安静环境下的录音。")
+        # Silence is a normal result, not a model failure requiring a second decode.
         return text
 
     @staticmethod
@@ -1733,6 +1885,8 @@ class VoiceRuntime:
             raise ValueError("不支持的朗读引擎。")
         if profile.get("kind") == "clone":
             raise ValueError("Edge 在线朗读不支持声音克隆；请为此用途选择本地 MOSS。")
+        if not self._edge_status(include_storage=False)["connection_ready"]:
+            raise RuntimeError("在线朗读的连接组件使用旧协议或无法加载，请在设置 → 语音更新 Edge 组件后再试。")
         try:
             import edge_tts
         except ImportError as exc:
@@ -1755,6 +1909,12 @@ class VoiceRuntime:
             if not temporary.is_file() or temporary.stat().st_size == 0:
                 raise RuntimeError("在线语音没有返回音频。")
             temporary.replace(output)
+        except Exception as exc:
+            if getattr(exc, "status", None) == 403:
+                await self._check_edge_update(after_failure=True)
+                raise RuntimeError("在线朗读服务拒绝连接（403），本次未生成音频。文字成果保留；"
+                                   "先在设置 → 语音检查连接组件更新；组件已更新仍被拒绝时，稍后重试或选用已就绪的本地朗读组件。") from exc
+            raise
         finally:
             temporary.unlink(missing_ok=True)
 
