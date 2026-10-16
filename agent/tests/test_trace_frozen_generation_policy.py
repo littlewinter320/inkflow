@@ -19,9 +19,9 @@ def test_trace_uses_frozen_profile_and_timeout_nulls_survive_replay(tmp_path, mo
     token = active_runtime.set(runtime)
     trace = TraceRecorder(tmp_path, "frozen-policy")
     try:
-        cases = [("balanced", "coordinator", False, True, 360.0, 720.0),
-                 ("economy", "writer", True, False, 180.0, 360.0),
-                 ("economy", "editor", False, True, 180.0, 360.0),
+        cases = [("balanced", "coordinator", False, True, 900.0, 1500.0),
+                 ("economy", "writer", True, False, 360.0, 720.0),
+                 ("economy", "editor", False, True, 360.0, 720.0),
                  ("quality", "memory_keeper", False, True, None, None)]
         attempts = []
         for index, (preset, role, requested, effective, soft, hard) in enumerate(cases):

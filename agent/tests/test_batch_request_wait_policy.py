@@ -46,14 +46,15 @@ def test_quality_waits_use_frozen_range_and_cancel_unlimited_requests(tmp_path, 
             with bound(selected, count) as (_, binding):
                 for role in ("coordinator", "writer", "editor", "reviewer", "memory_keeper"):
                     policy = _request_wait_policy(selected, role, 120)
-                    scale = 2 if preset == "balanced" else 1
+                    soft, hard = ((900 + 300 * (count - 1), 1500 + 600 * (count - 1)) if preset == "balanced"
+                                  else (360 + 120 * (count - 1), 720 + 240 * (count - 1)))
                     assert policy["batch_chapter_count"] == count
-                    assert policy["request_timeout_seconds"] == (None if preset == "quality" else (360 + 120 * (count - 1)) * scale)
-                    assert policy["soft_wait_seconds"] == (None if preset == "quality" else (180 + 60 * (count - 1)) * scale)
+                    assert policy["request_timeout_seconds"] == (None if preset == "quality" else hard)
+                    assert policy["soft_wait_seconds"] == (None if preset == "quality" else soft)
                 binding["manifest"]["stopped_at_chapter"] = binding["manifest"]["end_chapter_no"]
                 assert _request_wait_policy(selected, "writer", 120) == policy
                 if preset != "quality":
-                    assert _request_wait_policy(selected, "writer", 2000)["request_timeout_seconds"] == 2000
+                    assert _request_wait_policy(selected, "writer", 2000)["request_timeout_seconds"] == max(2000, hard)
     with bound() as (runtime, binding):
         for field, value in (("task_id", "unrelated-task"), ("snapshot_hash", "wrong-hash"), ("novel_id", "another-book")):
             original = binding["manifest"]["task_settings"][field]
@@ -70,9 +71,9 @@ def test_quality_waits_use_frozen_range_and_cancel_unlimited_requests(tmp_path, 
         binding["manifest"]["stopped_at_chapter"] = 99
         assert _request_wait_policy(settings, "writer", 120)["batch_chapter_count"] == 1
     independent = _request_wait_policy(settings, "writer", None)
-    assert (independent["soft_wait_seconds"], independent["request_timeout_seconds"]) == (180, 360)
+    assert (independent["soft_wait_seconds"], independent["request_timeout_seconds"]) == (360, 720)
     legacy_custom = _request_wait_policy(replace(settings, quality_preset="custom"), "coordinator", 120)
-    assert (legacy_custom["soft_wait_seconds"], legacy_custom["request_timeout_seconds"]) == (360, 720)
+    assert (legacy_custom["soft_wait_seconds"], legacy_custom["request_timeout_seconds"]) == (900, 1500)
     assert _request_wait_policy(replace(settings, quality_preset="quality"), None, 15)["request_timeout_seconds"] == 15
 
     import inkflow.provider as provider_module

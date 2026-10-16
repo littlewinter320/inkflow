@@ -142,9 +142,10 @@ def _request_wait_policy(settings: Settings, role: str | None,
         return policy
     count = _bound_batch_chapter_count(settings)
     preset = "balanced" if settings.quality_preset == "custom" else settings.quality_preset
-    scale = 2 if preset == "balanced" else 1
-    return {"request_timeout_seconds": None if preset == "quality" else max(timeout, (360.0 + 120.0 * (count - 1)) * scale),
-            "soft_wait_seconds": None if preset == "quality" else (_MIMO_SOFT_WAIT_SECONDS + 60.0 * (count - 1)) * scale,
+    soft, hard = ((900.0 + 300.0 * (count - 1), 1500.0 + 600.0 * (count - 1)) if preset == "balanced"
+                  else (360.0 + 120.0 * (count - 1), 720.0 + 240.0 * (count - 1)))
+    return {"request_timeout_seconds": None if preset == "quality" else max(timeout, hard),
+            "soft_wait_seconds": None if preset == "quality" else soft,
             "timeout_policy": f"{preset}_production", "batch_chapter_count": count}
 
 
