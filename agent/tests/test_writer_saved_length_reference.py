@@ -114,5 +114,10 @@ def test_saved_reference_requires_new_grant_and_only_inserts_into_original(tmp_p
             with pytest.raises(ValidationGateError, match="已有当前版本"):
                 asyncio.run(engine.write_chapter(project.root, 51, draft_reference=reference))
             assert len(provider.calls) == 1
+            failures = [json.loads(line) for path in (project.internal / "runs").glob("*-write-00051-*/events.jsonl")
+                        for line in path.read_text(encoding="utf-8").splitlines()]
+            assert any(event.get("stage") == "write" and event.get("metadata", {}).get("error_type") == "ValidationGateError"
+                and any(site["file"] == "engine.py" and site["function"] == "write_chapter"
+                        for site in event["metadata"]["error_site"]) for event in failures)
         finally:
             active_runtime.reset(runtime_token)

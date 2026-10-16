@@ -6,6 +6,7 @@ from difflib import SequenceMatcher
 import json
 import re
 import sqlite3
+import traceback
 import unicodedata
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterator
@@ -3134,7 +3135,10 @@ class InkFlowEngine:
             trace.finish(status="cancelled", summary="章节草稿生成已停止，已有版本保留")
             raise
         except Exception as exc:
-            trace.record("write", "failed", "章节生成失败", str(exc))
+            trace.record("write", "failed", "章节生成失败", str(exc), metadata={
+                "error_type": type(exc).__name__, "error_site": [
+                    {"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name}
+                    for frame in traceback.extract_tb(exc.__traceback__)]})
             trace.finish(status="failed", summary="草稿未完成")
             raise
 

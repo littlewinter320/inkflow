@@ -211,6 +211,12 @@ def test_natural_writer_grant_and_saved_original_resume(tmp_path, monkeypatch):
                 # gate failure. No new Coordinator decision is needed to resume.
                 async with project_write_lock(project.root):
                     session._save_pending_task(project, revised_route, "failed")
+                own = next(item for item in project.pending_work() if item.get("source", {}).get("task_id") == scope.task_id)
+                own_route = revised_route.model_copy(update={"pending_work_id": own["id"],
+                    "related_task_id": None, "response_kind": "new_task"})
+                pending_record = project.db.get_metadata(conversation_key("pending_creation_task"))
+                project.db.set_metadata(conversation_key("pending_creation_task"),
+                    {**pending_record, "intent": own_route.model_dump(mode="json")})
                 pending = session.pending_resume(project, "继续")
                 assert pending["task_id"] == scope.task_id and pending["intent"]["user_message"] == ui_message
                 monkeypatch.setattr(session, "_build_packet", lambda *a: ContextPacket(project_id=project.project_id,

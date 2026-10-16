@@ -571,6 +571,16 @@ class TerminalSession:
         if (any(before_grant.count(left) > before_grant.count(right) for left, right in (("“", "”"), ("「", "」"), ("『", "』")))
                 or before_grant.count('"') % 2):
             return None
+        if work is None and scope is not None and intent.pending_work_id and _saved_length_reference_requested(message):
+            own = project.db.get_metadata(f"pending_work:{intent.pending_work_id}", {})
+            source, saved = own.get("source", {}), own.get("intent", {})
+            related = source.get("related_task_id")
+            if (source.get("task_id") == scope.task_id and related and related != scope.task_id
+                    and saved.get("related_task_id") == related and saved.get("user_message") == message
+                    and saved.get("chapter_no") == target and saved.get("end_chapter_no") in {None, target}
+                    and intent.related_task_id in {None, related}):
+                intent = intent.model_copy(update={"pending_work_id": None, "related_task_id": related,
+                                                   "response_kind": "new_task"})
         if (target is not None and intent.action in {"revise_draft", "revise_review", "revise_review_accept"}
                 and _saved_length_reference_requested(message) and project.db.get_chapter(target) is None):
             # A complete unsaved return uses the verified reference path, not saved-chapter revision.
