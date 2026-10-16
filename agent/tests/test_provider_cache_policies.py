@@ -17,6 +17,30 @@ class CachePolicyAnswer(BaseModel):
     answer: str
 
 
+def test_mimo_canonical_objects_preserve_sources_lists_and_gate_material():
+    original = {"z": {"revision": 2, "body": "原句，空格  与标点。"},
+                "a": [{"position": 2, "body": "第二"}, {"body": "第一", "position": 1}]}
+    reordered = {"a": [{"body": "第二", "position": 2}, {"position": 1, "body": "第一"}],
+                 "z": {"body": "原句，空格  与标点。", "revision": 2}}
+    def packet(value, policy="mimo"):
+        return ContextPacket(project_id="offline", chapter_no=51, task="补写", estimated_tokens=0,
+            cache_policy=policy, sections=[ContextSection(key="J", title="资料",
+                content=json.dumps(value, ensure_ascii=False), source_ids=["source:v2"], hard=True, cache_scope="book")])
+    first, second = packet(original), packet(reordered)
+    saved = first.model_dump()
+    gate = first.gate_material()
+    assert first.model_prompt_parts()[0] == second.model_prompt_parts()[0]
+    assert json.loads(first.model_sections()[0].content) == original
+    assert first.model_dump() == saved and first.gate_material() == gate
+    changed = copy.deepcopy(original)
+    changed["z"]["revision"] = 3
+    assert first.model_prompt_parts()[0] != packet(changed).model_prompt_parts()[0]
+    changed = copy.deepcopy(original)
+    changed["a"].reverse()
+    assert first.model_prompt_parts()[0] != packet(changed).model_prompt_parts()[0]
+    assert packet(original, "deepseek").model_prompt_parts()[0] != packet(reordered, "deepseek").model_prompt_parts()[0]
+
+
 def test_provider_selection_changes_cache_projection_and_wire(tmp_path, monkeypatch):
     monkeypatch.setenv("INKFLOW_SETTINGS_PATH", str(tmp_path / "settings.json"))
     monkeypatch.setattr(Settings, "require_api_key", lambda self: "offline-test")

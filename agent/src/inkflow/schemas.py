@@ -1122,7 +1122,7 @@ class ContextSection(StrictModel):
     # Unknown/new sources default to the dynamic tail, never the cache prefix.
     cache_scope: Literal["global", "book", "canon", "chapter", "request"] = "request"
 
-    def model_content(self) -> str:
+    def model_content(self, *, canonical: bool = False) -> str:
         """Keep source text intact while excluding duplicated operational diagnostics."""
         try:
             value = json.loads(self.content)
@@ -1153,7 +1153,7 @@ class ContextSection(StrictModel):
                     for key in ("summary_body", "summary_content_hash", "summary_origin"):
                         hit.pop(key, None)
         # JSON whitespace is not source prose; strings, quotes and source identities remain exact.
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":")) if isinstance(value, (dict, list)) else self.content
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=canonical) if isinstance(value, (dict, list)) else self.content
 
 
 class ContextPacket(StrictModel):
@@ -1214,6 +1214,10 @@ class ContextPacket(StrictModel):
             if self.cache_policy == "mimo" and section.key in {"D", "G"} and section.cache_scope == "canon":
                 section = section.model_copy(update={"cache_scope": "chapter"})
             sections.append(section)
+        if self.cache_policy == "mimo":
+            # Object insertion order is not source meaning; lists and source strings stay exact.
+            sections = [section.model_copy(update={"content": section.model_content(canonical=True)})
+                        for section in sections]
         scopes = {"global": 0, "book": 1, "canon": 2, "chapter": 3, "request": 4}
 
         def priority(indexed: tuple[int, ContextSection]) -> tuple[int, int, int]:
