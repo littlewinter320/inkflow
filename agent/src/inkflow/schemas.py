@@ -702,6 +702,15 @@ class AcceptedContinuityLocalEdit(StrictModel):
     replacement: str = Field(max_length=800)
 
 
+class ReviewCopyEdit(AcceptedContinuityLocalEdit):
+    """An optional, source-bound micro edit proposed during the existing review."""
+
+    kind: Literal["typo", "punctuation", "duplicate", "expression"]
+    reason: str = Field(min_length=1, max_length=400)
+    meaning_preserved: bool
+    author_role: Literal["editor", "reviewer"] | None = None
+
+
 class AcceptedContinuityPatch(StrictModel):
     """Writer returns a handful of exact local edits, never a rewritten chapter."""
 
@@ -895,6 +904,7 @@ class ReviewReport(UnifiedRoleModel):
     summary: str
     strengths: list[str] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list)
+    copyedits: list[ReviewCopyEdit] = Field(default_factory=list, max_length=4)
     scorecard: list[ReviewScoreDimension] = Field(default_factory=list)
     source_hash: str = ""
     writer_notes_hash: str = ""
@@ -924,6 +934,7 @@ class ModeCheckOutput(UnifiedRoleModel):
     strengths: list[str] = Field(default_factory=list, max_length=8)
     approved_setting_proposals: list[int] = Field(default_factory=list, max_length=8)
     findings: list[ReviewFinding] = Field(default_factory=list, max_length=24)
+    copyedits: list[ReviewCopyEdit] = Field(default_factory=list, max_length=4)
     focus_observation: ReviewFocusObservation = Field(default_factory=ReviewFocusObservation)
     source_comparisons: list[ReviewSourceComparison] = Field(default_factory=list, max_length=8)
     reference_observations: list[ReviewReferenceObservation] = Field(default_factory=list, max_length=8)

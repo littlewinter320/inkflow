@@ -97,6 +97,7 @@ from .schemas import (
     ReviewSourceComparison,
     ReviewClaimDecision,
     ReviewClaimDecisionBatch,
+    ReviewCopyEdit,
     ReviewReport,
     ReviewScoreDimension,
     SceneDraftOutput,
@@ -315,6 +316,7 @@ class InkFlowEngine:
         run_id: str,
         draft: DraftOutput,
         card: dict[str, Any],
+        actor: str = "writer",
     ) -> dict[str, Any]:
         note = draft.hook_note.model_dump(mode="json") if draft.hook_note else {}
         note = {
@@ -346,7 +348,7 @@ class InkFlowEngine:
         return project.db.save_agent_artifact(
             artifact_type="writer_hook_note",
             run_id=run_id,
-            role="writer",
+            role=actor,
             data=note,
             chapter_no=chapter_no,
             chapter_version=chapter_version,
@@ -362,6 +364,7 @@ class InkFlowEngine:
         chapter_version: int,
         run_id: str,
         draft: DraftOutput,
+        actor: str = "writer",
     ) -> dict[str, Any] | None:
         if not draft.scene_blueprint:
             return None
@@ -373,7 +376,7 @@ class InkFlowEngine:
         return project.db.save_agent_artifact(
             artifact_type="writer_scene_blueprint",
             run_id=run_id,
-            role="writer",
+            role=actor,
             data={"scenes": [item.model_dump(mode="json") for item in draft.scene_blueprint]},
             chapter_no=chapter_no,
             chapter_version=chapter_version,
@@ -3508,7 +3511,15 @@ class InkFlowEngine:
                     trace.finish(status="waiting_user", summary=choice["reason"])
                     return {**reviewed, **choice, "revision_rounds": revisions,
                             "recovery_trace_id": trace.run_id}
-                if reviewed["verdict"] == "pass" and not choice:
+                current = project.db.get_chapter(chapter_no)
+                current_review = project.db.latest_review_record(chapter_no)
+                copyedit_patch = None
+                if (not choice and revisions < recovery["limit"] and current and current_review
+                        and current_review["report"].copyedits
+                        and current_review["chapter_version"] == current["version"]):
+                    copyedit_patch = _review_copyedit_patch(current_review["report"],
+                        (project.root / current["path"]).read_text(encoding="utf-8"))
+                if reviewed["verdict"] == "pass" and not choice and copyedit_patch is None:
                     break
                 if reviewed.get("preference_conflicts"):
                     trace.finish(status="waiting", summary="偏好互斥需本次取舍，保留正文与审查断点")
@@ -3536,7 +3547,7 @@ class InkFlowEngine:
                     return {**reviewed, "status": "needs_input", "reason": reason,
                             "stop_reason": reason,
                             "revision_rounds": revisions, "recovery_trace_id": trace.run_id}
-                if (reviewed["verdict"] != "patch" and not clarity_strategy) or revisions >= recovery["limit"]:
+                if (reviewed["verdict"] != "patch" and not clarity_strategy and copyedit_patch is None) or revisions >= recovery["limit"]:
                     record = project.db.latest_review_record(chapter_no)
                     notes = [item.verification_note or item.explanation for item in record["report"].findings
                              if item.verification_status == "uncertain" or item.severity in {"major", "blocking"}] if record else []
@@ -3558,7 +3569,8 @@ class InkFlowEngine:
                             raise ValidationGateError("修改选择的来源已变化，未按旧建议改稿。")
                         project.db.set_metadata(choice["key"], {**stored, "phase": "reserved"})
                 record_before = project.db.latest_review_record(chapter_no)
-                strategy = clarity_strategy or _local_repair_strategy(record_before["report"].findings if record_before else [], progress)
+                strategy = ("采用同次审查中已定位且不改变意思的微改建议；原文其余部分保留。" if copyedit_patch else
+                    clarity_strategy or _local_repair_strategy(record_before["report"].findings if record_before else [], progress))
                 before_hash = str(chapter["content_hash"])
                 trace.record("recovery.strategy", "selected", "按具体问题选择局部修订方法", details=strategy,
                              metadata={"findings": reviewed.get("findings", []), "chapter_no": chapter_no}, public=False)
@@ -3567,6 +3579,7 @@ class InkFlowEngine:
                     root, chapter_no, (instruction + "\n\n" + strategy).strip(),
                     provisional_chapters=provisional_chapters,
                     local_only=True,
+                    review_copyedits=copyedit_patch is not None,
                 )
                 if choice:
                     async with project_write_lock(project.root):
@@ -3578,9 +3591,10 @@ class InkFlowEngine:
                     progress.append(await self._record_revision_progress(project, chapter_no, revisions, before_hash, record_before, trace, instruction=instruction, provisional_chapters=provisional_chapters, unchanged=True))
                     trace.record("recovery.no_change", "warning", "正文没有变化，保留原审核结论并切换修订策略", public=False)
                     continue
-                trace.record("recovery.revise", "completed", "Writer 已修改，交回 Editor 检查新版本", metadata={"trace_id": revised["trace_id"], "version": revised["version"]})
+                actor = revised.get("revision_actor", "writer")
+                trace.record("recovery.revise", "completed", f"{actor} 已修改，交回原审查分工检查新版本", metadata={"trace_id": revised["trace_id"], "version": revised["version"]})
                 reviewed = await review_current()
-                progress.append(await self._record_revision_progress(project, chapter_no, revisions, before_hash, record_before, trace, instruction=instruction, provisional_chapters=provisional_chapters))
+                progress.append(await self._record_revision_progress(project, chapter_no, revisions, before_hash, record_before, trace, instruction=instruction, provisional_chapters=provisional_chapters, actor_role=actor))
             trace.finish(summary="当前版本已通过，交接所需审核已就绪")
             return {**reviewed, "trace_id": reviewed.get("trace_id", trace.run_id), "revision_rounds": revisions, "recovery_trace_id": trace.run_id}
         except asyncio.CancelledError:
@@ -3673,7 +3687,7 @@ class InkFlowEngine:
                         {"id": "improve-other", "label": "其他", "kind": "other"}]}]}
 
     async def _record_revision_progress(self, project: InkFlowProject, chapter_no: int, attempt: int,
-            before_hash: str, before: dict[str, Any] | None, trace: TraceRecorder, *, instruction: str = "", provisional_chapters: list[dict[str, Any]] | None = None, unchanged: bool = False) -> dict[str, Any]:
+            before_hash: str, before: dict[str, Any] | None, trace: TraceRecorder, *, instruction: str = "", provisional_chapters: list[dict[str, Any]] | None = None, unchanged: bool = False, actor_role: str = "writer") -> dict[str, Any]:
         """Record observed repair effects, independently of the Writer's explanation."""
         scope, runtime = active_task_settings.get(), active_runtime.get()
         chapter, review = project.db.get_chapter(chapter_no), project.db.latest_review_record(chapter_no)
@@ -3687,7 +3701,7 @@ class InkFlowEngine:
             "chapter_version": chapter["version"] if chapter else None, "review_id": review["id"] if current else None,
             "matched_evidence_count": len(old_keys & new_keys), "finding_count": len(new_keys),
             "issue_categories": sorted({item.rule_id for item in (before["report"].findings if before else []) if item.rule_id}),
-            "review_verdict": review["report"].verdict if current else "unknown", "role": "writer",
+            "review_verdict": review["report"].verdict if current else "unknown", "role": actor_role,
             "task_id": scope.task_id if scope else "", "snapshot_hash": scope.snapshot_hash if scope else "",
             "run_id": runtime.run_id if runtime else "", "recovery_trace_id": trace.run_id}
         result["method_feedback"] = (
@@ -3803,6 +3817,14 @@ class InkFlowEngine:
                     user_prompt += "\n\n# 主审已取得的Writer短答（仍须核验，不作正史证据）\n" + json_dumps(inherited_reply)
                 if role != (owners.get("general") or owners.get("logic_continuity")):
                     user_prompt += "\n你不是主审，writer_note_questions必须为空；归类问题修候选，缺历史资料用source_queries。"
+                if role in {"editor", "reviewer"}:
+                    user_prompt += (
+                        "\n\n# 可选微改建议\n可以在本次输出copyedits提出至多四处字词、标点、重复或不改变意思的小句修改，"
+                        "不必为润色硬造改动。target_excerpt必须逐字来自当前正文且只出现一次；replacement只含替换片段，"
+                        "不能涉及事实、数值、否定、时间、人物或剧情变化。每条写kind、reason、meaning_preserved，"
+                        "并在findings以minor问题给出对应原句和原因；author_role由程序绑定实际角色。"
+                        "这些只是建议，所有审核结论与记忆证据仍针对当前原文；不把建议已提出说成已修改或已重新通过。"
+                    )
                 if recheck_report is not None:
                     user_prompt += "\n\n# 定向补审任务（重新核对原文，不复述上一份报告）\n" + json_dumps({
                         "待修复审核缺口": recheck_report.confidence_basis,
@@ -4111,6 +4133,26 @@ class InkFlowEngine:
                 summary += f"；{focus_problem}只重新核对审核依据，不据此改写正文。"
             if verdict == "unknown" and comparison_problem:
                 summary += f"；{comparison_problem}，先补审查依据，不据此改写正文。"
+            copyedits: list[ReviewCopyEdit] = []
+            seen_copyedits: set[tuple[str, str]] = set()
+            copyedit_roles = dict.fromkeys([owners.get("expression"), focus_owner, *outputs])
+            for role in copyedit_roles:
+                if role not in {"editor", "reviewer"} or role not in outputs:
+                    continue
+                for edit in outputs[role].copyedits:
+                    identity = (edit.target_excerpt, edit.replacement)
+                    if identity not in seen_copyedits:
+                        seen_copyedits.add(identity)
+                        copyedits.append(edit.model_copy(update={"author_role": role}))
+            spans = sorted((content.index(edit.target_excerpt), content.index(edit.target_excerpt) + len(edit.target_excerpt))
+                for edit in copyedits if edit.target_excerpt and content.count(edit.target_excerpt) == 1)
+            if any(spans[index][0] < spans[index - 1][1] for index in range(1, len(spans))):
+                summary += "；微改建议存在分歧或重叠，本轮保留原文，各角色建议留档供协商。"
+                trace.record("review.copyedit_conflict", "deferred", "微改建议未自动采用，原问题和角色原始建议保留",
+                    metadata={"proposed_count": len(copyedits), "roles": list(copyedit_roles)}, public=False)
+                copyedits = []
+            else:
+                copyedits = copyedits[:4]
             report = ReviewReport(
                 preference_decisions=sorted([item for values in preference_decisions.values() for item in values],
                     key=lambda item: item["status"] == "resolved")[:6],
@@ -4123,7 +4165,7 @@ class InkFlowEngine:
                                    "roles": source_recoveries},
                 missing_source_ids=focus_output.missing_source_ids if focus_output else [],
                 source_queries=focus_output.source_queries if focus_output else [],
-                summary=summary, findings=findings,
+                summary=summary, findings=findings, copyedits=copyedits,
                 strengths=focus_output.strengths if focus_output else [],
                 hook_assessment=focus_output.hook_assessment if focus_output else None,
                 context_use_audit=focus_output.context_use_audit if focus_output else ContextUseAudit(),
@@ -4222,6 +4264,7 @@ class InkFlowEngine:
                 "preference_conflicts": [item.model_dump(mode="json") for output in outputs.values() for item in output.preference_conflicts],
                 "summary": summary, "finding_count": len(findings),
                 "findings": [item.model_dump(mode="json") for item in findings],
+                "copyedits": [item.model_dump(mode="json") for item in report.copyedits],
                 "score_total": None if verdict == "unknown" else _score_total(report.scorecard), "review_path": str(project.root / relative),
                 "review_id": review_id, "trace_id": trace.run_id,
                 "scorecard": [item.model_dump(mode="json") for item in report.scorecard],
@@ -5237,16 +5280,20 @@ class InkFlowEngine:
         instruction: str = "",
         *,
         provisional_chapters: list[dict[str, Any]] | None = None,
-        local_only: bool = False,
+        local_only: bool | None = None,
+        review_copyedits: bool = False,
     ) -> dict[str, Any]:
         project = InkFlowProject(root)
         trace = TraceRecorder(project.root, f"revise-{chapter_no:05d}", self.settings.trace_level)
         try:
-            local_only = local_only or bool(re.search(r"局部|只改|只替换|定点|定向", instruction))
             chapter = project.db.get_chapter(chapter_no)
             card = project.db.get_chapter_card(chapter_no)
             review_record = project.db.latest_review_record(chapter_no)
             plan_revision = project.db.pending_plan_revision(chapter_no)
+            # Ordinary review fixes use exact patches unless the caller chose
+            # otherwise. An authorized replacement plan keeps its existing path.
+            local_only = (not bool(plan_revision) if local_only is None else local_only) or bool(
+                re.search(r"局部|只改|只替换|定点|定向", instruction))
             if not chapter or chapter["status"] != "draft":
                 raise ProjectError(f"第 {chapter_no} 章没有可修订草稿。")
             if not card:
@@ -5262,6 +5309,28 @@ class InkFlowEngine:
 
             draft_path = project.root / chapter["path"]
             current_draft = draft_path.read_text(encoding="utf-8")
+            previous_notes = version_notes(project, chapter_no) if local_only else {}
+            approved_copyedit = (_review_copyedit_patch(review_record["report"], current_draft)
+                if review_copyedits and local_only and not plan_revision and review_record else None)
+            if review_copyedits and approved_copyedit is None:
+                raise ValidationGateError("微改建议已不适用于当前原文，保留草稿；请按当前审查问题续接。")
+            if approved_copyedit:
+                scope = active_task_settings.get()
+                bundle = review_record.get("mode_bundle") or {}
+                fingerprint = bundle.get("settings_fingerprint")
+                if (scope is None or bundle.get("mode") != scope.effective_collaboration_mode
+                        or not bundle.get("snapshot_hash")
+                        or (fingerprint != _review_settings_fingerprint(scope.settings) if fingerprint is not None
+                            else bundle["snapshot_hash"] != scope.snapshot_hash)
+                        or bundle.get("story_fingerprint") != self._writer_source_fingerprint(project, chapter_no)
+                        or _recovered_sources_changed(project, review_record["report"].evidence_recovery)
+                        or review_record["report"].writer_notes_hash != notes_hash(previous_notes)
+                        or any(edit.author_role not in check_owners_for_mode(scope.effective_collaboration_mode).values()
+                               for edit in review_record["report"].copyedits)):
+                    raise ValidationGateError("微改建议的原审查配置或分工已变化，未应用旧建议；请先核对当前版本。")
+                self._assert_task_settings()
+            revision_actor = ("editor" if any(edit.author_role == "editor" for edit in review_record["report"].copyedits)
+                else "reviewer") if approved_copyedit else "writer"
             if plan_revision:
                 if (chapter["version"] != plan_revision["draft_version"]
                         or content_hash(current_draft) != plan_revision["draft_hash"]
@@ -5281,7 +5350,11 @@ class InkFlowEngine:
             target_characters = int(card["target_words"])
             lower_bound = int(target_characters * (1 - self.settings.chapter_length_tolerance))
             upper_bound = int(target_characters * (1 + self.settings.chapter_length_tolerance))
-            packet = self._context_builder(project).build(
+            packet = ContextPacket(project_id=project.project_id, chapter_no=chapter_no, task=task,
+                cache_policy=self.settings.prompt_cache_policy, estimated_tokens=estimate_tokens(review_text),
+                sections=[ContextSection(key="review-copyedit", title="已审微改的本地定位依据",
+                    content=review_text, source_ids=[f"review:chapter:{chapter_no:05d}:v{chapter['version']}"], hard=True)],
+            ) if approved_copyedit else self._context_builder(project).build(
                 chapter_no,
                 task,
                 mode="revise",
@@ -5292,16 +5365,17 @@ class InkFlowEngine:
             trace.record(
                 "context.build",
                 "completed",
-                f"构建唯一 Context Packet，估算 {packet.estimated_tokens} tokens",
-                metadata={"sections": [section.key for section in packet.sections], "warnings": packet.warnings},
+                "复用同次审查的微改定位，不构建Writer模型输入" if approved_copyedit else f"构建唯一 Context Packet，估算 {packet.estimated_tokens} tokens",
+                metadata={"sections": [section.key for section in packet.sections], "warnings": packet.warnings,
+                          "model_input": not bool(approved_copyedit)},
             )
-            active_skills = self._writer_skills(
+            active_skills = [] if approved_copyedit else self._writer_skills(
                 packet, "证据定点修订", "回归连续性扫描", "自然中文正文", "Humanizer-zh 表达检查"
             )
             trace.record(
                 "writer.skills",
                 "completed",
-                "写作角色已装载修订技能；只修有依据的问题并保留有效声线",
+                "微改由原审查角色提出，未请求Writer" if approved_copyedit else "写作角色已装载修订技能；只修有依据的问题并保留有效声线",
                 metadata={"skills": active_skills, "skill_contract_version": "1", "packet_section": "I", "extra_model_calls": 0},
             )
             expression_only = (local_only and not plan_revision
@@ -5335,7 +5409,8 @@ class InkFlowEngine:
                     + "若当前版本偏短，请补足承载本章冲突、选择和后果的具体场景与感官动作；"
                     + "不得用重复解释、空泛总结、提纲或标题凑数。"
                 )
-            user_prompt += self._continuity_anchor(project, chapter_no, current_draft + "\n" + instruction)
+            if not approved_copyedit:
+                user_prompt += self._continuity_anchor(project, chapter_no, current_draft + "\n" + instruction)
             revision_system = LOCAL_REVISER_SYSTEM if local_only else REVISER_SYSTEM
             revision_limit = self.settings.max_output_tokens
             if local_only:
@@ -5347,32 +5422,51 @@ class InkFlowEngine:
             # Reviewer evidence and deterministic post-gates already carry
             # the reasoning contract, so reserve the response for the requested edits.
             revision_thinking = not self.settings.is_deepseek
-            trace.record_model_started(
-                "writer.revise",
-                model=self.settings.model,
-                agent_role="writer",
-                max_tokens=revision_limit,
-                timeout_seconds=self.settings.request_timeout_seconds,
-                thinking=revision_thinking,
-            )
-            result = await self.provider.generate_json(
-                system_prompt=revision_system,
-                user_prompt=user_prompt,
-                output_model=AcceptedContinuityPatch if local_only else DraftOutput,
-                effort=self.settings.reasoning_effort,
-                max_tokens=revision_limit,
-                thinking=revision_thinking,
-                agent_role="writer",
-            )
-            trace.record_model("writer.revise", result, "Writer 已返回修订候选，正在核对原句和来源")
+            if approved_copyedit:
+                patch = approved_copyedit
+                trace.record("review.copyedit", "completed", "采用原审查角色的同次微改，未新增Writer请求",
+                    metadata={"role": revision_actor, "review_id": review_record["id"],
+                        "source_hash": review_record["report"].source_hash,
+                        "copyedits": [edit.model_dump(mode="json") for edit in review_record["report"].copyedits],
+                        "extra_model_calls": 0})
+            else:
+                trace.record_model_started(
+                    "writer.revise", model=self.settings.model, agent_role="writer",
+                    max_tokens=revision_limit, timeout_seconds=self.settings.request_timeout_seconds,
+                    thinking=revision_thinking,
+                )
+                result = await self.provider.generate_json(
+                    system_prompt=revision_system, user_prompt=user_prompt,
+                    output_model=AcceptedContinuityPatch if local_only else DraftOutput,
+                    effort=self.settings.reasoning_effort, max_tokens=revision_limit,
+                    thinking=revision_thinking, agent_role="writer",
+                )
+                trace.record_model("writer.revise", result, "Writer 已返回修订候选，正在核对原句和来源")
+                if local_only:
+                    patch = result.data
             if local_only:
-                patch = result.data
                 header_end = current_draft.find("\n") if current_draft.startswith("#") else 0
                 if any(0 <= current_draft.find(edit.target_excerpt) < header_end for edit in patch.edits):
                     raise ValidationGateError("局部修订不能修改章节标题，原稿未改。")
                 patched = _apply_unique_replacements(current_draft,
                     [(edit.target_excerpt, edit.replacement) for edit in patch.edits])
-                draft = DraftOutput(title=str(chapter["title"]), content=patched, decision_summary=[patch.reason])
+                from .schemas import HookNote
+                previous_hook = previous_notes.get("hook_note") or {}
+                inherited_hook = {key: value for key, value in previous_hook.items() if key in HookNote.model_fields}
+                if approved_copyedit and inherited_hook.get("annotations"):
+                    inherited_hook["annotations"] = [dict(item) for item in inherited_hook["annotations"]]
+                    for annotation in inherited_hook["annotations"]:
+                        quote = str(annotation.get("quote") or "")
+                        for edit in patch.edits:
+                            if edit.target_excerpt in quote:
+                                quote = quote.replace(edit.target_excerpt, edit.replacement)
+                        if quote and quote in patched:
+                            annotation["quote"] = quote
+                draft = DraftOutput(title=str(chapter["title"]), content=patched, decision_summary=[patch.reason],
+                    hook_note=inherited_hook or None,
+                    new_fact_candidates=previous_hook.get("new_fact_candidates", []),
+                    thread_changes=previous_hook.get("thread_changes", []),
+                    scene_blueprint=(previous_notes.get("scene_blueprint") or {}).get("scenes", []))
             else:
                 draft = result.data
             if self._revision_source_fingerprint(project, chapter_no) != source_fingerprint:
@@ -5382,7 +5476,9 @@ class InkFlowEngine:
                     f"Writer 修订期间依据已变化，未覆盖当前草稿；候选稿在 {candidate_path}，请按当前版本继续。"
                 )
             chapter_title = _normalise_chapter_title(chapter_no, draft.title)
-            clean_content = draft.content if local_only else _deduplicate_exact_paragraphs(
+            # DraftOutput validates strings with whitespace stripping; exact
+            # replacements must preserve the untouched manuscript boundaries.
+            clean_content = patched if local_only else _deduplicate_exact_paragraphs(
                 _strip_model_chapter_heading(draft.content, chapter_no))
             if not local_only:
                 draft, clean_content = await self._repair_short_draft(
@@ -5431,13 +5527,23 @@ class InkFlowEngine:
                     run_id=trace.run_id,
                     draft=draft,
                     card=card,
+                    actor=revision_actor,
                 )
+                if local_only and previous_notes:
+                    trace.record("writer.notes.inherited", "completed", "局部修订保留原版公开说明，仍由新版本审查核对",
+                        metadata={"source_artifact_ids": previous_notes.get("artifact_ids", []),
+                            "inherited_from_version": previous_notes["chapter_version"],
+                            "source_content_hash": previous_notes["content_hash"],
+                            "chapter_version": version, "content_hash": hook_artifact["data"]["content_hash"],
+                            "setting_proposals_not_rebound": len((previous_notes.get("hook_note") or {}).get("setting_updates", []))},
+                        public=False)
                 blueprint_artifact = self._save_scene_blueprint(
                     project,
                     chapter_no=chapter_no,
                     chapter_version=version,
                     run_id=trace.run_id,
                     draft=draft,
+                    actor=revision_actor,
                 )
                 context_manifest = self._save_writer_context_manifest(
                     project,
@@ -5446,12 +5552,12 @@ class InkFlowEngine:
                     run_id=trace.run_id,
                     packet=packet,
                     active_skills=active_skills,
-                )
+                ) if not approved_copyedit else None
                 project.db.resolve_pending_collaboration(chapter_no=chapter_no, recipient_role="writer")
                 project.db.append_collaboration_message(
                     thread_id=f"chapter-{chapter_no:05d}-v{version}",
                     run_id=trace.run_id,
-                    sender_role="writer",
+                    sender_role=revision_actor,
                     recipient_role="editor",
                     message_type="handoff",
                     chapter_no=chapter_no,
@@ -5462,7 +5568,7 @@ class InkFlowEngine:
                         Path(chapter["path"]).as_posix(),
                         f"review:chapter:{chapter_no:05d}:v{previous_version}",
                         f"artifact:{hook_artifact['artifact_id']}",
-                        f"artifact:{context_manifest['artifact_id']}",
+                        *([f"artifact:{context_manifest['artifact_id']}"] if context_manifest else []),
                         *(
                             [f"artifact:{blueprint_artifact['artifact_id']}"]
                             if blueprint_artifact
@@ -5473,7 +5579,7 @@ class InkFlowEngine:
                 )
                 project.db.record_learning_event(
                     "revised",
-                    {"previous_version": previous_version, "new_version": version, "source": "reviewer_or_user"},
+                    {"previous_version": previous_version, "new_version": version, "source": revision_actor},
                     chapter_no=chapter_no,
                     chapter_version=version,
                 )
@@ -5493,9 +5599,10 @@ class InkFlowEngine:
                 "title": chapter_title,
                 "draft_path": str(draft_path),
                 "decision_summary": draft.decision_summary,
+                "revision_actor": revision_actor,
                 "hook_note": hook_artifact["data"],
                 "scene_blueprint": blueprint_artifact["data"] if blueprint_artifact else None,
-                "context_manifest": context_manifest["data"],
+                "context_manifest": context_manifest["data"] if context_manifest else None,
                 "skills_used": active_skills,
                 "trace_id": trace.run_id,
                 "next_action": "重新审查当前版本",
@@ -9328,6 +9435,45 @@ def _local_repair_strategy(findings: list[ReviewFinding], progress: list[dict[st
     if progress:
         method += "\n先对照原任务的实际修订结果，未通过不代表需要改全章：" + json_dumps(progress[-2:])
     return method
+
+
+def _review_copyedit_patch(report: ReviewReport, content: str) -> AcceptedContinuityPatch | None:
+    """Reuse a reviewer suggestion only for a small, located, non-semantic fix."""
+    if (report.verdict not in {"pass", "patch"} or report.source_hash != content_hash(content)
+            or not report.copyedits or report.missing_source_ids
+            or (report.memory_patch and report.memory_patch.unresolved_conflicts)
+            or any(item.severity in {"major", "blocking"} for item in report.findings)):
+        return None
+    edits, changed = [], 0
+    for edit in report.copyedits:
+        target, replacement = edit.target_excerpt, edit.replacement
+        matching = [item for item in report.findings if item.severity == "minor"
+            and item.category in {"style", "format", "readability"}
+            and item.verification_status == "anchored" and item.evidence and item.evidence in content
+            and item.semantic_status not in {"uncertain", "contradicted", "not_blocking"}
+            and (target in item.evidence or item.evidence in target)]
+        if (edit.author_role not in {"editor", "reviewer"} or not edit.meaning_preserved or not matching
+                or not target or content.count(target) != 1 or len(target) > 200 or len(replacement) > 240
+                or re.findall(r"\d+|[零〇一二三四五六七八九十百千万两]+", target)
+                    != re.findall(r"\d+|[零〇一二三四五六七八九十百千万两]+", replacement)
+                or re.findall(r"[不没未无非勿莫别]|\b(?:not|never|no|without)\b", target.casefold())
+                    != re.findall(r"[不没未无非勿莫别]|\b(?:not|never|no|without)\b", replacement.casefold())):
+            return None
+        if target == replacement:
+            continue
+        changed += sum(max(end_a - start_a, end_b - start_b)
+            for tag, start_a, end_a, start_b, end_b in SequenceMatcher(None, target, replacement).get_opcodes()
+            if tag != "equal")
+        edits.append({"target_excerpt": target, "replacement": replacement})
+    # shortcut: larger changes require the Writer path and its existing review.
+    if not edits or changed > 80:
+        return None
+    try:
+        _apply_unique_replacements(content, [(item["target_excerpt"], item["replacement"]) for item in edits])
+    except ValidationGateError:
+        return None
+    return AcceptedContinuityPatch(edits=edits,
+        reason="；".join(f"{item.author_role}：{item.reason}" for item in report.copyedits)[:1000])
 
 
 def _apply_unique_replacements(source: str, replacements: list[tuple[str, str]]) -> str:
