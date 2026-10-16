@@ -138,6 +138,16 @@ def _hook_planning_instruction(value: str) -> str:
     }.get(value, "大多数章节卡应给出自然的前向期待。")
 
 
+def _saved_length_reference_requested(message: str) -> bool:
+    reuse = re.search(r"(?:复用|沿用|保留).{0,16}(?:原稿|短稿|候选稿|已保存正文)", message)
+    if reuse is None or not re.search(r"(?:只|仅).{0,16}(?:补写|补足|扩写)", message):
+        return False
+    prefix = message[:reuse.start()]
+    return not (re.search(r"(?:不要|不得|不准|不允许|禁止|无需)\s*$", prefix)
+        or any(prefix.count(left) > prefix.count(right) for left, right in (("“", "”"), ("「", "」"), ("『", "』")))
+        or prefix.count('"') % 2)
+
+
 class InkFlowEngine:
     def __init__(self, provider: JsonModelProvider, settings: Settings | None = None):
         self.provider = provider
@@ -2788,6 +2798,111 @@ class InkFlowEngine:
             "confirmation": "可一次确认全部，或按章节号提出局部修改。",
         }
 
+    def _writer_length_reference(self, project: InkFlowProject, chapter_no: int,
+                                 reference: dict[str, str]) -> tuple[DraftOutput, Path, str]:
+        """An explicitly reauthorized old return is a reference, never a passed draft."""
+        from .conversation_scope import conversation_key
+        from .model_usage import usage_ledger_path
+        from .provider import _generation_schema, _model_from_json_content
+        from .studio import StudioDatabase
+        from .task_settings import restore_task_settings
+
+        scope, runtime = active_task_settings.get(), active_runtime.get()
+        grant = project.db.get_metadata(conversation_key("writer_authorization:" + reference.get("message_hash", "")), {})
+        intent = grant.get("intent", {})
+        if (scope is None or runtime is None or runtime.task_id != scope.task_id
+                or scope.novel_id != project.project_id or self.settings.writer_task_attempt_limit != 1
+                or grant.get("task_id") != scope.task_id or grant.get("snapshot_hash") != scope.snapshot_hash
+                or grant.get("novel_id") != project.project_id or grant.get("message_hash") != reference.get("message_hash")
+                or content_hash(intent.get("user_message", "")) != reference.get("message_hash")
+                or not _saved_length_reference_requested(intent.get("user_message", ""))
+                or intent.get("related_task_id") != reference.get("task_id") or reference.get("task_id") == scope.task_id
+                or intent.get("chapter_no") != chapter_no or intent.get("end_chapter_no") not in {None, chapter_no}
+                or intent.get("authorization") != "approved" or intent.get("authorization_source") != "current_request"
+                or intent.get("action") not in {"write_draft", "write_review", "write_review_accept"}):
+            raise ValidationGateError("旧原稿补写的本次授权身份不完整；未重新生成或修改正文。")
+        with project.db.connect() as connection:
+            old_work = [json.loads(row[0]) for row in connection.execute(
+                "SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'")]
+        if not any(item.get("source", {}).get("task_id") == reference["task_id"]
+                   and item.get("kind") == "workflow" and item.get("intent", {}).get("chapter_no") == chapter_no
+                   and item.get("intent", {}).get("end_chapter_no") in {None, chapter_no} for item in old_work):
+            raise ValidationGateError("未找到这份原稿对应的单章原任务，未猜选其他章节。")
+        candidates = []
+        for path in (project.internal / "recovery").glob("provider-response-*/writer-response.unverified.json"):
+            if not path.resolve().is_relative_to(project.root.resolve()):
+                continue
+            try:
+                raw = path.read_text(encoding="utf-8")
+                artifact = json.loads(raw)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(artifact, dict):
+                continue
+            if artifact.get("task_settings", {}).get("task_id") == reference["task_id"]:
+                candidates.append((path, artifact, content_hash(raw)))
+        if len(candidates) != 1:
+            raise ValidationGateError("原任务没有唯一可定位的完整返回，请先选择原稿；未重写整章。")
+        path, artifact, file_hash = candidates[0]
+        if (artifact.get("status") != "unverified" or artifact.get("authority") != "task_temporary_not_canon"
+                or artifact.get("role") != "writer" or artifact.get("schema") != "DraftOutput"
+                or artifact.get("finish_reason") not in {"stop", "end_turn", "stop_sequence"}
+                or artifact.get("content_hash") != content_hash(artifact.get("content", ""))
+                or artifact.get("schema_hash") != content_hash(json_dumps(_generation_schema(DraftOutput)))):
+            raise ValidationGateError("保存的原稿不完整或内容合同已变化；未采用断流片段或篡改后的返回。")
+        with sqlite3.connect((project.internal / "studio.db").resolve().as_uri() + "?mode=ro", uri=True) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute("""SELECT link.task_id,s.novel_id,s.snapshot_hash,s.snapshot_json,s.captured_at,s.source
+                FROM task_run_settings link LEFT JOIN task_settings_snapshots s ON s.task_id=link.task_id
+                WHERE link.run_id=?""", (artifact.get("run_id"),)).fetchone()
+            if row is None:
+                raise ValidationGateError("原稿的任务配置关联缺失，未用当前设置补填历史身份。")
+            snapshot = StudioDatabase._task_settings_record(row, project.project_id)
+            old_scope = restore_task_settings(snapshot, novel_id=project.project_id, workspace_root=project.root)
+        if old_scope.public_summary() != artifact.get("task_settings") or old_scope.task_id != reference["task_id"]:
+            raise ValidationGateError("原稿和原任务快照身份不一致，未采用该返回。")
+        with sqlite3.connect(usage_ledger_path().resolve().as_uri() + "?mode=ro", uri=True) as connection:
+            connection.row_factory = sqlite3.Row
+            attempt = connection.execute("SELECT * FROM model_attempts WHERE attempt_id=?", (artifact.get("attempt_id"),)).fetchone()
+        diagnostic = json.loads(attempt["diagnostic_json"] or "{}") if attempt else {}
+        if (attempt is None or any(attempt[key] != artifact.get(key) for key in ("attempt_id", "request_id"))
+                or attempt["task_id"] != old_scope.task_id or attempt["novel_id"] != project.project_id
+                or attempt["role"] != "writer" or attempt["request_sent"] != 1
+                or attempt["outcome"] != "completed" or not attempt["finished_at"]
+                or diagnostic.get("stage") != "DraftOutput" or diagnostic.get("materials_hash") != artifact.get("input_hash")
+                or (diagnostic.get("response_model") or attempt["model"]) != artifact.get("model")):
+            raise ValidationGateError("原稿缺少对应的完整 Writer 请求记录；未把失败返回当作可补写稿。")
+        draft = _model_from_json_content(artifact["content"], DraftOutput)
+        matched_output = False
+        for events_path in (project.internal / "runs").glob(f"*-write-{chapter_no:05d}-*/events.jsonl"):
+            if not events_path.resolve().is_relative_to(project.root.resolve()):
+                continue
+            for line in events_path.read_text(encoding="utf-8").splitlines():
+                event = json.loads(line)
+                metadata = event.get("metadata", {})
+                if (event.get("stage") != "writer.model" or event.get("status") != "completed"
+                        or not artifact.get("response_id") or metadata.get("response_id") != artifact["response_id"]):
+                    continue
+                output_path = Path(metadata.get("output_path") or "").resolve()
+                if output_path.parent != events_path.parent.resolve() or not output_path.is_file():
+                    raise ValidationGateError("原稿对应的结构化交稿记录缺失，未猜测采用其他输出。")
+                if DraftOutput.model_validate_json(output_path.read_text(encoding="utf-8")) != draft:
+                    raise ValidationGateError("保存原稿与原模型交稿不一致，请先核对改动；未重写正文。")
+                matched_output = True
+        if not matched_output:
+            raise ValidationGateError("未定位到本章对应的完整交稿记录，未用其他章的输出补写。")
+        # Old attachments do not inherit approval or evidence bindings in the new task.
+        draft = draft.model_copy(update={"setting_updates": []})
+        key = f"writer_reference:{scope.task_id}:{chapter_no}"
+        receipt = {"source_task_id": old_scope.task_id, "path": path.relative_to(project.root).as_posix(),
+                   "file_hash": file_hash, "snapshot_hash": scope.snapshot_hash, "message_hash": reference["message_hash"]}
+        stored = project.db.get_metadata(key)
+        if stored is not None and stored != receipt:
+            raise ValidationGateError("本次补写已绑定的原稿发生变化，未换稿或重置次数。")
+        if stored is None:
+            project.db.set_metadata(key, receipt)
+        return draft, path, file_hash
+
     async def write_chapter(
         self,
         root: str | Path,
@@ -2796,6 +2911,7 @@ class InkFlowEngine:
         *,
         provisional_chapters: list[dict[str, Any]] | None = None,
         retry_expected_state: dict[str, Any] | None = None,
+        draft_reference: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         project = await asyncio.to_thread(InkFlowProject, root)
         trace = TraceRecorder(project.root, f"write-{chapter_no:05d}", self.settings.trace_level)
@@ -2814,6 +2930,9 @@ class InkFlowEngine:
                     f"第 {chapter_no} 章已进入正史，不能消耗一次 Writer 调用后再尝试覆盖。"
                     "请先选择有安全点的分支修订；未确认恢复前不改正史。"
                 )
+            if draft_reference and existing_chapter:
+                raise ValidationGateError("本章已有当前版本，请从现有草稿修订，未用旧返回覆盖。")
+            reference = self._writer_length_reference(project, chapter_no, draft_reference) if draft_reference else None
             quality_hold = project.latest_accepted_quality_hold()
             if quality_hold and chapter_no > int(quality_hold["chapter_no"]):
                 held = int(quality_hold["chapter_no"])
@@ -2830,6 +2949,8 @@ class InkFlowEngine:
             existing_chapter = project.db.get_chapter(chapter_no)
             if existing_chapter and existing_chapter["status"] == "accepted":
                 raise ValidationGateError(f"第 {chapter_no} 章在补齐计划期间已进入正史，本次 Writer 不再启动。")
+            if reference and existing_chapter:
+                raise ValidationGateError("准备补写期间本章已有新草稿，未用旧返回覆盖；请从当前版本修订。")
             card = project.db.get_chapter_card(chapter_no)
             if not card:
                 raise ValidationGateError(f"缺少第 {chapter_no} 章章节卡。")
@@ -2877,38 +2998,36 @@ class InkFlowEngine:
             writer_prompt += "\n连续写作先核对前章已经完成的行动和时间，不把已发生的登记、见面、报信或取得证据再次写成首次发生，不复演前章整场对白。若章节卡的核心行动已由正史完成，应从该结果后的新选择、代价或后果推进，并在同次创作说明中解释衔接调整；未来规划不能覆盖已发生事实。\n"
             if self._writer_source_fingerprint(project, chapter_no) != source_fingerprint:
                 raise ValidationGateError("构建 Writer 输入期间章节依据发生变化，本次请求未发送；请按当前版本继续。")
-            trace.record_model_started(
-                "writer.model",
-                model=self.settings.model,
-                agent_role="writer",
-                # Keep the structured response bounded so a low-effort
-                # chapter request does not spend its budget echoing context.
-                # 6k is enough for a complete DraftOutput at the default
-                # 3k-character chapter target and its audit summary.
-                max_tokens=self.settings.max_output_tokens,
-                timeout_seconds=self.settings.request_timeout_seconds,
-                thinking=writer_thinking,
-            )
-            result = await self.provider.generate_json(
-                system_prompt=WRITER_SYSTEM,
-                user_prompt=writer_prompt,
-                cache_prefix=packet.model_prompt_parts()[0] or None,
-                output_model=DraftOutput,
-                effort=self.settings.reasoning_effort,
-                max_tokens=self.settings.max_output_tokens,
-                thinking=writer_thinking,
-                agent_role="writer",
-            )
-            draft = result.data
-            trace.record_model("writer.model", result, "完成章节草稿并给出可审计决策摘要")
+            if reference:
+                draft = reference[0]
+                trace.record("writer.reference", "completed", "复用明确指定的未审原稿，只对照当前资料定点补足篇幅",
+                    metadata={"source_task_id": draft_reference["task_id"],
+                        "reference_path": str(reference[1]), "reference_hash": reference[2],
+                        "authority": "unreviewed_reference", "base_generation_skipped": True})
+            else:
+                trace.record_model_started(
+                    "writer.model", model=self.settings.model, agent_role="writer",
+                    max_tokens=self.settings.max_output_tokens,
+                    timeout_seconds=self.settings.request_timeout_seconds, thinking=writer_thinking,
+                )
+                result = await self.provider.generate_json(
+                    system_prompt=WRITER_SYSTEM, user_prompt=writer_prompt,
+                    cache_prefix=packet.model_prompt_parts()[0] or None,
+                    output_model=DraftOutput, effort=self.settings.reasoning_effort,
+                    max_tokens=self.settings.max_output_tokens, thinking=writer_thinking, agent_role="writer",
+                )
+                draft = result.data
+                trace.record_model("writer.model", result, "完成章节草稿并给出可审计决策摘要")
             if self._writer_source_fingerprint(project, chapter_no) != source_fingerprint:
                 candidate_path = trace.run_dir / "stale-candidate.md"
                 atomic_write_text(candidate_path, draft.content)
                 raise ValidationGateError(f"Writer 等待期间章节依据已变化，未覆盖当前草稿；候选稿在 {candidate_path}，请按当前版本继续。")
             chapter_title = _normalise_chapter_title(chapter_no, draft.title)
-            clean_content = _deduplicate_exact_paragraphs(
-                _strip_model_chapter_heading(draft.content, chapter_no)
-            )
+            clean_content = _strip_model_chapter_heading(draft.content, chapter_no)
+            if not reference:
+                clean_content = _deduplicate_exact_paragraphs(clean_content)
+            if reference and _content_char_count(clean_content) >= int(int(card["target_words"]) * (1 - self.settings.chapter_length_tolerance)):
+                raise ValidationGateError("指定原稿已不属于篇幅不足的候选，本次补写没有启动；请按当前稿选择审核或修订。")
             draft, clean_content = await self._repair_short_draft(
                 draft,
                 clean_content,
@@ -2923,10 +3042,16 @@ class InkFlowEngine:
             chapter_text = f"# 第 {chapter_no} 章 {chapter_title}\n\n{clean_content}\n"
             relative = Path("chapters") / f"chapter_{chapter_no:05d}.draft.md"
             async with project_write_lock(project.root):
+                if reference and project.db.get_chapter(chapter_no):
+                    atomic_write_text(trace.run_dir / "stale-candidate.md", chapter_text)
+                    raise ValidationGateError("补写期间本章已有新版本，候选已保留，未用旧返回覆盖。")
                 if self._writer_source_fingerprint(project, chapter_no) != source_fingerprint:
                     candidate_path = trace.run_dir / "stale-candidate.md"
                     atomic_write_text(candidate_path, chapter_text)
                     raise ValidationGateError(f"Writer 修订期间章节依据已变化，未覆盖当前草稿；候选稿在 {candidate_path}，请按当前版本继续。")
+                if reference and content_hash(reference[1].read_text(encoding="utf-8")) != reference[2]:
+                    atomic_write_text(trace.run_dir / "stale-candidate.md", chapter_text)
+                    raise ValidationGateError("补写期间指定原稿发生变化，候选已保留，未覆盖当前版本。")
                 atomic_write_text(project.root / relative, chapter_text)
                 runtime = active_runtime.get()
                 version = project.db.upsert_draft(chapter_no, chapter_title, relative.as_posix(), chapter_text,
@@ -3106,14 +3231,16 @@ class InkFlowEngine:
         # concrete after every miss instead of repeating the same prompt.
         working_draft = draft
         working_content = clean_content
-        max_attempts = 2
         project = InkFlowProject(trace.project_root, recover_on_open=False)
-        recovery = await self._native_recovery_attempts(project, "writer.length", chapter_no)
+        recovery = await self._native_recovery_attempts(project, "writer.length", chapter_no,
+            limit=min(2, max(0, cap - sent)) if cap is not None else 2)
+        max_attempts = recovery["limit"]
         for _ in range(recovery["attempts"], recovery["limit"]):
             current = _content_char_count(working_content)
             if current >= lower_bound:
                 return working_draft, working_content
-            recovery = await self._native_recovery_attempts(project, "writer.length", chapter_no, reserve=True)
+            recovery = await self._native_recovery_attempts(project, "writer.length", chapter_no,
+                limit=max_attempts, reserve=True)
             attempt = recovery["attempts"]
             paragraphs = [item.strip() for item in working_content.split("\n\n") if item.strip()]
             repair_target = min(

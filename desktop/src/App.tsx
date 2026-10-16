@@ -268,6 +268,7 @@ type ThemeMode = "dark" | "light" | "system";
 type AccentPalette = "lime" | "jade" | "blue" | "violet" | "amber" | "rose";
 type UiDensity = "comfortable" | "compact";
 type PrefillLength = "short" | "medium" | "long";
+type ChatKeyStroke = { key: string; code?: string; ctrlKey?: boolean; altKey?: boolean; shiftKey?: boolean; metaKey?: boolean; repeat?: boolean; isComposing?: boolean; keyCode?: number; getModifierState?: (key: string) => boolean };
 type UiPreferences = {
   theme: ThemeMode;
   accent: AccentPalette;
@@ -276,7 +277,52 @@ type UiPreferences = {
   prefillDelayMs: number;
   prefillLength: PrefillLength;
   suggestedPromptsEnabled: boolean;
+  suggestionShortcutEnabled: boolean;
+  suggestionShortcut: string;
 };
+
+function normalizeSuggestionShortcut(value: unknown): string {
+  if (typeof value !== "string" || !value || value.length > 80) return "";
+  const parts = value.split("+");
+  const code = parts.pop() || "";
+  if (!/^(?:Key[A-Z]|Digit[0-9]|F(?:[1-9]|1[0-2])|Enter)$/.test(code)
+      || new Set(parts).size !== parts.length || parts.some(part => !["Ctrl", "Alt", "Shift", "Meta"].includes(part))) return "";
+  const ctrl = parts.includes("Ctrl"), alt = parts.includes("Alt"), shift = parts.includes("Shift"), meta = parts.includes("Meta");
+  if (!ctrl && !alt && !meta) return "";
+  if (code === "Enter" && !(alt && !ctrl && !meta && !shift)) return "";
+  if (code === "F10" || alt && ["F4", "KeyD", "KeyF"].includes(code)) return "";
+  if ((ctrl || meta) && (/^Digit/.test(code) || ["KeyA", "KeyB", "KeyC", "KeyF", "KeyH", "KeyI", "KeyJ", "KeyL", "KeyN", "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU", "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ", "F4", "F5", "F6", "F11", "F12"].includes(code))) return "";
+  if (meta && ["KeyD", "KeyE", "KeyG", "KeyK", "KeyM", "F1"].includes(code)) return "";
+  return [...(ctrl ? ["Ctrl"] : []), ...(alt ? ["Alt"] : []), ...(shift ? ["Shift"] : []), ...(meta ? ["Meta"] : []), code].join("+");
+}
+
+function suggestionShortcutFromKey(event: ChatKeyStroke): string {
+  if (event.isComposing || event.keyCode === 229 || event.getModifierState?.("AltGraph") || ["Dead", "Process", "Unidentified"].includes(event.key)) return "";
+  const code = event.code === "NumpadEnter" ? "Enter" : event.code || (/^[a-z]$/i.test(event.key) ? `Key${event.key.toUpperCase()}` : /^\d$/.test(event.key) ? `Digit${event.key}` : event.key);
+  return normalizeSuggestionShortcut([...(event.ctrlKey ? ["Ctrl"] : []), ...(event.altKey ? ["Alt"] : []), ...(event.shiftKey ? ["Shift"] : []), ...(event.metaKey ? ["Meta"] : []), code].join("+"));
+}
+
+function suggestionShortcutLabel(shortcut: string): string {
+  return normalizeSuggestionShortcut(shortcut).split("+").map(part => part.replace(/^Key|^Digit/, "")).join(" + ") || "未设置";
+}
+
+function matchesSuggestionShortcut(event: ChatKeyStroke, shortcut: string): boolean {
+  return !event.repeat && Boolean(shortcut) && suggestionShortcutFromKey(event) === normalizeSuggestionShortcut(shortcut) && Boolean(normalizeSuggestionShortcut(shortcut));
+}
+
+function canFillSuggestionShortcut(event: ChatKeyStroke, shortcut: string, enabled: boolean, inChat: boolean, modalOpen: boolean): boolean {
+  return enabled && inChat && !modalOpen && matchesSuggestionShortcut(event, shortcut);
+}
+
+function isChatSubmitKey(event: ChatKeyStroke): boolean {
+  return event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.repeat && !event.isComposing && event.keyCode !== 229;
+}
+
+function prepareSuggestionFill(current: string, prompt?: string): { value: string; filled: boolean; message: string } {
+  if (current.length) return { value: current, filled: false, message: "已有未发送内容，已保留；清空后再填入建议。" };
+  if (!prompt?.trim()) return { value: current, filled: false, message: "当前没有可填入的建议。" };
+  return { value: prompt.trim(), filled: true, message: "已填入建议，检查后再发送。" };
+}
 
 type SpeechRecognitionResultLike = { isFinal: boolean; [index: number]: { transcript: string } };
 type SpeechRecognitionEventLike = { resultIndex: number; results: ArrayLike<SpeechRecognitionResultLike> };
@@ -306,6 +352,8 @@ const defaultUiPreferences: UiPreferences = {
   prefillDelayMs: 900,
   prefillLength: "medium",
   suggestedPromptsEnabled: true,
+  suggestionShortcutEnabled: true,
+  suggestionShortcut: "Alt+Enter",
 };
 
 function loadUiPreferences(): UiPreferences {
@@ -319,6 +367,8 @@ function loadUiPreferences(): UiPreferences {
       prefillDelayMs: Math.max(300, Math.min(3000, Number(stored.prefillDelayMs) || defaultUiPreferences.prefillDelayMs)),
       prefillLength: ["short", "medium", "long"].includes(String(stored.prefillLength)) ? stored.prefillLength as PrefillLength : defaultUiPreferences.prefillLength,
       suggestedPromptsEnabled: stored.suggestedPromptsEnabled !== false,
+      suggestionShortcutEnabled: stored.suggestionShortcutEnabled !== false && (stored.suggestionShortcut === undefined || Boolean(normalizeSuggestionShortcut(stored.suggestionShortcut))),
+      suggestionShortcut: stored.suggestionShortcut === undefined ? defaultUiPreferences.suggestionShortcut : normalizeSuggestionShortcut(stored.suggestionShortcut),
     };
   } catch {
     return defaultUiPreferences;
@@ -372,6 +422,7 @@ function App() {
     },
   ]);
   const [chatInput, setChatInput] = useState("");
+  const [suggestionFillStatus, setSuggestionFillStatus] = useState("");
   const [busy, setBusy] = useState(false);
   const [cancelReady, setCancelReady] = useState(false);
   const [projectLoading, setProjectLoading] = useState(false);
@@ -548,7 +599,10 @@ function App() {
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(uiPreferencesStorageKey, JSON.stringify(uiPreferences));
+    try {
+      const value = JSON.stringify(uiPreferences);
+      if (localStorage.getItem(uiPreferencesStorageKey) !== value) localStorage.setItem(uiPreferencesStorageKey, value);
+    } catch { /* Keep current-window preferences usable if local storage is unavailable. */ }
     const root = window.document.documentElement;
     const applyTheme = () => {
       const resolved = uiPreferences.theme === "system"
@@ -563,6 +617,22 @@ function App() {
     media.addEventListener("change", applyTheme);
     return () => media.removeEventListener("change", applyTheme);
   }, [uiPreferences]);
+
+  useEffect(() => {
+    const sync = (event: StorageEvent) => {
+      if (event.key !== null && event.key !== uiPreferencesStorageKey) return;
+      const next = loadUiPreferences();
+      setUiPreferences(current => JSON.stringify(current) === JSON.stringify(next) ? current : next);
+    };
+    window.addEventListener("storage", sync);
+    return () => window.removeEventListener("storage", sync);
+  }, []);
+
+  useEffect(() => {
+    if (!suggestionFillStatus) return;
+    const timer = window.setTimeout(() => setSuggestionFillStatus(""), 4500);
+    return () => window.clearTimeout(timer);
+  }, [suggestionFillStatus]);
 
   const request = useCallback(
     async <T,>(method: string, params: Record<string, unknown> = {}): Promise<T> => {
@@ -1882,6 +1952,33 @@ function App() {
   };
 
   const stats = document?.statistics || emptyStatistics;
+  const visibleSuggestedPrompts = useMemo(() => (suggestedPrompts.length ? suggestedPrompts : initialSuggestedPrompts(dashboard, busy, pendingQuestions.length > 0))
+    .filter(item => item.prompt?.trim()).slice(0, 4), [suggestedPrompts, dashboard, busy, pendingQuestions.length]);
+  const fillSuggestedPrompt = useCallback((prompt?: string) => {
+    if (voiceStarting || voiceRecording || voiceTranscribing) { setSuggestionFillStatus("语音输入尚未结束，已保留当前输入。请停止听写后再填入建议。"); return; }
+    const result = prepareSuggestionFill(chatInputRef.current?.value ?? chatInput, prompt);
+    setSuggestionFillStatus(result.message);
+    if (result.filled) {
+      setChatInput(result.value);
+      setPromptOptimization(null);
+      setPromptUndo(null);
+    }
+    chatInputRef.current?.focus();
+  }, [chatInput, voiceStarting, voiceRecording, voiceTranscribing]);
+  useEffect(() => {
+    const fillFromShortcut = (event: KeyboardEvent) => {
+      const input = chatInputRef.current;
+      const inChat = Boolean(input && input.getClientRects().length && event.target instanceof Element && input.closest(".conversation-panel")?.contains(event.target));
+      if (!canFillSuggestionShortcut(event, uiPreferences.suggestionShortcut,
+        uiPreferences.suggestedPromptsEnabled && uiPreferences.suggestionShortcutEnabled, inChat,
+        showSettings || Boolean(window.document.querySelector('[aria-modal="true"], dialog[open]')))) return;
+      event.preventDefault();
+      event.stopPropagation();
+      fillSuggestedPrompt(visibleSuggestedPrompts[0]?.prompt);
+    };
+    window.addEventListener("keydown", fillFromShortcut, true);
+    return () => window.removeEventListener("keydown", fillFromShortcut, true);
+  }, [uiPreferences.suggestedPromptsEnabled, uiPreferences.suggestionShortcutEnabled, uiPreferences.suggestionShortcut, showSettings, visibleSuggestedPrompts, fillSuggestedPrompt]);
   useEffect(() => {
     if (!projectRoot || sharedWorkspaceRef.current || !window.inkflow.publishWorkspaceState) return;
     const timer = window.setTimeout(() => { void window.inkflow.publishWorkspaceState({ projectRoot, dashboard, tree, document, messages: messages.slice(-200), suggestedPrompts, events: events.slice(-200), pendingQuestions, busy, cancelReady, activeRunId, runStartedAt: runStartedAtRef.current, collaboration, contextStatus, notice, error }).catch(() => undefined); }, 100);
@@ -2011,8 +2108,8 @@ function App() {
           <BatchProgressStatus batches={collaboration?.batches || []} events={events} activeRunId={activeRunId} />
           {uiPreferences.suggestedPromptsEnabled && (
             <div className="quick-row" role="toolbar" aria-label="下一步推荐输入">
-              {(suggestedPrompts.length ? suggestedPrompts : initialSuggestedPrompts(dashboard, busy, pendingQuestions.length > 0)).slice(0, 4).map((item) => (
-                <button key={item.prompt} type="button" title={item.reason ? `${item.reason}\n${item.prompt}` : item.prompt} onClick={() => { setChatInput(item.prompt); chatInputRef.current?.focus(); }}>{item.label}</button>
+              {visibleSuggestedPrompts.map((item, index) => (
+                <button key={item.prompt} type="button" title={[item.reason, item.prompt, index === 0 && uiPreferences.suggestionShortcutEnabled && uiPreferences.suggestionShortcut ? `${suggestionShortcutLabel(uiPreferences.suggestionShortcut)} 只填入，检查后再发送` : ""].filter(Boolean).join("\n")} onClick={() => fillSuggestedPrompt(item.prompt)}>{item.label}{index === 0 && uiPreferences.suggestionShortcutEnabled && uiPreferences.suggestionShortcut && <kbd className="suggestion-shortcut-hint">{suggestionShortcutLabel(uiPreferences.suggestionShortcut)}</kbd>}</button>
               ))}
             </div>
           )}
@@ -2047,15 +2144,17 @@ function App() {
               onChange={(event) => {
                 const value = event.target.value;
                 setChatInput(value);
+                setSuggestionFillStatus("");
               }}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                if (isChatSubmitKey(event.nativeEvent)) {
                   event.preventDefault();
                   void sendChat();
                 }
               }}
               placeholder={pendingQuestions.length ? "补充你的选择，或说说希望怎么调整…" : busy ? "可以补充这次任务的要求，墨宝会接着当前进度处理…" : uiPreferences.suggestedPromptsEnabled && suggestedPrompts[0]?.prompt ? readableSourceText(suggestedPrompts[0].prompt) : initialSuggestedPrompts(dashboard, false, false)[0]?.prompt || "说说你想写的故事，或想先完善哪些设定…"}
             />
+            {suggestionFillStatus && <p className="suggestion-fill-status" role="status" aria-live="polite">{suggestionFillStatus}</p>}
             {(voiceStarting || voiceRecording || voiceTranscribing) && <div className="voice-live-transcript" role="status" aria-live="polite">
               <div><strong>实时听写</strong><span>只是预览，停止后才回填输入框</span></div>
               <p>{voiceTranscript || voiceInputPhase || "请开始说话…"}</p>{voiceTranscript && <small>{voiceInputPhase}</small>}{voiceLiveProblem && <p className="form-error">{voiceLiveProblem}</p>}
@@ -3400,6 +3499,29 @@ function modelSettingsForm(provider: Record<string, unknown> | null) {
   return { request_timeout_seconds: Number(provider?.request_timeout_seconds ?? 180), planning_timeout_seconds: Number(provider?.planning_timeout_seconds ?? 600), collaboration_preset: String(provider?.collaboration_preset || "everyday"), quality_preset: String(provider?.quality_preset || "custom"), quality_custom_context: provider?.quality_custom_context !== false, provider_kind: String(provider?.provider_kind || "deepseek"), api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), hook_strategy: String(provider?.hook_strategy || "most_chapters"), chapter_length_tolerance: Number(provider?.chapter_length_tolerance ?? 0.1), review_min_confidence: Number(provider?.review_min_confidence ?? 0.8), acceptance_confirmation_mode: String(provider?.acceptance_confirmation_mode || "auto_after_review"), planning_publication_mode: String(provider?.planning_publication_mode || "auto_after_review"), planning_window_chapters: Number(provider?.planning_window_chapters ?? 10), dialogue_history_mode: String(provider?.dialogue_history_mode || "auto"), dialogue_history_interval: Number(provider?.dialogue_history_interval || 1), dialogue_history_limit: Number(provider?.dialogue_history_limit || 100), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), context_budget_mode: String(provider?.context_budget_mode || "unified"), agent_context_budgets: agentContextBudgetsFromProvider(provider?.agent_context_budgets), max_output_tokens: Number(provider?.max_output_tokens || 32000), input_price_per_million: Number(provider?.input_price_per_million || 0), output_price_per_million: Number(provider?.output_price_per_million || 0), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_experience_detail: String(provider?.review_experience_detail || "standard"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), manual_edit_review_enabled: provider?.manual_edit_review_enabled !== false, agent_generation: agentGenerationFromProvider(provider?.agent_generation), role_models: roleModelsFromProvider(provider?.role_models) };
 }
 
+function SuggestionShortcutSettings({ preferences, onChange }: { preferences: UiPreferences; onChange: (patch: Partial<UiPreferences>) => void }) {
+  const [recording, setRecording] = useState(false);
+  const [feedback, setFeedback] = useState("");
+  useEffect(() => setRecording(false), [preferences.suggestionShortcut, preferences.suggestionShortcutEnabled]);
+  return <div className="suggestion-shortcut-settings">
+    <label className="setting-check"><input type="checkbox" checked={preferences.suggestionShortcutEnabled} disabled={!preferences.suggestionShortcut} onChange={event => onChange({ suggestionShortcutEnabled: event.target.checked })} />快捷键填入第一条建议 <small>只在显示下一步提示词时生效</small></label>
+    <div className="settings-inline-actions"><span>当前键位：<kbd>{suggestionShortcutLabel(preferences.suggestionShortcut)}</kbd></span><button type="button" aria-pressed={recording} onBlur={() => setRecording(false)} onClick={() => { setFeedback(""); setRecording(value => !value); }} onKeyDown={event => {
+      if (!recording || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+      if (event.key === "Tab") { setRecording(false); return; }
+      event.preventDefault(); event.stopPropagation();
+      if (event.repeat) return;
+      if (event.key === "Escape") { setRecording(false); setFeedback("已取消录制，原键位保留。"); return; }
+      if (["Control", "Alt", "Shift", "Meta"].includes(event.key)) return;
+      const shortcut = suggestionShortcutFromKey(event.nativeEvent);
+      if (!shortcut) { setFeedback("请用 Ctrl、Alt 或 Meta 搭配字母、数字或功能键。Enter 组合只支持 Alt+Enter，常用编辑键和系统保留键不能使用。"); return; }
+      onChange({ suggestionShortcut: shortcut, suggestionShortcutEnabled: true });
+      setRecording(false); setFeedback(`已保存 ${suggestionShortcutLabel(shortcut)}；回到聊天区后只填入建议。`);
+    }}>{recording ? "请按新的组合键…" : preferences.suggestionShortcut ? "更改键位" : "录制快捷键"}</button><button type="button" disabled={!preferences.suggestionShortcut && !recording} onClick={() => { setRecording(false); onChange({ suggestionShortcut: "", suggestionShortcutEnabled: false }); setFeedback("快捷键已清空并停用，建议按钮仍可使用。"); }}>清空并停用</button></div>
+    <p className="form-hint">默认 Alt+Enter。已有未发送内容时不覆盖；填入后由你检查并发送。录制时按 Esc 取消；未设置键位时须先录制。</p>
+    {feedback && <p className="form-hint" role="status">{feedback}</p>}
+  </div>;
+}
+
 function SettingsDialog({ initialSection = "appearance", projectRoot, provider, voiceSettings, voiceStatus, preferences, onPreferencesChange, onClose, onSaved, onVoiceSaved }: {
   initialSection?: SettingsSection;
   projectRoot: string;
@@ -3629,7 +3751,7 @@ function SettingsDialog({ initialSection = "appearance", projectRoot, provider, 
   };
   const activePreset = form.quality_custom_context || form.quality_preset === "custom" ? "custom" : form.quality_preset;
   const inferredProvider = form.provider_kind;
-  const settingKeywords: Record<SettingsSection, string> = { story_settings: "本书 设定 人物 场景 道具 世界 模板 资料 记录 证据 分类", author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", models: "模型 服务商 API 密钥 价格 费用 能力 列表 等待 超时 秒数", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", repair: "版本 修复 引擎 连接 组件 更新", advanced: "高级 temperature top p top k PowerShell" };
+  const settingKeywords: Record<SettingsSection, string> = { story_settings: "本书 设定 人物 场景 道具 世界 模板 资料 记录 证据 分类", author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", models: "模型 服务商 API 密钥 价格 费用 能力 列表 等待 超时 秒数", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数 智能提示词 下一步 建议 快捷键 键位 录制", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", repair: "版本 修复 引擎 连接 组件 更新", advanced: "高级 temperature top p top k PowerShell" };
   const visibleSections = SETTINGS_SECTIONS.filter((item) => `${item.label}${item.note}${settingKeywords[item.id]}`.toLowerCase().includes(search.trim().toLowerCase()));
   const chooseProvider = (id: string) => {
     const choice = PROVIDER_OPTIONS.find((item) => item.id === id);
@@ -3820,7 +3942,7 @@ function SettingsDialog({ initialSection = "appearance", projectRoot, provider, 
           <SettingGroup title="章节检查"><div className="settings-fields two"><label>结尾钩子<select value={form.hook_strategy} onChange={(event) => updateForm({ hook_strategy: event.target.value })}><option value="most_chapters">大多数章节保留期待</option><option value="key_chapters">重点章节使用明确钩子</option><option value="natural_afterglow">自然余味优先</option></select></label><label>字数容差 <small>上下 {(form.chapter_length_tolerance * 100).toFixed(0)}%</small><input type="range" min={0.05} max={0.3} step={0.05} value={form.chapter_length_tolerance} onChange={(event) => updateForm({ chapter_length_tolerance: Number(event.target.value) })} /></label><label>自动通过最低审查符合度 <small>{(Math.max(0.8, form.review_min_confidence) * 100).toFixed(0)}%</small><input type="range" min={0.8} max={1} step={0.05} value={Math.max(0.8, form.review_min_confidence)} onChange={(event) => updateForm({ review_min_confidence: Number(event.target.value) })} /></label></div><p className="form-hint">默认字数±10%。自动通过须必需项无硬问题、来源证据齐全且加权符合度达到设置值（至少80%）。百分比不是正确概率；缺资料先补审，不让 Writer 为漏读改稿。</p></SettingGroup>
           <SettingGroup title="验收确认策略" note="选择草稿审核通过后如何验收。"><label>确认方式<select value={form.acceptance_confirmation_mode} onChange={(event) => updateForm({ acceptance_confirmation_mode: event.target.value })}><option value="auto_after_review">Editor 审查通过后自动验收（默认）</option><option value="batch_once">批次提交前确认一次</option><option value="per_chapter">逐章确认</option></select></label><p className="form-hint">“自动验收”只在当前版本没有硬问题且 Editor 审查通过时生效；尚未完成的审查不会伪装成通过。切换设置只影响之后的操作。</p></SettingGroup>
           <SettingGroup title="预填续写" note="启用后，编辑停顿会调用当前 Writer 模型，因此可能产生费用。"><label className="setting-check"><input type="checkbox" checked={preferences.prefillEnabled} onChange={(event) => updatePreferences({ prefillEnabled: event.target.checked })} />允许在编辑器中手动开启灰字预填候选</label><div className="settings-fields two"><label>等待时间 <small>{preferences.prefillDelayMs} 毫秒</small><input type="range" min="300" max="3000" step="100" value={preferences.prefillDelayMs} onChange={(event) => updatePreferences({ prefillDelayMs: Number(event.target.value) })} /></label><label>候选长度<select value={preferences.prefillLength} onChange={(event) => updatePreferences({ prefillLength: event.target.value as PrefillLength })}><option value="short">短句</option><option value="medium">一小段</option><option value="long">长段落</option></select></label></div></SettingGroup>
-          <SettingGroup title="智能提示词" note="输入框上方的快捷按钮根据最近对话和项目阶段提供下一步建议。"><label className="setting-check"><input type="checkbox" checked={preferences.suggestedPromptsEnabled} onChange={(event) => updatePreferences({ suggestedPromptsEnabled: event.target.checked })} />显示下一步提示词 <small>执行结束后由Coordinator结合实际结果生成建议，会计入当前任务模型用量；关闭后不生成建议</small></label></SettingGroup>
+          <SettingGroup title="智能提示词" note="输入框上方的快捷按钮根据最近对话和项目阶段提供下一步建议。"><label className="setting-check"><input type="checkbox" checked={preferences.suggestedPromptsEnabled} onChange={(event) => updatePreferences({ suggestedPromptsEnabled: event.target.checked })} />显示下一步提示词 <small>执行结束后由Coordinator结合实际结果生成建议，会计入当前任务模型用量；关闭后不生成建议</small></label><SuggestionShortcutSettings preferences={preferences} onChange={updatePreferences} /></SettingGroup>
           <SettingGroup title="对话历史" note="对话保存在本书项目中。"><div className="settings-fields two"><label>保存方式<select value={form.dialogue_history_mode} onChange={(event) => updateForm({ dialogue_history_mode: event.target.value })}><option value="auto">主动保存（自动写入）</option><option value="manual">被动保存（只在对话历史里手动保存）</option><option value="both">两者都有</option></select></label><label>最多保留 <small>条记录</small><input type="number" min={5} max={1000} value={form.dialogue_history_limit} onChange={(event) => updateForm({ dialogue_history_limit: Number(event.target.value) })} /></label></div><div className="settings-fields"><label>自动保存间隔 <small>每 N 轮写入一次</small><input type="number" min={1} max={50} value={form.dialogue_history_interval} disabled={form.dialogue_history_mode === "manual"} onChange={(event) => updateForm({ dialogue_history_interval: Number(event.target.value) })} /></label></div><p className="form-hint">主动保存会在满 N 轮时写入一次；“两者都有”同时开放对话历史里的手动保存。超出保留上限时只删除最旧的记录，不会改动正史。</p></SettingGroup>
         </SettingsPane>}
         {section === "voice" && <SettingsPane title="语音" note="按用途选择已就绪的语音组件；安装完成不会自动切换。">

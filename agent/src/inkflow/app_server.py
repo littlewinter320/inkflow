@@ -31,7 +31,7 @@ from .role_protocol import ACTIVE_COLLABORATION_MODES, adapt_role, new_task_mode
 from .schemas import BookBrief, CollaborationReply, ContextPacket, ContextSection, MemoryPatch, ModeCheckOutput, NovelIdeaBundle, NovelIdeaCandidate, PrefillSuggestion, PromptOptimization, ProviderProbe, ReviewReport, SuggestedPrompt, TerminalIntent, WriterDirectionSet
 from .review_verifier import verify_review
 from .studio import StudioDatabase, StudioService, bind_active_collaboration, chapter_retry_state, text_statistics
-from .terminal_session import TerminalSession
+from .terminal_session import TerminalSession, _suggestions_forbidden
 from .trace import TraceRecorder, recent_trace_runs
 from .runtime import RunRuntime, active_runtime
 from .model_usage import UsageLedger, normalized_usage, usage_attempts
@@ -690,10 +690,21 @@ class InkFlowAppService:
                 "source_method": "critique_then_synthesize",
             }
         if method == "assistant.suggest":
-            project = self._try_project(params.get("workspace_root") or params.get("project_root"))
+            project = None
+            if params.get("workspace_root") or params.get("project_root"):
+                try:
+                    project = await asyncio.to_thread(self._project, params)
+                except Exception:
+                    pass  # Suggestions are a read-only convenience, not a recovery trigger.
             from .conversation_scope import conversation_key
             saved = project.db.get_metadata(conversation_key("next_step_suggestions"), {}) if project else {}
             valid = bool(project and saved.get("basis") == TerminalSession._suggestion_basis(project))
+            pending = project.db.get_metadata(conversation_key("pending_creation_task"), {}) if project else {}
+            if valid and isinstance(pending, dict) and pending.get("intent"):
+                try:
+                    valid = not _suggestions_forbidden(TerminalIntent.model_validate(pending["intent"]))
+                except (ValueError, TypeError):
+                    valid = False
             return {
                 "suggestions": saved.get("suggestions", []) if valid else [],
                 "model": "", "fallback": False, "source": "coordinator" if valid else "none",

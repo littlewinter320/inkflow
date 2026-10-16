@@ -217,3 +217,9 @@ input, textarea, select { background: var(--bg); border-radius: 10px; }
 .context-material-list > button:last-child { border-bottom: 0; }
 .context-material-list > button:hover, .context-material-list > button:focus-visible { color: var(--accent); }
 .context-material-list > button small { color: var(--muted); }
+
+.suggestion-shortcut-hint { margin-left: 6px; color: var(--faint); font: inherit; font-size: 10px; }
+.suggestion-fill-status { margin: 0; padding: 0 12px 7px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.suggestion-shortcut-settings { margin-top: 12px; padding-top: 3px; border-top: 1px solid var(--line-soft); }
+.suggestion-shortcut-settings kbd { padding: 2px 5px; border: 1px solid var(--line-soft); border-radius: 4px; color: var(--text); font: inherit; }
+.suggestion-shortcut-settings button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }

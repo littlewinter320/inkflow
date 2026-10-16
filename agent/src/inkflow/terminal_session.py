@@ -19,7 +19,7 @@ from .preferences import (preference_section, PREFERENCE_USE_CONTRACT, PREFERENC
 from .config import Settings, save_user_settings
 from .craft import AUTHOR_VOICE_CONTRACT
 from .coordinator import Coordinator, NO_ACCEPTANCE_PATTERN
-from .engine import InkFlowEngine
+from .engine import InkFlowEngine, _saved_length_reference_requested
 from .errors import InkFlowError, ProjectBusyError, ValidationGateError, provider_failure_guidance
 from .planning_pipeline import PlanningNeedsAttention, load_active_planning, restore_kept_planning_publication
 from .project import InkFlowProject
@@ -225,6 +225,63 @@ def _requested_upper_layers(text: str) -> set[str]:
 
 def _requests_upper_plan_edit(text: str) -> bool:
     return bool(_requested_upper_layers(text))
+
+
+def _suggestions_forbidden(intent: TerminalIntent, *, user_message: str | None = None) -> bool:
+    """Recognize only result recommendations, never prohibit normal review work."""
+    if set(intent.forbidden_actions) & {"extra_calls", "extra_model_calls", "suggested_prompts", "next_step_suggestions"}:
+        return True
+    target = r"(?:(?:下一步|后续)(?:的)?(?:推荐|建议|提示词)|(?:推荐|建议)(?:下(?:一)?步|后续))"
+    action = r"(?:(?:再|继续|自动|主动|额外|另外|单独|为我|给我|帮我|生成|提供|给出|输出|显示|弹出)\s*)*"
+    # A forbidden-action entry is already a constraint, unlike quoted prose in
+    # the user message. Accept the existing Chinese contract as well as IDs.
+    if any(re.fullmatch(action + target + r"[。！!\s]*", item.strip()) for item in intent.forbidden_actions):
+        return True
+    text = intent.user_message if user_message is None else user_message
+    text = re.sub(r'```[\s\S]*?```|`[^`\n]*`|“[^”]*”|「[^」]*」|『[^』]*』|‘[^’]*’|"[^"\n]*"', "\ufffc", text)
+    prefix = r"(?:(?:请|也|并且|并|且|还|本次|这次|本轮|接下来|之后|现在|暂时|先)\s*)*"
+    refusal = r"(?:不用|无需|不必|不需要|不要|别|禁止)"
+    return any(re.fullmatch(prefix + refusal + action + target + r"(?:了|即可|就行|就好)?\s*", clause.strip())
+               for clause in re.split(r"[，,。！!；;\n]", text))
+
+
+def _with_waiting_guidance(response: dict[str, Any]) -> dict[str, Any]:
+    """Lift actual workflow causes without reading arbitrary model artifacts."""
+    if workflow_result_status(response) not in {"waiting_user", "waiting_condition", "failed"}:
+        return response
+    placeholders = {"等待你的选择", "等待用户选择", "等待条件满足后继续", "需要用户确认", "任务未完成", "先完成当前版本的选择"}
+
+    def specific(value: Any) -> str:
+        if not isinstance(value, str) or not value.strip():
+            return ""
+        parts = [part.strip() for part in re.split(r"[：:。！!\n]", value) if part.strip()]
+        return "" if parts and all(part in placeholders for part in parts) else value.strip()
+
+    nodes = []
+    stack = [response]
+    while stack:
+        value = stack.pop(0)
+        if not isinstance(value, dict) or workflow_result_status(value) == "completed":
+            continue
+        nodes.append(value)
+        if isinstance(value.get("result"), dict):
+            stack.append(value["result"])
+        if isinstance(value.get("steps"), list):
+            stack.extend(item for item in value["steps"] if isinstance(item, dict))
+    # A wrapper's summary must not hide an actual cause in a stopped node.
+    reason = next((text for key in ("gate", "stop_reason", "reason", "detail") for value in nodes
+                   if (text := specific(value.get(key)))), "")
+    if not reason:
+        reason = specific(workflow_failure_reason(response)) or next((text for value in nodes for key in ("message", "summary")
+            if (text := specific(value.get(key)))), "")
+    if not reason:
+        cards = response.get("questions") if isinstance(response.get("questions"), list) else []
+        reason = next((specific(card.get("question")) for card in cards
+                       if isinstance(card, dict) and specific(card.get("question"))), "")
+    if not reason:
+        reason = "当前步骤尚未完成，具体等待原因尚未返回；请展开本次运行记录核对。"
+    return {**response, "reason": specific(response.get("reason")) or reason,
+            "reply": specific(response.get("reply")) or reason}
 
 
 def _focused_recent_plan_request(text: str) -> bool:
@@ -522,7 +579,7 @@ class TerminalSession:
         if intent.chapter_no != target or intent.end_chapter_no not in {None, target}:
             return None
         if work is None:
-            return intent.model_copy(update={"user_message": message})
+            return intent.model_copy(update={"user_message": message, "authorization_source": "current_request"})
         previous, source = work.get("intent"), work.get("source", {})
         if (work.get("kind") != "workflow" or not isinstance(previous, dict)
                 or not source.get("task_id") or source["task_id"] == scope.task_id or work["id"] in message
@@ -1187,9 +1244,15 @@ class TerminalSession:
                 and not pending.get("route_answer")
                 and not text[int(pending.get("resume_end", 0)):].strip("。！!，, \t\r\n"))
             authorization_text = pending.get("intent", {}).get("user_message", text) if same_task_resume else text
-            writer_authorized = self._fresh_writer_authorization(project, authorization_text, intent, None) is not None
+            authorized_intent = self._fresh_writer_authorization(project, authorization_text, intent, None)
+            writer_authorized = authorized_intent is not None
             if writer_authorized:
+                intent = authorized_intent
+            elif same_task_resume:
                 intent = intent.model_copy(update={"user_message": authorization_text})
+            if _suggestions_forbidden(intent, user_message=authorization_text) and len(intent.forbidden_actions) < 16:
+                intent = intent.model_copy(update={"forbidden_actions": list(dict.fromkeys([
+                    *intent.forbidden_actions, "suggested_prompts"]))})
             if intent.pending_work_id and intent.action != "pending_work":
                 selected_work = next((item for item in project.pending_work() if item["id"] == intent.pending_work_id), None)
                 trace.record("controller.pending_work.selection", "completed", "核对 Coordinator 提出的待办关联",
@@ -1468,6 +1531,7 @@ class TerminalSession:
                 self._remember_question(project, intent, ticket, response)
             if captured_preferences:
                 response["preference_updates"] = captured_preferences
+            response = _with_waiting_guidance(response)
             self._append_dialogue(project, text, intent, response)
             failure = workflow_failure_reason(response)
             outcome = workflow_result_status(response)
@@ -1508,7 +1572,7 @@ class TerminalSession:
             }
             payload["status"] = outcome
             payload["pending_work"] = project.pending_work()
-            if intent.action == "chat":
+            if intent.action == "chat" or _suggestions_forbidden(intent):
                 payload["suggested_prompts"] = []
             elif include_suggestions and not response.get("questions") and not set(intent.forbidden_actions) & {"extra_calls", "extra_model_calls"}:
                 suggestions = await self._suggest_after_result(project, intent, response, trace)
@@ -4217,6 +4281,14 @@ class TerminalSession:
         chapter_no = int(intent.chapter_no or 1)
         instruction = intent.operation_instruction
         steps: list[dict[str, Any]] = []
+        draft_reference = None
+        if (intent.action in {"write_draft", "write_review", "write_review_accept"}
+                and _saved_length_reference_requested(intent.user_message)):
+            project = await asyncio.to_thread(InkFlowProject, root)
+            if (not intent.related_task_id
+                    or self._fresh_writer_authorization(project, intent.user_message, intent, None) is None):
+                raise ValidationGateError("定点补写须明确关联已保存原稿及本次新增的一次 Writer 授权；未重新生成正文。")
+            draft_reference = {"task_id": intent.related_task_id, "message_hash": content_hash(intent.user_message)}
 
         if intent.action in {"accept", "review_accept", "write_review_accept", "revise_review_accept"}:
             project = InkFlowProject(root)
@@ -4229,7 +4301,8 @@ class TerminalSession:
 
         if intent.action == "write_draft":
             written = self._reuse_workflow_writer(await asyncio.to_thread(InkFlowProject, root), chapter_no, "write", instruction)
-            steps.append(written or await self._run_step("writer.write", self.engine.write_chapter(root, chapter_no, instruction)))
+            steps.append(written or await self._run_step("writer.write", self.engine.write_chapter(
+                root, chapter_no, instruction, **({"draft_reference": draft_reference} if draft_reference else {}))))
             return {
                 "steps": steps,
                 "next_action": "草稿已生成；你可以先阅读章节文件，确认后再说“审查第 N 章”或“按意见修改第 N 章”。",
@@ -4238,7 +4311,8 @@ class TerminalSession:
         if intent.action in {"write_review", "write_review_accept"}:
             written = self._reuse_workflow_writer(await asyncio.to_thread(InkFlowProject, root), chapter_no, "write", instruction)
             written = written or await self._run_step(
-                "writer.write", self.engine.write_chapter(root, chapter_no, instruction)
+                "writer.write", self.engine.write_chapter(root, chapter_no, instruction,
+                    **({"draft_reference": draft_reference} if draft_reference else {}))
             )
             steps.append(written)
             if "gate" in written:
@@ -4381,6 +4455,8 @@ class TerminalSession:
 
     async def _suggest_after_result(self, project, intent, response, trace):
         from .schemas import SuggestedPrompts
+        if _suggestions_forbidden(intent):
+            return []
         try:
             project.reconcile_pending_work(current_pass=lambda number: self.engine.current_pass_review(project, number))
             basis = self._suggestion_basis(project)
