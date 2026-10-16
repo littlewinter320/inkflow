@@ -33,7 +33,7 @@ def test_trace_uses_frozen_profile_and_timeout_nulls_survive_replay(tmp_path, mo
                                            max_tokens=1600, timeout_seconds=120, thinking=requested)
                 metadata = trace.events[-1].metadata
                 assert metadata["thinking"] is effective
-                assert metadata["max_tokens"] == (8192 if effective else 1600)
+                assert metadata["max_tokens"] == (settings.max_output_tokens if effective else 1600)
                 assert metadata["timeout_seconds"] == metadata["request_timeout_seconds"] == hard
                 assert metadata["soft_wait_seconds"] == soft and metadata["batch_chapter_count"] == 1
                 attempt = ModelAttempt(settings, request_id=f"request-{index}", task_id=scope.task_id,

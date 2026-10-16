@@ -93,7 +93,10 @@ def test_missing_title_reuses_prose_and_counts_patch_in_original_request(offline
         assert set(schema["properties"]) == {"title"} and schema["required"] == ["title"]
         if kind != "anthropic":
             assert payloads[0]["thinking"] == payloads[1]["thinking"] == {"type": "enabled"}
-        assert payloads[1].get("max_completion_tokens", payloads[1].get("max_tokens")) <= (1600 if kind == "anthropic" else 8192)
+        repair_limit = payloads[1].get("max_completion_tokens", payloads[1].get("max_tokens"))
+        assert repair_limit <= (1600 if kind == "anthropic" else 32000)
+        if kind != "anthropic":
+            assert repair_limit == payloads[0].get("max_completion_tokens", payloads[0].get("max_tokens"))
         assert any(event.get("metadata", {}).get("kind") == "missing_fields" for event in events)
         artifacts = list((root / ".inkflow/recovery").glob("provider-response-*/writer-response.unverified.json"))
         assert len(artifacts) == 1 and json.loads(json.loads(artifacts[0].read_text(encoding="utf-8"))["content"]) == source

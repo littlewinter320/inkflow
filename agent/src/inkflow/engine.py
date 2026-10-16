@@ -219,6 +219,7 @@ class InkFlowEngine:
         self._assert_task_settings()
         soft_limit, hard_limit = self.settings.context_budget_for(role)
         output_reserve = max(8_000, int(project.db.get_brief().target_chapter_words * 2.4)) if role == "writer" else 8_000
+        output_reserve = self.settings.generation_output_budget(role, output_reserve, self.settings.thinking_for(role))
         return ContextBuilder(
             project,
             soft_limit,
@@ -237,6 +238,8 @@ class InkFlowEngine:
                            system_prompt: str, tail: str, output_model: type, role: str) -> tuple[str, list[str]]:
         system = _json_system_prompt(system_prompt, output_model)
         reserve = self._mode_output_budget(packet, role) if issubclass(output_model, ModeCheckOutput) else self.settings.effective_output_tokens(8_000, role)
+        reserve = self.settings.effective_output_tokens(
+            self.settings.generation_output_budget(role, reserve, self.settings.thinking_for(role)), role)
         _, hard_limit = self.settings.context_budget_for(role)
         def input_tokens(prompt: str) -> int:
             return estimate_tokens(json.dumps([{"role": "system", "content": system},
@@ -256,7 +259,8 @@ class InkFlowEngine:
         section = next((item for item in packet.sections if item.key == "CSET"), None)
         payload = json.loads(section.content) if section else {}
         count = sum(len(collection.get("records", [])) for collection in payload.get("collections", []))
-        return self.settings.effective_output_tokens(8_000 + 350 * count, role)
+        return self.settings.effective_output_tokens(self.settings.generation_output_budget(
+            role, 8_000 + 350 * count, self.settings.thinking_for(role)), role)
 
     @staticmethod
     def _writer_skills(packet: ContextPacket, *built_in: str) -> list[str]:

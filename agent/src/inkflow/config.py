@@ -760,9 +760,9 @@ class Settings:
         return True if role in {"editor", "reviewer", "memory_keeper"} else requested
 
     def generation_output_budget(self, role: str | None, requested: int, thinking: bool) -> int:
-        # Thinking and final JSON share the output limit; tiny routing budgets preceded thinking presets.
+        # Native reasoning shares the output limit with JSON; honor the author's ceiling, not a hidden 8k cap.
         if (self.is_mimo or self.is_deepseek) and thinking and role in self.agent_generation:
-            return max(requested, 8192)
+            return self.max_output_tokens
         return requested
 
     def get_api_key(self) -> str | None:

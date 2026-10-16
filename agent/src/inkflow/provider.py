@@ -869,7 +869,8 @@ class DeepSeekProvider:
                     field_repair = repair
                     payload["messages"] = [{"role": "system", "content": repair.system},
                                            {"role": "user", "content": repair.prompt}]
-                    requested_max_tokens = min(requested_max_tokens, 8192 if thinking else 1600)
+                    requested_max_tokens = min(requested_max_tokens,
+                        self.settings.generation_output_budget(agent_role, 1600, thinking))
                     recovery_events.append({"attempt": attempt + 1, "kind": "missing_fields",
                         "error_type": "ValidationError", "strategy": "保留原正文，原Writer只补缺失元信息",
                         "fields": [list(path) for path in repair.paths], "usage_unknown": False})
