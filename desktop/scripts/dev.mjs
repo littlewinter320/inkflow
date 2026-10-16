@@ -3,6 +3,7 @@ import { createServer } from "node:net";
 import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const require = createRequire(import.meta.url);
@@ -56,10 +57,17 @@ const port = await new Promise((resolve, reject) => {
   });
 });
 
-const child = spawn(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", "npm run dev:services"], {
+const desktopRoot = fileURLToPath(new URL("..", import.meta.url));
+const concurrentlyPackage = require.resolve("concurrently/package.json");
+const concurrentlyCli = path.resolve(path.dirname(concurrentlyPackage), require(concurrentlyPackage).bin.concurrently);
+const serviceEnv = { ...process.env };
+delete serviceEnv.Path;
+serviceEnv.PATH = [path.join(desktopRoot, "node_modules/.bin"), path.dirname(process.execPath),
+  path.join(process.env.SystemRoot || "C:/Windows", "System32"), process.env.PATH || process.env.Path || ""].join(path.delimiter);
+const child = spawn(process.execPath, [concurrentlyCli, "-k", `vite --port ${port}`,
+  `wait-on tcp:${port} file:dist-electron/main.js && cross-env VITE_DEV_SERVER_URL=http://localhost:${port} "${executable}" .`], {
   cwd: new URL("..", import.meta.url),
-  env: { ...process.env,
-    PATH: `${path.dirname(process.execPath)}${path.delimiter}${path.dirname(process.env.ComSpec || "C:/Windows/System32/cmd.exe")}${path.delimiter}${process.env.PATH || process.env.Path || ""}`,
+  env: { ...serviceEnv,
     INKFLOW_DEV_PORT: String(port), INKFLOW_DEV_EXECUTABLE: executable },
   stdio: "inherit",
   windowsHide: true,

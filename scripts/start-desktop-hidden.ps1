@@ -150,13 +150,12 @@ function Get-DescendantProcessIds([int]$RootProcessId, [object[]]$Processes) {
 try {
     $node = (Get-Command node.exe -ErrorAction Stop).Source
     $nodeRoot = Split-Path -Parent $node
-    $npmCli = Join-Path $nodeRoot 'node_modules\npm\bin\npm-cli.js'
-    if (-not (Test-Path -LiteralPath $npmCli)) {
-        throw "npm CLI not found next to node.exe: $npmCli"
-    }
+    $devScript = Join-Path $desktopRoot 'scripts\dev.mjs'
+    $desktopBin = Join-Path $desktopRoot 'node_modules\.bin'
+    $env:Path = "$desktopBin;$nodeRoot;$windowsSystem32;$env:Path"
     $process = Start-Process `
         -FilePath $node `
-        -ArgumentList @("`"$npmCli`"", 'run', 'dev') `
+        -ArgumentList @("`"$devScript`"") `
         -WorkingDirectory $desktopRoot `
         -WindowStyle Hidden `
         -RedirectStandardOutput $stdout `
@@ -170,7 +169,7 @@ try {
     return
 }
 
-# Confirm a visible main window from this exact npm launch, not an old log line
+# Confirm a visible main window from this exact development launch, not an old log line
 # or another Electron process. Vite, TypeScript and Electron remain hidden.
 $startupTimeoutSeconds = 30
 $deadline = (Get-Date).AddSeconds($startupTimeoutSeconds)

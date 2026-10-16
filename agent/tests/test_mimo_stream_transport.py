@@ -129,6 +129,6 @@ def test_mimo_sse_terminal_refusals_and_explicit_permanent_errors_do_not_retry(t
         assert len(requests)==before+1
     mode={"error":{"code":"not_documented_here","message":"Try again later"}}
     before=len(requests)
-    with pytest.raises(ProviderError,match="2 次限次"):
+    with pytest.raises(ProviderError,match="模型请求尝试 2 次"):
         asyncio.run(provider.generate_json(**args))
     assert len(requests)==before+2

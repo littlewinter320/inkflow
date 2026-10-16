@@ -173,13 +173,15 @@ def _publish_request_started(runtime, *, role: str | None, model: str, attempt: 
 def _preserve_writer_response(settings: Settings, accounting: ModelAttempt, *, role: str | None,
                               output_model: type[BaseModel], content: str, model: str,
                               response_id: str | None, finish_reason: str | None,
-                              serialized_input: str, attempt: int) -> Path | None:
+                              serialized_input: str, attempt: int, incomplete: bool = False,
+                              stream_diagnostic: dict[str, Any] | None = None) -> Path | None:
     from .model_usage import project_identity
     from .schemas import DraftOutput
     from .task_settings import TASK_SETTINGS_FIELDS
 
     scope, runtime = active_task_settings.get(), active_runtime.get()
-    if (role != "writer" or output_model is not DraftOutput or finish_reason not in {"stop", "end_turn", "stop_sequence"}
+    if (role != "writer" or output_model is not DraftOutput
+            or (not incomplete and finish_reason not in {"stop", "end_turn", "stop_sequence"})
             or not content or scope is None or runtime is None or settings.workspace_root is None
             or scope.settings.workspace_root is None or not scope.task_id or not scope.snapshot_hash
             or not scope.novel_id or runtime.task_id != scope.task_id
@@ -194,13 +196,15 @@ def _preserve_writer_response(settings: Settings, accounting: ModelAttempt, *, r
     path = root / ".inkflow" / "recovery" / f"provider-response-{uuid4().hex}" / "writer-response.unverified.json"
     if not path.resolve().is_relative_to(root):
         return None
-    artifact = {"status": "unverified", "authority": "task_temporary_not_canon",
+    artifact = {"status": "incomplete" if incomplete else "unverified", "authority": "task_temporary_not_canon",
                 "task_settings": scope.public_summary(), "run_id": runtime.run_id,
                 "request_id": accounting.fields.get("request_id"),
                 "attempt_id": accounting.attempt_id or f"unrecorded-{uuid4().hex}", "attempt": attempt,
                 "role": role, "model": model, "response_id": response_id, "finish_reason": finish_reason,
                 "schema": output_model.__name__, "schema_hash": content_hash(json_dumps(_generation_schema(output_model))),
                 "input_hash": content_hash(serialized_input), "content_hash": content_hash(content), "content": content}
+    if stream_diagnostic is not None:
+        artifact["stream_diagnostic"] = stream_diagnostic
     try:
         atomic_write_text(path, json_dumps(artifact) + "\n")
     except (OSError, UnicodeError) as exc:
@@ -212,8 +216,9 @@ def _preserve_writer_response(settings: Settings, accounting: ModelAttempt, *, r
         raise failure from exc
     try:
         runtime.publish({"type": "model.response_preserved", "role": role,
-            "summary": "已保存本次写作返回，仍须完成格式、来源和正文核验。",
-            "metadata": {"status": "unverified", "artifact_path": path.relative_to(root).as_posix(),
+            "summary": ("已保存断流前收到的写作片段；内容未完成，未作为草稿采用。" if incomplete else
+                        "已保存本次写作返回，仍须完成格式、来源和正文核验。"),
+            "metadata": {"status": artifact["status"], "artifact_path": path.relative_to(root).as_posix(),
                          "task_id": scope.task_id, "snapshot_hash": scope.snapshot_hash,
                          "content_hash": artifact["content_hash"], "attempt": attempt}})
     except Exception as exc:
@@ -327,6 +332,7 @@ def _remote_protocol_diagnostic(exc: Exception) -> dict[str, str]:
         "MiMo 流式响应包含无效片段，未采用不完整内容。", "MiMo 流式响应未正常返回，未采用不完整内容。",
         "MiMo 流式响应的结构不完整。", "MiMo 流式响应包含不支持的文本片段。",
         "MiMo 流式响应在完成前中断，未采用不完整内容。",
+        "MiMo 已结束的消息又返回文本，未采用异常结果。", "MiMo 流式结束标记不一致，未采用异常结果。",
     }
     if message in local_reasons:
         reason = message
@@ -337,19 +343,49 @@ def _remote_protocol_diagnostic(exc: Exception) -> dict[str, str]:
     elif "illegal status line" in message or "illegal header line" in message:
         reason = "HTTPX：远端返回了无效的 HTTP 状态行或响应头。"
     else:
-        reason = "HTTPX：远端协议异常，未保留原始响应内容。"
+        reason = "HTTPX：远端协议异常，未采用不完整返回。"
     return {"transport_reason": _redact_error(reason)[:240]}
 
 
 async def _mimo_stream_response(client: httpx.AsyncClient, url: str, *, headers: dict[str, str],
-                                payload: dict[str, Any]) -> httpx.Response:
+                                payload: dict[str, Any], state: dict[str, Any] | None = None) -> httpx.Response:
     """Collect MiMo SSE into the existing completion contract within one attempt."""
+    state = state if state is not None else {}
+    clock = asyncio.get_running_loop().time
+    started, last_report = clock(), 0.0
+    runtime, last_phase = active_runtime.get(), ""
+    content, reasoning = [], []
+    body: dict[str, Any] = {}
+    diagnostic = {"phase": "connecting", "event_count": 0, "content_chars": 0, "reasoning_chars": 0,
+                  "headers_ms": None, "first_event_ms": None, "last_event_ms": None,
+                  "finish_reason": None, "tail_interrupted": False}
+    state.update(diagnostic=diagnostic, completed=False)
+
+    def report() -> None:
+        nonlocal last_report, last_phase
+        now = clock()
+        if diagnostic["phase"] == last_phase and now - last_report < 30:
+            return
+        last_report, last_phase = now, diagnostic["phase"]
+        if runtime is not None:
+            summary = {"waiting": "模型连接已建立，正在等待返回片段。",
+                       "thinking": "正在接收模型思考阶段的数据，尚未收到正文。",
+                       "content": f"正在接收模型返回，已收到 {diagnostic['content_chars']:,} 个字符。",
+                       "finished": "模型已结束输出，正在接收用量与传输收尾。"}[last_phase]
+            try:
+                runtime.publish({"type": "model.stream.progress", "summary": summary,
+                    "role": state.get("role"), "model": payload.get("model"),
+                    "metadata": {**diagnostic, "elapsed_ms": round((now - started) * 1000)}})
+            except Exception as exc:
+                warnings.warn(f"流式接收进度暂未送达（{type(exc).__name__}）；原请求继续。", RuntimeWarning, stacklevel=2)
+
     async with client.stream("POST", url, headers=headers, json=payload) as response:
+        diagnostic.update(phase="waiting", headers_ms=round((clock() - started) * 1000))
         if response.status_code >= 400 or "application/json" in response.headers.get("content-type", "").lower():
             await response.aread()
+            state.clear()
             return response
-        body: dict[str, Any] = {}
-        content, reasoning = [], []
+        report()
         finish_reason = None
 
         def consume(data: str) -> bool:
@@ -367,6 +403,11 @@ async def _mimo_stream_response(client: httpx.AsyncClient, url: str, *, headers:
                 raise httpx.RemoteProtocolError("MiMo 流式响应未正常返回，未采用不完整内容。")
             if not isinstance(chunk, dict):
                 raise httpx.RemoteProtocolError("MiMo 流式响应未正常返回，未采用不完整内容。")
+            elapsed_ms = round((clock() - started) * 1000)
+            diagnostic["event_count"] += 1
+            diagnostic["last_event_ms"] = elapsed_ms
+            if diagnostic["first_event_ms"] is None:
+                diagnostic["first_event_ms"] = elapsed_ms
             for key in ("id", "model"):
                 if chunk.get(key):
                     body[key] = chunk[key]
@@ -394,37 +435,70 @@ async def _mimo_stream_response(client: httpx.AsyncClient, url: str, *, headers:
                     if value is not None:
                         if not isinstance(value, str):
                             raise httpx.RemoteProtocolError("MiMo 流式响应包含不支持的文本片段。")
+                        if finish_reason is not None and value:
+                            raise httpx.RemoteProtocolError("MiMo 已结束的消息又返回文本，未采用异常结果。")
                         target.append(value)
+                        diagnostic["content_chars" if key == "content" else "reasoning_chars"] += len(value)
+                        if value:
+                            diagnostic["phase"] = "content" if diagnostic["content_chars"] else "thinking"
                 if choice.get("finish_reason") is not None:
+                    if finish_reason is not None and finish_reason != choice["finish_reason"]:
+                        raise httpx.RemoteProtocolError("MiMo 流式结束标记不一致，未采用异常结果。")
                     finish_reason = choice["finish_reason"]
+                    diagnostic.update(finish_reason=finish_reason, phase="finished")
+            report()
             return False
 
         event_lines = []
-        async for line in response.aiter_lines():
-            if not line:
-                if event_lines:
-                    done = consume("\n".join(event_lines))
-                    event_lines = []
-                    if done:
-                        break
-            elif line.startswith("data:"):
-                event_lines.append(line[5:].lstrip(" "))
-        if event_lines:
-            consume("\n".join(event_lines))
+        lines = response.aiter_lines().__aiter__()
+        try:
+            while True:
+                try:
+                    line = await anext(lines)
+                except StopAsyncIteration:
+                    break
+                except httpx.RemoteProtocolError:
+                    # A confirmed message end survives a broken HTTP trailer; parser errors never enter this catch.
+                    if finish_reason != "stop" or event_lines:
+                        raise
+                    diagnostic["tail_interrupted"] = True
+                    break
+                if not line:
+                    if event_lines:
+                        done = consume("\n".join(event_lines))
+                        event_lines = []
+                        if done:
+                            break
+                elif line.startswith("data:"):
+                    event_lines.append(line[5:].lstrip(" "))
+            if event_lines:
+                consume("\n".join(event_lines))
+        except BaseException as exc:
+            diagnostic["error_type"] = type(exc).__name__
+            raise
+        finally:
+            diagnostic["elapsed_ms"] = round((clock() - started) * 1000)
+            diagnostic["observed_usage"] = normalized_usage(body.get("usage") or {})
+            state.update(content="".join(content), model=body.get("model"), response_id=body.get("id"))
         if not isinstance(finish_reason, str) or not finish_reason:
+            diagnostic["error_type"] = "MissingFinishReason"
             raise httpx.RemoteProtocolError("MiMo 流式响应在完成前中断，未采用不完整内容。")
         if finish_reason not in {"stop", "length"}:
             raise _MimoPermanentStreamError("小米 MiMo 未正常完成本次文本输出，未采用模型结果；请查看服务状态后处理当前步骤。")
         body["choices"] = [{"index": 0, "finish_reason": finish_reason,
                             "message": {"role": "assistant", "content": "".join(content),
                                         "reasoning_content": "".join(reasoning) or None}}]
+        state["completed"] = True
         return httpx.Response(response.status_code, json=body, request=response.request)
 
 
 async def _mimo_response_with_reminder(client: httpx.AsyncClient, url: str, *, headers: dict[str, str],
                                       payload: dict[str, Any], timeout: float | None, role: str | None,
-                                      attempt: int, soft_wait_seconds: float | None = None) -> httpx.Response:
+                                      attempt: int, soft_wait_seconds: float | None = None,
+                                      state: dict[str, Any] | None = None) -> httpx.Response:
     runtime = active_runtime.get()
+    if state is not None:
+        state["role"] = role
 
     async def remind() -> None:
         await asyncio.sleep(soft_wait_seconds)
@@ -441,7 +515,7 @@ async def _mimo_response_with_reminder(client: httpx.AsyncClient, url: str, *, h
     reminder = (asyncio.create_task(remind()) if runtime is not None and soft_wait_seconds is not None
                 and (timeout is None or timeout > soft_wait_seconds) else None)
     try:
-        return await _mimo_stream_response(client, url, headers=headers, payload=payload)
+        return await _mimo_stream_response(client, url, headers=headers, payload=payload, state=state)
     finally:
         if reminder is not None:
             reminder.cancel()
@@ -689,6 +763,7 @@ class DeepSeekProvider:
                               "request_sent": False, "usage": {}}
             attempt_usage.append(attempt_record)
             response_complete = False
+            stream_state: dict[str, Any] = {}
             retry_kind = "format"
             retry_delay = 0.0
             try:
@@ -701,7 +776,7 @@ class DeepSeekProvider:
                                                  attempt=attempt + 1, wait_policy=wait_policy)
                         request = (_mimo_response_with_reminder(client, url, headers=headers, payload=payload,
                                                         timeout=request_timeout, role=agent_role, attempt=attempt + 1,
-                                                        soft_wait_seconds=wait_policy["soft_wait_seconds"])
+                                                        soft_wait_seconds=wait_policy["soft_wait_seconds"], state=stream_state)
                             if self.settings.is_mimo else client.post(url, headers=headers, json=payload))
                         response = (await request if request_timeout is None
                                     else await asyncio.wait_for(request, timeout=request_timeout))
@@ -815,6 +890,8 @@ class DeepSeekProvider:
                     retry_kind = "transport"
                     retry_delay = float(2 ** attempt)
                 transport_diagnostic = _remote_protocol_diagnostic(exc)
+                if stream_state:
+                    transport_diagnostic["stream"] = stream_state.get("diagnostic", {})
                 if attempt + 1 < attempts:
                     recovery_events.append({
                         "attempt": attempt + 1,
@@ -867,13 +944,40 @@ class DeepSeekProvider:
                     continue
                 break
             finally:
-                accounting.finish()
+                try:
+                    if stream_state:
+                        diagnostic = stream_state.get("diagnostic", {})
+                        if runtime:
+                            try:
+                                runtime.publish({"type": "model.stream.finished" if stream_state.get("completed") else "model.stream.interrupted",
+                                    "role": agent_role, "model": str(payload["model"]),
+                                    "summary": ("模型消息已完整接收；传输尾部断开，继续原格式与来源核验。"
+                                        if diagnostic.get("tail_interrupted") else "本次流式接收已结束。"
+                                        if stream_state.get("completed") else
+                                        "模型请求已停止，接收片段不作为完整结果采用。"
+                                        if diagnostic.get("error_type") == "CancelledError" else
+                                        f"连接已中断，断开前收到 {diagnostic.get('content_chars', 0):,} 个返回字符；未完成结果未采用。"),
+                                    "metadata": diagnostic})
+                            except Exception as exc:
+                                warnings.warn(f"流式接收诊断暂未送达（{type(exc).__name__}）；未重发请求。", RuntimeWarning, stacklevel=2)
+                        if not stream_state.get("completed") and stream_state.get("content"):
+                            _preserve_writer_response(self.settings, accounting, role=agent_role, output_model=request_model,
+                                content=stream_state["content"], model=str(stream_state.get("model") or payload["model"]),
+                                response_id=stream_state.get("response_id"), finish_reason=diagnostic.get("finish_reason"),
+                                serialized_input=serialized_input, attempt=attempt + 1, incomplete=True,
+                                stream_diagnostic=diagnostic)
+                finally:
+                    accounting.finish()
         if isinstance(last_error, (httpx.TimeoutException, asyncio.TimeoutError)):
             reason = "连接或等待模型响应超时；请检查网络和模型服务后续接当前步骤。"
         elif isinstance(last_error, httpx.ConnectError):
             reason = "未能建立到模型服务的连接，本步还没有收到模型结果。请检查网络、代理或服务可用性；连接恢复后续接当前步骤。"
         elif isinstance(last_error, httpx.RemoteProtocolError):
             reason = _remote_protocol_diagnostic(last_error)["transport_reason"]
+            if stream_state.get("diagnostic"):
+                received = stream_state["diagnostic"].get("content_chars", 0)
+                reason += f" 断开前已收到 {received:,} 个返回字符；" + (
+                    "片段仍不完整，未作为草稿采用。" if received else "尚未收到正文片段。")
         elif isinstance(last_error, ValidationError):
             labels = {"title": "标题", "content": "正文"}
             missing = list(dict.fromkeys(labels[item["loc"][0]]
