@@ -3060,6 +3060,21 @@ class InkFlowEngine:
         lower_bound = int(target * (1 - self.settings.chapter_length_tolerance))
         upper_bound = int(target * (1 + self.settings.chapter_length_tolerance))
         current = _content_char_count(clean_content)
+        runtime = active_runtime.get()
+        cap = self.settings.writer_task_attempt_limit
+        sent = sum(item.get("role") == "writer" and item.get("request_sent") is True
+                   for item in runtime.attempt_fragments) if runtime else 0
+        if (current < lower_bound or current > upper_bound) and cap is not None and sent >= cap:
+            candidate_path = trace.run_dir / "recovery-candidate.md"
+            atomic_write_text(candidate_path, clean_content)
+            reason = (f"第 {chapter_no} 章正文已完整返回，有效 {current} 字，本章要求 {lower_bound}～{upper_bound} 字。"
+                      f"本任务的 {cap} 次 Writer 请求已用完，未发送篇幅补写或压缩；现有原稿已保存。")
+            trace.record(stage, "waiting_user", reason, metadata={"candidate_path": str(candidate_path),
+                "characters": current, "lower_bound": lower_bound, "upper_bound": upper_bound, "request_sent": False})
+            failure = ValidationGateError(reason)
+            failure.recovery_node, failure.recovery_exhausted = "writer.length", True
+            failure.next_action = "先查看现有原稿；需要补足或压缩时，只调整对应段落，新增 Writer 请求须明确授权。"
+            raise failure
         if current > upper_bound:
             return await self._repair_long_draft(
                 draft,
