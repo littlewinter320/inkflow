@@ -551,8 +551,8 @@ class TerminalSession:
         """A new human grant has its own cap; an old recovery keeps its used attempts."""
         scope, runtime = active_task_settings.get(), active_runtime.get()
         grant = re.match(
-            r"^\s*(?:我)?(?:这次|本次|现在)(?:明确)?(?:新增|追加|重新)一次第\s*(\d+)\s*章"
-            r"(?:写作|Writer)(?:尝试|请求)(?:的)?授权(?=[：:，,。；;])", message, re.I)
+            r"^\s*(?:墨宝[，,]\s*)?(?:我)?(?:这次|本次|现在)(?:我)?(?:明确)?(?:新增|追加|重新)一次第\s*(\d+)\s*章"
+            r"(?:写作|Writer)(?:(?:尝试|请求)|(?:定点)?补写)(?:的)?授权(?=[：:，,。；;])", message, re.I)
         target, end = TerminalSession._explicit_chapter_range(message)
         if grant is None:
             # An explicit grant can follow the failure description; ordinary continuation is not a new grant.
@@ -571,6 +571,12 @@ class TerminalSession:
         if (any(before_grant.count(left) > before_grant.count(right) for left, right in (("“", "”"), ("「", "」"), ("『", "』")))
                 or before_grant.count('"') % 2):
             return None
+        if (target is not None and intent.action in {"revise_draft", "revise_review", "revise_review_accept"}
+                and _saved_length_reference_requested(message) and project.db.get_chapter(target) is None):
+            # A complete unsaved return uses the verified reference path, not saved-chapter revision.
+            intent = intent.model_copy(update={"action": {
+                "revise_draft": "write_draft", "revise_review": "write_review",
+                "revise_review_accept": "write_review_accept"}[intent.action]})
         if (target is None or end is not None or scope is None or runtime is None or runtime.task_id != scope.task_id
                 or scope.novel_id != project.project_id or scope.settings.writer_task_attempt_limit != 1
                 or intent.authorization != "approved" or intent.authorization_source not in {"none", "current_request"}

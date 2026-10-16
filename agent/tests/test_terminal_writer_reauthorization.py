@@ -160,6 +160,7 @@ def test_natural_writer_grant_and_saved_original_resume(tmp_path, monkeypatch):
         "请先用平衡档、四人连续性审查把第51章完成，审查通过后接收，前50章不要改，也先不写后面的章节。"
         "本次Writer最多请求一次，格式修复也算在内。沿用我保存的MiMo设置和当前生效规划，不重新规划，"
         "不为小幅润色额外调用，也不用生成下一步推荐。"
+        "沿用已保存的完整短稿，只定点补写，原段落保留。"
     )
     routed = original.model_copy(update={"pending_work_id": old["id"], "related_task_id": "old-natural-task",
         "response_kind": "task_revision", "confidence": "high", "user_message": ui_message,
@@ -171,6 +172,7 @@ def test_natural_writer_grant_and_saved_original_resume(tmp_path, monkeypatch):
         "刚才连接断了。这次我明确追加一次Writer请求，请先把第51章完成。",
         "刚才提示“连接断开”，这次我明确追加一次Writer请求，请先把第51章完成。",
         "请先把第51章完成，我这次明确追加一次Writer请求。",
+        "墨宝，这次我明确新增一次第51章Writer定点补写授权，沿用已保存的完整短稿，只定点补写。",
     )
     rejected = (
         "继续", "代码修好了，请再试一次第51章。", "换个提示词继续第51章。",
@@ -196,10 +198,19 @@ def test_natural_writer_grant_and_saved_original_resume(tmp_path, monkeypatch):
                 for message in rejected:
                     assert session._fresh_writer_authorization(project, message, routed, work) is None, message
 
+                revised_route = routed.model_copy(update={"action": "revise_review_accept"})
+                assert session._fresh_writer_authorization(project, ui_message, revised_route, work).action == "write_review_accept"
+                assert session._fresh_writer_authorization(project, recognized[-1], revised_route, work).action == "write_review_accept"
+                assert session._fresh_writer_authorization(project, recognized[1], revised_route, work) is None
+                original_lookup = project.db.get_chapter
+                monkeypatch.setattr(project.db, "get_chapter", lambda chapter: {"status": "accepted"})
+                assert session._fresh_writer_authorization(project, ui_message, revised_route, work) is None
+                monkeypatch.setattr(project.db, "get_chapter", original_lookup)
+
                 # Recreate the saved successful route from the local old-work
                 # gate failure. No new Coordinator decision is needed to resume.
                 async with project_write_lock(project.root):
-                    session._save_pending_task(project, routed, "failed")
+                    session._save_pending_task(project, revised_route, "failed")
                 pending = session.pending_resume(project, "继续")
                 assert pending["task_id"] == scope.task_id and pending["intent"]["user_message"] == ui_message
                 monkeypatch.setattr(session, "_build_packet", lambda *a: ContextPacket(project_id=project.project_id,
@@ -219,6 +230,7 @@ def test_natural_writer_grant_and_saved_original_resume(tmp_path, monkeypatch):
                 saved_intent, task_id, snapshot_hash = dispatched[0]
                 assert task_id == scope.task_id and snapshot_hash == scope.snapshot_hash
                 assert saved_intent.user_message == ui_message and saved_intent.pending_work_id is None
+                assert saved_intent.action == "write_review_accept"
                 assert saved_intent.related_task_id == "old-natural-task" and saved_intent.chapter_no == 51
                 key = conversation_key("writer_authorization:" + content_hash(ui_message))
                 receipt = project.db.get_metadata(key)
