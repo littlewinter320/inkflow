@@ -496,24 +496,40 @@ class TerminalSession:
         grant = re.match(
             r"^\s*(?:我)?(?:这次|本次|现在)(?:明确)?(?:新增|追加|重新)一次第\s*(\d+)\s*章"
             r"(?:写作|Writer)(?:尝试|请求)(?:的)?授权(?=[：:，,。；;])", message, re.I)
-        if (grant is None or scope is None or runtime is None or runtime.task_id != scope.task_id
+        target, end = TerminalSession._explicit_chapter_range(message)
+        if grant is None:
+            # An explicit grant can follow the failure description; ordinary continuation is not a new grant.
+            grant = re.search(
+                r"(?:^|[，,。；;！？!\n])\s*(?:(?:这次|本次|现在)(?:我)?|我(?:这次|本次|现在)?)"
+                r"(?:明确)?(?:新增|追加|重新)(?:授权)?一次\s*(?:Writer|写作)(?:尝试|请求)(?:的)?(?:授权)?"
+                r"(?=[：:，,。；;！？!\n]|$)", message, re.I)
+            prefix = re.split(r"[。！？!\n]", message[:grant.start()])[-1] if grant else ""
+            if grant is None or re.search(r"如果|假如|要是|假设|是否|能否|不要|不允许|禁止", prefix):
+                return None
+        elif target != int(grant.group(1)):
+            return None
+        if re.search(r"[？?]", re.split(r"[。！!\n]", message[grant.end():], maxsplit=1)[0]):
+            return None
+        before_grant = message[:grant.start()]
+        if (any(before_grant.count(left) > before_grant.count(right) for left, right in (("“", "”"), ("「", "」"), ("『", "』")))
+                or before_grant.count('"') % 2):
+            return None
+        if (target is None or end is not None or scope is None or runtime is None or runtime.task_id != scope.task_id
                 or scope.novel_id != project.project_id or scope.settings.writer_task_attempt_limit != 1
                 or intent.authorization != "approved" or intent.authorization_source not in {"none", "current_request"}
                 or intent.action not in {"write_draft", "write_review", "write_review_accept"}):
             return None
-        target = int(grant.group(1))
-        if (TerminalSession._explicit_chapter_range(message) != (target, None)
-                or intent.chapter_no != target or intent.end_chapter_no not in {None, target}):
+        if intent.chapter_no != target or intent.end_chapter_no not in {None, target}:
             return None
         if work is None:
-            return intent
+            return intent.model_copy(update={"user_message": message})
         previous, source = work.get("intent"), work.get("source", {})
         if (work.get("kind") != "workflow" or not isinstance(previous, dict)
                 or not source.get("task_id") or source["task_id"] == scope.task_id or work["id"] in message
                 or previous.get("chapter_no") != target or previous.get("end_chapter_no") not in {None, target}):
             return None
         return intent.model_copy(update={"pending_work_id": None, "response_kind": "new_task",
-            "related_task_id": source["task_id"], "authorization_source": "current_request"})
+            "related_task_id": source["task_id"], "authorization_source": "current_request", "user_message": message})
 
     @staticmethod
     def _confirmed_pending_work_intent(project: InkFlowProject, text: str) -> TerminalIntent | None:
@@ -1167,18 +1183,24 @@ class TerminalSession:
                 metadata={"raw_intent": route_result.data.model_dump(mode="json"), "model": route_result.model,
                           "response_id": route_result.response_id, "message_hash": content_hash(text),
                           "source": proposal_basis, "task_settings": task_scope.public_summary() if task_scope else None}, public=False)
-            writer_authorized = self._fresh_writer_authorization(project, text, intent, None) is not None
+            same_task_resume = (pending and task_scope and pending.get("task_id") == task_scope.task_id
+                and not pending.get("route_answer")
+                and not text[int(pending.get("resume_end", 0)):].strip("。！!，, \t\r\n"))
+            authorization_text = pending.get("intent", {}).get("user_message", text) if same_task_resume else text
+            writer_authorized = self._fresh_writer_authorization(project, authorization_text, intent, None) is not None
+            if writer_authorized:
+                intent = intent.model_copy(update={"user_message": authorization_text})
             if intent.pending_work_id and intent.action != "pending_work":
                 selected_work = next((item for item in project.pending_work() if item["id"] == intent.pending_work_id), None)
                 trace.record("controller.pending_work.selection", "completed", "核对 Coordinator 提出的待办关联",
                     metadata={"work_id": intent.pending_work_id, "current_source": selected_work is not None,
                               "response_kind": intent.response_kind, "action": intent.action})
-                fresh = self._fresh_writer_authorization(project, text, intent, selected_work) if isinstance(selected_work, dict) else None
+                fresh = self._fresh_writer_authorization(project, authorization_text, intent, selected_work) if isinstance(selected_work, dict) else None
                 if fresh is not None:
                     trace.record("controller.pending_work.authorization", "completed", "按本次明确新增的单次写作授权建立独立限次记录，保留旧任务次数",
                         metadata={"previous_work_id": selected_work["id"], "previous_task_id": selected_work["source"]["task_id"],
                                   "previous_run_id": selected_work.get("run_id"), "previous_source": selected_work["source"],
-                                  "message_hash": content_hash(text), "writer_task_attempt_limit": 1}, public=False)
+                                  "message_hash": content_hash(authorization_text), "writer_task_attempt_limit": 1}, public=False)
                     intent = fresh
                 elif (pending is None and local_work is None
                         and intent.response_kind == "new_task" and not intent.related_task_id
@@ -1198,7 +1220,7 @@ class TerminalSession:
                 # Preserve successful understanding even when a later local gate cannot proceed.
                 async with project_write_lock(project.root):
                     if writer_authorized and not intent.pending_work_id:
-                        key = conversation_key("writer_authorization:" + content_hash(text))
+                        key = conversation_key("writer_authorization:" + content_hash(authorization_text))
                         authorization = project.db.get_metadata(key)
                         if authorization is not None and (not isinstance(authorization, dict)
                                 or authorization.get("task_id") != task_scope.task_id
@@ -1209,7 +1231,7 @@ class TerminalSession:
                             runtime = active_runtime.get()
                             project.db.set_metadata(key, {"task_id": task_scope.task_id, "run_id": runtime.run_id,
                                 "snapshot_hash": task_scope.snapshot_hash, "novel_id": project.project_id,
-                                "trace_id": trace.run_id, "message_hash": content_hash(text),
+                                "trace_id": trace.run_id, "message_hash": content_hash(authorization_text),
                                 "intent": intent.model_dump(mode="json")})
                     self._save_pending_task(project, intent, "running")
             if intent.pending_work_id and intent.action != "pending_work":

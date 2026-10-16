@@ -135,3 +135,103 @@ def test_new_single_writer_grant_preserves_old_cap_and_checkpoints_before_gate(t
                 active_runtime.reset(token)
 
     asyncio.run(scenario())
+
+
+def test_natural_writer_grant_and_saved_original_resume(tmp_path, monkeypatch):
+    monkeypatch.setenv("INKFLOW_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    project = InkFlowProject.create(tmp_path, BookBrief(title="自然授权", genre="悬疑", protagonist="调查员",
+        premise="调查员沿现行规划核对街坊留下的旧线索。"))
+    settings = Settings(writer_task_attempt_limit=1, quality_preset="balanced", workspace_root=tmp_path)
+    scope = StudioService(project).db.prepare_task_settings("saved-natural-authorization", novel_id=project.project_id,
+        settings=settings, workspace_root=project.root, collaboration_mode="everyday")
+    runtime = RunRuntime(publish=lambda event: None, run_id="saved-natural-run", task_id=scope.task_id)
+    session = TerminalSession(InkFlowEngine(ScriptedProvider([]), scope.settings))
+    original = TerminalIntent(action="write_review_accept", chapter_no=51, authorization="approved",
+        authorization_source="current_request", visible_reason="完成第51章")
+    old = project.record_pending_work(kind="workflow", reason="旧Writer请求失败", next_action="等待明确新增授权",
+        source={"task_id": "old-natural-task"}, run_id="old-natural-run", status="interrupted",
+        intent=original.model_dump(mode="json"), chapter_no=51)
+    recovery_key = "coordinator_recovery:old-natural-task:writer.write"
+    recovery = {"status": "waiting_user", "attempts": [{"run_id": "old-a"}, {"run_id": "old-b"}]}
+    project.db.set_metadata(recovery_key, recovery)
+    work = next(item for item in project.pending_work() if item["id"] == old["id"])
+    ui_message = (
+        "刚才第51章断流了，这次我明确追加一次Writer请求，旧的失败记录和次数都保留。"
+        "请先用平衡档、四人连续性审查把第51章完成，审查通过后接收，前50章不要改，也先不写后面的章节。"
+        "本次Writer最多请求一次，格式修复也算在内。沿用我保存的MiMo设置和当前生效规划，不重新规划，"
+        "不为小幅润色额外调用，也不用生成下一步推荐。"
+    )
+    routed = original.model_copy(update={"pending_work_id": old["id"], "related_task_id": "old-natural-task",
+        "response_kind": "task_revision", "confidence": "high", "user_message": ui_message,
+        "operation_instruction": ui_message})
+    recognized = (
+        ui_message,
+        "我这次明确追加一次Writer请求，请先把第51章完成。",
+        "这次我明确追加一次Writer请求，请先把第51章完成。",
+        "刚才连接断了。这次我明确追加一次Writer请求，请先把第51章完成。",
+        "刚才提示“连接断开”，这次我明确追加一次Writer请求，请先把第51章完成。",
+        "请先把第51章完成，我这次明确追加一次Writer请求。",
+    )
+    rejected = (
+        "继续", "代码修好了，请再试一次第51章。", "换个提示词继续第51章。",
+        "不要追加一次Writer请求，只查看第51章。",
+        "如果可以，这次我明确追加一次Writer请求，请先把第51章完成。",
+        "假如这次我明确追加一次Writer请求，请先把第51章完成。",
+        "“这次我明确追加一次Writer请求”，这是例句，第51章先不写。",
+        "“刚才连接断了。这次我明确追加一次Writer请求，请先把第51章完成。”",
+        "这次我明确追加一次Writer请求吗？请先查看第51章。",
+        "这次我明确追加一次Writer请求，可以吗？请先查看第51章。",
+        "这次我明确追加一次Writer请求，请先把第52章完成。",
+    )
+
+    async def scenario():
+        with use_task_settings(scope):
+            token = active_runtime.set(runtime)
+            try:
+                for message in recognized:
+                    fresh = session._fresh_writer_authorization(project, message, routed, work)
+                    assert fresh is not None, message
+                    assert fresh.pending_work_id is None and fresh.related_task_id == "old-natural-task"
+                    assert fresh.user_message == message
+                for message in rejected:
+                    assert session._fresh_writer_authorization(project, message, routed, work) is None, message
+
+                # Recreate the saved successful route from the local old-work
+                # gate failure. No new Coordinator decision is needed to resume.
+                async with project_write_lock(project.root):
+                    session._save_pending_task(project, routed, "failed")
+                pending = session.pending_resume(project, "继续")
+                assert pending["task_id"] == scope.task_id and pending["intent"]["user_message"] == ui_message
+                monkeypatch.setattr(session, "_build_packet", lambda *a: ContextPacket(project_id=project.project_id,
+                    chapter_no=51, task="自然授权续接检查", estimated_tokens=0, sections=[]))
+                async def no_coordinator(packet):
+                    raise AssertionError("the saved natural grant must resume without a Coordinator call")
+                monkeypatch.setattr(session, "_route_packet", no_coordinator)
+                dispatched = []
+                async def no_production(root, intent, ticket, plan, *args, **kwargs):
+                    from inkflow.task_settings import active_task_settings
+                    active = active_task_settings.get()
+                    dispatched.append((intent, active.task_id, active.snapshot_hash))
+                    return {"status": "completed", "reply": "离线仅核授权交接，不生成或接受正文。"}
+                monkeypatch.setattr(session, "_dispatch", no_production)
+                completed = await session.handle(project.root, "继续", opened_project=project, include_suggestions=False)
+                assert completed["status"] == "completed" and len(dispatched) == 1
+                saved_intent, task_id, snapshot_hash = dispatched[0]
+                assert task_id == scope.task_id and snapshot_hash == scope.snapshot_hash
+                assert saved_intent.user_message == ui_message and saved_intent.pending_work_id is None
+                assert saved_intent.related_task_id == "old-natural-task" and saved_intent.chapter_no == 51
+                key = conversation_key("writer_authorization:" + content_hash(ui_message))
+                receipt = project.db.get_metadata(key)
+                assert receipt["task_id"] == scope.task_id and receipt["snapshot_hash"] == scope.snapshot_hash
+                assert receipt["message_hash"] == content_hash(ui_message)
+                assert receipt["intent"]["user_message"] == ui_message
+                assert project.db.get_metadata(conversation_key("writer_authorization:" + content_hash("继续"))) is None
+                repeated = session.pending_resume(project, ui_message)
+                assert repeated["task_id"] == scope.task_id and repeated["writer_authorization"]
+                assert project.db.get_metadata(recovery_key) == recovery
+                assert project.db.get_metadata(f"pending_work:{old['id']}") == old
+                assert not session.engine.provider.calls and runtime.calls == 0
+            finally:
+                active_runtime.reset(token)
+
+    asyncio.run(scenario())
