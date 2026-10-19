@@ -605,6 +605,25 @@ class TerminalSession:
             "related_task_id": source["task_id"], "authorization_source": "current_request", "user_message": message})
 
     @staticmethod
+    def _fresh_review_authorization(project: InkFlowProject, message: str, intent: TerminalIntent) -> TerminalIntent | None:
+        scope, runtime = active_task_settings.get(), active_runtime.get()
+        grant = re.match(r"^\s*(?:墨宝[，,]\s*)?(?:我)?(?:这次|本次|现在)(?:我)?明确授权"
+            r"(?:新增|追加)一次第\s*(\d+)\s*章(?:补审|审查)(?:任务)?[。；;，,]", message)
+        if (grant is None or scope is None or runtime is None or runtime.task_id != scope.task_id
+                or scope.novel_id != project.project_id or intent.action not in {"review", "review_accept"}
+                or intent.authorization != "approved" or intent.authorization_source != "current_request"):
+            return None
+        target, end = TerminalSession._explicit_chapter_range(message)
+        if (target != int(grant[1]) or end is not None or intent.chapter_no != target
+                or intent.end_chapter_no not in {None, target}):
+            return None
+        chapter = project.db.get_chapter(target)
+        if not chapter or chapter.get("status") != "draft":
+            return None
+        return intent.model_copy(update={"user_message": message, "response_kind": "new_task",
+            "pending_work_id": None, "related_task_id": None, "pending_work_decision": "inspect"})
+
+    @staticmethod
     def _confirmed_pending_work_intent(project: InkFlowProject, text: str) -> TerminalIntent | None:
         if re.fullmatch(r"\s*(?:处理|解决|收尾)(?:当前)?(?:全部|所有)(?:的)?待办[。！!\s]*", text):
             return TerminalIntent(action="pending_work", authorization="approved", confidence="high",
@@ -1262,8 +1281,11 @@ class TerminalSession:
             authorization_text = pending.get("intent", {}).get("user_message", text) if same_task_resume else text
             authorized_intent = self._fresh_writer_authorization(project, authorization_text, intent, None)
             writer_authorized = authorized_intent is not None
+            review_authorized_intent = self._fresh_review_authorization(project, authorization_text, intent)
             if writer_authorized:
                 intent = authorized_intent
+            elif review_authorized_intent is not None:
+                intent = review_authorized_intent
             elif same_task_resume:
                 intent = intent.model_copy(update={"user_message": authorization_text})
             if _suggestions_forbidden(intent, user_message=authorization_text) and len(intent.forbidden_actions) < 16:
@@ -1298,6 +1320,15 @@ class TerminalSession:
             if routing_response is None and intent.authorization == "approved" and _resumable_intent(intent):
                 # Preserve successful understanding even when a later local gate cannot proceed.
                 async with project_write_lock(project.root):
+                    if review_authorized_intent is not None:
+                        key = conversation_key("review_authorization:" + content_hash(authorization_text))
+                        grant = project.db.get_metadata(key)
+                        if grant is not None and (not isinstance(grant, dict)
+                                or grant.get("task_id") != task_scope.task_id or grant.get("novel_id") != project.project_id):
+                            raise ValidationGateError("这次新增审查授权已绑定原补审任务，未创建新次数；请继续原补审。")
+                        if grant is None:
+                            project.db.set_metadata(key, {"task_id": task_scope.task_id, "novel_id": project.project_id,
+                                "snapshot_hash": task_scope.snapshot_hash, "message_hash": content_hash(authorization_text)})
                     if writer_authorized and not intent.pending_work_id:
                         key = conversation_key("writer_authorization:" + content_hash(authorization_text))
                         authorization = project.db.get_metadata(key)
@@ -3744,7 +3775,7 @@ class TerminalSession:
         # The executed action must be the same immutable, validated workflow
         # shown to the user. The engine owns each step's production gates.
         if active_task_settings.get() is None:
-            project = InkFlowProject(root)
+            project = await asyncio.to_thread(InkFlowProject, root)
             scope = StudioService(project).db.prepare_task_settings(
                 f"dispatch-{uuid4().hex}", novel_id=project.project_id,
                 settings=self.engine.settings, workspace_root=project.root,
@@ -3756,12 +3787,13 @@ class TerminalSession:
                     packet=packet, consume_steering=consume_steering,
                 )
         from .studio import bind_active_collaboration
-        bind_active_collaboration(InkFlowProject(root, recover_on_open=False), intent.action,
+        project = InkFlowProject(root, recover_on_open=False)
+        bind_active_collaboration(project, intent.action,
             specialist=intent.specialist_role, reason=intent.specialist_reason,
             forbidden_actions=intent.forbidden_actions)
         if ticket is None or dispatch_plan is None:
             task_scope = active_task_settings.get()
-            ticket, dispatch_plan = Coordinator(InkFlowProject(root, recover_on_open=False)).compile(
+            ticket, dispatch_plan = Coordinator(project).compile(
                 intent,
                 collaboration_mode=task_scope.effective_collaboration_mode if task_scope else "everyday",
                 task_snapshot_hash=task_scope.snapshot_hash if task_scope else None,
@@ -4307,7 +4339,6 @@ class TerminalSession:
             draft_reference = {"task_id": intent.related_task_id, "message_hash": content_hash(intent.user_message)}
 
         if intent.action in {"accept", "review_accept", "write_review_accept", "revise_review_accept"}:
-            project = InkFlowProject(root)
             scope = active_task_settings.get()
             chapter = project.db.get_chapter(chapter_no)
             receipt = project.db.get_metadata(f"workflow_accept:{scope.task_id}:{chapter_no}", {}) if scope else {}
@@ -4405,12 +4436,12 @@ class TerminalSession:
             # pass 报告。用户明确是在已有合格版本上接收时，不重复调用
             # Reviewer；这避免无意义的重复等待，同时仍由 accept_chapter
             # 再次校验版本、哈希、结论和 记忆服务 门禁。
-            reused = self._reuse_current_pass_review(InkFlowProject(root), chapter_no)
+            reused = self._reuse_current_pass_review(project, chapter_no)
             if reused is not None:
                 steps.append(reused)
                 return await self._conditionally_accept(root, chapter_no, steps, reused)
             reviewed = await self._run_step("engine.review_mode", self.engine.review_and_repair(
-                root, chapter_no, instruction=instruction, max_revision_rounds=intent.max_revision_rounds,
+                root, chapter_no, instruction=instruction, max_revision_rounds=0,
             ))
             steps.append(reviewed)
             if "gate" in reviewed:

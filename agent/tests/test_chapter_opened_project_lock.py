@@ -90,3 +90,44 @@ def test_short_write_contention_does_not_request_coordinator_diagnosis(tmp_path)
         active_runtime.reset(token)
     assert result["coordinator_recovery"]["status"] == "not_run"
     assert result["steps"] == response["steps"] and not provider.calls and runtime.calls == 0
+
+
+def test_review_accept_dispatch_reuses_read_handle_during_short_other_write(tmp_path, monkeypatch):
+    from inkflow.schemas import TerminalIntent
+    from inkflow.task_settings import capture_task_settings, restore_task_settings, use_task_settings
+    from inkflow.terminal_session import TerminalSession
+
+    project = project_fixture(tmp_path)
+    project.db.upsert_draft(11, "旧记录", "chapter11.md", "现有草稿不变。")
+    settings = Settings(workspace_root=project.root)
+    scope = restore_task_settings(capture_task_settings(settings, novel_id=project.project_id),
+        novel_id=project.project_id, workspace_root=project.root)
+    provider = ScriptedProvider([])
+    engine = InkFlowEngine(provider, settings)
+    calls = []
+    async def review(*args, **kwargs):
+        calls.append(True)
+        assert kwargs["max_revision_rounds"] == 0
+        assert (project.internal / "project.write.lock").exists()
+        return {"verdict": "unknown", "summary": "离线仅检查调度入口，不执行审核或接受。"}
+    monkeypatch.setattr(engine, "review_and_repair", review)
+    session = TerminalSession(engine)
+    async def exercise():
+        ready = asyncio.Event()
+        async def other_write():
+            async with project_write_lock(project.root):
+                ready.set()
+                await asyncio.sleep(.1)
+        with use_task_settings(scope):
+            owner = asyncio.create_task(other_write())
+            await ready.wait()
+            try:
+                result = await session._dispatch(project.root, TerminalIntent(action="review_accept", chapter_no=11,
+                    authorization="approved", authorization_source="current_request", visible_reason="只补审当前草稿"))
+                assert result["steps"][0]["result"]["verdict"] == "unknown"
+                assert result["steps"][-1]["skipped"]
+            finally:
+                await owner
+    asyncio.run(exercise())
+    assert calls == [True] and not provider.calls
+    assert not (project.internal / "project.write.lock").exists()
