@@ -44,6 +44,7 @@ PERSISTED_SETTING_NAMES = {
     "context_budget_mode",
     "agent_context_budgets",
     "max_output_tokens",
+    "automatic_output_tokens",
     "max_concurrent_model_requests",
     "writer_task_attempt_limit",
     "request_timeout_seconds",
@@ -246,6 +247,7 @@ class Settings:
         default_factory=lambda: {name: dict(values) for name, values in DEFAULT_AGENT_CONTEXT_BUDGETS.items()}
     )
     max_output_tokens: int = 32_000
+    automatic_output_tokens: bool = False
     max_concurrent_model_requests: int = 3
     writer_task_attempt_limit: int | None = None
     request_timeout_seconds: float = 180.0
@@ -426,6 +428,8 @@ class Settings:
                                      f"完整输入约 {input_tokens:,} tokens，可用上下文 {hard:,} tokens。"
                                      "请调整该角色预算或缩小本次输入后继续。")
         limits = self.model_limits(selected)
+        if self.automatic_output_tokens and role in self.agent_generation:
+            return min(requested, remaining, limits.get("max_output_tokens", requested))
         return min(requested, self.max_output_tokens, remaining, limits.get("max_output_tokens", requested))
 
     def role_settings_view(self, protocol_version: int = 1) -> dict[str, Any]:
@@ -481,6 +485,7 @@ class Settings:
         soft = _positive_int(value.get("context_soft_tokens", defaults.context_soft_tokens), "软上下文预算")
         hard = _positive_int(value.get("context_hard_tokens", defaults.context_hard_tokens), "硬上下文上限")
         output = _positive_int(value.get("max_output_tokens", defaults.max_output_tokens), "单次输出上限")
+        automatic_output = _as_bool(value.get("automatic_output_tokens", False))
         max_concurrent_model_requests = _bounded_int_range(
             value.get("max_concurrent_model_requests", defaults.max_concurrent_model_requests),
             "模型请求并发上限",
@@ -503,10 +508,10 @@ class Settings:
             value.get("agent_context_budgets", {}), None
         )
         agent_context_budgets = _agent_context_budgets(raw_agent_budgets)
-        if output > hard:
+        if not automatic_output and output > hard:
             raise ConfigurationError("单次模型输出上限不能大于已配置的最大上下文。")
         limits = _official_model_limits(base_url, model)
-        if limits and output > limits["max_output_tokens"]:
+        if not automatic_output and limits and output > limits["max_output_tokens"]:
             raise ConfigurationError(f"模型 {model} 的已核实输出上限为 {limits['max_output_tokens']:,} tokens；"
                                      "请调整输出设置或选择支持更大输出的模型。")
         timeout = _positive_float(
@@ -592,6 +597,7 @@ class Settings:
             agent_context_budgets=agent_context_budgets,
             role_settings_warnings=tuple(dict.fromkeys((*context_warnings, *generation_warnings))),
             max_output_tokens=output,
+            automatic_output_tokens=automatic_output,
             max_concurrent_model_requests=max_concurrent_model_requests,
             writer_task_attempt_limit=writer_task_attempt_limit,
             request_timeout_seconds=timeout,
@@ -760,6 +766,9 @@ class Settings:
         return True if role in {"editor", "reviewer", "memory_keeper"} else requested
 
     def generation_output_budget(self, role: str | None, requested: int, thinking: bool) -> int:
+        if self.automatic_output_tokens and role in self.agent_generation:
+            # Preparation reserves an estimate; the adapter fits actual capacity after compiling input.
+            return requested
         # Native reasoning shares the output limit with JSON; honor the author's ceiling, not a hidden 8k cap.
         if (self.is_mimo or self.is_deepseek) and thinking and role in self.agent_generation:
             return self.max_output_tokens

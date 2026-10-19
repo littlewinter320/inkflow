@@ -14,6 +14,55 @@ class ProfileAnswer(BaseModel):
     answer: str
 
 
+def test_automatic_output_removes_author_ceiling_and_preserves_context_boundary(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from inkflow.task_settings import capture_task_settings, restore_task_settings, _canonical
+    from inkflow.utils import content_hash, json_dumps
+    from inkflow.engine import _review_settings_fingerprint
+
+    monkeypatch.setenv("INKFLOW_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setattr(Settings, "require_api_key", lambda self: "offline-test")
+    sent = []
+    client = httpx.AsyncClient
+    def respond(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": '{"answer":"ok"}'}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 10}})
+    monkeypatch.setattr("inkflow.provider.httpx.AsyncClient", lambda **kwargs:
+        client(transport=httpx.MockTransport(respond), **kwargs))
+    for kind, model, url, capacity in (("mimo", "mimo-v2.6-flash", "https://token-plan-cn.xiaomimimo.com/v1", 131072),
+                                      ("mimo", "mimo-v2.5", "https://token-plan-cn.xiaomimimo.com/v1", 131072),
+                                      ("deepseek", "deepseek-v4-flash", "https://api.deepseek.com", 393216)):
+        old = Settings(provider_kind=kind, model=model, base_url=url, workspace_root=tmp_path, max_output_tokens=40000)
+        snapshot = capture_task_settings(old, novel_id="offline")
+        snapshot["settings"].pop("automatic_output_tokens")
+        snapshot["snapshot_hash"] = content_hash(_canonical({k: v for k, v in snapshot.items() if k != "snapshot_hash"}))
+        before = json.dumps(snapshot)
+        restored = restore_task_settings(snapshot, novel_id="offline", workspace_root=tmp_path)
+        assert not restored.settings.automatic_output_tokens and json.dumps(snapshot) == before
+        assert _review_settings_fingerprint(old) == content_hash(json_dumps(snapshot["settings"], indent=None))
+        assert not Settings.from_mapping({k: v for k, v in old.to_mapping().items() if k != "automatic_output_tokens"}).automatic_output_tokens
+        automatic = Settings.from_mapping({**old.to_mapping(), "automatic_output_tokens": True})
+        for role in automatic.agent_generation:
+            assert automatic.generation_output_budget(role, 1600, False) == 1600
+            asyncio.run(DeepSeekProvider(automatic).generate_json(system_prompt="合同", user_prompt="离线输入",
+                output_model=ProfileAnswer, agent_role=role, max_tokens=1600))
+            if kind == "mimo" and model != "mimo-v2.5":
+                assert "max_completion_tokens" not in sent[-1] and "max_tokens" not in sent[-1]
+            else:
+                assert sent[-1]["max_completion_tokens" if kind == "mimo" else "max_tokens"] == capacity
+        limited = replace(automatic, context_hard_tokens=45000, context_soft_tokens=40000)
+        asyncio.run(DeepSeekProvider(limited).generate_json(system_prompt="合同", user_prompt="资料" * 3000,
+            output_model=ProfileAnswer, agent_role="writer", max_tokens=1600))
+        field = "max_completion_tokens" if kind == "mimo" else "max_tokens"
+        assert 0 < sent[-1][field] < 45000
+        assert automatic.effective_output_tokens(1, None) == 1
+        assert old.effective_output_tokens(capacity, "writer") == 40000
+        project = type("Project", (), {"db": type("DB", (), {"get_brief": lambda self:
+            type("Brief", (), {"target_chapter_words": 2900})()})()})()
+        assert InkFlowEngine(None, limited)._context_builder(project, "writer").output_reserve_tokens == 8000
+
+
 def test_thinking_profiles_and_retry_preserve_actual_role_policy(tmp_path, monkeypatch):
     monkeypatch.setenv("INKFLOW_SETTINGS_PATH", str(tmp_path / "settings.json"))
     monkeypatch.setattr(Settings, "require_api_key", lambda self: "offline-test")

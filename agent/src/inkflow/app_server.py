@@ -434,6 +434,7 @@ class InkFlowAppService:
                 "context_budget_mode": settings.context_budget_mode,
                 "agent_context_budgets": settings.agent_context_budgets,
                 "max_output_tokens": settings.max_output_tokens,
+                "automatic_output_tokens": settings.automatic_output_tokens,
                 "request_timeout_seconds": settings.request_timeout_seconds,
                 "planning_timeout_seconds": settings.planning_timeout_seconds,
                 "writer_task_attempt_limit": settings.writer_task_attempt_limit,
@@ -443,7 +444,8 @@ class InkFlowAppService:
                     "model_limits": settings.model_limits(settings.model_for(role)),
                     "capabilities": settings.parameter_capabilities(settings.model_for(role)),
                     "context_tokens": settings.context_budget_for(role)[1],
-                    "max_output_tokens": settings.effective_output_tokens(settings.max_output_tokens, role)}
+                    "max_output_tokens": settings.effective_output_tokens(settings.context_budget_for(role)[1]
+                        if settings.automatic_output_tokens else settings.max_output_tokens, role)}
                     for role in settings.agent_generation},
                 "inquiry_frequency": settings.inquiry_frequency,
                 "hook_strategy": settings.hook_strategy,
@@ -502,6 +504,7 @@ class InkFlowAppService:
                     "context_budget_mode",
                     "agent_context_budgets",
                     "max_output_tokens",
+                    "automatic_output_tokens",
                     "request_timeout_seconds",
                     "planning_timeout_seconds",
                     "writer_task_attempt_limit",

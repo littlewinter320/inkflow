@@ -21,6 +21,7 @@ from .writer_notes import recent_approved_notes
 
 
 _COMPRESSED_NOTE = "（已按完整条目压缩；完整资料仍保存在本地）"
+_RECENT_PROSE_SOFT_LIMIT = 24_000
 active_batch_context: ContextVar[dict[str, Any] | None] = ContextVar("inkflow_batch_operation", default=None)
 
 
@@ -200,6 +201,34 @@ def _fit_soft_content(content: str, limit: int, *, keep_tail: bool = False) -> s
         return rendered
     empty = [] if isinstance(value, list) else {}
     return json.dumps(empty, ensure_ascii=False, indent=2)
+
+
+def _covered_recent_source(hit: dict[str, Any], recent: dict[int, dict[str, Any]],
+                           retained_prose: str) -> str | None:
+    """Reuse only a verified canonical excerpt whose whole chapter survives E compression."""
+    resolved = hit.get("resolved_source")
+    if hit.get("body_kind") != "accepted_prose" or not isinstance(resolved, dict):
+        return None
+    number, version = resolved.get("chapter_no"), resolved.get("version")
+    if type(number) is not int or number < 1 or type(version) is not int or version < 1:
+        return None
+    loaded = recent.get(number)
+    if not loaded or loaded.get("version") != version:
+        return None
+    canonical, source_hash = loaded.get("content"), resolved.get("source_hash")
+    identity = f"chapter:{number:05d}"
+    if (not isinstance(canonical, str) or not source_hash
+            or resolved.get("source_id") != identity
+            or loaded.get("content_hash") != source_hash or content_hash(canonical) != source_hash
+            or hit.get("version") != version or hit.get("source_hash") != source_hash):
+        return None
+    body, start, end = hit.get("body"), resolved.get("start"), resolved.get("end")
+    if (not isinstance(body, str) or not body.strip() or type(start) is not int or type(end) is not int
+            or not 0 <= start < end <= len(canonical) or canonical[start:end] != body):
+        return None
+    # Keep the chapter heading too: evidence lookup must still scope this source to its own prose.
+    block = f"### 第 {number} 章\n\n{canonical}".strip()
+    return identity if block in retained_prose else None
 
 
 def _voice_preferences_content(items: list[dict[str, Any]]) -> str:
@@ -460,10 +489,31 @@ class ContextBuilder:
             *recent_ids,
             *[source_id for section in cited_chapters for source_id in section.source_ids],
         }
+        retained_recent = _fit_soft_content("\n\n".join(recent_parts), _RECENT_PROSE_SOFT_LIMIT, keep_tail=True)
+        recent_sources = {int(item["chapter_no"]): item for item in recent}
+        prose_coverage = [(str(item["source_id"]),
+                           _covered_recent_source(item, recent_sources, retained_recent)
+                           if str(item["source_id"]) not in pinned_sources else None)
+                          for item in retrieval_hits]
+        covered_prose = {identity: source for identity, source in prose_coverage if source}
+        for identity, source in prose_coverage:
+            if source != covered_prose.get(identity):
+                covered_prose.pop(identity, None)
+        already_loaded.update(covered_prose)
         duplicate_retrieval_ids = sorted(
             str(item["source_id"]) for item in retrieval_hits
             if str(item["source_id"]) in already_loaded
         )
+        if covered_prose:
+            discarded = self.retriever.last_diagnostics.setdefault("discarded", [])
+            discarded[:0] = [{"source_id": item["source_id"], "source_type": item.get("source_type"),
+                              "chapter_no": item["resolved_source"]["chapter_no"],
+                              "resolved_source": dict(item["resolved_source"]),
+                              "retrieval_uses": item.get("retrieval_uses", []),
+                              "reason": f"已由本次 {covered_prose[str(item['source_id'])]} 同版正史全文覆盖，压缩后仍保留。"}
+                             for item in retrieval_hits if str(item["source_id"]) in covered_prose]
+            del discarded[self.retriever.last_diagnostics.get("discarded_display_limit", 80):]
+            reading_candidates = [item for item in reading_candidates if str(item["source_id"]) not in covered_prose]
         eligible_preference_ids = {str(item["preference_id"]) for item in applicable}
         preference_retrieval_omissions = []
         selected_hits = []
@@ -1332,7 +1382,7 @@ class ContextBuilder:
         """只压缩低权威软资料；顺序固定且优先保留高相关候选和最近正文。"""
 
         actions: list[str] = []
-        targets = {"RECOVERY": 4_000, "H": 4_000, "I": 4_000, "J1": 2_000, "J2": 4_000, "E1": 4_000, "F": 10_000, "E": 24_000, "D1": 8_000}
+        targets = {"RECOVERY": 4_000, "H": 4_000, "I": 4_000, "J1": 2_000, "J2": 4_000, "E1": 4_000, "F": 10_000, "E": _RECENT_PROSE_SOFT_LIMIT, "D1": 8_000}
         for key in ("RECOVERY", "H", "J1", "I", "J2", "E1", "F", "E", "D1"):
             if _packet_input_tokens(packet, protected_input) <= int(self.soft_token_limit * 0.82):
                 break

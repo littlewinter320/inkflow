@@ -89,6 +89,10 @@ def _budgeted_generation(method):
             kwargs["thinking"] = self.settings.thinking_for(role, kwargs.get("thinking", True))
             kwargs["max_tokens"] = self.settings.generation_output_budget(
                 role, kwargs.get("max_tokens", 32_000), kwargs["thinking"])
+            selected = _selected_model(self.settings, role, kwargs.get("model_override"))
+            limits = self.settings.model_limits(selected)
+            if self.settings.automatic_output_tokens and role in self.settings.agent_generation and limits:
+                kwargs["max_tokens"] = min(limits["max_output_tokens"], self.settings.context_budget_for(role, model_override=selected)[1])
             return await method(self, **kwargs)
     return generate
 
@@ -171,17 +175,19 @@ def _publish_request_started(runtime, *, role: str | None, model: str, attempt: 
         warnings.warn(f"模型等待信息暂未送达（{type(exc).__name__}）；原请求继续。", RuntimeWarning, stacklevel=2)
 
 
-def _preserve_writer_response(settings: Settings, accounting: ModelAttempt, *, role: str | None,
+def _preserve_model_response(settings: Settings, accounting: ModelAttempt, *, role: str | None,
                               output_model: type[BaseModel], content: str, model: str,
                               response_id: str | None, finish_reason: str | None,
                               serialized_input: str, attempt: int, incomplete: bool = False,
                               stream_diagnostic: dict[str, Any] | None = None) -> Path | None:
     from .model_usage import project_identity
-    from .schemas import DraftOutput
+    from .schemas import DraftOutput, ModeCheckOutput
     from .task_settings import TASK_SETTINGS_FIELDS
 
     scope, runtime = active_task_settings.get(), active_runtime.get()
-    if (role != "writer" or output_model is not DraftOutput
+    writer = role == "writer" and output_model is DraftOutput
+    review = role in {"editor", "reviewer", "memory_keeper"} and issubclass(output_model, ModeCheckOutput)
+    if ((not writer and not review)
             or (not incomplete and finish_reason not in {"stop", "end_turn", "stop_sequence"})
             or not content or scope is None or runtime is None or settings.workspace_root is None
             or scope.settings.workspace_root is None or not scope.task_id or not scope.snapshot_hash
@@ -194,7 +200,7 @@ def _preserve_writer_response(settings: Settings, accounting: ModelAttempt, *, r
             != {key: value for key, value in scope.settings.to_mapping().items() if key in TASK_SETTINGS_FIELDS}):
         return None
     # Use a local UUID, never task IDs or provider-controlled response IDs, as a path component.
-    path = root / ".inkflow" / "recovery" / f"provider-response-{uuid4().hex}" / "writer-response.unverified.json"
+    path = root / ".inkflow" / "recovery" / f"provider-response-{uuid4().hex}" / f"{role}-response.unverified.json"
     if not path.resolve().is_relative_to(root):
         return None
     artifact = {"status": "incomplete" if incomplete else "unverified", "authority": "task_temporary_not_canon",
@@ -209,7 +215,7 @@ def _preserve_writer_response(settings: Settings, accounting: ModelAttempt, *, r
     try:
         atomic_write_text(path, json_dumps(artifact) + "\n")
     except (OSError, UnicodeError) as exc:
-        failure = ProviderError("已收到写作返回，但本地未验证产物保存失败；本步骤不会重新请求模型。请修复本地存储条件后处理，不能把这次返回视为已保存草稿。")
+        failure = ProviderError("已收到模型返回，但本地未验证产物保存失败；本步骤不会重新请求模型。请修复本地存储条件后处理，不能把这次返回视为已核验产物。")
         failure.recovery_node = "provider.response_preservation"
         failure.recovery_attempts = attempt
         failure.recovery_exhausted = True
@@ -217,14 +223,28 @@ def _preserve_writer_response(settings: Settings, accounting: ModelAttempt, *, r
         raise failure from exc
     try:
         runtime.publish({"type": "model.response_preserved", "role": role,
-            "summary": ("已保存断流前收到的写作片段；内容未完成，未作为草稿采用。" if incomplete else
-                        "已保存本次写作返回，仍须完成格式、来源和正文核验。"),
+            "summary": ("已保存断流前收到的返回片段；内容未完成，未采用。" if incomplete else
+                        "已保存本次模型返回，仍须完成格式、来源和相应职责核验。"),
             "metadata": {"status": artifact["status"], "artifact_path": path.relative_to(root).as_posix(),
                          "task_id": scope.task_id, "snapshot_hash": scope.snapshot_hash,
                          "content_hash": artifact["content_hash"], "attempt": attempt}})
     except Exception as exc:
-        warnings.warn(f"写作返回已保存，通知暂未送达（{type(exc).__name__}）；未重发模型请求。", RuntimeWarning, stacklevel=2)
+        warnings.warn(f"模型返回已保存，通知暂未送达（{type(exc).__name__}）；未重发模型请求。", RuntimeWarning, stacklevel=2)
     return path
+
+
+def _report_invalid_output(exc: Exception, role: str | None, attempt: int) -> list[dict[str, str]]:
+    issues = [{"location": ".".join(map(str, item["loc"])), "type": item["type"], "message": item["msg"][:500]}
+        for item in exc.errors(include_input=False, include_url=False)[:8]] if isinstance(exc, ValidationError) else []
+    runtime = active_runtime.get()
+    if issues and runtime:
+        try:
+            runtime.publish({"type": "model.output.invalid", "role": role,
+                "summary": "本次模型返回未通过结构核验；具体缺项与原因已记入诊断，未作为通过结果采用。",
+                "metadata": {"attempt": attempt, "validation_errors": issues}})
+        except Exception as error:
+            warnings.warn(f"输出诊断暂未送达（{type(error).__name__}）；未重发模型请求。", RuntimeWarning, stacklevel=2)
+    return issues
 
 
 def _generation_schema(output_model: type[T]) -> dict[str, Any]:
@@ -740,6 +760,11 @@ class DeepSeekProvider:
             requested_max_tokens = self.settings.effective_output_tokens(
                 min(max_tokens, requested_max_tokens), agent_role, model_override, estimate_tokens(serialized_input))
             payload[token_parameter] = requested_max_tokens
+            # MiMo's documented default is its full model capacity; only send a smaller context boundary.
+            if (self.settings.automatic_output_tokens and agent_role in self.settings.agent_generation
+                    and self.settings.is_mimo and model_override != "mimo-v2.5"
+                    and requested_max_tokens == self.settings.model_limits(model_override).get("max_output_tokens")):
+                payload.pop(token_parameter)
             reservation_output = requested_max_tokens
             reserved = runtime.reserve(
                 estimate_tokens(serialized_input) + reservation_output
@@ -826,7 +851,7 @@ class DeepSeekProvider:
                         f"completion_tokens={usage.get('completion_tokens', 'unknown')}, "
                         f"reasoning_tokens={detail.get('reasoning_tokens', 'unknown')}）。"
                     )
-                _preserve_writer_response(self.settings, accounting, role=agent_role, output_model=request_model,
+                _preserve_model_response(self.settings, accounting, role=agent_role, output_model=request_model,
                     content=content, model=str(body.get("model") or payload["model"]), response_id=body.get("id"),
                     finish_reason=choice.get("finish_reason"), serialized_input=serialized_input, attempt=attempt + 1)
                 parsed = _model_from_json_content(content, request_model)
@@ -856,8 +881,7 @@ class DeepSeekProvider:
                 ProviderError,
             ) as exc:
                 accounting.failure = accounting.failure or type(exc).__name__
-                validation_errors = [{"location": ".".join(map(str, item["loc"])), "type": item["type"], "message": item["msg"][:500]}
-                    for item in exc.errors(include_input=False, include_url=False)[:8]] if isinstance(exc, ValidationError) else []
+                validation_errors = _report_invalid_output(exc, agent_role, attempt + 1)
                 last_error = exc
                 if getattr(exc, "recovery_exhausted", False):
                     raise
@@ -870,8 +894,9 @@ class DeepSeekProvider:
                     field_repair = repair
                     payload["messages"] = [{"role": "system", "content": repair.system},
                                            {"role": "user", "content": repair.prompt}]
-                    requested_max_tokens = min(requested_max_tokens,
-                        self.settings.generation_output_budget(agent_role, 1600, thinking))
+                    if not self.settings.automatic_output_tokens:
+                        requested_max_tokens = min(requested_max_tokens,
+                            self.settings.generation_output_budget(agent_role, 1600, thinking))
                     recovery_events.append({"attempt": attempt + 1, "kind": "missing_fields",
                         "error_type": "ValidationError", "strategy": "保留原正文，原Writer只补缺失元信息",
                         "fields": [list(path) for path in repair.paths], "usage_unknown": False})
@@ -963,7 +988,7 @@ class DeepSeekProvider:
                             except Exception as exc:
                                 warnings.warn(f"流式接收诊断暂未送达（{type(exc).__name__}）；未重发请求。", RuntimeWarning, stacklevel=2)
                         if not stream_state.get("completed") and stream_state.get("content"):
-                            _preserve_writer_response(self.settings, accounting, role=agent_role, output_model=request_model,
+                            _preserve_model_response(self.settings, accounting, role=agent_role, output_model=request_model,
                                 content=stream_state["content"], model=str(stream_state.get("model") or payload["model"]),
                                 response_id=stream_state.get("response_id"), finish_reason=diagnostic.get("finish_reason"),
                                 serialized_input=serialized_input, attempt=attempt + 1, incomplete=True,
@@ -1154,7 +1179,7 @@ class AnthropicProvider:
                 if body.get("stop_reason") == "max_tokens":
                     raise ProviderError("Anthropic 输出达到本次 tokens 上限，响应被截断；未补造正文或缺失字段。")
                 content = "".join(str(block.get("text") or "") for block in blocks if block.get("type") == "text")
-                _preserve_writer_response(self.settings, accounting, role=agent_role, output_model=request_model,
+                _preserve_model_response(self.settings, accounting, role=agent_role, output_model=request_model,
                     content=content, model=str(body.get("model") or payload["model"]), response_id=body.get("id"),
                     finish_reason=body.get("stop_reason"), serialized_input=serialized_input, attempt=attempt + 1)
                 parsed = _model_from_json_content(content, request_model)
@@ -1175,6 +1200,7 @@ class AnthropicProvider:
                 raise
             except (httpx.HTTPError, asyncio.TimeoutError, json.JSONDecodeError, ValidationError, ProviderError) as exc:
                 accounting.failure = accounting.failure or type(exc).__name__
+                _report_invalid_output(exc, agent_role, attempt + 1)
                 if (field_repair is None and response_complete and isinstance(exc, ValidationError)
                         and attempt + 1 < attempts):
                     repair = _draft_field_repair(exc, output_model, agent_role)

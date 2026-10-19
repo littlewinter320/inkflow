@@ -128,7 +128,8 @@ def _review_context_fingerprint(packet: ContextPacket) -> str:
 
 def _review_settings_fingerprint(settings: Settings) -> str:
     return content_hash(json_dumps({key: value for key, value in settings.to_mapping().items()
-                                   if key in TASK_SETTINGS_FIELDS}, indent=None))
+                                   if key in TASK_SETTINGS_FIELDS
+                                   and (key != "automatic_output_tokens" or value)}, indent=None))
 
 
 def _hook_planning_instruction(value: str) -> str:

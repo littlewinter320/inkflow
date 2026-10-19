@@ -10,7 +10,7 @@ import pytest
 
 from inkflow.config import Settings
 from inkflow.errors import ProviderError
-from inkflow.provider import AnthropicProvider, DeepSeekProvider, _generation_schema, _preserve_writer_response
+from inkflow.provider import AnthropicProvider, DeepSeekProvider, _generation_schema, _preserve_model_response
 from inkflow.runtime import RunRuntime, active_runtime
 from inkflow.schemas import DraftOutput
 from inkflow.task_settings import active_task_settings, capture_task_settings, restore_task_settings
@@ -93,15 +93,15 @@ def test_writer_response_is_bound_unverified_and_not_retried_after_local_save_fa
     kwargs = dict(role="writer", output_model=DraftOutput, content=raw, model=settings.model, response_id=None,
                   finish_reason="stop", serialized_input="[]", attempt=1)
     before = set(artifacts())
-    assert _preserve_writer_response(settings, accounting, **kwargs) is None
+    assert _preserve_model_response(settings, accounting, **kwargs) is None
     with bound(settings, "offline-no-artifact") as (scope, _, _):
-        assert _preserve_writer_response(replace(settings, workspace_root=tmp_path / "wrong-project"), accounting, **kwargs) is None
+        assert _preserve_model_response(replace(settings, workspace_root=tmp_path / "wrong-project"), accounting, **kwargs) is None
         manifest.write_text(json.dumps({"project_id": "another-project"}), encoding="utf-8")
-        assert _preserve_writer_response(settings, accounting, **kwargs) is None
+        assert _preserve_model_response(settings, accounting, **kwargs) is None
         manifest.write_text("{}", encoding="utf-8")
-        assert _preserve_writer_response(settings, accounting, **kwargs) is None
+        assert _preserve_model_response(settings, accounting, **kwargs) is None
         manifest.write_text(json.dumps({"project_id": scope.novel_id}), encoding="utf-8")
-        assert _preserve_writer_response(settings, accounting, **{**kwargs, "finish_reason": "length"}) is None
+        assert _preserve_model_response(settings, accounting, **{**kwargs, "finish_reason": "length"}) is None
     assert set(artifacts()) == before
 
     def failed_save(*_args, **_kwargs):

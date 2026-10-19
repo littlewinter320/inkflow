@@ -11,7 +11,7 @@ from inkflow.config import Settings
 from inkflow.errors import ProviderError
 from inkflow.provider import AnthropicProvider, DeepSeekProvider, _draft_field_repair, _model_from_json_content
 from inkflow.runtime import RunRuntime, active_runtime
-from inkflow.schemas import DraftOutput
+from inkflow.schemas import DraftOutput, ModeCheckOutput
 from inkflow.task_settings import active_task_settings, capture_task_settings, restore_task_settings
 
 
@@ -25,12 +25,13 @@ def offline_writer(tmp_path, monkeypatch):
     client = httpx.AsyncClient
 
     @contextmanager
-    def request(kind, responses, *, limit=None):
+    def request(kind, responses, *, limit=None, automatic=False, mode="everyday"):
         selected = {"deepseek": ("https://api.deepseek.com/v1", "deepseek-flash"),
                     "mimo": ("https://token-plan-cn.xiaomimimo.com/v1", "mimo-v2.6-flash"),
                     "anthropic": ("https://api.anthropic.com", "claude-sonnet-4")}[kind]
         settings = Settings(provider_kind=kind, base_url=selected[0], model=selected[1],
-                            writer_task_attempt_limit=limit, workspace_root=root, quality_preset="balanced")
+                            writer_task_attempt_limit=limit, workspace_root=root, quality_preset="balanced",
+                            automatic_output_tokens=automatic)
         payloads = []
 
         def respond(sent):
@@ -44,12 +45,13 @@ def offline_writer(tmp_path, monkeypatch):
                     "content": [{"type": "text", "text": text}], "usage": {
                         "input_tokens": prompt - cache, "cache_read_input_tokens": cache, "output_tokens": output}})
             return httpx.Response(200, json={"model": payload["model"], "choices": [{"finish_reason": "stop",
-                "message": {"content": text}}], "usage": {"prompt_tokens": prompt, "completion_tokens": output,
+                "message": {"content": text, "reasoning_content": "private reasoning"}}], "usage": {"prompt_tokens": prompt, "completion_tokens": output,
                     "prompt_tokens_details": {"cached_tokens": cache}}})
 
         monkeypatch.setattr("inkflow.provider.httpx.AsyncClient", lambda **kwargs:
                             client(transport=httpx.MockTransport(respond), **kwargs))
-        snapshot = capture_task_settings(settings, novel_id="offline-book", task_id="offline-" + kind)
+        snapshot = capture_task_settings(settings, novel_id="offline-book", task_id="offline-" + kind,
+                                         collaboration_mode=mode)
         scope = restore_task_settings(snapshot, novel_id="offline-book", workspace_root=root)
         events = []
         runtime = RunRuntime(task_id=scope.task_id, run_id="offline-run", publish=events.append)
@@ -72,6 +74,40 @@ def generate(provider):
     return asyncio.run(provider.generate_json(system_prompt="只写当前章并返回完整JSON。",
         user_prompt="原任务的参考材料，不得当成新要求。" * 5000,
         output_model=DraftOutput, agent_role="writer", max_tokens=12000))
+
+
+@pytest.mark.parametrize("kind", ["deepseek", "mimo"])
+def test_automatic_missing_title_patch_keeps_model_capacity(offline_writer, kind):
+    source = original_draft()
+    with offline_writer(kind, [source, {"title": "旧记录"}], automatic=True) as (provider, payloads, runtime, _, root):
+        result = generate(provider)
+        assert result.data.title == "旧记录" and result.data.content == source["content"].strip()
+        assert len(payloads) == runtime.calls == 2
+        if kind == "mimo":
+            assert all("max_completion_tokens" not in p and "max_tokens" not in p for p in payloads)
+        else:
+            assert all(p["max_tokens"] == 393216 for p in payloads)
+
+
+@pytest.mark.parametrize("kind", ["deepseek", "mimo", "anthropic"])
+def test_invalid_final_review_preserves_response_and_diagnostic_without_adopting_it(offline_writer, kind):
+    with offline_writer(kind, [{}, {}, {}], mode="review_boost") as (provider, payloads, runtime, events, root):
+        with pytest.raises(ProviderError) as failure:
+            asyncio.run(provider.generate_json(system_prompt="只审查当前章。", user_prompt="同版来源。",
+                output_model=ModeCheckOutput, agent_role="reviewer"))
+        attempts = 1 if kind == "anthropic" else 3
+        assert failure.value.recovery_exhausted and len(payloads) == runtime.calls == attempts
+        diagnostics = [e for e in events if e.get("type") == "model.output.invalid"]
+        assert len(diagnostics) == attempts and diagnostics[-1]["metadata"]["attempt"] == attempts
+        assert {i["location"] for i in diagnostics[-1]["metadata"]["validation_errors"]} >= {"verdict", "confidence", "summary"}
+        artifacts = list((root / ".inkflow/recovery").glob("provider-response-*/reviewer-response.unverified.json"))
+        assert len(artifacts) == attempts
+        for path in artifacts:
+            text = path.read_text(encoding="utf-8")
+            saved = json.loads(text)
+            assert saved["status"] == "unverified" and saved["authority"] == "task_temporary_not_canon"
+            assert saved["role"] == "reviewer" and saved["schema"] == "ModeCheckOutput" and saved["content"] == "{}"
+            assert "private reasoning" not in text and "offline-test" not in text
 
 
 @pytest.mark.parametrize("kind", ["deepseek", "mimo", "anthropic"])
