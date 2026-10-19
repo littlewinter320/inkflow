@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import json
 from typing import Annotated, Any, Literal
+from typing_extensions import Required, TypedDict
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from .role_protocol import AgentRole, CollaborationMode, ROLE_PROTOCOL_VERSION, adapt_role, new_task_mode
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class ConversationReply(StrictModel):
+    reply: str = Field(min_length=1, max_length=1500)
 
 
 class UnifiedRoleModel(StrictModel):
@@ -121,12 +127,13 @@ class SuggestedPrompt(StrictModel):
 
     label: str = Field(min_length=1, max_length=24)
     prompt: str = Field(min_length=1, max_length=200)
+    reason: str = Field(default="", max_length=180)
 
 
 class SuggestedPrompts(StrictModel):
-    """对话输入区的动态提示词预测结果；失败时由本地规则兜底。"""
+    """Coordinator 根据实际结果提出的下一步选项，不代表执行授权。"""
 
-    suggestions: list[SuggestedPrompt] = Field(min_length=1, max_length=5)
+    suggestions: list[SuggestedPrompt] = Field(min_length=2, max_length=4)
 
 
 class VolumeCompass(StrictModel):
@@ -546,24 +553,101 @@ class SceneBlueprintItem(StrictModel):
     reading_promise: str = ""
 
 
+class SettingEvidenceRef(TypedDict, total=False):
+    source_kind: Required[Literal["canonical", "draft", "planning", "writer_hook"]]
+    chapter_no: int | None
+    path: str | None
+    artifact_id: str | None
+    quote: Required[str]
+    relation: Literal["support", "counter", "belief", "reference"]
+    source_hash: str | None
+    source_version: int | None
+
+
 class SettingRecordProposal(StrictModel):
     collection_id: str = Field(min_length=1, max_length=180)
     record_id: str | None = Field(default=None, max_length=180)
-    expected_revision: int | None = Field(default=None, ge=1)
+    expected_revision: int | None = Field(default=None, ge=0)
     title: str = Field(min_length=1, max_length=160)
     values: dict[str, Any] = Field(min_length=1, max_length=40)
-    evidence_refs: list[dict[str, Any]] = Field(default_factory=list, max_length=12)
+    evidence_refs: list[SettingEvidenceRef] = Field(default_factory=list, max_length=12)
     epistemic_status: Literal["hypothesis", "objective", "belief", "rumor", "user_constraint"] = "hypothesis"
+
+    @field_validator("evidence_refs", mode="before")
+    @classmethod
+    def normalize_evidence_identity(cls, value):
+        if not isinstance(value, list):
+            return value
+        result = []
+        for item in value:
+            if not isinstance(item, dict):
+                result.append(item)
+                continue
+            ref = dict(item)
+            source = ref.pop("source_chapter", None)
+            source_id = ref.pop("source_id", None)
+            if source is not None and source_id is not None and source != source_id:
+                raise ValueError("设定引用包含不同的来源身份，不能猜测采用哪一个")
+            source = source if source is not None else source_id
+            explicit_kind = ref.get("source_kind")
+            if "source_kind" not in ref:
+                ref["source_kind"] = "canonical"
+            if ref.get("chapter_no") is not None and source is not None:
+                chapter = source if type(source) is int else int(source[8:]) if isinstance(source, str) and source.startswith("chapter:") and source[8:].isdigit() else None
+                if chapter != ref["chapter_no"]:
+                    raise ValueError("设定引用的新旧章号不一致，不能串用来源")
+            if ref.get("chapter_no") is None and source is not None:
+                if type(source) is int:
+                    ref["chapter_no"] = source
+                elif isinstance(source, str) and source.startswith("chapter:") and source[8:].isdigit():
+                    ref["chapter_no"] = int(source[8:])
+                elif source in {"BOOK.md", "PLAN.md", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md"}:
+                    if explicit_kind not in {None, "planning"} or ref.get("path") not in {None, source}:
+                        raise ValueError("设定引用的文件与来源类型不一致")
+                    ref.update(source_kind="planning", path=source)
+                else:
+                    raise ValueError("设定来源必须是明确章号或当前文档名称，不能把未知文字当章号")
+            result.append(ref)
+        return result
+
+    @field_validator("evidence_refs")
+    @classmethod
+    def require_evidence_location(cls, values):
+        for ref in values:
+            if not ref["quote"].strip():
+                raise ValueError("设定依据须填写连续原句")
+            if ref["source_kind"] in {"canonical", "draft"} and (type(ref.get("chapter_no")) is not int or ref["chapter_no"] < 1):
+                raise ValueError("正文设定依据须填写chapter_no正整数章号；文档引用用planning及path")
+            if ref["source_kind"] == "planning" and ref.get("path") not in {"BOOK.md", "PLAN.md", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md"}:
+                raise ValueError("规划设定依据须填写当前文档path")
+        return values
 
 
 class SettingRecordSet(StrictModel):
-    records: list[SettingRecordProposal] = Field(min_length=1, max_length=8)
+    records: list[SettingRecordProposal] = Field(default_factory=list, max_length=8)
+
+
+class SettingRuleCorrection(StrictModel):
+    old_rule: str = Field(min_length=1)
+    new_rule: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    source_id: str = Field(min_length=1)
+    source_quote: str = Field(min_length=4)
+
+
+class StorySettingsAudit(StrictModel):
+    summary: str = Field(min_length=1, max_length=2400)
+    findings: list[str] = Field(default_factory=list, max_length=12)
+    rule_corrections: list[SettingRuleCorrection] = Field(default_factory=list, max_length=8)
+    needs_choice: list[str] = Field(default_factory=list, max_length=3)
+    setting_updates: list[SettingRecordProposal] = Field(default_factory=list, max_length=8)
+    questions: list["ClarificationQuestion"] = Field(default_factory=list, max_length=3)
 
 
 class DraftOutput(StrictModel):
     setting_updates: list[SettingRecordProposal] = Field(default_factory=list, max_length=8)
-    title: str
-    content: str = Field(min_length=100)
+    title: str = Field(description="独立的章节标题，必须单独返回；不能只把标题写进content。")
+    content: str = Field(min_length=100, description="完整小说正文，不含Markdown章节标题；公开创作说明放在其他专用字段。")
     decision_summary: list[str] = Field(
         default_factory=lambda: ["模型未提供结构化摘要；正文将由后续审查确认。"],
         min_length=1,
@@ -574,30 +658,12 @@ class DraftOutput(StrictModel):
     hook_note: HookNote | None = None
     scene_blueprint: list[SceneBlueprintItem] = Field(default_factory=list, max_length=8)
 
-    @field_validator("content")
-    @classmethod
-    def validate_novel_punctuation(cls, value: str) -> str:
-        count = value.count("、")
-        if count:
-            raise ValueError(
-                f"小说正文禁止使用中文顿号，当前仍有 {count} 个；请改写包含顿号的完整句子，"
-                "用自然句法或‘和’‘跟’‘与’连接，不要机械替换成其他标点"
-            )
-        return value
-
-
 class SceneDraftOutput(StrictModel):
     """Writer prose for an isolated scene draft; no review or canon authority."""
 
     title: str = Field(min_length=1, max_length=120)
     content: str = Field(min_length=1, max_length=20_000)
     decision_summary: list[str] = Field(min_length=1, max_length=8)
-
-    @field_validator("content")
-    @classmethod
-    def validate_novel_punctuation(cls, value: str) -> str:
-        return DraftOutput.validate_novel_punctuation(value)
-
 
 class ParagraphInsertion(StrictModel):
     before_paragraph: int = Field(ge=0)
@@ -633,7 +699,16 @@ class AcceptedContinuityDiagnosis(StrictModel):
 
 class AcceptedContinuityLocalEdit(StrictModel):
     target_excerpt: str = Field(min_length=1, max_length=500)
-    replacement: str = Field(min_length=1, max_length=800)
+    replacement: str = Field(max_length=800)
+
+
+class ReviewCopyEdit(AcceptedContinuityLocalEdit):
+    """An optional, source-bound micro edit proposed during the existing review."""
+
+    kind: Literal["typo", "punctuation", "duplicate", "expression"]
+    reason: str = Field(min_length=1, max_length=400)
+    meaning_preserved: bool
+    author_role: Literal["editor", "reviewer"] | None = None
 
 
 class AcceptedContinuityPatch(StrictModel):
@@ -724,6 +799,15 @@ class ReviewScoreDimension(StrictModel):
     deductions: list[ReviewFinding] = Field(default_factory=list)
 
 
+class SettingUseCheck(StrictModel):
+    record_id: str = Field(min_length=1)
+    record_revision: int | None = Field(default=None, ge=1)
+    disposition: Literal["compatible", "conflict", "not_applicable", "needs_evidence"]
+    setting_quote: str = Field(min_length=1, max_length=400)
+    chapter_quote: str = Field(default="", max_length=400)
+    reason: str = Field(min_length=1, max_length=500)
+
+
 class ContextUseAudit(StrictModel):
     """Reviewer 对 Writer 是否正确使用上下文的公开核对结果。"""
 
@@ -731,6 +815,7 @@ class ContextUseAudit(StrictModel):
     missing_required_source_ids: list[str] = Field(default_factory=list)
     conflicting_source_ids: list[str] = Field(default_factory=list)
     summary: str = ""
+    setting_checks: list[SettingUseCheck] = Field(default_factory=list)
 
 
 class ReviewFocusObservation(StrictModel):
@@ -819,6 +904,7 @@ class ReviewReport(UnifiedRoleModel):
     summary: str
     strengths: list[str] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list)
+    copyedits: list[ReviewCopyEdit] = Field(default_factory=list, max_length=4)
     scorecard: list[ReviewScoreDimension] = Field(default_factory=list)
     source_hash: str = ""
     writer_notes_hash: str = ""
@@ -848,6 +934,7 @@ class ModeCheckOutput(UnifiedRoleModel):
     strengths: list[str] = Field(default_factory=list, max_length=8)
     approved_setting_proposals: list[int] = Field(default_factory=list, max_length=8)
     findings: list[ReviewFinding] = Field(default_factory=list, max_length=24)
+    copyedits: list[ReviewCopyEdit] = Field(default_factory=list, max_length=4)
     focus_observation: ReviewFocusObservation = Field(default_factory=ReviewFocusObservation)
     source_comparisons: list[ReviewSourceComparison] = Field(default_factory=list, max_length=8)
     reference_observations: list[ReviewReferenceObservation] = Field(default_factory=list, max_length=8)
@@ -855,6 +942,20 @@ class ModeCheckOutput(UnifiedRoleModel):
     memory_patch: MemoryPatch | None = None
     hook_assessment: HookAssessment | None = None
     context_use_audit: ContextUseAudit = Field(default_factory=ContextUseAudit)
+
+    @model_validator(mode="after")
+    def consistent_generation_verdict(self, info: ValidationInfo) -> "ModeCheckOutput":
+        if (info.context and info.context.get("model_generation") and self.verdict == "patch"
+                and not self.findings and not (self.memory_patch and self.memory_patch.unresolved_conflicts)):
+            raise ValueError("审核标为需要修订，却没有列出问题。请核对本次结论：存在问题须给有据findings；资料不足用unknown；必要检查完成且没有问题用pass。返回memory_patch本身不表示正文需要修订。")
+        if info.context and info.context.get("model_generation"):
+            failed_required = [item.criterion for item in self.assessments
+                if item.criterion in {"continuity", "causality", "requirements"}
+                and item.status in {"partial", "failed"}]
+            if failed_required and not any(item.severity in {"major", "blocking"} and item.rule_id
+                    for item in self.findings):
+                raise ValueError("必需项判为未满足，却只给出普通表达问题或未标明规则的指控。请由当前审核角色纠正结论：已证实硬矛盾须在findings给适用rule_id及双方原句；资料不足用data_missing；仅有普通表达弱点不能把已完成的核心结果判为partial或failed，应在质量项说明。不得编造硬问题来凑结论。")
+        return self
 
 
 # Import-name compatibility only; no separate output contract or execution path.
@@ -1021,6 +1122,39 @@ class ContextSection(StrictModel):
     # Unknown/new sources default to the dynamic tail, never the cache prefix.
     cache_scope: Literal["global", "book", "canon", "chapter", "request"] = "request"
 
+    def model_content(self, *, canonical: bool = False) -> str:
+        """Keep source text intact while excluding duplicated operational diagnostics."""
+        try:
+            value = json.loads(self.content)
+        except (ValueError, TypeError):
+            return self.content or "（无）"
+        if self.key == "MEMORY" and isinstance(value, dict):
+            value.pop("query_input", None)
+            value.pop("canonical_batch_scope", None)
+            retrieval = value.get("retrieval")
+            if isinstance(retrieval, dict):
+                for key in ("query", "discarded", "discarded_display_limit", "branches", "overlaps", "selected", "source_reads", "writer_reference_omissions"):
+                    retrieval.pop(key, None)
+        elif self.key == "WORK" and isinstance(value, list):
+            for work in value:
+                if not isinstance(work, dict):
+                    continue
+                if isinstance(work.get("source"), dict):
+                    work["source"].pop("failure_case", None)
+                if isinstance(work.get("progress"), dict):
+                    work["progress"].pop("original_node_receipts", None)
+        elif self.key == "F" and isinstance(value, dict):
+            for hit in value.get("自适应结果", []):
+                if not isinstance(hit, dict):
+                    continue
+                for key in ("score", "reranker_score", "retrieval_reasons", "entities"):
+                    hit.pop(key, None)
+                if hit.get("body_kind") == "accepted_prose" and hit.get("resolved_source"):
+                    for key in ("summary_body", "summary_content_hash", "summary_origin"):
+                        hit.pop(key, None)
+        # JSON whitespace is not source prose; strings, quotes and source identities remain exact.
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=canonical) if isinstance(value, (dict, list)) else self.content
+
 
 class ContextPacket(StrictModel):
     project_id: str
@@ -1029,6 +1163,7 @@ class ContextPacket(StrictModel):
     sections: list[ContextSection]
     estimated_tokens: int
     warnings: list[str] = Field(default_factory=list)
+    cache_policy: Literal["standard", "deepseek", "mimo"] = "standard"
 
     def to_markdown(self) -> str:
         output = [
@@ -1047,26 +1182,73 @@ class ContextPacket(StrictModel):
         return "\n".join(output).rstrip() + "\n"
 
     def to_model_prompt(self) -> str:
-        """Compile reusable source scopes before current chapter/request material."""
+        return "".join(self.model_prompt_parts())
 
+    def model_sections(self) -> list[ContextSection]:
+        """Project provider-specific ordering without changing sources or gate material."""
+        sections = []
+        for section in self.sections:
+            if self.cache_policy in {"deepseek", "mimo"} and section.key in {"CSET", "SET"}:
+                try:
+                    value = json.loads(section.content)
+                except (ValueError, TypeError):
+                    value = None
+                if (isinstance(value, dict) and isinstance(value.get("collections"), list)
+                        and all(isinstance(item, dict) and isinstance(item.get("records", []), list)
+                                and all(isinstance(record, dict) for record in item.get("records", []))
+                                for item in value["collections"])):
+                    coverage = value.pop("coverage", None)
+                    if self.cache_policy == "mimo":
+                        # Relevance selects the set; stable identities order that same set on the wire.
+                        value["collections"].sort(key=lambda item: str(item.get("collection_id", "")))
+                        for collection in value["collections"]:
+                            if isinstance(collection.get("records"), list):
+                                collection["records"].sort(key=lambda item: (
+                                    item.get("epistemic_status") != "user_constraint", str(item.get("record_id", ""))))
+                    section = section.model_copy(update={"content": json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+                        "cache_scope": "canon" if self.cache_policy == "mimo" else section.cache_scope})
+                    if coverage is not None:
+                        sections.append(ContextSection(key=f"{section.key}-coverage", title="设定选择与未装入范围",
+                            content=json.dumps({"coverage": coverage}, ensure_ascii=False, separators=(",", ":")),
+                            hard=section.hard, cache_scope="request"))
+            if self.cache_policy == "mimo" and section.key in {"D", "G"} and section.cache_scope == "canon":
+                section = section.model_copy(update={"cache_scope": "chapter"})
+            sections.append(section)
+        if self.cache_policy == "mimo":
+            # Object insertion order is not source meaning; lists and source strings stay exact.
+            sections = [section.model_copy(update={"content": section.model_content(canonical=True)})
+                        for section in sections]
         scopes = {"global": 0, "book": 1, "canon": 2, "chapter": 3, "request": 4}
 
         def priority(indexed: tuple[int, ContextSection]) -> tuple[int, int, int]:
             index, section = indexed
-            # Book sections have a fixed order. Sorting by their changing length
-            # invalidated DeepSeek's exact-prefix cache on unrelated edits.
-            # The book contract is a longer-lived prefix than a revisable
-            # outline boundary. Keep it ahead of O0 so a new outline draft
-            # does not invalidate the book-level DeepSeek cache.
             book_order = {"J": 0, "B": 1, "O0": 2, "O1": 3, "O2": 4, "C0": 5}
-            order = book_order.get(section.key, 10 + index) if section.cache_scope == "book" else index
+            canon_order = ({"CSET": 0, "SET": 0, "B": 1} if self.cache_policy == "mimo" else
+                           {"B": 0, "CSET": 1, "D": 2, "G": 3} if self.cache_policy == "deepseek" else
+                           {"B": 0, "D": 1, "CSET": 2, "G": 3})
+            # Append-only batch memory remains reusable ahead of the changing chapter card.
+            order = (book_order.get(section.key, 10 + index) if section.cache_scope == "book"
+                     else canon_order.get(section.key, 10 + index) if section.cache_scope == "canon"
+                     else -1 if section.cache_scope == "chapter" and section.key == "E0" else index)
             return (scopes[section.cache_scope], order, index)
 
+        return [section for _, section in sorted(enumerate(sections), key=priority)]
+
+    def model_prompt_parts(self) -> tuple[str, str]:
+        """Compile reusable source scopes before current chapter/request material."""
+
         output = ["# 墨流编译上下文", ""]
-        for _, section in sorted(enumerate(self.sections), key=priority):
-            output.extend([f"## {section.key}. {section.title}", "", section.content or "（无）", ""])
+        prefix = ""
+        for section in self.model_sections():
+            if not prefix and section.cache_scope in {"chapter", "request"}:
+                prefix = "\n".join(output) + "\n"
+                output = []
+            output.extend([f"## {section.key}. {section.title}", "", section.model_content(), ""])
             if section.source_ids:
                 output.extend([f"来源：{', '.join(sorted(section.source_ids))}", ""])
+        if not prefix:
+            prefix = "\n".join(output) + "\n"
+            output = []
         output.extend([
             "## 本次执行信息",
             "",
@@ -1075,7 +1257,7 @@ class ContextPacket(StrictModel):
         ])
         if self.warnings:
             output.extend(["", "警告：", *[f"- {item}" for item in self.warnings]])
-        return "\n".join(output).rstrip() + "\n"
+        return prefix, "\n".join(output).rstrip() + "\n"
 
     def gate_material(self) -> str:
         """Return only acceptance-critical context for stale-review detection."""
@@ -1374,6 +1556,7 @@ class PreferenceObservation(StrictModel):
     explicit: bool = False
     preference_id: str = Field(default="", max_length=180)
     expected_revision: int | None = Field(default=None, ge=0)
+    feedback_kind: Literal["none", "liked", "corrective", "disliked"] = "none"
 
 
 class CoordinatorRecoveryStep(StrictModel):
@@ -1404,6 +1587,9 @@ class TerminalIntent(StrictModel):
     """Coordinator 的受限路由输出；不能发明工作流、写正文或强制验收。"""
 
     action: TerminalAction
+    specialist_role: Literal["reviewer", "memory_keeper"] | None = None
+    specialist_reason: str = Field(default="", max_length=300)
+    planning_discussion: str = Field(default="", max_length=400)
     preference_conflicts: list[PreferenceConflict] = Field(default_factory=list, max_length=3)
     preference_observations: list[PreferenceObservation] = Field(default_factory=list, max_length=3)
     outline_level: Literal["story", "detail"] = "story"
@@ -1441,9 +1627,12 @@ class TerminalIntent(StrictModel):
     confirmation_token: str | None = Field(default=None, max_length=120)
     batch_id: str | None = Field(default=None, max_length=180)
     batch_review_only: bool = False
+    review_before_revision: bool = False
     plan_change_confirmed: bool = False
     planning_revision_no: int | None = Field(default=None, ge=0)
     planning_part: Literal["none", "outline", "detail", "recent"] = "none"
+    planning_total_chapters: int | None = Field(default=None, ge=1)
+    planning_volume_count: int | None = Field(default=None, ge=1, le=20)
     planning_reference_chapter_no: int | None = Field(default=None, ge=1)
     planning_reference_volume_no: int | None = Field(default=None, ge=1)
     target_characters: int | None = Field(default=None, ge=1_000, le=5_000_000)
@@ -1474,3 +1663,4 @@ class ClarificationQuestion(StrictModel):
 
 ReviewReport.model_rebuild()
 ModeCheckOutput.model_rebuild()
+StorySettingsAudit.model_rebuild()

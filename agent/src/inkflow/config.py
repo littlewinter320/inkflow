@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -43,13 +44,18 @@ PERSISTED_SETTING_NAMES = {
     "context_budget_mode",
     "agent_context_budgets",
     "max_output_tokens",
+    "automatic_output_tokens",
     "max_concurrent_model_requests",
+    "writer_task_attempt_limit",
     "request_timeout_seconds",
     "planning_timeout_seconds",
     "trace_level",
     "show_provider_reasoning",
     "inquiry_frequency",
     "hook_strategy",
+    "quality_preset",
+    "quality_custom_context",
+    "collaboration_preset",
     "chapter_length_tolerance",
     "review_min_confidence",
     "acceptance_confirmation_mode",
@@ -88,6 +94,7 @@ PERSISTED_SETTING_NAMES = {
     "voice_segment_chars",
     "voice_cache_limit_mb",
     "voice_debug",
+    "voice_data_dir",
     "input_price_per_million",
     "output_price_per_million",
 }
@@ -199,6 +206,12 @@ def save_user_settings(updates: dict[str, Any], *, validate_only: bool = False) 
             else:
                 current[key] = value
         validated = Settings.from_mapping(current)
+        problems = [problem for role in validated.agent_generation for problem in validated.generation_problems(role)]
+        if problems:
+            raise ConfigurationError("模型参数尚未保存：" + "；".join(problems) + "。原有设置与密钥保留。")
+        if validated.provider_kind == "mimo":
+            validated = replace(validated, base_url=mimo_endpoint_for_key(
+                validated.base_url, validated.get_api_key() or ""))
         clean = validated.to_mapping()
         if validate_only:
             return clean
@@ -234,13 +247,18 @@ class Settings:
         default_factory=lambda: {name: dict(values) for name, values in DEFAULT_AGENT_CONTEXT_BUDGETS.items()}
     )
     max_output_tokens: int = 32_000
+    automatic_output_tokens: bool = False
     max_concurrent_model_requests: int = 3
+    writer_task_attempt_limit: int | None = None
     request_timeout_seconds: float = 180.0
     planning_timeout_seconds: float = 600.0
     trace_level: str = "full"
     show_provider_reasoning: bool = True
     inquiry_frequency: str = "medium"
     hook_strategy: str = "most_chapters"
+    quality_preset: str = "custom"
+    quality_custom_context: bool = True
+    collaboration_preset: str = "everyday"
     chapter_length_tolerance: float = 0.10
     review_min_confidence: float = 0.80
     acceptance_confirmation_mode: str = "auto_after_review"
@@ -281,12 +299,17 @@ class Settings:
     voice_segment_chars: int = 360
     voice_cache_limit_mb: int = 1024
     voice_debug: bool = False
+    voice_data_dir: str = ""
     input_price_per_million: float = 0.0
     output_price_per_million: float = 0.0
     workspace_root: Path | None = None
     role_settings_warnings: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
+        if self.collaboration_preset not in {"everyday", "adaptive", "full_specialist"}:
+            raise ConfigurationError("协作方式请选择日常协作、按需加强或全面协作。")
+        if self.quality_preset not in {"economy", "balanced", "quality", "custom"}:
+            raise ConfigurationError("质量与消耗请选择节省、平衡、高质量或自定义。")
         self.role_models = _role_models(self.role_models, None)
         self.agent_generation = _agent_generation(self.agent_generation)
         self.agent_context_budgets = _agent_context_budgets(self.agent_context_budgets)
@@ -307,6 +330,80 @@ class Settings:
 
     def model_limits(self, model_override: str | None = None) -> dict[str, Any]:
         return _official_model_limits(self.base_url, model_override or self.model)
+
+    def parameter_capabilities(self, model_override: str | None = None) -> dict[str, Any]:
+        """Project the adapter's supported parameters for the actual selected model."""
+        model = (model_override or self.model).casefold()
+        kind = self.provider_kind
+        sampling = {"temperature": True, "top_p": True, "top_k": False}
+        constraints: dict[str, Any] = {"temperature": [0, 2], "top_p": [0, 1]}
+        effort_values: list[str] = []
+        effort_map: dict[str, str] = {}
+        non_thinking_effort = "none"
+        sampling_without_reasoning_only = False
+        completion_tokens = self.is_mimo
+        if self.is_mimo:
+            constraints.update(temperature=[0, 1.5], top_p=[.01, 1], thinking_temperature=1.0, thinking_top_p=.95)
+        elif kind == "anthropic":
+            constraints["temperature"] = [0, 1]
+            sampling["top_k"] = True
+            # New Claude generations reject custom sampling; retain stored values for older models.
+            if re.match(r"^claude-(?:(?:sonnet|opus|haiku)-5|opus-4-[78]|mythos|fable)", model):
+                sampling = dict.fromkeys(sampling, False)
+            elif model.startswith("claude-opus-4-1"):
+                sampling["top_p"] = False
+        elif self.is_deepseek:
+            effort_values = ["low", "high", "max"]
+            effort_map = {"medium": "high"}
+            if urlparse(self.base_url).hostname == "api.deepseek.com" and model in {
+                "deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro",
+            }:
+                constraints.update(thinking_temperature_ignored=True, thinking_top_p_min=.95, non_thinking_top_p=1.0)
+        elif kind == "openai":
+            reasoning_model = bool(re.match(r"^(?:gpt-[56](?:[.\-]|$)|o[134](?:\-|$))", model)) and "-chat" not in model
+            if reasoning_model:
+                completion_tokens = True
+                modern = bool(re.match(r"^gpt-(?:5\.[1-9]|6)", model))
+                effort_values = (["none"] if modern else []) + ["low", "medium", "high"]
+                supports_max = bool(re.match(r"^gpt-(?:5\.[6-9]|6)", model))
+                if supports_max:
+                    effort_values.append("max")
+                else:
+                    effort_map["max"] = "high"
+                non_thinking_effort = "none" if modern else "minimal" if model.startswith("gpt-5") else "low"
+                sampling_without_reasoning_only = modern
+                if not modern:
+                    sampling.update(temperature=False, top_p=False)
+            if model.startswith(("o1-mini", "o1-preview")):
+                effort_values = []
+        elif kind == "gemini" and re.match(r"^gemini-(?:2\.5|3|4)", model):
+            effort_values = ["low", "medium", "high"]
+            effort_map = {"max": "high"}
+            non_thinking_effort = "none" if model.startswith("gemini-2.5-flash") else "low"
+        elif kind == "openrouter":
+            sampling["top_k"] = True
+            effort_values = ["none", "low", "medium", "high"]
+            effort_map = {"max": "high"}
+        elif kind == "ollama" and model.startswith("gpt-oss"):
+            effort_values = ["none", "low", "medium", "high"]
+            effort_map = {"max": "high"}
+        return {"sampling_parameters": sampling, "sampling_constraints": constraints,
+                "sampling_without_reasoning_only": sampling_without_reasoning_only,
+                "top_k": sampling["top_k"], "reasoning_effort": bool(effort_values),
+                "reasoning_effort_values": effort_values, "reasoning_effort_map": effort_map,
+                "non_thinking_effort": non_thinking_effort, "max_completion_tokens": completion_tokens}
+
+    def generation_problems(self, role: str, model_override: str | None = None) -> list[str]:
+        capabilities = self.parameter_capabilities(model_override or self.model_for(role))
+        generation = self.generation_for(role)
+        label = {"coordinator": "协调", "writer": "创作", "editor": "编辑",
+                 "reviewer": "专项审查", "memory_keeper": "记忆整理"}[role]
+        problems = []
+        for name, title in (("temperature", "温度"), ("top_p", " Top P")):
+            low, high = capabilities["sampling_constraints"][name]
+            if capabilities["sampling_parameters"][name] and not low <= generation[name] <= high:
+                problems.append(f"{label}{title}须在 {low:g}～{high:g} 之间")
+        return problems
 
     def context_budget_for(self, role: str | None, protocol_version: int = 1,
                            model_override: str | None = None) -> tuple[int, int]:
@@ -331,6 +428,8 @@ class Settings:
                                      f"完整输入约 {input_tokens:,} tokens，可用上下文 {hard:,} tokens。"
                                      "请调整该角色预算或缩小本次输入后继续。")
         limits = self.model_limits(selected)
+        if self.automatic_output_tokens and role in self.agent_generation:
+            return min(requested, remaining, limits.get("max_output_tokens", requested))
         return min(requested, self.max_output_tokens, remaining, limits.get("max_output_tokens", requested))
 
     def role_settings_view(self, protocol_version: int = 1) -> dict[str, Any]:
@@ -386,12 +485,18 @@ class Settings:
         soft = _positive_int(value.get("context_soft_tokens", defaults.context_soft_tokens), "软上下文预算")
         hard = _positive_int(value.get("context_hard_tokens", defaults.context_hard_tokens), "硬上下文上限")
         output = _positive_int(value.get("max_output_tokens", defaults.max_output_tokens), "单次输出上限")
+        automatic_output = _as_bool(value.get("automatic_output_tokens", False))
         max_concurrent_model_requests = _bounded_int_range(
             value.get("max_concurrent_model_requests", defaults.max_concurrent_model_requests),
             "模型请求并发上限",
             1,
             16,
         )
+        writer_task_attempt_limit = value.get("writer_task_attempt_limit", defaults.writer_task_attempt_limit)
+        if writer_task_attempt_limit is not None:
+            if isinstance(writer_task_attempt_limit, bool) or not isinstance(writer_task_attempt_limit, (int, str)):
+                raise ConfigurationError("本任务写作请求上限必须是正整数或留空。")
+            writer_task_attempt_limit = _positive_int(writer_task_attempt_limit, "本任务写作请求上限")
         if soft > hard:
             raise ConfigurationError("软上下文预算不能大于硬上下文上限。")
         context_budget_mode = _choice(
@@ -403,10 +508,10 @@ class Settings:
             value.get("agent_context_budgets", {}), None
         )
         agent_context_budgets = _agent_context_budgets(raw_agent_budgets)
-        if output > hard:
+        if not automatic_output and output > hard:
             raise ConfigurationError("单次模型输出上限不能大于已配置的最大上下文。")
         limits = _official_model_limits(base_url, model)
-        if limits and output > limits["max_output_tokens"]:
+        if not automatic_output and limits and output > limits["max_output_tokens"]:
             raise ConfigurationError(f"模型 {model} 的已核实输出上限为 {limits['max_output_tokens']:,} tokens；"
                                      "请调整输出设置或选择支持更大输出的模型。")
         timeout = _positive_float(
@@ -492,7 +597,9 @@ class Settings:
             agent_context_budgets=agent_context_budgets,
             role_settings_warnings=tuple(dict.fromkeys((*context_warnings, *generation_warnings))),
             max_output_tokens=output,
+            automatic_output_tokens=automatic_output,
             max_concurrent_model_requests=max_concurrent_model_requests,
+            writer_task_attempt_limit=writer_task_attempt_limit,
             request_timeout_seconds=timeout,
             planning_timeout_seconds=planning_timeout,
             trace_level=trace_level,
@@ -501,6 +608,9 @@ class Settings:
             ),
             inquiry_frequency=inquiry_frequency,
             hook_strategy=hook_strategy,
+            quality_preset=str(value.get("quality_preset", defaults.quality_preset)),
+            quality_custom_context=_as_bool(value.get("quality_custom_context", defaults.quality_custom_context)),
+            collaboration_preset=str(value.get("collaboration_preset", "everyday")),
             chapter_length_tolerance=chapter_length_tolerance,
             review_min_confidence=review_min_confidence,
             acceptance_confirmation_mode=acceptance_confirmation_mode,
@@ -572,6 +682,7 @@ class Settings:
                 8192,
             ),
             voice_debug=_as_bool(value.get("voice_debug", defaults.voice_debug)),
+            voice_data_dir=str(value.get("voice_data_dir", defaults.voice_data_dir) or "").strip(),
             input_price_per_million=_non_negative_float(
                 value.get("input_price_per_million", defaults.input_price_per_million), "输入单价"
             ),
@@ -593,6 +704,7 @@ class Settings:
             "context_hard_tokens": "INKFLOW_CONTEXT_HARD_TOKENS",
             "max_output_tokens": "INKFLOW_MAX_OUTPUT_TOKENS",
             "max_concurrent_model_requests": "INKFLOW_MAX_CONCURRENT_MODEL_REQUESTS",
+            "writer_task_attempt_limit": "INKFLOW_WRITER_TASK_ATTEMPT_LIMIT",
             "request_timeout_seconds": "INKFLOW_TIMEOUT_SECONDS",
             "planning_timeout_seconds": "INKFLOW_PLANNING_TIMEOUT_SECONDS",
             "trace_level": "INKFLOW_TRACE_LEVEL",
@@ -625,7 +737,12 @@ class Settings:
         for field, environment_name in environment_mapping.items():
             if environment_name in os.environ:
                 value[field] = os.environ[environment_name]
-        return cls.from_mapping(value, workspace_root)
+        settings = cls.from_mapping(value, workspace_root)
+        if settings.provider_kind == "mimo":
+            # Only live settings follow the current credential; frozen task mappings stay unchanged.
+            settings = replace(settings, base_url=mimo_endpoint_for_key(
+                settings.base_url, settings.get_api_key() or ""))
+        return settings
 
     @property
     def is_deepseek(self) -> bool:
@@ -636,6 +753,26 @@ class Settings:
         return self.provider_kind == "mimo" or urlparse(self.base_url).hostname in {
             "api.xiaomimimo.com", "token-plan-cn.xiaomimimo.com",
         }
+
+    @property
+    def prompt_cache_policy(self) -> str:
+        return "mimo" if self.is_mimo else "deepseek" if self.is_deepseek else "standard"
+
+    def thinking_for(self, role: str | None, requested: bool = True) -> bool:
+        if not (self.is_mimo or self.is_deepseek):
+            return requested
+        if role in {"writer", "coordinator"}:
+            return self.quality_preset != "economy"
+        return True if role in {"editor", "reviewer", "memory_keeper"} else requested
+
+    def generation_output_budget(self, role: str | None, requested: int, thinking: bool) -> int:
+        if self.automatic_output_tokens and role in self.agent_generation:
+            # Preparation reserves an estimate; the adapter fits actual capacity after compiling input.
+            return requested
+        # Native reasoning shares the output limit with JSON; honor the author's ceiling, not a hidden 8k cap.
+        if (self.is_mimo or self.is_deepseek) and thinking and role in self.agent_generation:
+            return self.max_output_tokens
+        return requested
 
     def get_api_key(self) -> str | None:
         provider_env = PROVIDER_ENV_KEYS.get(self.provider_kind)
@@ -675,25 +812,37 @@ def api_key_status(provider_kind: str = "deepseek") -> dict[str, Any]:
     """只返回来源和是否存在，不读取到调用者，更不返回密钥本身。"""
 
     provider_kind = provider_kind.strip().lower()
+    def present(key: str, storage: str) -> dict[str, Any]:
+        return {"api_key_configured": bool(key), "api_key_storage": storage,
+                "api_key_preview": ("••••••••" + key[-4:]) if key else ""}
     if os.getenv("INKFLOW_API_KEY"):
-        return {"api_key_configured": True, "api_key_storage": "environment:INKFLOW_API_KEY"}
+        return present(os.environ["INKFLOW_API_KEY"].strip(), "environment:INKFLOW_API_KEY")
     environment_name = PROVIDER_ENV_KEYS.get(provider_kind)
     if environment_name and os.getenv(environment_name):
-        return {"api_key_configured": True, "api_key_storage": f"environment:{environment_name}"}
+        return present(os.environ[environment_name].strip(), f"environment:{environment_name}")
     if provider_kind == "ollama":
         return {"api_key_configured": True, "api_key_storage": "not_required"}
     try:
         import keyring
 
-        configured = bool(keyring.get_password(KEYRING_SERVICE, _keyring_account(provider_kind)))
-        if not configured and provider_kind == "deepseek":
-            configured = bool(keyring.get_password(KEYRING_SERVICE, KEYRING_ACCOUNT))
+        stored = keyring.get_password(KEYRING_SERVICE, _keyring_account(provider_kind)) or ""
+        if not stored and provider_kind == "deepseek":
+            stored = keyring.get_password(KEYRING_SERVICE, KEYRING_ACCOUNT) or ""
     except Exception:
-        configured = False
-    return {
-        "api_key_configured": configured,
-        "api_key_storage": "windows_credential_manager" if configured else "not_configured",
-    }
+        stored = ""
+    return present(stored, "windows_credential_manager" if stored else "not_configured")
+
+
+def mimo_endpoint_for_key(base_url: str, key: str) -> str:
+    if base_url.strip().rstrip("/") not in {
+        "https://api.xiaomimimo.com/v1", "https://token-plan-cn.xiaomimimo.com/v1",
+    }:
+        return base_url
+    if key.startswith(("tp-", "ttp-")):
+        return "https://token-plan-cn.xiaomimimo.com/v1"
+    if key.startswith("sk-"):
+        return "https://api.xiaomimimo.com/v1"
+    return base_url
 
 
 def save_api_key_to_keyring(api_key: str, provider_kind: str = "deepseek") -> None:

@@ -15,6 +15,15 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.is_file() else ""
 
 
+def planning_document_label(relative: str, revision_no: int = 0) -> str:
+    name = Path(relative.replace("\\", "/")).name
+    kind = ("全书大纲" if name.startswith("outline-") else
+            "卷细纲" if name.startswith("volume-detail-") else
+            "近期章节规划" if name.startswith("chapter-window-") else
+            "章节衔接与恢复记录" if name.startswith("database-") else "大纲候选")
+    return f"第 {revision_no} 版的{kind}" if revision_no else f"旧版{kind}"
+
+
 def cleanup_preview(project: InkFlowProject) -> dict[str, Any]:
     suggestion_path = project.root / "planning" / "cleanup-suggestions.json"
     active_path = project.root / "planning" / "active-v2.json"
@@ -58,6 +67,7 @@ def cleanup_preview(project: InkFlowProject) -> dict[str, Any]:
                 continue
             actual = content_hash(_read(path)) if allowed and path.is_file() else ""
             blocked = ""
+            dependent = False
             if not allowed:
                 blocked = "历史文件路径不合法"
             elif actual != item.get("content_hash"):
@@ -82,6 +92,8 @@ def cleanup_preview(project: InkFlowProject) -> dict[str, Any]:
                 if dependent:
                     blocked = "此快照含已接受章节引用的旧版执行卡，恢复依赖必须保留"
             candidates.append({"path": relative, "content_hash": actual, "reason": "已被新版替换的规划历史",
+                               "display_name": planning_document_label(relative, int(record.get("revision_no") or 0)),
+                               "handling_note": "正文仍需要这份衔接记录，请保留" if dependent and relative.endswith(".json") and blocked else blocked or "已被新版替换，可选择清理",
                                "blocked": blocked, "action": "永久删除历史副本", "revision_id": revision_id})
     for item in suggestions.get("candidates", []):
         if not isinstance(item, dict):
@@ -110,6 +122,7 @@ def cleanup_preview(project: InkFlowProject) -> dict[str, Any]:
         elif path.name in references or relative in references:
             blocked = "当前资料仍引用该候选"
         candidates.append({"path": relative, "content_hash": actual,
+                           "display_name": "未采用的大纲候选", "handling_note": blocked or "可选择清理",
                            "reason": "旧大纲候选，与当前生效大纲不同",
                            "blocked": blocked, "action": "永久删除文件", "revision_id": ""})
     token_data = {"active": content_hash(_read(active_path)),

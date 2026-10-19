@@ -1,15 +1,24 @@
+import { ContextMaterials, type ContextMaterialsSnapshot } from "./ContextMaterials";
+import { SavedApiKey } from "./SavedApiKey";
+import { CacheMeter } from "./CacheMeter";
+import { settingsDiff, mergeSettings } from "./settingsPatch";
+import { VersionRepair } from "./VersionRepair";
 import { AuthorPreferences } from "./AuthorPreferences";
-import { ManualEditMonitor, StorySettings } from "./StorySettings";
+import { BookSettingsBrowser, ManualEditMonitor, StorySettings } from "./StorySettings";
 import type { ManualEditJob } from "./StorySettings";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { FormEvent, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, MutableRefObject, PointerEvent as ReactPointerEvent, ReactNode } from "react";
-import { Mascot, MascotShowcase, MobaoGuide, mobaoIdlePoster } from "./Mascot";
+import type { CSSProperties, MutableRefObject, ReactNode } from "react";
+import { Mascot, MobaoCompanion, MobaoAvatar } from "./Mascot";
 import type { MascotMood } from "./Mascot";
 import { ProjectCenter } from "./ProjectCenter";
 import { VoiceCenter } from "./VoiceCenter";
 import type { VoiceSettings, VoiceSource, VoiceStatus } from "./VoiceCenter";
-import { LocalWavRecorder } from "./voiceRecording";
+import { LocalWavRecorder, voiceInputFailure } from "./voiceRecording";
+import { detachedPanel, useWorkspaceLayout, WorkspaceDropPreview, WorkspaceMenu, WorkspacePanel } from "./Workspace";
+import type { PanelId } from "./workspaceLayout";
+import { documentLabel, readableSourceText } from "./readableNames";
+import { readableRecord, readableRecordText, readableValue } from "./readableRecords";
 
 const Editor = lazy(() => import("./MonacoEditors").then((module) => ({ default: module.Editor })));
 const DiffEditor = lazy(() => import("./MonacoEditors").then((module) => ({ default: module.DiffEditor })));
@@ -76,6 +85,7 @@ type Dashboard = {
   brief: Record<string, unknown>;
   status: { chapters?: Record<string, number>; active_facts?: number; open_threads?: number };
   current_plan: Record<string, unknown> | null;
+  chapter_outline?: { state: string; revision_no?: number; volumes: Array<{ volume_no: number; title: string; chapter_start: number; chapter_end: number }>; cards: Array<Record<string, unknown>> };
   facts: Array<Record<string, unknown>>;
   threads: Array<Record<string, unknown>>;
   bible_entries: Array<Record<string, unknown>>;
@@ -123,19 +133,27 @@ type EngineEvent = {
     stop_conditions?: string[];
   };
 };
-type Message = { id: string; role: "user" | "assistant" | "system"; text: string; details?: string; reasoning?: string[]; animate?: boolean; createdAt?: string };
+type Message = { id: string; role: "user" | "assistant" | "system"; text: string; details?: string; indices?: TreeItem[]; reasoning?: string[]; animate?: boolean; createdAt?: string; process?: { startedAt: string; finishedAt: string; status: string; steps: EngineEvent[] } };
 type ConversationHistoryEntry = { id: string; user: string; assistant: string; action_note: string; recorded_at: string };
-type SuggestedPromptItem = { label: string; prompt: string };
+type SuggestedPromptItem = { label: string; prompt: string; reason?: string };
 
-// 输入区动态提示词的本地兜底：模型预测失败或尚未返回时显示这组固定建议。
-const defaultSuggestedPrompts: SuggestedPromptItem[] = [
-  { label: "先问我", prompt: "先不要执行任务。请根据当前项目状态和最近讨论，用选项卡主动问我一到三个最值得确认、容易回答的问题。" },
-  { label: "规划当前篇章", prompt: "帮我规划当前篇章" },
-  { label: "生成独立大纲", prompt: "生成第 1 到第 10 章的独立大纲" },
-  { label: "写当前章", prompt: "写当前章的草稿，先不要审查" },
-  { label: "审查当前章", prompt: "审查当前章" },
-  { label: "查看状态", prompt: "查看当前项目状态" },
-];
+const defaultSuggestedPrompts: SuggestedPromptItem[] = [];
+
+function initialSuggestedPrompts(dashboard: Dashboard | null, busy: boolean, waitingForAnswer: boolean): SuggestedPromptItem[] {
+  const accepted = dashboard?.chapter_progress?.accepted_through || 0;
+  const written = dashboard?.chapter_progress?.written_through || accepted;
+  const current = written > 0 ? `第${written}章` : "当前小说";
+  const first = waitingForAnswer
+    ? { label: "帮我比较选项", prompt: "解释这次需要我决定的几个方向，各自会怎样影响故事；先不要替我选择。" }
+    : busy
+      ? { label: "看看当前进度", prompt: "说明当前任务已经完成什么、现在进行到哪里；只查看，不重新生成。" }
+      : written > accepted
+        ? { label: `看看第${written}章`, prompt: `查看第${written}章的正文和最新审查，说明还有哪些问题、哪些已经解决；先不要改稿。` }
+        : { label: "接下来怎么写", prompt: `结合已接受的${accepted > 0 ? `前${accepted}章` : "故事方向"}和现行规划，给我几个下一段剧情的方向，先不生成正文。` };
+  return [first,
+    { label: "想想新点子", prompt: `围绕${current}的剧情和人物，提出几个符合已有设定的新点子，先作为建议。` },
+    { label: "对照当前设定", prompt: `说明${current}实际用了哪些人物和世界设定，找出需要核对的地方；先不要修改。` }];
+}
 type PromptOptimizationResult = {
   original_prompt: string;
   optimized_prompt: string;
@@ -154,7 +172,7 @@ type SelectionDraft = {
 };
 type QuestionOption = { id: string; label: string; description?: string; recommended?: boolean; kind?: "choice" | "other" };
 type QuestionCard = { id: string; header: string; question: string; why_it_matters?: string; selection: "single" | "multiple"; options: QuestionOption[] };
-type Tab = "project" | "editor" | "chapter" | "review" | "memory" | "references" | "listen" | "process";
+type Tab = "project" | "editor" | "chapter" | "review" | "references" | "listen" | "process";
 type RecentProject = { root: string; title: string; openedAt: string };
 type NovelIdea = {
   concept_id: string;
@@ -179,7 +197,11 @@ type AgentGeneration = { temperature: number; top_p: number; top_k: number | nul
 type AgentGenerationProfiles = Record<AgentRole, AgentGeneration>;
 type AgentContextBudgets = Record<AgentRole, { soft: number; hard: number }>;
 type ContextStatus = {
-  status: "idle" | "safe" | "watch" | "near_limit" | "stale";
+  project_root?: string;
+  status: "idle" | "safe" | "watch" | "near_limit" | "stale" | "unavailable";
+  actor?: string;
+  read_error?: string;
+  roles?: Array<{ materials?: ContextMaterialsSnapshot; role: string; model: string; input_tokens: number | null; input_kind: "reported" | "estimated" | "unknown"; context_limit_tokens: number; limit_source: string; remaining_tokens: number | null; used_percent: number | null; output_reserve_tokens: number | null; updated_at?: string; request_state: string }>;
   estimated_tokens: number;
   before_compression_tokens: number;
   previous_updated_at?: string;
@@ -215,6 +237,7 @@ type BatchChapterSummary = {
 };
 type BatchSummary = {
   batch_id: string; status: string; run_id?: string; resume_available?: boolean;
+  historical?: boolean; history_reason?: string;
   stop_reason?: string; stopped_at_chapter?: number; start_chapter_no?: number; end_chapter_no?: number;
   phase?: string; current_phase?: string; error?: string; next_action?: string; pending_work_id?: string;
   checkpoint?: { chapter_no?: number; phase?: string; error?: string };
@@ -224,34 +247,28 @@ type BatchSummary = {
   chapters: BatchChapterSummary[];
 };
 type LearningEvent = { event_id: string; event_type: string; chapter_no?: number; created_at: string; payload: Record<string, unknown> };
-type UsageSummary = { calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; prompt_cache_hit_rate?: number | null; prompt_cache_miss_rate?: number | null; average_prompt_tokens?: number; average_completion_tokens?: number; cache_reported_calls?: number; cache_unknown_calls?: number; cache_unknown_prompt_tokens?: number };
+type UsageSummary = { calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; prompt_cache_hit_rate?: number | null; prompt_cache_miss_rate?: number | null; average_prompt_tokens?: number | null; average_completion_tokens?: number | null; cache_reported_calls?: number; cache_unknown_calls?: number; cache_unknown_prompt_tokens?: number };
+type CacheObservationGroup = UsageSummary & { provider: string; endpoint: string | null; legacy_endpoint_host?: string | null; model: string; role: string; scope_known: boolean; input_unknown_calls?: number; output_unknown_calls?: number; by_contract: Array<UsageSummary & { stage?: string | null; prompt_family: string; system_contract_hash: string; quality_hash: string; thinking?: string; cache_policy?: string; message_layout?: string; response_models?: string[] }> };
+type CurrentModelCache = { available: boolean; provider?: string; endpoint?: string | null; cache_policy?: string; by_agent_role: Partial<Record<AgentRole, CacheObservationGroup>>; history_groups: CacheObservationGroup[]; unscoped_calls?: number; warning?: string };
 type PerformanceDiagnostic = { calls: number; sent_calls: number; not_sent_calls: number; unknown_sent_calls: number; request_count: number; failed_calls: number; unknown_usage_calls: number; unknown_cost_calls: number; raw_input_tokens: number | null; cached_input_tokens: number | null; uncached_input_tokens: number | null; output_tokens: number | null; attempt_elapsed_ms: number | null; unknown_duration_calls: number; same_scope_groups?: Array<{ stage: string; calls: number; scope_known: boolean; raw_input_tokens: number | null; cached_input_tokens: number | null; uncached_input_tokens: number | null; output_tokens: number | null }>; writer_sequence?: Array<{ before_attempt_id: string; after_attempt_id: string; conclusion: string }>; time_note?: string; quality_note?: string };
 type QualifiedProduction = { accepted_products: number; unknown_cost_calls: number; known_estimated_cost: number; estimated_cost_per_product: number | null; limitation: string };
 type RecentCacheSummary = { calls: number; reported_calls: number; unknown_calls: number; input_tokens: number; hit_tokens: number; miss_tokens: number; hit_rate: number | null; last_at: string | null; by_role?: Record<string, { calls: number; reported_calls: number; unknown_calls: number; hit_rate: number | null }>; by_family?: Record<string, { calls: number; reported_calls: number; input_tokens: number; hit_tokens: number; miss_tokens: number; hit_rate: number | null }>; performance_diagnostic?: PerformanceDiagnostic; qualified_production?: QualifiedProduction };
 type VoiceInstallProgress = { status: string; stage: string; progress: number; summary: string; downloaded_mb: number; retryable: boolean; error?: string };
 type PersistentUsage = { calls: number; since: string | null; estimated_cost: number; pending_estimated_cost: number; unknown_usage_calls: number; unknown_cost_calls: number; price_note: string };
-type PendingWorkItem = { id: string; kind: string; status: string; reason: string; next_action: string; chapter_no?: number | null; handling?: string; can_process?: boolean; can_reject?: boolean; reject_label?: string; reject_impact?: string; reject_blocked_reason?: string; updated_at?: string; rejection?: { reason?: string; at?: string }; parent_id?: string; processing_attempts?: number; source?: Record<string, unknown>; intent?: { action?: string; batch_id?: string | null } };
-type CollaborationOverview = { messages: CollaborationMessage[]; pending_work?: PendingWorkItem[]; rejected_work?: PendingWorkItem[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; trace_runs?: TraceRun[]; usage?: UsageSummary & { by_agent_role?: Record<string, UsageSummary>; recent_deepseek_cache?: RecentCacheSummary | null; estimated_cost: number; currency: string; pricing_configured: boolean; accounting?: { available: boolean; warning?: string; project?: PersistentUsage; all_projects?: PersistentUsage } } };
+type PendingWorkItem = { id: string; kind: string; status: string; reason: string; next_action: string; chapter_no?: number | null; remaining_chapter_no?: number; completed_through?: number; handling?: string; can_process?: boolean; can_reject?: boolean; reject_label?: string; reject_impact?: string; reject_blocked_reason?: string; updated_at?: string; rejection?: { reason?: string; at?: string }; parent_id?: string; processing_attempts?: number; source?: Record<string, unknown>; intent?: { action?: string; batch_id?: string | null; end_chapter_no?: number | null } };
+type CollaborationOverview = { messages: CollaborationMessage[]; pending_work?: PendingWorkItem[]; rejected_work?: PendingWorkItem[]; threads?: Array<Record<string, unknown>>; tasks: Array<Record<string, unknown>>; batches: BatchSummary[]; learning_events: LearningEvent[]; artifacts?: Array<Record<string, unknown>>; trace_runs?: TraceRun[]; usage?: UsageSummary & { by_agent_role?: Record<string, UsageSummary>; current_model_cache?: CurrentModelCache; recent_deepseek_cache?: RecentCacheSummary | null; estimated_cost: number | null; currency: string; pricing_configured: boolean; accounting?: { available: boolean; warning?: string; project?: PersistentUsage; all_projects?: PersistentUsage } } };
 type PrefillResult = { insertion: string; document_hash: string; cursor_offset: number; confidence: string };
-type WorkspacePreset = "balanced" | "writing" | "planning" | "review";
-type WorkspaceResizeTarget = "navigation" | "assistant" | "inspector";
-type WorkspaceLayout = {
-  navigationVisible: boolean;
-  assistantVisible: boolean;
-  inspectorVisible: boolean;
-  assistantPosition: "left" | "right" | "bottom" | "floating";
-  assistantX: number;
-  assistantY: number;
-  assistantHeight: number;
-  navigationWidth: number;
-  assistantWidth: number;
-  inspectorWidth: number;
-};
+function busyMascotMood(events: EngineEvent[], runId: string | null): "writing" | "reviewing" | "thinking" {
+  const current = [...events].reverse().find(event => event.run_id === runId && event.role);
+  if (current?.role === "writer") return /outline|planning|plan|detail|window|candidate/.test(current.stage || "") ? "thinking" : "writing";
+  return current && ["editor", "reviewer", "memory_keeper"].includes(current.role || "") ? "reviewing" : "thinking";
+}
 
 type ThemeMode = "dark" | "light" | "system";
 type AccentPalette = "lime" | "jade" | "blue" | "violet" | "amber" | "rose";
 type UiDensity = "comfortable" | "compact";
 type PrefillLength = "short" | "medium" | "long";
+type ChatKeyStroke = { key: string; code?: string; ctrlKey?: boolean; altKey?: boolean; shiftKey?: boolean; metaKey?: boolean; repeat?: boolean; isComposing?: boolean; keyCode?: number; getModifierState?: (key: string) => boolean };
 type UiPreferences = {
   theme: ThemeMode;
   accent: AccentPalette;
@@ -260,7 +277,52 @@ type UiPreferences = {
   prefillDelayMs: number;
   prefillLength: PrefillLength;
   suggestedPromptsEnabled: boolean;
+  suggestionShortcutEnabled: boolean;
+  suggestionShortcut: string;
 };
+
+function normalizeSuggestionShortcut(value: unknown): string {
+  if (typeof value !== "string" || !value || value.length > 80) return "";
+  const parts = value.split("+");
+  const code = parts.pop() || "";
+  if (!/^(?:Key[A-Z]|Digit[0-9]|F(?:[1-9]|1[0-2])|Enter)$/.test(code)
+      || new Set(parts).size !== parts.length || parts.some(part => !["Ctrl", "Alt", "Shift", "Meta"].includes(part))) return "";
+  const ctrl = parts.includes("Ctrl"), alt = parts.includes("Alt"), shift = parts.includes("Shift"), meta = parts.includes("Meta");
+  if (!ctrl && !alt && !meta) return "";
+  if (code === "Enter" && !(alt && !ctrl && !meta && !shift)) return "";
+  if (code === "F10" || alt && ["F4", "KeyD", "KeyF"].includes(code)) return "";
+  if ((ctrl || meta) && (/^Digit/.test(code) || ["KeyA", "KeyB", "KeyC", "KeyF", "KeyH", "KeyI", "KeyJ", "KeyL", "KeyN", "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU", "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ", "F4", "F5", "F6", "F11", "F12"].includes(code))) return "";
+  if (meta && ["KeyD", "KeyE", "KeyG", "KeyK", "KeyM", "F1"].includes(code)) return "";
+  return [...(ctrl ? ["Ctrl"] : []), ...(alt ? ["Alt"] : []), ...(shift ? ["Shift"] : []), ...(meta ? ["Meta"] : []), code].join("+");
+}
+
+function suggestionShortcutFromKey(event: ChatKeyStroke): string {
+  if (event.isComposing || event.keyCode === 229 || event.getModifierState?.("AltGraph") || ["Dead", "Process", "Unidentified"].includes(event.key)) return "";
+  const code = event.code === "NumpadEnter" ? "Enter" : event.code || (/^[a-z]$/i.test(event.key) ? `Key${event.key.toUpperCase()}` : /^\d$/.test(event.key) ? `Digit${event.key}` : event.key);
+  return normalizeSuggestionShortcut([...(event.ctrlKey ? ["Ctrl"] : []), ...(event.altKey ? ["Alt"] : []), ...(event.shiftKey ? ["Shift"] : []), ...(event.metaKey ? ["Meta"] : []), code].join("+"));
+}
+
+function suggestionShortcutLabel(shortcut: string): string {
+  return normalizeSuggestionShortcut(shortcut).split("+").map(part => part.replace(/^Key|^Digit/, "")).join(" + ") || "未设置";
+}
+
+function matchesSuggestionShortcut(event: ChatKeyStroke, shortcut: string): boolean {
+  return !event.repeat && Boolean(shortcut) && suggestionShortcutFromKey(event) === normalizeSuggestionShortcut(shortcut) && Boolean(normalizeSuggestionShortcut(shortcut));
+}
+
+function canFillSuggestionShortcut(event: ChatKeyStroke, shortcut: string, enabled: boolean, inChat: boolean, modalOpen: boolean): boolean {
+  return enabled && inChat && !modalOpen && matchesSuggestionShortcut(event, shortcut);
+}
+
+function isChatSubmitKey(event: ChatKeyStroke): boolean {
+  return event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.repeat && !event.isComposing && event.keyCode !== 229;
+}
+
+function prepareSuggestionFill(current: string, prompt?: string): { value: string; filled: boolean; message: string } {
+  if (current.length) return { value: current, filled: false, message: "已有未发送内容，已保留；清空后再填入建议。" };
+  if (!prompt?.trim()) return { value: current, filled: false, message: "当前没有可填入的建议。" };
+  return { value: prompt.trim(), filled: true, message: "已填入建议，检查后再发送。" };
+}
 
 type SpeechRecognitionResultLike = { isFinal: boolean; [index: number]: { transcript: string } };
 type SpeechRecognitionEventLike = { resultIndex: number; results: ArrayLike<SpeechRecognitionResultLike> };
@@ -268,6 +330,7 @@ type SpeechRecognitionLike = {
   continuous: boolean;
   interimResults: boolean;
   lang: string;
+  onstart: (() => void) | null;
   onresult: ((event: SpeechRecognitionEventLike) => void) | null;
   onerror: ((event: { error?: string }) => void) | null;
   onend: (() => void) | null;
@@ -280,28 +343,7 @@ type SpeechRecognitionWindow = Window & {
   webkitSpeechRecognition?: new () => SpeechRecognitionLike;
 };
 
-const workspaceLayoutStorageKey = "inkflow.workspace-layout.v2";
 const uiPreferencesStorageKey = "inkflow.ui-preferences.v1";
-const defaultWorkspaceLayout: WorkspaceLayout = {
-  navigationVisible: true,
-  assistantVisible: true,
-  inspectorVisible: false,
-  assistantPosition: "right",
-  assistantX: 80,
-  assistantY: 100,
-  assistantHeight: 600,
-  navigationWidth: 210,
-  assistantWidth: 350,
-  inspectorWidth: 236,
-};
-
-const workspacePresets: Record<WorkspacePreset, WorkspaceLayout> = {
-  balanced: defaultWorkspaceLayout,
-  writing: { ...defaultWorkspaceLayout, navigationWidth: 218, assistantVisible: false, inspectorVisible: false },
-  planning: { ...defaultWorkspaceLayout, navigationWidth: 260, assistantWidth: 500, inspectorVisible: false },
-  review: { ...defaultWorkspaceLayout, navigationWidth: 226, assistantWidth: 390, assistantPosition: "right", inspectorVisible: true },
-};
-
 const defaultUiPreferences: UiPreferences = {
   theme: "dark",
   accent: "amber",
@@ -310,37 +352,9 @@ const defaultUiPreferences: UiPreferences = {
   prefillDelayMs: 900,
   prefillLength: "medium",
   suggestedPromptsEnabled: true,
+  suggestionShortcutEnabled: true,
+  suggestionShortcut: "Alt+Enter",
 };
-
-function clampWorkspaceWidth(target: WorkspaceResizeTarget, value: number) {
-  const bounds: Record<WorkspaceResizeTarget, [number, number]> = {
-    navigation: [180, 420],
-    assistant: [320, 760],
-    inspector: [170, 420],
-  };
-  const [minimum, maximum] = bounds[target];
-  return Math.round(Math.max(minimum, Math.min(maximum, value)));
-}
-
-function loadWorkspaceLayout(): WorkspaceLayout {
-  try {
-    const stored = JSON.parse(localStorage.getItem(workspaceLayoutStorageKey) || "{}") as Partial<WorkspaceLayout>;
-    return {
-      navigationVisible: stored.navigationVisible !== false,
-      assistantVisible: stored.assistantVisible !== false,
-      inspectorVisible: stored.inspectorVisible ?? defaultWorkspaceLayout.inspectorVisible,
-      assistantPosition: ["left", "right", "bottom", "floating"].includes(String(stored.assistantPosition)) ? stored.assistantPosition as WorkspaceLayout["assistantPosition"] : "right",
-      assistantX: Math.max(0, Math.min(window.innerWidth - 320, Number(stored.assistantX) || 80)),
-      assistantY: Math.max(0, Math.min(window.innerHeight - 80, Number(stored.assistantY) || 100)),
-      assistantHeight: Math.max(260, Math.min(window.innerHeight * .9, Number(stored.assistantHeight) || 600)),
-      navigationWidth: clampWorkspaceWidth("navigation", Number(stored.navigationWidth) || defaultWorkspaceLayout.navigationWidth),
-      assistantWidth: clampWorkspaceWidth("assistant", Number(stored.assistantWidth) || defaultWorkspaceLayout.assistantWidth),
-      inspectorWidth: clampWorkspaceWidth("inspector", Number(stored.inspectorWidth) || defaultWorkspaceLayout.inspectorWidth),
-    };
-  } catch {
-    return defaultWorkspaceLayout;
-  }
-}
 
 function loadUiPreferences(): UiPreferences {
   try {
@@ -353,6 +367,8 @@ function loadUiPreferences(): UiPreferences {
       prefillDelayMs: Math.max(300, Math.min(3000, Number(stored.prefillDelayMs) || defaultUiPreferences.prefillDelayMs)),
       prefillLength: ["short", "medium", "long"].includes(String(stored.prefillLength)) ? stored.prefillLength as PrefillLength : defaultUiPreferences.prefillLength,
       suggestedPromptsEnabled: stored.suggestedPromptsEnabled !== false,
+      suggestionShortcutEnabled: stored.suggestionShortcutEnabled !== false && (stored.suggestionShortcut === undefined || Boolean(normalizeSuggestionShortcut(stored.suggestionShortcut))),
+      suggestionShortcut: stored.suggestionShortcut === undefined ? defaultUiPreferences.suggestionShortcut : normalizeSuggestionShortcut(stored.suggestionShortcut),
     };
   } catch {
     return defaultUiPreferences;
@@ -390,6 +406,8 @@ function App() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [tree, setTree] = useState<ProjectTree | null>(null);
   const [document, setDocument] = useState<DocumentData | null>(null);
+  const [bookRawEditing, setBookRawEditing] = useState(false);
+  useEffect(() => { setBookRawEditing(false); }, [document?.relative_path, projectRoot]);
   const [reviewDocument, setReviewDocument] = useState<DocumentData | null>(null);
   const [referenceDocument, setReferenceDocument] = useState<DocumentData | null>(null);
   const [text, setText] = useState("");
@@ -404,13 +422,17 @@ function App() {
     },
   ]);
   const [chatInput, setChatInput] = useState("");
+  const [suggestionFillStatus, setSuggestionFillStatus] = useState("");
   const [busy, setBusy] = useState(false);
   const [cancelReady, setCancelReady] = useState(false);
   const [projectLoading, setProjectLoading] = useState(false);
   const [openingDocumentPath, setOpeningDocumentPath] = useState<string | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
+  const runEventsRef = useRef<EngineEvent[]>([]);
+  const runStartedAtRef = useRef("");
   const projectRootRef = useRef("");
+  const sharedWorkspaceRef = useRef(false);
   const projectOpenRequestRef = useRef(0);
   const editorNavigationRef = useRef(0);
   const editorSnapshotRef = useRef<EditorSnapshot>({ session: 0, projectRoot: "", document: null, text: "", savedText: "" });
@@ -430,11 +452,11 @@ function App() {
   const [projectOpenFailure, setProjectOpenFailure] = useState<{ root: string; message: string } | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsInitialSection, setSettingsInitialSection] = useState<SettingsSection>("appearance");
+  const openSettings = (section: SettingsSection = "appearance") => { setSettingsInitialSection(section); setShowSettings(true); };
   const [showManualMonitor, setShowManualMonitor] = useState(false);
   const [manualJobs, setManualJobs] = useState<ManualEditJob[]>([]);
   const [manualMonitorError, setManualMonitorError] = useState("");
-  const conversationPanelRef = useRef<HTMLElement | null>(null);
-  const floatingMoveRef = useRef<{ x: number; y: number; startX: number; startY: number } | null>(null);
   const [showUpdate, setShowUpdate] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
@@ -449,20 +471,26 @@ function App() {
   const [promptOptimization, setPromptOptimization] = useState<PromptOptimizationResult | null>(null);
   const [promptUndo, setPromptUndo] = useState<string | null>(null);
   const [contextStatus, setContextStatus] = useState<ContextStatus | null>(null);
-  const contextSnapshotRef = useRef<{ updatedAt: string; estimatedTokens: number } | null>(null);
   const [collaboration, setCollaboration] = useState<CollaborationOverview | null>(null);
   const [pendingRejection, setPendingRejection] = useState<{ root: string; item: PendingWorkItem; decision: "reject" | "reopen" } | null>(null);
   const [pendingDecisionWorking, setPendingDecisionWorking] = useState(false);
   const [pendingDecisionError, setPendingDecisionError] = useState("");
   const [canonMigration, setCanonMigration] = useState<CanonMigration | null>(null);
   const [showMigration, setShowMigration] = useState(false);
-  const [workspaceLayout, setWorkspaceLayout] = useState<WorkspaceLayout>(loadWorkspaceLayout);
+  const workspace = useWorkspaceLayout(mobaoWorkAreaRef, projectRoot,
+    (id, bounds) => detachWorkspacePanel(id, bounds, false), (id, hide) => returnWorkspacePanel(id, hide));
   const [uiPreferences, setUiPreferences] = useState<UiPreferences>(loadUiPreferences);
   const [voiceSettings, setVoiceSettings] = useState<VoiceSettings | null>(null);
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus | null>(null);
   const [voiceSource, setVoiceSource] = useState<VoiceSource | null>(null);
   const [voiceRevision, setVoiceRevision] = useState(0);
   const [voiceRecording, setVoiceRecording] = useState(false);
+  const [voiceStarting, setVoiceStarting] = useState(false);
+  const [voiceLiveProblem, setVoiceLiveProblem] = useState("");
+  const [voiceInputPhase, setVoiceInputPhase] = useState("");
+  const voiceInputBusyRef = useRef(false);
+  const voiceSessionRef = useRef("");
+  const voiceBrowserTimerRef = useRef<number | null>(null);
   const [voiceTranscribing, setVoiceTranscribing] = useState(false);
   const [voiceTranscript, setVoiceTranscript] = useState("");
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
@@ -472,15 +500,17 @@ function App() {
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
   const voiceLiveTimerRef = useRef<number | null>(null);
   const voiceLiveBusyRef = useRef(false);
+  const voiceDecodeRef = useRef<{ recorder: LocalWavRecorder; byteLength: number; result: Promise<{ text: string }> } | null>(null);
   const voiceRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const voiceTranscriptRef = useRef("");
   const voiceFinalTranscriptRef = useRef("");
   const voiceBaseInputRef = useRef("");
+  const voiceProjectRef = useRef("");
   const startupStartedRef = useRef(false);
-  const resizeRef = useRef<{ target: WorkspaceResizeTarget; startX: number; startWidth: number; direction: 1 | -1 } | null>(null);
   const voiceRecorderRef = useRef<LocalWavRecorder | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioPlaybackSequenceRef = useRef(0);
+  const autoReadPausedRef = useRef(false);
   const speakingMessageIdRef = useRef<string | null>(null);
 
   const replaceEditorDocument = useCallback((loaded: DocumentData | null, root: string) => {
@@ -490,6 +520,30 @@ function App() {
     setText(content);
     setSavedText(content);
   }, []);
+
+  const applySharedWorkspace = useCallback((state: Record<string, unknown>) => {
+    if (typeof state.projectRoot !== "string") return;
+    projectRootRef.current = state.projectRoot;
+    setProjectRoot(state.projectRoot);
+    setProjectLoading(false);
+    setDashboard((state.dashboard ?? null) as Dashboard | null);
+    setTree((state.tree ?? null) as ProjectTree | null);
+    replaceEditorDocument((state.document ?? null) as DocumentData | null, state.projectRoot);
+    if (Array.isArray(state.messages)) setMessages(state.messages as Message[]);
+    if (Array.isArray(state.suggestedPrompts)) setSuggestedPrompts(state.suggestedPrompts as SuggestedPromptItem[]);
+    if (Array.isArray(state.events)) setEvents(state.events as EngineEvent[]);
+    if (Array.isArray(state.pendingQuestions)) setPendingQuestions(state.pendingQuestions as QuestionCard[]);
+    setBusy(state.busy === true);
+    setCancelReady(state.cancelReady === true);
+    const runId = typeof state.activeRunId === "string" ? state.activeRunId : null;
+    activeRunIdRef.current = runId; setActiveRunId(runId);
+    runStartedAtRef.current = typeof state.runStartedAt === "string" ? state.runStartedAt : "";
+    runEventsRef.current = Array.isArray(state.events) ? (state.events as EngineEvent[]).filter(item => item.run_id === runId) : [];
+    setCollaboration((state.collaboration ?? null) as CollaborationOverview | null);
+    setContextStatus((state.contextStatus ?? null) as ContextStatus | null);
+    setNotice(typeof state.notice === "string" ? state.notice : "");
+    setError(typeof state.error === "string" ? state.error : "");
+  }, [replaceEditorDocument]);
 
   const changeEditorText = useCallback((value: string) => {
     editorSnapshotRef.current = { ...editorSnapshotRef.current, text: value };
@@ -537,31 +591,18 @@ function App() {
     audioPlaybackSequenceRef.current += 1;
     audioRef.current?.pause();
     if (voiceLiveTimerRef.current !== null) window.clearInterval(voiceLiveTimerRef.current);
-    voiceRecognitionRef.current?.abort();
+    if (voiceBrowserTimerRef.current !== null) window.clearTimeout(voiceBrowserTimerRef.current);
+    const recognition = voiceRecognitionRef.current;
+    voiceRecognitionRef.current = null;
+    recognition?.abort();
     if (voiceRecorderRef.current) void voiceRecorderRef.current.stop();
   }, []);
 
-  const updateWorkspaceLayout = useCallback((change: Partial<WorkspaceLayout>) => {
-    setWorkspaceLayout((current) => ({ ...current, ...change }));
-  }, []);
-
-  const applyWorkspacePreset = useCallback((preset: WorkspacePreset) => {
-    setWorkspaceLayout({ ...workspacePresets[preset] });
-  }, []);
-
-  const startWorkspaceResize = useCallback((target: WorkspaceResizeTarget, direction: 1 | -1, event: ReactPointerEvent<HTMLDivElement>) => {
-    const widthKey = target === "navigation" ? "navigationWidth" : target === "assistant" ? "assistantWidth" : "inspectorWidth";
-    resizeRef.current = { target, startX: event.clientX, startWidth: workspaceLayout[widthKey], direction };
-    event.preventDefault();
-    window.document.body.classList.add("layout-resizing");
-  }, [workspaceLayout]);
-
   useEffect(() => {
-    localStorage.setItem(workspaceLayoutStorageKey, JSON.stringify(workspaceLayout));
-  }, [workspaceLayout]);
-
-  useEffect(() => {
-    localStorage.setItem(uiPreferencesStorageKey, JSON.stringify(uiPreferences));
+    try {
+      const value = JSON.stringify(uiPreferences);
+      if (localStorage.getItem(uiPreferencesStorageKey) !== value) localStorage.setItem(uiPreferencesStorageKey, value);
+    } catch { /* Keep current-window preferences usable if local storage is unavailable. */ }
     const root = window.document.documentElement;
     const applyTheme = () => {
       const resolved = uiPreferences.theme === "system"
@@ -578,32 +619,20 @@ function App() {
   }, [uiPreferences]);
 
   useEffect(() => {
-    const resize = (event: PointerEvent) => {
-      const moving = floatingMoveRef.current;
-      if (moving) {
-        const width = conversationPanelRef.current?.clientWidth || 320;
-        setWorkspaceLayout(current => ({ ...current, assistantX: Math.max(0, Math.min(window.innerWidth - width, moving.x + event.clientX - moving.startX)), assistantY: Math.max(0, Math.min(window.innerHeight - 80, moving.y + event.clientY - moving.startY)) }));
-        return;
-      }
-      const activeResize = resizeRef.current;
-      if (!activeResize) return;
-      const width = clampWorkspaceWidth(activeResize.target, activeResize.startWidth + (event.clientX - activeResize.startX) * activeResize.direction);
-      const widthKey = activeResize.target === "navigation" ? "navigationWidth" : activeResize.target === "assistant" ? "assistantWidth" : "inspectorWidth";
-      setWorkspaceLayout((current) => ({ ...current, [widthKey]: width }));
+    const sync = (event: StorageEvent) => {
+      if (event.key !== null && event.key !== uiPreferencesStorageKey) return;
+      const next = loadUiPreferences();
+      setUiPreferences(current => JSON.stringify(current) === JSON.stringify(next) ? current : next);
     };
-    const stop = () => {
-      resizeRef.current = null;
-      floatingMoveRef.current = null;
-      window.document.body.classList.remove("layout-resizing");
-    };
-    window.addEventListener("pointermove", resize);
-    window.addEventListener("pointerup", stop);
-    return () => {
-      window.removeEventListener("pointermove", resize);
-      window.removeEventListener("pointerup", stop);
-      window.document.body.classList.remove("layout-resizing");
-    };
+    window.addEventListener("storage", sync);
+    return () => window.removeEventListener("storage", sync);
   }, []);
+
+  useEffect(() => {
+    if (!suggestionFillStatus) return;
+    const timer = window.setTimeout(() => setSuggestionFillStatus(""), 4500);
+    return () => window.clearTimeout(timer);
+  }, [suggestionFillStatus]);
 
   const request = useCallback(
     async <T,>(method: string, params: Record<string, unknown> = {}): Promise<T> => {
@@ -681,6 +710,7 @@ function App() {
     }
   }, [projectRoot, provider?.manual_edit_review_enabled, request]);
   useEffect(() => {
+    if (sharedWorkspaceRef.current) return;
     if (!projectRoot) { setManualJobs([]); setManualMonitorError(""); return; }
     let active = true; let polling = false;
     const poll = async () => {
@@ -692,21 +722,38 @@ function App() {
     const timer = window.setInterval(() => void poll(), 8000);
     return () => { active = false; window.clearInterval(timer); };
   }, [projectRoot, refreshManualEdits]);
-  useEffect(() => {
-    const panel = conversationPanelRef.current;
-    if (!panel || workspaceLayout.assistantPosition !== "floating") return;
-    const observer = new ResizeObserver(entries => {
-      const size = entries[0]?.borderBoxSize[0];
-      if (!size) return;
-      setWorkspaceLayout(current => {
-        const width = clampWorkspaceWidth("assistant", size.inlineSize);
-        const height = Math.round(size.blockSize);
-        return current.assistantWidth === width && current.assistantHeight === height ? current : { ...current, assistantWidth: width, assistantHeight: height };
-      });
-    });
-    observer.observe(panel);
-    return () => observer.disconnect();
-  }, [workspaceLayout.assistantPosition, workspaceLayout.assistantVisible]);
+  const compareVersion = async (versionId: string) => {
+    if (sharedWorkspaceRef.current) { await window.inkflow.workspaceCommand("compare", versionId, document?.relative_path); return; }
+    setActiveTab("editor");
+                try {
+                  const version = await request<{ content: string }>("document.version.read", { version_id: versionId });
+                  setCompareContent(version.content);
+                } catch (cause) {
+                  setError(errorMessage(cause));
+                }
+                };
+  const resolveAnnotation = async (annotationId: string) => {
+    if (sharedWorkspaceRef.current) { await window.inkflow.workspaceCommand("annotation", annotationId, document?.relative_path); return; }
+                const sourceEditor = editorSnapshotRef.current;
+                await request("annotation.update", { project_root: sourceEditor.projectRoot, annotation_id: annotationId, status: "resolved" });
+                if (sourceEditor.document) {
+                  const loaded = await request<DocumentData>("document.read", { project_root: sourceEditor.projectRoot, relative_path: sourceEditor.document.relative_path });
+                  if (editorSnapshotRef.current.session === sourceEditor.session && editorSnapshotRef.current.document?.content_hash === loaded.content_hash) {
+                    editorSnapshotRef.current = { ...editorSnapshotRef.current, document: loaded };
+                    setDocument(loaded);
+                  }
+                }
+                };
+  const detachWorkspacePanel = async (panel: PanelId, bounds?: { x: number; y: number; width: number; height: number }, remember = true) => {
+    try { if (!window.inkflow.openWorkspacePanel) throw new Error("重启墨流后即可使用独立面板。当前窗口中的拖动和缩放已经可以使用。"); if (remember) workspace.remember(); await window.inkflow.openWorkspacePanel(projectRoot, panel, document?.relative_path, bounds); workspace.markNative(panel, true); }
+    catch (cause) { setError(errorMessage(cause)); }
+  };
+
+  const returnWorkspacePanel = async (panel: PanelId, hide = false) => {
+    try { await window.inkflow.returnWorkspacePanel(panel, hide); }
+    catch (cause) { setError(errorMessage(cause)); }
+  };
+
   const openConversationWindow = async (conversationId?: string) => {
     try { await window.inkflow.openConversationWindow(projectRoot, conversationId); }
     catch (cause) { setError(errorMessage(cause)); }
@@ -844,7 +891,7 @@ function App() {
       setNotice("这份文件还有未保存修改；先保存或保留修改后再删除。");
       return;
     }
-    const confirmed = await window.inkflow.confirm(`将“${source.relative_path}”移入本项目回收站，保留文件供恢复。当前内容未变化；确认删除吗？`);
+    const confirmed = await window.inkflow.confirm(`将“${documentLabel(source.relative_path)}”移入本项目回收站，保留文件供恢复。当前内容未变化；确认删除吗？`);
     if (!confirmed) return;
     try {
       const result = await window.inkflow.request<{ relative_path: string }>("document.delete", {
@@ -856,7 +903,7 @@ function App() {
       setCompareContent(null);
       setActiveTab("project");
       await refresh(snapshot.projectRoot);
-      setNotice(`已将 ${result.relative_path} 移入项目回收站，可在“项目 → 回收站”恢复。`);
+      setNotice(`已将 ${documentLabel(result.relative_path)} 移入项目回收站，可在“项目 → 回收站”恢复。`);
     } catch (cause) {
       setError(`删除没有完成，当前文件未被忽略。${errorMessage(cause)}`);
     }
@@ -897,7 +944,6 @@ function App() {
       replaceEditorDocument(null, root);
       setReviewDocument(null);
       setReferenceDocument(null);
-      contextSnapshotRef.current = null;
       setActiveTab("project");
       const projectTitle = String(opened.dashboard.brief.title || "未命名小说");
       let recentProjectWarning = "";
@@ -993,8 +1039,12 @@ function App() {
     // 最近项目只在主界面展示，用户点击后再进入工作区，避免启动时误跳到项目页。
     void window.inkflow.launchContext()
       .then((launch) => {
+        sharedWorkspaceRef.current = launch.shared === true;
+        for (const id of launch.nativePanels || []) workspace.markNative(id, true);
         const projectRootFromArgs = launch.projectRoot;
-        if (projectRootFromArgs) void openProject(projectRootFromArgs, { optimistic: true });
+        if (launch.sharedState) applySharedWorkspace(launch.sharedState);
+        else if (launch.shared && projectRootFromArgs) { projectRootRef.current = projectRootFromArgs; setProjectRoot(projectRootFromArgs); }
+        else if (projectRootFromArgs) void openProject(projectRootFromArgs, { optimistic: true });
       })
       .catch(showStartupError);
     void window.inkflow.request<Record<string, unknown>>("app.initialize").then(setAppInfo).catch(showStartupError);
@@ -1007,7 +1057,9 @@ function App() {
   // the one-time startup guard above applies only to initialization requests.
   useEffect(() => {
     const removeEvent = window.inkflow.onEvent((value) => {
+      if (sharedWorkspaceRef.current) return;
       const event = value as EngineEvent;
+      if (event.run_id === activeRunIdRef.current) runEventsRef.current.push({ ...event, timestamp: event.timestamp || new Date().toISOString() });
       setEvents((items) => [...items.slice(-199), { ...event, timestamp: new Date().toISOString() }]);
       if (event.type?.startsWith("voice.job.")) setVoiceRevision((current) => current + 1);
       if (/^voice\.(edge|moss|asr)\.(ready|models_failed|install\.(queued|failed))$/.test(event.type || "")) {
@@ -1053,43 +1105,42 @@ function App() {
   }, [projectRoot, uiPreferences.suggestedPromptsEnabled]);
 
   useEffect(() => {
-    if (!projectRoot) { setContextStatus(null); setCollaboration(null); contextSnapshotRef.current = null; return; }
+    if (sharedWorkspaceRef.current) return;
+    if (!projectRoot) { setContextStatus(null); setCollaboration(null); return; }
     let active = true;
-    let polling = false;
-    const poll = async () => {
-      if (!active || polling || activeRunIdRef.current || projectRefreshRef.current?.root === projectRoot || !canPollWorkspace(window.document.visibilityState, window.document.hasFocus())) return;
-      polling = true;
+    let pollingContext = false;
+    let pollingProgress = false;
+    const pollContext = async () => {
+      if (!active || pollingContext || !canPollWorkspace(window.document.visibilityState, window.document.hasFocus())) return;
+      pollingContext = true;
       try {
-        const [value, overview, projectStatus] = await Promise.all([
-          window.inkflow.request<ContextStatus>("context.status", { project_root: projectRoot }),
+        const value = await window.inkflow.request<ContextStatus>("context.status", { project_root: projectRoot });
+        if (active) setContextStatus(value);
+      } catch (cause) {
+        if (active) setContextStatus(previous => ({ ...(previous || { estimated_tokens: 0, before_compression_tokens: 0,
+          soft_limit_tokens: 0, hard_limit_tokens: 0, hard_usage_percent: 0, compression_applied: false,
+          hard_sections: [], compressible_sections: [], warnings: [] }), status: "unavailable",
+          read_error: `上下文状态暂时无法更新：${errorMessage(cause)}。稍后会自动再查，当前任务不会因此重新发送。` }));
+      } finally { pollingContext = false; }
+    };
+    const pollProgress = async () => {
+      if (!active || pollingProgress || activeRunIdRef.current || projectRefreshRef.current?.root === projectRoot || !canPollWorkspace(window.document.visibilityState, window.document.hasFocus())) return;
+      pollingProgress = true;
+      try {
+        const [overview, projectStatus] = await Promise.all([
           window.inkflow.request<CollaborationOverview>("collaboration.overview", { project_root: projectRoot }),
           window.inkflow.request<Dashboard>("project.status", { project_root: projectRoot }),
         ]);
-        if (active) {
-          const updatedAt = String(value.updated_at || "");
-          const estimatedTokens = Math.max(0, Number(value.estimated_tokens || 0));
-          const previous = contextSnapshotRef.current;
-          const changed = Boolean(updatedAt && previous && previous.updatedAt && updatedAt !== previous.updatedAt);
-          const change = changed && previous ? estimatedTokens - previous.estimatedTokens : value.change_since_previous_tokens ?? null;
-          if (updatedAt && (!previous || previous.updatedAt !== updatedAt)) {
-            contextSnapshotRef.current = { updatedAt, estimatedTokens };
-          }
-          setContextStatus({
-            ...value,
-            previous_updated_at: value.previous_updated_at || previous?.updatedAt || "",
-            previous_estimated_tokens: value.previous_estimated_tokens ?? previous?.estimatedTokens ?? null,
-            change_since_previous_tokens: change,
-          });
-          setCollaboration(overview);
-          setDashboard(projectStatus);
-        }
-      } catch { /* 状态面板不能打断正文工作流；下一轮继续读取。 */ }
-      finally { polling = false; }
+        if (active) { setCollaboration(overview); setDashboard(projectStatus); }
+      } catch { /* 状态查看失败不重发小说任务。 */ }
+      finally { pollingProgress = false; }
     };
-    void poll();
-    const timer = window.setInterval(() => void poll(), 15000);
-    window.addEventListener("focus", poll);
-    return () => { active = false; window.clearInterval(timer); window.removeEventListener("focus", poll); };
+    void pollContext(); void pollProgress();
+    const contextTimer = window.setInterval(() => void pollContext(), 4000);
+    const progressTimer = window.setInterval(() => void pollProgress(), 15000);
+    window.addEventListener("focus", pollContext); window.addEventListener("focus", pollProgress);
+    return () => { active = false; window.clearInterval(contextTimer); window.clearInterval(progressTimer);
+      window.removeEventListener("focus", pollContext); window.removeEventListener("focus", pollProgress); };
   }, [projectRoot]);
 
   const batchProgressActive = Boolean(activeRunId && ((collaboration?.batches || []).some(batch => batch.run_id === activeRunId)
@@ -1117,6 +1168,11 @@ function App() {
   }, [projectRoot, activeRunId, batchProgressActive]);
 
   const openDocument = async (item: TreeItem) => {
+    if (sharedWorkspaceRef.current) {
+      try { await window.inkflow.workspaceCommand("document", item.relative_path); }
+      catch (cause) { setError(errorMessage(cause)); }
+      return;
+    }
     const root = projectRootRef.current;
     const navigationId = ++editorNavigationRef.current;
     const isCurrent = () => navigationId === editorNavigationRef.current && root === projectRootRef.current;
@@ -1144,10 +1200,11 @@ function App() {
         setActiveTab("editor");
       }
       if (isCurrent()) setOpeningDocumentPath(null);
-      if (item.chapter_no) {
+      const openedChapter = item.chapter_no || currentChapter(loaded.relative_path);
+      if (openedChapter) {
         const workspace = await window.inkflow.request<Record<string, unknown>>("chapter.workspace", {
           project_root: root,
-          chapter_no: item.chapter_no,
+          chapter_no: openedChapter,
         });
         if (isCurrent()) setChapterWorkspace(workspace);
       } else {
@@ -1294,7 +1351,8 @@ function App() {
     } catch (cause) { if (current()) fail(cause); }
   };
 
-  const speakText = async (messageId: string, content: string) => {
+  const speakText = async (messageId: string, content: string, automatic = false) => {
+    if (automatic && autoReadPausedRef.current) return;
     if (speakingMessageIdRef.current === messageId) { stopAudioPlayback(); return; }
     stopAudioPlayback();
     const sequence = audioPlaybackSequenceRef.current;
@@ -1303,11 +1361,15 @@ function App() {
     try {
       const result = await request<{ audio_path: string }>("voice.speak", { text: content });
       if (sequence !== audioPlaybackSequenceRef.current) return;
+      autoReadPausedRef.current = false;
       await playAudioPath(result.audio_path, messageId, sequence);
     } catch (cause) {
       if (sequence !== audioPlaybackSequenceRef.current) return;
       stopAudioPlayback();
-      setError(audioPlaybackFailure(cause));
+      if (automatic) {
+        autoReadPausedRef.current = true;
+        setNotice(`${audioPlaybackFailure(cause)} 自动朗读已暂停；文字任务继续，服务恢复后可点击朗读重试。`);
+      } else setError(audioPlaybackFailure(cause));
     }
   };
   useEffect(() => { stopAudioPlayback(); }, [projectRoot]);
@@ -1321,7 +1383,7 @@ function App() {
     const model = editorRef.current?.getModel();
     const selected = selection && model && !selection.isEmpty() ? model.getValueInRange(selection) : "";
     setVoiceSource({
-      name: selected ? `${document.relative_path} · 当前选区` : document.relative_path,
+      name: selected ? `${documentLabel(document.relative_path)} · 当前选区` : documentLabel(document.relative_path),
       type: selected ? "selection" : document.relative_path.endsWith(".draft.md") ? "draft" : "document",
       text: selected || text,
     });
@@ -1330,7 +1392,7 @@ function App() {
 
   const copyMessageText = async (message: Message) => {
     try {
-      await navigator.clipboard.writeText(message.text);
+      await navigator.clipboard.writeText(readableWorkMessage(message.text, collaborationPending(collaboration).work, manualJobs));
       setNotice("已复制这条消息。");
     } catch {
       setError("复制失败：剪贴板当前不可用。");
@@ -1364,7 +1426,7 @@ function App() {
     void sendChat(undefined, target.text);
   };
 
-  // Stage suggestions are local; no conversation payload is needed.
+  // Read the Coordinator recommendations saved with the actual result; refreshing never calls a model.
   const refreshSuggestedPrompts = async (root = projectRootRef.current) => {
     if (!uiPreferences.suggestedPromptsEnabled || !root || root !== projectRootRef.current) return;
     if (suggestionRefreshRef.current?.root === root) return suggestionRefreshRef.current.promise;
@@ -1373,8 +1435,8 @@ function App() {
         const result = await request<{ suggestions: SuggestedPromptItem[] }>("assistant.suggest", { project_root: root, workspace_root: root });
         if (root !== projectRootRef.current) return;
         if (Array.isArray(result?.suggestions)) {
-          const cleaned = result.suggestions.map(item => ({ label: String(item?.label || "继续"), prompt: String(item?.prompt || "").trim() })).filter(item => item.prompt);
-          if (cleaned.length > 0) setSuggestedPrompts(cleaned);
+          const cleaned = result.suggestions.map(item => ({ label: String(item?.label || "继续"), prompt: String(item?.prompt || "").trim(), reason: item.reason })).filter(item => item.prompt);
+          setSuggestedPrompts(cleaned);
         }
       } catch { /* Keep the existing local suggestions; writing can continue. */ }
     })();
@@ -1383,28 +1445,40 @@ function App() {
     finally { if (suggestionRefreshRef.current?.promise === promise) suggestionRefreshRef.current = null; }
   };
 
-  // 边听边出字：录音中每 2.5 秒对当前累计音频做一次快照转写，结果实时填入输入框。
+  // One in-flight local decode per recording; late results never change a new session.
   const transcribeLiveSnapshot = async () => {
     const recorder = voiceRecorderRef.current;
     if (!recorder || voiceLiveBusyRef.current) return;
+    if (!recorder.seconds || !recorder.hasSignal) {
+      setVoiceInputPhase(recorder.seconds ? "已连接麦克风，但还没收到明显声音，请检查静音或输入设备。" : "麦克风已连接，等待录音数据…");
+      return;
+    }
     voiceLiveBusyRef.current = true;
+    setVoiceInputPhase("正在本地识别，第一次使用需要加载模型…");
     try {
       const bytes = recorder.snapshot();
-      if (bytes.length <= 44) return;
-      const path = await window.inkflow.saveVoiceRecording(bytes, "wav");
-      const result = await request<{ text: string }>("voice.transcribe", { audio_path: path });
+      const path = await window.inkflow.saveVoiceRecording(bytes, "wav", voiceSessionRef.current);
+      const decoding = request<{ text: string }>("voice.transcribe", { audio_path: path });
+      voiceDecodeRef.current = { recorder, byteLength: bytes.length, result: decoding };
+      const result = await decoding;
+      if (voiceRecorderRef.current !== recorder) return;
+      setVoiceLiveProblem("");
+      setVoiceInputPhase(result.text.trim() ? "正在听写，停止后回填输入框。" : "已收到声音，暂未识别出清晰说话内容。继续说话后会再核对。");
       if (result.text.trim()) {
         voiceTranscriptRef.current = result.text.trim();
         setVoiceTranscript(result.text.trim());
       }
-    } catch {
-      // The browser speech recognizer is the primary path; this is an optional offline fallback.
-    } finally {
-      voiceLiveBusyRef.current = false;
-    }
+    } catch (cause) {
+      if (voiceRecorderRef.current !== recorder) return;
+      setVoiceLiveProblem(voiceInputFailure(cause));
+      setVoiceInputPhase("实时识别遇到问题。停止录音时仍会保留完整录音并核对一次。");
+      if (voiceLiveTimerRef.current !== null) window.clearInterval(voiceLiveTimerRef.current);
+      voiceLiveTimerRef.current = null;
+    } finally { voiceLiveBusyRef.current = false; }
   };
 
   const commitVoiceTranscript = (transcript: string) => {
+    if (voiceProjectRef.current !== projectRootRef.current) { setNotice("录音期间已切换小说，识别结果没有放入另一部小说的输入框。请回到原小说核对录音。"); return; }
     const clean = transcript.trim();
     const base = voiceBaseInputRef.current.trim();
     voiceBaseInputRef.current = "";
@@ -1423,15 +1497,16 @@ function App() {
     const recognition = voiceRecognitionRef.current;
     if (!recognition) return false;
     setVoiceTranscribing(true);
-    try {
-      recognition.stop();
-    } catch {
-      // The browser may already have ended recognition; commit the latest text.
+    setVoiceRecording(false);
+    const finish = () => {
+      if (voiceRecognitionRef.current !== recognition) return;
       voiceRecognitionRef.current = null;
       setVoiceTranscribing(false);
       commitVoiceTranscript(voiceFinalTranscriptRef.current || voiceTranscriptRef.current);
-    }
-    setVoiceRecording(false);
+    };
+    if (voiceBrowserTimerRef.current !== null) window.clearTimeout(voiceBrowserTimerRef.current);
+    voiceBrowserTimerRef.current = window.setTimeout(() => { finish(); recognition.abort(); }, 8000);
+    try { recognition.stop(); } catch { finish(); }
     return true;
   };
 
@@ -1439,6 +1514,11 @@ function App() {
     event?.preventDefault();
     const message = (overrideMessage ?? chatInput).trim();
     if (!message || !projectRoot) return;
+    if (sharedWorkspaceRef.current) {
+      try { await window.inkflow.workspaceCommand("chat", message); setChatInput(""); }
+      catch (cause) { setError(errorMessage(cause)); }
+      return;
+    }
     if (busy) {
       const queuedAt = new Date().toISOString();
       setChatInput("");
@@ -1476,19 +1556,25 @@ function App() {
     const runId = `desktop-${crypto.randomUUID()}`;
     const runRoot = projectRootRef.current || projectRoot;
     activeRunIdRef.current = runId;
+    runEventsRef.current = [];
+    runStartedAtRef.current = new Date().toISOString();
     cancelRequestedRef.current = false;
     setActiveRunId(runId);
     let refreshSuggestions = false;
     try {
-      const result = await request<unknown>("conversation.send", { message, run_id: runId });
+      const result = await request<unknown>("conversation.send", { message, run_id: runId, include_suggestions: uiPreferences.suggestedPromptsEnabled });
       const visible = visibleResult(result);
+      if (runRoot === projectRootRef.current && result && typeof result === "object") {
+        const choices = (result as Record<string, unknown>).suggested_prompts;
+        setSuggestedPrompts(Array.isArray(choices) ? choices as SuggestedPromptItem[] : []);
+      }
       const refreshScope = chatRefreshScope(result);
       refreshSuggestions = Boolean(refreshScope === "project" && result && typeof result === "object"
         && ["completed", "accepted", "resolved"].includes(String((result as Record<string, unknown>).status || "")));
       const questionSource = result && typeof result === "object" ? (result as Record<string, unknown>).questions : null;
       if (Array.isArray(questionSource)) setPendingQuestions(questionSource as QuestionCard[]);
       const assistantMessageId = crypto.randomUUID();
-      setMessages((items) => [...items, { id: assistantMessageId, role: "assistant", text: visible.summary, details: visible.details, reasoning: visible.reasoning, animate: true, createdAt: new Date().toISOString() }]);
+      setMessages((items) => [...items, { id: assistantMessageId, role: "assistant", text: visible.summary, details: visible.details, indices: resultIndices(result, runRoot), reasoning: visible.reasoning, animate: true, createdAt: new Date().toISOString(), process: { startedAt: runStartedAtRef.current, finishedAt: new Date().toISOString(), status: String((result as Record<string, unknown>)?.status || "completed"), steps: [...runEventsRef.current] } }]);
       if (result && typeof result === "object" && (result as Record<string, unknown>).settings_updated) {
         // Coordinator settings changes are persisted by the engine. Refresh
         // the two settings snapshots so reopening Settings immediately shows
@@ -1496,8 +1582,8 @@ function App() {
         void window.inkflow.request<Record<string, unknown>>("provider.status", { workspace_root: projectRootRef.current }).then(setProvider).catch(() => undefined);
         void window.inkflow.request<VoiceSettings>("voice.settings.get", { workspace_root: projectRootRef.current }).then(setVoiceSettings).catch(() => undefined);
       }
-      if (voiceSettings?.voice_enabled && voiceSettings.voice_output_enabled && voiceSettings.voice_auto_read) void speakText(assistantMessageId, visible.summary);
-      try {
+      if (voiceSettings?.voice_enabled && voiceSettings.voice_output_enabled && voiceSettings.voice_auto_read) void speakText(assistantMessageId, visible.summary, true);
+      void (async () => { try {
         const history = await request<{ entries: ConversationHistoryEntry[] }>("conversation.history", { project_root: runRoot, limit: 100 });
         if (runRoot === projectRootRef.current) {
           setConversationHistory(history.entries);
@@ -1517,18 +1603,15 @@ function App() {
           .replace(/^Error:\s*/i, "")
           .trim();
         setNotice(`本次对话结果已返回；只是项目面板没有刷新，已提交的正文不会因此撤回。\n刷新失败原因：${reason}\n可稍后点“刷新”核对章节状态。`);
-      }
+      } })();
       const resultState = result && typeof result === "object" ? String((result as Record<string, unknown>).status || "") : "";
-      if (["failed", "interrupted", "waiting_condition"].includes(resultState) && runRoot === projectRootRef.current) {
-        setSuggestedPrompts([{ label: "查看待办与恢复条件", prompt: "查看待办" }]);
-      }
       const completedIntent = result && typeof result === "object" ? (result as Record<string, unknown>).intent as Record<string, unknown> | undefined : undefined;
       if (["completed", "accepted", "resolved"].includes(resultState) && runRoot === projectRootRef.current &&
           !(Array.isArray(questionSource) && questionSource.length) && completedIntent?.action !== "discuss" &&
           !(completedIntent?.action === "pending_work" && ["inspect", "defer"].includes(String(completedIntent.pending_work_decision)))) {
         setMobaoCompletion({ id: `${runRoot}:${runId}:${assistantMessageId}`, root: runRoot, runId, messageId: assistantMessageId, summary: visible.summary });
       }
-      setMascotMood(resultState === "failed" ? "rest" :
+      setMascotMood(resultState === "failed" ? "frustrated" :
         ["waiting_user", "waiting_condition", "needs_input", "interrupted"].includes(resultState) ||
         (Array.isArray(questionSource) && questionSource.length > 0) ? "waiting" : "success");
     } catch (cause) {
@@ -1537,11 +1620,12 @@ function App() {
       setMessages((items) => [...items, {
         id: crypto.randomUUID(),
         role: "assistant",
-        text: cancelled ? messageText : `\u8fd9\u6b21\u6ca1\u6709\u5b8c\u6210\uff1a${messageText}`,
+        text: messageText,
+        process: { startedAt: runStartedAtRef.current, finishedAt: new Date().toISOString(), status: cancelled ? "cancelled" : "failed", steps: [...runEventsRef.current] },
       }]);
       if (!cancelled) setError(messageText);
       setMascotMood(cancelled ? "waiting" : "rest");
-      if (runRoot === projectRootRef.current) setSuggestedPrompts([{ label: "查看待办与恢复条件", prompt: "查看待办" }]);
+      if (runRoot === projectRootRef.current) setSuggestedPrompts([]);
     } finally {
       if (activeRunIdRef.current === runId) {
         activeRunIdRef.current = null;
@@ -1557,97 +1641,117 @@ function App() {
   };
 
   const toggleVoiceInput = async () => {
-    if (voiceRecording) {
-      if (stopBrowserVoiceInput()) return;
-      if (voiceLiveTimerRef.current !== null) {
-        window.clearInterval(voiceLiveTimerRef.current);
-        voiceLiveTimerRef.current = null;
-      }
-      setVoiceRecording(false);
-      setVoiceTranscribing(true);
-      try {
-        const bytes = await voiceRecorderRef.current?.stop();
-        voiceRecorderRef.current = null;
-        if (!bytes?.length) throw new Error("\u5f55\u97f3\u5185\u5bb9\u4e3a\u7a7a\uff0c\u8bf7\u91cd\u65b0\u5f55\u5236\u3002");
-        const path = await window.inkflow.saveVoiceRecording(bytes, "wav");
-        const result = await request<{ text: string }>("voice.transcribe", { audio_path: path });
-        commitVoiceTranscript(result.text);
-      } catch (cause) {
-        setError(errorMessage(cause));
-      } finally {
-        setVoiceTranscribing(false);
-      }
-      return;
-    }
-    if (!voiceSettings?.voice_enabled || !voiceSettings.voice_input_enabled) {
-      setNotice("\u8bf7\u5148\u5728\u8bbe\u7f6e\u7684\u201c\u8bed\u97f3\u201d\u5206\u7c7b\u4e2d\u5f00\u542f\u672c\u5730\u8bed\u97f3\u8f93\u5165\u3002");
-      setShowSettings(true);
-      return;
-    }
-    const recognition = createSpeechRecognition();
-    if (voiceSettings.voice_input_engine === "browser" && recognition) {
-      voiceBaseInputRef.current = chatInput;
-      voiceTranscriptRef.current = "";
-      voiceFinalTranscriptRef.current = "";
-      setVoiceTranscript("");
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = "zh-CN";
-      recognition.onresult = (event) => {
-        let finalText = "";
-        let interimText = "";
-        for (let index = event.resultIndex; index < event.results.length; index += 1) {
-          const result = event.results[index];
-          const transcript = String(result?.[0]?.transcript || "").trim();
-          if (!transcript) continue;
-          if (result.isFinal) finalText += transcript;
-          else interimText += transcript;
-        }
-        if (finalText) voiceFinalTranscriptRef.current = `${voiceFinalTranscriptRef.current} ${finalText}`.trim();
-        const visible = `${voiceFinalTranscriptRef.current} ${interimText}`.trim();
-        voiceTranscriptRef.current = visible;
-        setVoiceTranscript(visible);
-      };
-      recognition.onerror = (event) => {
-        if (event.error && event.error !== "aborted") setNotice(`\u5b9e\u65f6\u542c\u5199\u6682\u65f6\u4e0d\u53ef\u7528\uff08${event.error}\uff09\uff0c\u8bf7\u7ee7\u7eed\u8bf4\u8bdd\u6216\u505c\u6b62\u540e\u68c0\u67e5\u8f93\u5165\u3002`);
-      };
-      recognition.onend = () => {
-        if (voiceRecognitionRef.current !== recognition) return;
-        voiceRecognitionRef.current = null;
-        setVoiceRecording(false);
-        setVoiceTranscribing(false);
-        commitVoiceTranscript(voiceFinalTranscriptRef.current || voiceTranscriptRef.current);
-      };
-      voiceRecognitionRef.current = recognition;
-      try {
-        recognition.start();
-        setVoiceRecording(true);
-        setNotice("\u6b63\u5728\u5b9e\u65f6\u542c\u5199\uff0c\u7070\u8272\u6587\u5b57\u4f1a\u968f\u7740\u8bf4\u8bdd\u66f4\u65b0\uff1b\u518d\u6b21\u70b9\u51fb\u9ea6\u514b\u98ce\u505c\u6b62\u5e76\u56de\u586b\u8f93\u5165\u6846\u3002");
-      } catch (cause) {
-        voiceRecognitionRef.current = null;
-        setError(errorMessage(cause));
-      }
-      return;
-    }
-    if (voiceSettings.voice_input_engine === "browser") {
-      setError("当前桌面环境不支持浏览器实时识别；请在语音设置改选本地 SenseVoice。");
-      return;
-    }
-    if (!voiceStatus?.ready_for_input) {
-      setNotice("\u5f53\u524d\u73af\u5883\u6ca1\u6709\u6d4f\u89c8\u5668\u5b9e\u65f6\u542c\u5199\uff0c\u4e14\u672c\u5730 ASR \u7ec4\u4ef6\u672a\u5b89\u88c5\u3002\u53ef\u4ee5\u5728\u8bbe\u7f6e\u4e2d\u67e5\u770b\u8bed\u97f3\u7ec4\u4ef6\u72b6\u6001\uff1b\u4e0d\u4f1a\u81ea\u52a8\u53d1\u9001\u7a7a\u767d\u7ed3\u679c\u3002");
-      setShowSettings(true);
-      return;
-    }
+    if (voiceInputBusyRef.current || voiceTranscribing) return;
+    voiceInputBusyRef.current = true;
     try {
-      voiceBaseInputRef.current = chatInput;
-      voiceTranscriptRef.current = "";
-      setVoiceTranscript("");
-      voiceRecorderRef.current = await LocalWavRecorder.start(voiceSettings.voice_input_device);
-      setVoiceRecording(true);
-      setNotice("\u6b63\u5728\u542c\u5199\uff1b\u8bc6\u522b\u7ed3\u679c\u4f1a\u5b9e\u65f6\u51fa\u73b0\uff0c\u518d\u70b9\u4e00\u6b21\u9ea6\u514b\u98ce\u505c\u6b62\u3002");
-      voiceLiveTimerRef.current = window.setInterval(() => { void transcribeLiveSnapshot(); }, 2500);
+      if (voiceRecording) {
+        if (stopBrowserVoiceInput()) return;
+        if (voiceLiveTimerRef.current !== null) window.clearInterval(voiceLiveTimerRef.current);
+        voiceLiveTimerRef.current = null;
+        const recorder = voiceRecorderRef.current;
+        voiceRecorderRef.current = null;
+        setVoiceRecording(false);
+        setVoiceTranscribing(true);
+        setVoiceInputPhase("正在核对完整录音，完成后回填输入框…");
+        try {
+          const bytes = await recorder?.stop();
+          if (!recorder?.hasSignal || !bytes || bytes.length <= 44) throw new Error("这次录音没有收到明显声音。请确认麦克风没有静音，并检查语音设置中的输入设备。");
+          const path = await window.inkflow.saveVoiceRecording(bytes, "wav");
+          const decoded = voiceDecodeRef.current;
+          const result = await withDeadline(decoded?.recorder === recorder && decoded.byteLength === bytes.length ? decoded.result : request<{ text: string }>("voice.transcribe", { audio_path: path }), 120000,
+            "这次录音已保存，但识别还没有及时完成。请稍后再试；可以在语音设置检查本地识别组件。");
+          setVoiceLiveProblem("");
+          commitVoiceTranscript(result.text);
+        } catch (cause) { setError(voiceInputFailure(cause)); }
+        finally { setVoiceTranscribing(false); setVoiceInputPhase(""); }
+        return;
+      }
+      setVoiceStarting(true);
+      voiceProjectRef.current = projectRootRef.current;
+      voiceDecodeRef.current = null;
+      setVoiceInputPhase("正在准备麦克风…");
+      setError(""); setNotice(""); setVoiceLiveProblem("");
+      const settings = await withDeadline(request<VoiceSettings>("voice.settings.get"), 10000, "没能及时读取语音设置，请重新打开墨流后再试。");
+      setVoiceSettings(settings);
+      if (!settings.voice_enabled || !settings.voice_input_enabled) {
+        setNotice("语音输入尚未开启，请在语音设置中开启后再试。"); openSettings("voice"); return;
+      }
+      const recognition = settings.voice_input_engine === "browser" ? createSpeechRecognition() : null;
+      if (recognition) {
+        voiceBaseInputRef.current = chatInput;
+        voiceTranscriptRef.current = ""; voiceFinalTranscriptRef.current = ""; setVoiceTranscript("");
+        recognition.continuous = true; recognition.interimResults = true; recognition.lang = "zh-CN";
+        recognition.onstart = () => {
+          if (voiceRecognitionRef.current !== recognition) return;
+          if (voiceBrowserTimerRef.current !== null) window.clearTimeout(voiceBrowserTimerRef.current);
+          voiceBrowserTimerRef.current = null;
+          setVoiceInputPhase("正在浏览器听写，停止后回填输入框。");
+        };
+        recognition.onresult = event => {
+          if (voiceRecognitionRef.current !== recognition) return;
+          let finalText = "", interimText = "";
+          for (let index = event.resultIndex; index < event.results.length; index += 1) {
+            const result = event.results[index], text = String(result?.[0]?.transcript || "").trim();
+            if (result.isFinal) finalText += text; else interimText += text;
+          }
+          if (finalText) voiceFinalTranscriptRef.current = `${voiceFinalTranscriptRef.current} ${finalText}`.trim();
+          const visible = `${voiceFinalTranscriptRef.current} ${interimText}`.trim();
+          voiceTranscriptRef.current = visible; setVoiceTranscript(visible);
+        };
+        recognition.onerror = event => {
+          if (event.error === "aborted" || voiceRecognitionRef.current !== recognition) return;
+          const partial = voiceFinalTranscriptRef.current || voiceTranscriptRef.current;
+          voiceRecognitionRef.current = null;
+          if (voiceBrowserTimerRef.current !== null) window.clearTimeout(voiceBrowserTimerRef.current);
+          voiceBrowserTimerRef.current = null;
+          recognition.abort(); setVoiceRecording(false); setVoiceTranscribing(false);
+          if (partial.trim()) commitVoiceTranscript(partial);
+          setError(voiceInputFailure(event.error));
+        };
+        recognition.onend = () => {
+          if (voiceRecognitionRef.current !== recognition) return;
+          voiceRecognitionRef.current = null;
+          if (voiceBrowserTimerRef.current !== null) window.clearTimeout(voiceBrowserTimerRef.current);
+          voiceBrowserTimerRef.current = null;
+          setVoiceRecording(false); setVoiceTranscribing(false);
+          commitVoiceTranscript(voiceFinalTranscriptRef.current || voiceTranscriptRef.current);
+        };
+        voiceRecognitionRef.current = recognition;
+        try { recognition.start(); } catch (cause) { voiceRecognitionRef.current = null; throw cause; }
+        setVoiceRecording(true);
+        voiceBrowserTimerRef.current = window.setTimeout(() => {
+          if (voiceRecognitionRef.current !== recognition) return;
+          voiceRecognitionRef.current = null; recognition.abort(); setVoiceRecording(false);
+          setError("浏览器听写服务没有启动。可在语音设置中选择已安装的本地识别后重试。");
+        }, 12000);
+        return;
+      }
+      const status = await withDeadline(request<Pick<VoiceStatus, "asr" | "ready_for_input">>("voice.status", { input_only: true }), 10000,
+        "本地识别组件没有及时返回状态。请重新打开墨流或查看语音设置后再试。");
+      if (!status.asr?.asr_ready) {
+        const asr = status.asr;
+        setNotice(asr?.installing ? `识别组件正在准备：${asr.install_summary || "依赖与模型尚未齐全"}。完成后再点语音即可。`
+          : asr?.last_error ? `识别组件准备失败：${readableSourceText(asr.last_error)}。请在语音设置检查对应步骤。`
+          : asr?.package_installed ? "识别程序已安装，但模型或录音读取组件不完整。请在语音设置查看缺少的部分。"
+          : asr?.has_local_files ? "找到了本地识别模型，但当前程序缺少运行它的组件。请在语音设置补齐组件，已有模型会继续使用。"
+          : "没有找到可用的本地识别组件，请在语音设置中安装或检查位置。");
+        openSettings("voice"); return;
+      }
+      if (settings.voice_input_engine !== "local") {
+        const selected = await request<VoiceSettings>("voice.settings.configure", { voice_input_engine: "local" });
+        setVoiceSettings(selected);
+      }
+      voiceBaseInputRef.current = chatInput; voiceTranscriptRef.current = ""; setVoiceTranscript("");
+      voiceSessionRef.current = crypto.randomUUID();
+      voiceRecorderRef.current = await LocalWavRecorder.start(settings.voice_input_device);
+      setVoiceRecording(true); setVoiceInputPhase("正在本地听写，请开始说话…");
+      if (voiceRecorderRef.current.deviceFallback) setNotice("原来选择的麦克风不可用，这次已使用系统默认输入设备。");
+      voiceLiveTimerRef.current = window.setInterval(() => { void transcribeLiveSnapshot(); }, 1200);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "\u65e0\u6cd5\u4f7f\u7528\u9ea6\u514b\u98ce\uff0c\u8bf7\u68c0\u67e5 Windows \u6743\u9650\u3002");
+      setError(voiceInputFailure(cause));
+      setVoiceRecording(false);
+    } finally {
+      setVoiceStarting(false); voiceInputBusyRef.current = false;
     }
   };
 
@@ -1713,21 +1817,27 @@ function App() {
     const runId = `desktop-${crypto.randomUUID()}`;
     const runRoot = projectRootRef.current || projectRoot;
     activeRunIdRef.current = runId;
+    runEventsRef.current = [];
+    runStartedAtRef.current = new Date().toISOString();
     cancelRequestedRef.current = false;
     setActiveRunId(runId);
     try {
       const result = await request<unknown>("workflow.run", {
-        action,
+        action, include_suggestions: uiPreferences.suggestedPromptsEnabled,
         run_id: runId,
         ...(chapterNo ? { chapter_no: chapterNo } : {}),
         authorization_source: action === "batch_accept" || (action === "batch_draft" && acceptanceMode === "batch_once") ? "batch_preapproval" : action === "accept" ? "per_chapter_click" : acceptanceMode === "auto_after_review" && ["review", "batch_draft"].includes(action) ? "settings_auto_accept" : "current_request",
         ...extra,
       });
       const visible = visibleResult(result);
+      if (runRoot === projectRootRef.current && result && typeof result === "object") {
+        const choices = (result as Record<string, unknown>).suggested_prompts;
+        setSuggestedPrompts(Array.isArray(choices) ? choices as SuggestedPromptItem[] : []);
+      }
       const assistantMessageId = crypto.randomUUID();
       setMessages((items) => [
         ...items,
-        { id: assistantMessageId, role: "assistant", text: visible.summary, details: visible.details, reasoning: visible.reasoning, animate: true },
+        { id: assistantMessageId, role: "assistant", text: visible.summary, details: visible.details, indices: resultIndices(result, runRoot), reasoning: visible.reasoning, animate: true, process: { startedAt: runStartedAtRef.current, finishedAt: new Date().toISOString(), status: String((result as Record<string, unknown>)?.status || "completed"), steps: [...runEventsRef.current] } },
       ]);
       if (runRoot === projectRootRef.current) await refresh(runRoot);
       const resultRecord = result && typeof result === "object" ? result as Record<string, unknown> : {};
@@ -1842,6 +1952,52 @@ function App() {
   };
 
   const stats = document?.statistics || emptyStatistics;
+  const visibleSuggestedPrompts = useMemo(() => (suggestedPrompts.length ? suggestedPrompts : initialSuggestedPrompts(dashboard, busy, pendingQuestions.length > 0))
+    .filter(item => item.prompt?.trim()).slice(0, 4), [suggestedPrompts, dashboard, busy, pendingQuestions.length]);
+  const fillSuggestedPrompt = useCallback((prompt?: string) => {
+    if (voiceStarting || voiceRecording || voiceTranscribing) { setSuggestionFillStatus("语音输入尚未结束，已保留当前输入。请停止听写后再填入建议。"); return; }
+    const result = prepareSuggestionFill(chatInputRef.current?.value ?? chatInput, prompt);
+    setSuggestionFillStatus(result.message);
+    if (result.filled) {
+      setChatInput(result.value);
+      setPromptOptimization(null);
+      setPromptUndo(null);
+    }
+    chatInputRef.current?.focus();
+  }, [chatInput, voiceStarting, voiceRecording, voiceTranscribing]);
+  useEffect(() => {
+    const fillFromShortcut = (event: KeyboardEvent) => {
+      const input = chatInputRef.current;
+      const inChat = Boolean(input && input.getClientRects().length && event.target instanceof Element && input.closest(".conversation-panel")?.contains(event.target));
+      if (!canFillSuggestionShortcut(event, uiPreferences.suggestionShortcut,
+        uiPreferences.suggestedPromptsEnabled && uiPreferences.suggestionShortcutEnabled, inChat,
+        showSettings || Boolean(window.document.querySelector('[aria-modal="true"], dialog[open]')))) return;
+      event.preventDefault();
+      event.stopPropagation();
+      fillSuggestedPrompt(visibleSuggestedPrompts[0]?.prompt);
+    };
+    window.addEventListener("keydown", fillFromShortcut, true);
+    return () => window.removeEventListener("keydown", fillFromShortcut, true);
+  }, [uiPreferences.suggestedPromptsEnabled, uiPreferences.suggestionShortcutEnabled, uiPreferences.suggestionShortcut, showSettings, visibleSuggestedPrompts, fillSuggestedPrompt]);
+  useEffect(() => {
+    if (!projectRoot || sharedWorkspaceRef.current || !window.inkflow.publishWorkspaceState) return;
+    const timer = window.setTimeout(() => { void window.inkflow.publishWorkspaceState({ projectRoot, dashboard, tree, document, messages: messages.slice(-200), suggestedPrompts, events: events.slice(-200), pendingQuestions, busy, cancelReady, activeRunId, runStartedAt: runStartedAtRef.current, collaboration, contextStatus, notice, error }).catch(() => undefined); }, 100);
+    return () => window.clearTimeout(timer);
+  }, [projectRoot, dashboard, tree, document, messages, events, pendingQuestions, busy, cancelReady, activeRunId, collaboration, contextStatus, notice, error, suggestedPrompts]);
+
+  const workspaceActionsRef = useRef<Record<string, (value: string) => Promise<void>>>({});
+  workspaceActionsRef.current = { chat: value => sendChat(undefined, value), document: value => openDocument({ id: value, label: value, relative_path: value, kind: value.startsWith("reviews/") ? "review" : "document" }), compare: compareVersion, annotation: resolveAnnotation };
+  useEffect(() => window.inkflow.onWorkspaceEvent?.(value => {
+    if (value.type === "state" && sharedWorkspaceRef.current && value.state && typeof value.state === "object") { applySharedWorkspace(value.state as Record<string, unknown>); return; }
+    if (value.type === "returned" && ["navigation", "assistant", "inspector"].includes(String(value.panel))) { workspace.markNative(value.panel as PanelId, false, !value.hidden); return; }
+    if (value.type === "native-drag" && value.projectRoot === projectRootRef.current) { workspace.nativeDrag(value); return; }
+    if (value.type !== "command" || value.projectRoot !== projectRootRef.current) return;
+    const input = String(value.value || "");
+    if (["compare", "annotation"].includes(String(value.command)) && value.relativePath !== editorSnapshotRef.current.document?.relative_path) { setError("文档已经切换，请在批注与版本面板中重新选择当前文件的条目。"); return; }
+    const operation = workspaceActionsRef.current[String(value.command)]?.(input);
+    if (operation) void operation.catch(cause => setError(errorMessage(cause)));
+  }), [projectRoot, request, applySharedWorkspace]);
+
   const title = String(dashboard?.brief.title || "墨流");
   const isDirty = Boolean(document && text !== savedText);
   const pendingSummary = collaborationPending(collaboration);
@@ -1861,7 +2017,7 @@ function App() {
             <button onClick={openFolder}>打开项目</button>
           </div>
           <div className="welcome-meta">
-            <span>版本 {String(appInfo?.version || "0.7.0")}</span>
+            <span>版本 {String(updateInfo.currentVersion || appInfo?.version || "读取中")}</span>
             <span>{!provider ? "正在读取模型配置…" : provider.api_key_configured ? "模型已配置" : "尚未配置模型 Key"}</span>
             <button className="text-button" onClick={() => setShowSettings(true)}>模型设置</button>
             <button className="text-button" onClick={() => setShowUpdate(true)}>检查更新</button>
@@ -1893,34 +2049,19 @@ function App() {
         } />}
         {showCreate && <CreateProject onClose={() => setShowCreate(false)} onCreated={openProject} />}
         {showManualMonitor && <Modal title="手动修改核对" subtitle="后台检测、依据和你的决定" onClose={() => setShowManualMonitor(false)} className="manual-monitor-modal"><ManualEditMonitor jobs={manualJobs} error={manualMonitorError} onRefresh={() => void refreshManualEdits()} onDecision={decideManualEdit} /></Modal>}
-      {showSettings && <SettingsDialog projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} layout={workspaceLayout} preferences={uiPreferences} onLayoutChange={updateWorkspaceLayout} onLayoutPreset={applyWorkspacePreset} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
+      {showSettings && <SettingsDialog initialSection={settingsInitialSection} projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} preferences={uiPreferences} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
         {showUpdate && <UpdateDialog info={updateInfo} onClose={() => setShowUpdate(false)} />}
       </div>
     );
   }
 
-  const workspaceGridClass = [
-    "workspace-grid",
-    workspaceLayout.navigationVisible ? "navigation-visible" : "navigation-hidden",
-    workspaceLayout.assistantVisible ? "assistant-visible" : "assistant-hidden",
-    `assistant-${workspaceLayout.assistantPosition}`,
-  ].join(" ");
-  const workspaceGridStyle = {
-    "--navigation-width": `${workspaceLayout.navigationWidth}px`,
-    "--assistant-width": `${workspaceLayout.assistantWidth}px`,
-    "--chat-x": `${workspaceLayout.assistantX}px`,
-    "--chat-y": `${workspaceLayout.assistantY}px`,
-    "--chat-height": `${workspaceLayout.assistantHeight}px`,
-  } as CSSProperties;
-
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${detachedPanel ? "workspace-detached" : ""}`}>
       <header className="topbar">
-        <div className="wordmark"><img src={mobaoIdlePoster} alt="墨宝" /><div><strong>墨流</strong><small>INKFLOW</small></div></div>
         <div className="project-heading">
           <strong>{title}</strong>
           {projectLoading ? <span className="working-dot">正在载入项目</span> : busy && <span className="working-dot">正在工作</span>}
-          <ChapterMilestones value={dashboard} />
+          <WorkspaceMenu workspace={workspace} onReturn={returnWorkspacePanel} />
         </div>
         <nav className="top-actions">
           <button onClick={() => setShowCreate(true)}>＋ 新建</button>
@@ -1928,51 +2069,37 @@ function App() {
           <button onClick={() => setShowSearch(true)}>⌕ 搜索</button>
           <button onClick={() => void window.inkflow.openPath(projectRoot)}>打开文件夹</button>
           <button onClick={() => setShowSettings(true)}>设置</button>
-          <button onClick={() => void openConversationWindow()}>＋ 对话窗口</button>
           <button onClick={() => setShowManualMonitor(true)}>修改核对</button>
           <button onClick={() => setShowUpdate(true)}>{updateInfo.status === "downloaded" ? "安装更新" : "检查更新"}</button>
         </nav>
       </header>
 
-      <main className={workspaceGridClass} style={workspaceGridStyle} ref={mobaoWorkAreaRef}>
-        {workspaceLayout.navigationVisible && <>
-        <aside className="left-rail">
-          <div className="rail-heading"><span>小说结构</span><button title="新建小说" onClick={() => setShowCreate(true)}>＋</button></div>
+      <main className="workspace-grid workspace-free" data-moving={Boolean(workspace.moving)} ref={mobaoWorkAreaRef}>
+        <WorkspaceDropPreview workspace={workspace} />
+        <WorkspacePanel id="navigation" workspace={workspace} className="left-rail" onDetach={detachWorkspacePanel} actions={<button className="panel-icon" title="新建小说" aria-label="新建小说" onClick={() => setShowCreate(true)}>＋</button>}>
           {Boolean(dashboard?.recovery_warnings?.length) && <details className="rail-recovery"><summary>有 {dashboard?.recovery_warnings?.length} 项文件待核对</summary>{dashboard?.recovery_warnings?.map((warning, index) => <p key={`${index}-${warning}`}>{warning}</p>)}</details>}
-          <TreeSection label="故事依据" items={(tree?.items || []).filter(item => ["BOOK.md", "OUTLINE.md", "STORY_DETAIL.md"].includes(item.relative_path))} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
-          <TreeSection label="近期章节规划" items={(tree?.items || []).filter(item => item.relative_path === "RECENT_PLAN.md")} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
-          {(tree?.items || []).some(item => item.relative_path === "PLAN.md") && <TreeSection label="旧版近期计划" items={(tree?.items || []).filter(item => item.relative_path === "PLAN.md")} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />}
-          <TreeSection label="正史与记录" items={(tree?.items || []).filter(item => ["STATE.md", "DIALOGUE.md"].includes(item.relative_path))} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
+          <button className="tree-label tree-setting-entry" type="button" title="本书设定 · 分层管理" onClick={() => openSettings("story_settings")}>本书设定 · 分层管理</button>
+          <TreeSection label="当前资料" items={(tree?.items || []).filter(item => ["BOOK.md", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md"].includes(item.relative_path))} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
           {(tree?.groups || []).filter(group => group.items.length > 0).map((group) => (
-            <TreeSection key={group.id} label={group.label} items={group.items} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
+            group.id === "chapters" ? <ChapterTree key={`${dashboard?.root}:chapters`} items={group.items} outline={dashboard?.chapter_outline} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} /> : <TreeSection key={group.id} label={group.label} items={group.items} onOpen={openDocument} active={document?.relative_path} opening={openingDocumentPath} />
           ))}
-          <section className="rail-pending" aria-label="待办摘要"><div><strong>待办与收尾</strong><span>{pendingSummary.count}</span></div><p>{pendingSummary.count ? "按章节查看下一步" : "当前没有待办"}{pendingSummary.messages.length ? ` · ${pendingSummary.messages.length} 条待回应消息` : ""}</p><button type="button" onClick={() => setActiveTab("process")}>打开待办看板</button></section>
-          <details className="rail-tools"><summary>资料与容量详情</summary><ContextBudgetPanel value={contextStatus} onPin={setContextPin} /></details>
+          <section className="rail-pending" aria-label="待办摘要"><div><strong>待办与收尾</strong><span>{pendingSummary.count}</span></div><p>{pendingSummary.count ? "按章节查看下一步" : "当前没有待办"}{pendingSummary.messages.length ? ` · ${pendingSummary.messages.length} 条协作记录` : ""}</p><button type="button" onClick={() => setActiveTab("process")}>打开待办看板</button></section>
           <div className="rail-summary">
             <div><span>草稿</span><strong>{dashboard?.status.chapters?.draft || 0}</strong></div>
             <div><span>正史</span><strong>{dashboard?.status.chapters?.accepted || 0}</strong></div>
             <div><span>伏笔</span><strong>{dashboard?.status.open_threads || 0}</strong></div>
           </div>
-        </aside>
-        <ResizeHandle className="navigation-resize" label="调整小说结构栏宽度" onResizeStart={(event) => startWorkspaceResize("navigation", 1, event)} />
-        </>}
-
-        {workspaceLayout.assistantVisible && <>
-        <section className="conversation-panel" ref={conversationPanelRef}>
-          <div className="floating-chat-controls">
-            {workspaceLayout.assistantPosition === "floating" && <button type="button" className="chat-drag-handle" aria-label="移动对话面板，方向键微调位置" onPointerDown={event => { event.preventDefault(); floatingMoveRef.current = { x: workspaceLayout.assistantX, y: workspaceLayout.assistantY, startX: event.clientX, startY: event.clientY }; }} onKeyDown={event => { const delta = ({ ArrowLeft: [-20, 0], ArrowRight: [20, 0], ArrowUp: [0, -20], ArrowDown: [0, 20] } as Record<string, number[]>)[event.key]; if (!delta) return; event.preventDefault(); updateWorkspaceLayout({ assistantX: Math.max(0, Math.min(window.innerWidth - 320, workspaceLayout.assistantX + delta[0])), assistantY: Math.max(0, Math.min(window.innerHeight - 80, workspaceLayout.assistantY + delta[1])) }); }}>⠿ 移动</button>}
-            <select className="conversation-layout-select" aria-label="对话面板位置" value={workspaceLayout.assistantPosition} onChange={event => updateWorkspaceLayout({ assistantPosition: event.target.value as WorkspaceLayout["assistantPosition"] })}><option value="left">正文左侧</option><option value="right">正文右侧</option><option value="bottom">正文下方</option><option value="floating">自由浮动</option></select>
-            <button type="button" onClick={() => void openConversationWindow()}>＋ 独立对话</button>
-            <button type="button" onClick={() => setShowManualMonitor(true)}>后台核对</button>
-          </div>
-          {manualJobs.some(job => ["needs_confirmation", "awaiting_confirmation", "waiting_user", "needs_evidence", "revision_requested", "conflict", "blocked", "failed"].includes(job.status)) && <details className="manual-edit-issues"><summary>手动修改有待处理问题</summary><p>原稿已保留，待核对改动不会自动变成正史。</p><button type="button" onClick={() => setShowManualMonitor(true)}>查看证据并决定</button></details>}
+          <div className="rail-context"><ContextBudgetPanel value={contextStatus} onPin={setContextPin} /></div>
+        </WorkspacePanel>
+        <WorkspacePanel id="assistant" workspace={workspace} className="conversation-panel" onDetach={detachWorkspacePanel} actions={<button className="panel-icon" title="新建独立对话" aria-label="新建独立对话" onClick={() => void openConversationWindow()}>＋</button>}>
+          {manualJobs.some(job => (job.kind !== "setting_record" || job.issues?.some(issue => issue.hard_conflict)) && ["needs_confirmation", "awaiting_confirmation", "waiting_user", "needs_evidence", "revision_requested", "conflict", "blocked", "failed"].includes(job.status)) && <details className="manual-edit-issues"><summary>有影响当前写作的修改待核对</summary><button type="button" onClick={() => setShowManualMonitor(true)}>查看问题并决定</button></details>}
           <div className="panel-title">
             <div><h2>和墨宝一起写</h2><p className="panel-status" role="status">{busy ? "任务进行中，可以继续补充想法" : "把想法告诉我。"}</p></div>
             <div className="panel-mascot">
               <button className="history-trigger" onClick={() => setShowHistory(true)}>对话历史 <span>{conversationHistory.length}</span></button>
               <div className="mascot-conversation" ref={mobaoDockRef}>
                 <Mascot
-                  mood={busy ? ([...events].reverse().find(item => item.run_id === activeRunId && item.role)?.role === "writer" ? "writing" : [...events].reverse().find(item => item.run_id === activeRunId && item.role)?.role === "reviewer" ? "reviewing" : "thinking") : mascotMood}
+                  mood={busy ? busyMascotMood(events, activeRunId) : mascotMood}
                   onSettled={() => setMascotMood("idle")}
                 />
               </div>
@@ -1980,18 +2107,20 @@ function App() {
           </div>
           <BatchProgressStatus batches={collaboration?.batches || []} events={events} activeRunId={activeRunId} />
           {uiPreferences.suggestedPromptsEnabled && (
-            <div className="quick-row">
-              {suggestedPrompts.slice(0, 2).map((item) => (
-                <button key={item.prompt} type="button" title={item.prompt} onClick={() => void sendChat(undefined, item.prompt)}>{item.label}</button>
+            <div className="quick-row" role="toolbar" aria-label="下一步推荐输入">
+              {visibleSuggestedPrompts.map((item, index) => (
+                <button key={item.prompt} type="button" title={[item.reason, item.prompt, index === 0 && uiPreferences.suggestionShortcutEnabled && uiPreferences.suggestionShortcut ? `${suggestionShortcutLabel(uiPreferences.suggestionShortcut)} 只填入，检查后再发送` : ""].filter(Boolean).join("\n")} onClick={() => fillSuggestedPrompt(item.prompt)}>{item.label}{index === 0 && uiPreferences.suggestionShortcutEnabled && uiPreferences.suggestionShortcut && <kbd className="suggestion-shortcut-hint">{suggestionShortcutLabel(uiPreferences.suggestionShortcut)}</kbd>}</button>
               ))}
             </div>
           )}
           <div className="messages" ref={messagesRef}>
             {messages.map((message) => (
               <article key={message.id} className={`message ${message.role}`} ref={message.id === mobaoCompletion?.messageId ? mobaoTargetRef : undefined}>
-                <span className="avatar">{message.role === "user" ? "你" : message.role === "system" ? "记" : "墨"}</span>
+                <span className={`avatar ${message.role === "user" ? "" : "mobao-message-avatar"}`}>{message.role === "user" ? "你" : <MobaoAvatar animate={!busy && message.id === messages.at(-1)?.id} mood={message.process?.status === "failed" || /尚未完成|没有完成|失败|异常/.test(message.text) ? "frustrated" : /硬冲突|严重问题/.test(message.text) ? "angry" : message.process?.status?.startsWith("waiting") || /等待|需要你/.test(message.text) ? "waiting" : /正在思考/.test(message.text) ? "thinking" : message.process?.status === "completed" || /已完成|已核对|已接受|已保存/.test(message.text) ? "complete" : /休息|暂停/.test(message.text) ? "rest" : "calm"} />}</span>
                 <div>
-                  <p>{message.text}</p>
+                  <p>{message.role === "assistant" && message.text.startsWith("这次没有完成：") ? errorMessage(readableWorkMessage(message.text.replace(/^这次没有完成：\s*/, ""), collaborationPending(collaboration).work, manualJobs)) : readableWorkMessage(message.text, collaborationPending(collaboration).work, manualJobs)}</p>
+                  {message.indices?.length ? <div className="message-indices">{message.indices.map(item => <button key={item.id} onClick={() => void openDocument(item)}>{item.label}</button>)}</div> : null}
+                  {message.process && <ProcessDisclosure {...message.process} reasoning={message.reasoning} />}
                   {message.createdAt && <time className="message-time" dateTime={message.createdAt}>{formatTime(message.createdAt)}</time>}
                   <div className="message-actions">
                     {message.id !== "welcome" && (
@@ -2001,12 +2130,12 @@ function App() {
                         {message.role === "user" && <button type="button" className="message-action" title="清掉这条之后的消息并原样重发" disabled={busy} onClick={() => rerunMessage(message.id)}>重新运行</button>}
                       </>
                     )}
-                    <button className={`message-speak ${speakingMessageId === message.id ? "playing" : ""}`} title="朗读这条对话" aria-label="朗读这条对话" onClick={() => void speakText(message.id, message.text)}>{speakingMessageId === message.id ? "■" : "◖))"}</button>
+                    <button className={`message-speak ${speakingMessageId === message.id ? "playing" : ""}`} title="朗读这条对话" aria-label="朗读这条对话" onClick={() => void speakText(message.id, readableWorkMessage(message.text, collaborationPending(collaboration).work, manualJobs))}>{speakingMessageId === message.id ? "■" : "◖))"}</button>
                   </div>
                 </div>
               </article>
             ))}
-            {busy && activeRunId && <LiveRunCard summary={[...events].reverse().find(item => item.run_id === activeRunId && item.summary)?.summary} steps={events.filter(item => item.run_id === activeRunId).slice(-6)} />}
+            {busy && activeRunId && <LiveRunCard summary={[...events].reverse().find(item => item.run_id === activeRunId && item.summary)?.summary} steps={runEventsRef.current} startedAt={runStartedAtRef.current} />}
           </div>
           <form className="composer" onSubmit={sendChat}>
             <textarea
@@ -2015,18 +2144,20 @@ function App() {
               onChange={(event) => {
                 const value = event.target.value;
                 setChatInput(value);
+                setSuggestionFillStatus("");
               }}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                if (isChatSubmitKey(event.nativeEvent)) {
                   event.preventDefault();
                   void sendChat();
                 }
               }}
-              placeholder="比如：接着写到第6章，哪里不顺就帮我改好。"
+              placeholder={pendingQuestions.length ? "补充你的选择，或说说希望怎么调整…" : busy ? "可以补充这次任务的要求，墨宝会接着当前进度处理…" : uiPreferences.suggestedPromptsEnabled && suggestedPrompts[0]?.prompt ? readableSourceText(suggestedPrompts[0].prompt) : initialSuggestedPrompts(dashboard, false, false)[0]?.prompt || "说说你想写的故事，或想先完善哪些设定…"}
             />
-            {voiceRecording && <div className="voice-live-transcript" role="status" aria-live="polite">
+            {suggestionFillStatus && <p className="suggestion-fill-status" role="status" aria-live="polite">{suggestionFillStatus}</p>}
+            {(voiceStarting || voiceRecording || voiceTranscribing) && <div className="voice-live-transcript" role="status" aria-live="polite">
               <div><strong>实时听写</strong><span>只是预览，停止后才回填输入框</span></div>
-              <p>{voiceTranscript || "请开始说话…"}</p>
+              <p>{voiceTranscript || voiceInputPhase || "请开始说话…"}</p>{voiceTranscript && <small>{voiceInputPhase}</small>}{voiceLiveProblem && <p className="form-error">{voiceLiveProblem}</p>}
             </div>}
             {promptOptimization && <div className="prompt-optimization-preview">
               <div><strong>提示词已优化</strong><span>{promptOptimization.change_summary.join(" · ")}</span><button type="button" onClick={() => { setPromptUndo(chatInput); setChatInput(promptOptimization.optimized_prompt); }}>采用优化版</button></div>
@@ -2035,7 +2166,7 @@ function App() {
             <div className="composer-foot">
               <span>Enter 发送 · Shift+Enter 换行</span>
               <div>
-                <button className={`voice-input-action ${voiceRecording ? "recording" : ""}`} type="button" disabled={voiceTranscribing} onClick={() => void toggleVoiceInput()} title="普通话语音输入">{voiceTranscribing ? "识别中…" : voiceRecording ? "■ 停止" : "● 语音"}</button>
+                <button className={`voice-input-action ${voiceRecording ? "recording" : ""}`} type="button" disabled={voiceStarting || voiceTranscribing} onClick={() => void toggleVoiceInput()} title="普通话语音输入">{voiceStarting ? "准备中…" : voiceTranscribing ? "识别中…" : voiceRecording ? "■ 停止" : "● 语音"}</button>
                 {busy && <button className="stop-action" type="button" disabled={!cancelReady} onClick={() => void cancelActiveRun()} title={cancelReady ? "停止当前任务" : "任务刚启动，稍后可停止"}>{cancelReady ? "停止任务" : "任务启动中…"}</button>}
                 {promptUndo !== null && <button type="button" onClick={undoPromptOptimization}>撤回优化</button>}
                 <button className="optimize-action" type="button" disabled={promptOptimizing || !chatInput.trim()} onClick={() => void optimizeChatPrompt()}>{promptOptimizing ? "优化中…" : "优化提示词"}</button>
@@ -2043,13 +2174,13 @@ function App() {
               </div>
             </div>
           </form>
-        </section>
-        {["left", "right"].includes(workspaceLayout.assistantPosition) && <ResizeHandle className="assistant-resize" label="调整 AI 对话栏宽度" onResizeStart={(event) => startWorkspaceResize("assistant", workspaceLayout.assistantPosition === "left" ? 1 : -1, event)} />}
-        </>}
-
-        <section className="workbench">
+        </WorkspacePanel>
+        <WorkspacePanel id="inspector" workspace={workspace} className="inspection-panel" onDetach={detachWorkspacePanel}>
+          <DocumentInspector document={document} onCompare={compareVersion} onResolve={resolveAnnotation} />
+        </WorkspacePanel>
+        <section className="workbench" style={{ left: workspace.geometry.editor.x, top: workspace.geometry.editor.y, width: workspace.geometry.editor.width, height: workspace.geometry.editor.height }}>
           <div className="tabbar">
-            {(["project", "editor", "chapter", "review", "memory", "references", "listen", "process"] as Tab[]).map((tab) => (
+            {(["project", "editor", "chapter", "review", "references", "listen", "process"] as Tab[]).map((tab) => (
               <button key={tab} className={activeTab === tab ? "active" : ""} onClick={() => setActiveTab(tab)}>
                 {tabLabel(tab)}
               </button>
@@ -2069,7 +2200,8 @@ function App() {
               onError={setError}
             />
           )}
-          {activeTab === "editor" && (
+          {activeTab === "editor" && document?.relative_path === "BOOK.md" && !bookRawEditing && <BookSettingsBrowser projectRoot={projectRoot} brief={dashboard?.brief || {}} refreshKey={messages.filter(message => message.role === "assistant").at(-1)?.id || ""} onManage={() => openSettings("story_settings")} onEdit={() => setBookRawEditing(true)} onAudit={() => { setChatInput("检查本书设定与当前规划，有依据的缺项请补齐，具体冲突请解释；不要改已经接受的正文。"); chatInputRef.current?.focus(); }} />}
+          {activeTab === "editor" && (document?.relative_path !== "BOOK.md" || bookRawEditing) && (
             <EditorPanel
               projectRoot={projectRoot}
               document={document}
@@ -2086,28 +2218,6 @@ function App() {
               onAnnotate={openSelectionActions}
               onListen={openListeningCenter}
               onStopCompare={() => setCompareContent(null)}
-              onCompare={async (versionId) => {
-                try {
-                  const version = await request<{ content: string }>("document.version.read", { version_id: versionId });
-                  setCompareContent(version.content);
-                } catch (cause) {
-                  setError(errorMessage(cause));
-                }
-              }}
-              onResolve={async (annotationId) => {
-                const sourceEditor = editorSnapshotRef.current;
-                await request("annotation.update", { project_root: sourceEditor.projectRoot, annotation_id: annotationId, status: "resolved" });
-                if (sourceEditor.document) {
-                  const loaded = await request<DocumentData>("document.read", { project_root: sourceEditor.projectRoot, relative_path: sourceEditor.document.relative_path });
-                  if (editorSnapshotRef.current.session === sourceEditor.session && editorSnapshotRef.current.document?.content_hash === loaded.content_hash) {
-                    editorSnapshotRef.current = { ...editorSnapshotRef.current, document: loaded };
-                    setDocument(loaded);
-                  }
-                }
-              }}
-              inspectorVisible={workspaceLayout.inspectorVisible}
-              inspectorWidth={workspaceLayout.inspectorWidth}
-              onResizeInspector={(event) => startWorkspaceResize("inspector", -1, event)}
               theme={uiPreferences.theme === "system" ? (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark") : uiPreferences.theme}
               prefillEnabled={uiPreferences.prefillEnabled}
               prefillDelayMs={uiPreferences.prefillDelayMs}
@@ -2117,18 +2227,17 @@ function App() {
           )}
           {activeTab === "chapter" && <ChapterPanel workspace={chapterWorkspace} request={request} onPrompt={(value) => setChatInput(value)} />}
           {activeTab === "review" && <ReviewPanel document={document} reviewDocument={reviewDocument} tree={tree} workspace={chapterWorkspace} request={request} onOpen={openDocument} onPrompt={setChatInput} />}
-          {activeTab === "memory" && <MemoryPanel dashboard={dashboard} workspace={chapterWorkspace} request={request} onRefresh={() => refresh()} />}
           {activeTab === "references" && <ReferencesPanel request={request} />}
           {activeTab === "listen" && <VoiceCenter refreshKey={voiceRevision} projectRoot={projectRoot} source={voiceSource} characterNames={(dashboard?.bible_entries || []).filter((item) => String(item.kind || "") === "character").map((item) => String(item.name || "")).filter(Boolean)} request={request} onNotice={setNotice} onError={setError} onPlay={(path) => playAudioPath(path)} />}
-          {activeTab === "process" && <ProcessPanelCompact events={events} collaboration={collaboration} context={contextStatus} provider={provider} workspace={chapterWorkspace} request={request} referenceDocument={referenceDocument} onOpenReference={openReference} onCloseReference={() => setReferenceDocument(null)} onNavigate={setActiveTab} pendingBoard={<CollaborationBoard value={collaboration} busy={busy || pendingDecisionWorking} onReject={(item) => { setPendingDecisionError(""); setPendingRejection({ root: projectRoot, item, decision: "reject" }); }} onReopen={(item) => { setPendingDecisionError(""); setPendingRejection({ root: projectRoot, item, decision: "reopen" }); }} onProcessAll={() => void sendChat(undefined, "处理所有待办")} onWork={(item, action) => { if (action === "inspect" && item.kind === "manual_edit" && item.handling === "decision") setShowManualMonitor(true); else void sendChat(undefined, `${action === "process" ? "处理待办" : action === "defer" ? "下次再处理待办" : "查看待办"} ${item.id}`); }} onAcceptBatch={(batchId) => void runWorkflow("batch_accept", { batch_id: batchId })} onResumeBatch={(batchId) => void runWorkflow("batch_resume", { batch_id: batchId })} onInspectBatch={(batch) => { updateWorkspaceLayout({ assistantVisible: true }); setChatInput(`请查看批次 ${batch.batch_id}${batch.pending_work_id ? ` 的待处理事项 ${batch.pending_work_id}` : ""}，先说明保留正文及待核范围并询问我是否处理；现在不要改写或补审。`); window.setTimeout(() => chatInputRef.current?.focus(), 0); }} />} />}
+          {activeTab === "process" && <ProcessPanelCompact events={events} collaboration={collaboration} context={contextStatus} provider={provider} workspace={chapterWorkspace} request={request} referenceDocument={referenceDocument} onOpenReference={openReference} onCloseReference={() => setReferenceDocument(null)} onNavigate={setActiveTab} pendingBoard={<CollaborationBoard value={collaboration} busy={busy || pendingDecisionWorking} onReject={(item) => { setPendingDecisionError(""); setPendingRejection({ root: projectRoot, item, decision: "reject" }); }} onReopen={(item) => { setPendingDecisionError(""); setPendingRejection({ root: projectRoot, item, decision: "reopen" }); }} onProcessAll={() => void sendChat(undefined, "处理所有待办")} onWork={(item, action) => { if (action === "inspect" && item.kind === "manual_edit" && item.handling === "decision") setShowManualMonitor(true); else void sendChat(undefined, `${action === "process" ? "处理待办" : action === "defer" ? "下次再处理待办" : "查看待办"} ${item.id}`); }} onAcceptBatch={(batchId) => void runWorkflow("batch_accept", { batch_id: batchId })} onResumeBatch={(batchId) => void runWorkflow("batch_resume", { batch_id: batchId })} onInspectBatch={(batch) => { workspace.toggle("assistant", true); setChatInput(`请查看批次 ${batch.batch_id}${batch.pending_work_id ? ` 的待处理事项 ${batch.pending_work_id}` : ""}，先说明保留正文及待核范围并询问我是否处理；现在不要改写或补审。`); window.setTimeout(() => chatInputRef.current?.focus(), 0); }} />} />}
         </section>
       </main>
       <footer className="status-strip project-body-total" aria-label="正文总字数" title="累计本书当前已保存的正文，草稿与已接受章节各计一次；规划、报告和历史版本不计入。"><span>{typeof dashboard?.written_characters === "number" ? `正文总字 ${dashboard.written_characters.toLocaleString()}` : "正文总字 待读取"}</span></footer>
 
-      <MobaoGuide cue={mobaoCompletion?.root === projectRoot ? mobaoCompletion : null}
+      <MobaoCompanion cue={mobaoCompletion?.root === projectRoot ? mobaoCompletion : null}
         workAreaRef={mobaoWorkAreaRef} targetRef={mobaoTargetRef} dockRef={mobaoDockRef}
         autoPreview={Boolean(completionReference(events, mobaoCompletion?.runId))}
-        disabled={busy || projectLoading || Boolean(chatInput.trim()) || text !== savedText || voiceRecording || voiceTranscribing || pendingQuestions.length > 0 || pendingComputerActions.length > 0 || showSettings || showCreate || showManualMonitor || showHistory || showSearch || showUpdate || showMigration || Boolean(pendingRejection) || Boolean(selectionDraft || compareContent)}
+        disabled={busy || projectLoading || !projectRoot || Boolean(chatInput.trim()) || text !== savedText || voiceStarting || voiceRecording || voiceTranscribing || pendingQuestions.length > 0 || pendingComputerActions.length > 0 || showSettings || showCreate || showManualMonitor || showHistory || showSearch || showUpdate || showMigration || Boolean(pendingRejection) || Boolean(selectionDraft || compareContent)}
         onPreview={() => {
           const reference = completionReference(events, mobaoCompletion?.runId);
           if (!reference) { mobaoTargetRef.current?.scrollIntoView({ block: "nearest" }); return; }
@@ -2143,10 +2252,10 @@ function App() {
             setReferenceDocument(loaded); setActiveTab("process");
           }).catch(cause => setError(errorMessage(cause)));
         }} />
-      {(notice || error) && <Toast kind={error ? "error" : "info"} text={error || notice} onClose={() => { setError(""); setNotice(""); setMascotMood("idle"); }} action={error ? (/任务记录|原任务状态/.test(error) ? { label: "查看可恢复任务", onClick: () => setActiveTab("project") } : /API Key|密钥|模型接口|服务商|模型配置需要处理/.test(error) ? { label: "打开设置", onClick: () => setShowSettings(true) } : /音频|播放|语音|朗读|解码/.test(error) ? { label: "查看音频", onClick: () => setActiveTab("listen") } : /重新审查/.test(error) ? { label: "打开审查", onClick: () => setActiveTab("review") } : /上下文容量|上下文占用/.test(error) ? { label: "查看上下文", onClick: () => setActiveTab("process") } : { label: "查看协作台", onClick: () => setActiveTab("process") }) : undefined} />}
+      {(notice || error) && <Toast kind={error ? "error" : "info"} text={error || notice} onClose={() => { setError(""); setNotice(""); setMascotMood("idle"); }} action={error ? (/任务记录|原任务状态/.test(error) ? { label: "查看可恢复任务", onClick: () => setActiveTab("project") } : /API Key|密钥|模型接口|服务商|模型配置需要处理/.test(error) ? { label: "打开设置", onClick: () => setShowSettings(true) } : /麦克风|听写|识别|连接组件|语音输入/.test(error) ? { label: "打开语音设置", onClick: () => openSettings("voice") } : /音频|播放|语音|朗读|解码/.test(error) ? { label: "查看音频", onClick: () => setActiveTab("listen") } : /重新审查/.test(error) ? { label: "打开审查", onClick: () => setActiveTab("review") } : /上下文容量|上下文占用/.test(error) ? { label: "查看上下文", onClick: () => setActiveTab("process") } : { label: "查看协作台", onClick: () => setActiveTab("process") }) : undefined} />}
       {showCreate && <CreateProject onClose={() => setShowCreate(false)} onCreated={openProject} />}
       {showManualMonitor && <Modal title="手动修改核对" subtitle="后台检测、依据和你的决定" onClose={() => setShowManualMonitor(false)} className="manual-monitor-modal"><ManualEditMonitor jobs={manualJobs} error={manualMonitorError} onRefresh={() => void refreshManualEdits()} onDecision={decideManualEdit} /></Modal>}
-      {showSettings && <SettingsDialog projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} layout={workspaceLayout} preferences={uiPreferences} onLayoutChange={updateWorkspaceLayout} onLayoutPreset={applyWorkspacePreset} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
+      {showSettings && <SettingsDialog initialSection={settingsInitialSection} projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} preferences={uiPreferences} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />}
       {showUpdate && <UpdateDialog info={updateInfo} onClose={() => setShowUpdate(false)} />}
       {showSearch && <SearchDialog request={request} result={searchResult} setResult={setSearchResult} onClose={() => setShowSearch(false)} onOpen={async (relativePath) => {
         const item = [...(tree?.items || []), ...(tree?.groups.flatMap((group) => group.items) || [])].find((entry) => entry.relative_path === relativePath);
@@ -2203,21 +2312,15 @@ function App() {
 }
 
 function ContextBudgetPanel({ value, onPin }: { value: ContextStatus | null; onPin: (sourceId: string, pinned: boolean) => void }) {
-  const stale = value?.status === "stale";
-  const used = stale ? 0 : Math.max(0, Math.min(100, Number(value?.hard_usage_percent || 0)));
-  const label = stale ? "\u9879\u76ee\u8d44\u6599\u5df2\u53d8\u5316\uff0c\u7b49\u5f85\u91cd\u65b0\u7f16\u8bd1" : value?.status === "near_limit" ? "\u63a5\u8fd1\u4e0a\u9650" : value?.status === "watch" ? "\u6ce8\u610f\u5bb9\u91cf" : value?.status === "safe" ? "\u5bb9\u91cf\u5b89\u5168" : "\u7b49\u5f85\u4e0a\u4e0b\u6587";
-  const compressed = Boolean(value?.compression_applied);
-  const previousChange = value?.change_since_previous_tokens;
-  const previousLabel = typeof previousChange === "number" ? `${previousChange > 0 ? "+" : ""}${previousChange.toLocaleString()} tokens` : "首次编译";
   return <details className={`context-budget ${value?.status || "idle"}`}>
-    <summary><span>上下文容量</span><strong>{stale ? "—" : `${used.toFixed(1)}%`}</strong></summary>
-    <div className="context-meter"><i style={{ width: `${used}%` }} /></div>
-    <p>{stale ? label : `${label} · ${Number(value?.estimated_tokens || 0).toLocaleString()} / ${Number(value?.hard_limit_tokens || 0).toLocaleString()} tokens`}</p>
-    <small className="context-budget-change">与上次编译：{previousLabel}{compressed ? `；本轮压缩减少 ${Math.max(0, Number(value?.before_compression_tokens || 0) - Number(value?.estimated_tokens || 0)).toLocaleString()} tokens` : "；本轮未触发压缩"}</small>
-    {value?.cache_prefix && <small>缓存前缀 · {value.cache_prefix.role}：{value.cache_prefix.reason}{value.cache_prefix.first_changed_section ? `（起点 ${value.cache_prefix.first_changed_section}）` : ""}。这是本地诊断，实际命中以供应商返回为准。</small>}
-    <small>{value?.stale_reason || (compressed ? `\u5df2\u4ece ${Number(value?.before_compression_tokens || 0).toLocaleString()} tokens \u5b9a\u5411\u538b\u7f29\uff1b\u786c\u7ea6\u675f\u672a\u52a8\u3002` : "\u6bcf 4 \u79d2\u5237\u65b0\uff0c\u63a5\u8fd1\u8f6f\u9884\u7b97\u65f6\u53ea\u538b\u7f29\u4f4e\u6743\u5a01\u3001\u4f4e\u76f8\u5173\u8d44\u6599\u3002")}</small>
-    {value && <ul><li>不可压缩：{value.hard_sections.map((item) => item.title).join("、") || "尚未生成"}</li><li>可压缩：{value.compressible_sections.map((item) => item.title).join("、") || "尚未生成"}</li></ul>}
-    {value && <details className="context-explain"><summary>查看保留与压缩理由</summary>{[...value.hard_sections, ...value.compressible_sections].map((item) => <div key={`${item.key}-${item.title}`}><strong>{item.title}</strong><small>{item.reason || "由当前资料优先级决定。"}</small>{["D1", "D2"].includes(item.key) && (item.source_ids || []).slice(0, 6).map((sourceId) => <button key={sourceId} type="button" onClick={() => onPin(sourceId, item.key !== "D2")}>{item.key === "D2" ? `解除 ${sourceId}` : `锁定 ${sourceId}`}</button>)}</div>)}</details>}
+    <summary>上下文{value?.read_error ? " · 待更新" : ""}</summary>
+    <RoleContextCards value={value} />
+    {value && <details className="context-explain"><summary>资料保留与压缩详情</summary>
+      {[...value.hard_sections, ...value.compressible_sections].map(item => <div key={`${item.key}-${item.title}`}><strong>{item.title}</strong><small>{item.reason || "由当前资料优先级决定。"}</small>
+        {["D1", "D2"].includes(item.key) && (item.source_ids || []).slice(0, 6).map(sourceId => <button key={sourceId} type="button" onClick={() => onPin(sourceId, item.key !== "D2")}>{item.key === "D2" ? "解除这份资料的锁定" : "锁定这份资料"}</button>)}
+      </div>)}
+      {value.cache_prefix && <p>{roleLabel(value.cache_prefix.role)}的缓存参考：{value.cache_prefix.reason}。实际命中以服务返回为准。</p>}
+    </details>}
   </details>;
 }
 
@@ -2227,15 +2330,6 @@ function chapterMilestones(value: Dashboard | null) {
   const written = Math.max(accepted, Number(progress?.written ?? (accepted + Number(value?.status.chapters?.draft || 0))));
   return { written, accepted, awaitingReview: progress ? Math.max(0, Number(progress.awaiting_review)) : null,
     writtenThrough: progress?.written_through, acceptedThrough: progress?.accepted_through };
-}
-
-function ChapterMilestones({ value }: { value: Dashboard | null }) {
-  const progress = chapterMilestones(value);
-  return <span className="chapter-milestones" aria-label="正文产出、核对与接受分别统计">
-    <span title={progress.writtenThrough ? `已产出至第 ${progress.writtenThrough} 章；草稿与已接受正文各计一次` : "当前已保存的章节，包含草稿与已接受正文"}>已写 <strong>{progress.written}</strong></span>
-    <span title={progress.awaitingReview === null ? "当前引擎尚未提供可核实的审核统计" : "已保存但尚未接受的草稿；具体审核、记忆交接与等待原因见当前章节报告"}>待核/待接受 <strong>{progress.awaitingReview ?? "—"}</strong></span>
-    <span title={progress.acceptedThrough ? `已接受至第 ${progress.acceptedThrough} 章；仅统计已提交正史` : "仅统计已提交正史的章节"}>已接受 <strong>{progress.accepted}</strong></span>
-  </span>;
 }
 
 function roleLabel(role: string) {
@@ -2340,8 +2434,11 @@ function BatchProgressStatus({ batches, events, activeRunId }: { batches: BatchS
 
 function collaborationPending(value: CollaborationOverview | null) {
   const items = [...new Map((value?.pending_work || []).filter(item => !["completed", "superseded", "rejected", "cancelled"].includes(item.status)).map(item => [item.id, item])).values()];
-  const work = items.filter(item => !item.parent_id || !items.some(parent => parent.id === item.parent_id));
-  const batches = (value?.batches || []).filter(batch => !(batch.chapters.length && batch.chapters.every(batchChapterAccepted))
+  const suggestions = items.filter(item => item.can_reject === true && item.can_process === false
+    && ["memory_summary", "optimization", "coordinator_recovery", "development_repair", "recovery_decision"].includes(item.kind) && item.status !== "deferred");
+  const work = items.filter(item => !suggestions.includes(item) && (!item.parent_id || !items.some(parent => parent.id === item.parent_id)));
+  const historicalBatches = (value?.batches || []).filter(batch => batch.historical);
+  const batches = (value?.batches || []).filter(batch => !batch.historical && !(batch.chapters.length && batch.chapters.every(batchChapterAccepted))
     && !work.some(item => item.id === batch.pending_work_id || item.intent?.batch_id === batch.batch_id || item.source?.batch_id === batch.batch_id));
   const readyBatches = batches.filter((item) => ["ready_for_acceptance", "accepting"].includes(item.status)
     && !item.remaining_review_range?.length && !item.chapters.some((chapter) => chapter.dependency_reason || ["invalidated", "stale", "memory_pending"].includes(chapter.memory_status || "")));
@@ -2352,7 +2449,7 @@ function collaborationPending(value: CollaborationOverview | null) {
   const messages = (value?.messages || []).filter(item => ["pending", "responded", "escalated"].includes(item.status));
   const rejected = [...new Map([...(value?.rejected_work || []), ...(value?.pending_work || []).filter(item => item.status === "rejected")].map(item => [item.id, item])).values()];
   return { items, work, readyBatches, resumableBatches, pendingBatches, messages,
-    rejected, count: Array.isArray(value?.pending_work) ? work.filter(item => item.status !== "deferred").length : readyBatches.length + resumableBatches.length + pendingBatches.length };
+    rejected, suggestions, historicalBatches, count: Array.isArray(value?.pending_work) ? work.filter(item => item.status !== "deferred").length : readyBatches.length + resumableBatches.length + pendingBatches.length };
 }
 
 function canPollWorkspace(visibility: string, focused: boolean): boolean {
@@ -2362,6 +2459,7 @@ function canPollWorkspace(visibility: string, focused: boolean): boolean {
 function audioPlaybackFailure(cause?: unknown, mediaCode?: number): string {
   const message = cause instanceof Error ? cause.message : String(cause || "");
   const name = cause && typeof cause === "object" && "name" in cause ? String(cause.name) : "";
+  if (/403|在线朗读服务拒绝/.test(message)) return "在线朗读服务拒绝连接（403），这次没有生成音频。请在语音设置中检查连接组件更新；已经更新仍被拒绝时，稍后再试或选用已就绪的本地朗读组件。";
   if (mediaCode === 4 || name === "NotSupportedError" || /no supported source|unsupported source|not supported|播放器无法打开/i.test(message)) return "音频已经生成，但本地文件格式或播放地址当前不可用。已有文件保留，请在听读页查看或导出音频，核对格式后再播放。";
   if (mediaCode === 3) return "音频文件无法解码。已有文件保留，请在听读页导出并核对格式，不必重新生成正文。";
   if (mediaCode === 2) return "本地音频暂时无法读取。请确认文件仍存在，并从听读页重新打开。";
@@ -2381,11 +2479,12 @@ function completionReference(events: EngineEvent[], runId?: string): TraceRefere
   return [...events].reverse().filter(event => event.run_id === runId && runId
     && ["completed", "accepted", "resolved"].includes(event.status || "")
     && !/context|retriev|input/.test(`${event.stage || ""} ${event.type || ""}`))
-    .flatMap(event => event.references || []).find(reference => reference.exists);
+    .flatMap(event => event.references || []).find(reference => reference.exists
+      && !/^\.inkflow[\\/]/i.test(reference.relative_path) && /\.(md|txt)$/i.test(reference.relative_path));
 }
 
 function pendingWorkLabel(item: PendingWorkItem, action = false): string {
-  if (item.kind === "plan_revision") return item.status === "needs_writer" ? action ? "修订并复审这章" : "执行卡修订交接" : action ? "复审这章" : "规划交接核对";
+  if (item.kind === "plan_revision") return item.status === "needs_writer" ? action ? "核对并按需修订" : "章节规划核对" : action ? "复核这章" : "规划交接核对";
   const labels: Record<string, [string, string]> = {
     accepted_projection: ["正史文件同步", "同步章节文件"], planning_publication: ["规划发布收尾", "恢复规划发布"],
     manual_edit: ["手动修改核对", "继续核对修改"], review_gate: ["本章审查缺口", "补齐本章审查"],
@@ -2395,6 +2494,24 @@ function pendingWorkLabel(item: PendingWorkItem, action = false): string {
     memory_summary: ["摘要整理建议", "核对并整理摘要"], memory_summary_rebuild: ["摘要重建建议", "核对并重建摘要"],
   };
   return labels[item.kind]?.[action ? 1 : 0] || (action ? "按原任务处理" : "任务条件待核对");
+}
+
+function readableWorkMessage(text: string, items: PendingWorkItem[], jobs: ManualEditJob[] = []): string {
+  const match = text.match(/^(处理待办|查看待办|下次再处理待办)\s+([a-zA-Z0-9-]{1,180})[。！!\s]*$/);
+  if (!match) return readableSourceText(text, jobs.map(job => [job.relative_path || "", job.display_name || ""] as [string, string]));
+  const item = items.find(value => value.id === match[2]);
+  const start = item?.remaining_chapter_no || item?.chapter_no;
+  const end = item?.intent?.end_chapter_no;
+  const scope = start ? `第${start}${end && end > start ? `—${end}` : ""}章的` : "";
+  const target = item?.kind === "workflow" ? `${scope}${item.intent?.action === "plan" ? "规划任务" : "未完成任务"}` : item ? `${scope}${pendingWorkLabel(item)}` : "刚才选中的待办";
+  const action = match[1] === "查看待办" ? "查看" : match[1] === "下次再处理待办" ? "下次继续处理" : "继续处理";
+  return `${action}${target}。`;
+}
+
+function readableWorkReason(item: PendingWorkItem): string {
+  const quotes = [...new Set(item.reason.match(/@quote:\d+/g) || [])];
+  if (quotes.length) return `${item.chapter_no ? `第${item.chapter_no}章有` : "有"}${quotes.length}条记忆引用还没有定位到原文，需要继续核对引用和来源；目前还不能把相关记忆纳入正史。`;
+  return readableSourceText(item.reason.replace(/^editor:\s*/i, "编辑检查："), item.source?.display_name && item.source?.relative_path ? [[String(item.source.relative_path), String(item.source.display_name)]] : []);
 }
 
 function pendingDecisionPayload(projectRoot: string, item: PendingWorkItem, decision: "reject" | "reopen", reason = "") {
@@ -2407,14 +2524,15 @@ function CollaborationBoard({ value, busy, onProcessAll, onWork, onReject, onReo
   const pending = collaborationPending(value);
   const active = pending.work.filter(item => item.status !== "deferred");
   const deferred = pending.work.filter(item => item.status === "deferred");
-  const chapterNumbers = [...new Set(active.map(item => item.chapter_no || 0))].sort((a, b) => a - b);
+  const chapterOf = (item: PendingWorkItem) => item.remaining_chapter_no || item.chapter_no || 0;
+  const chapterNumbers = [...new Set(active.map(chapterOf))].sort((a, b) => a - b);
   const rank = (item: PendingWorkItem) => item.handling === "running" ? 0 : item.can_process ? 1 : item.handling === "decision" ? 2 : 3;
   const renderWork = (item: PendingWorkItem) => {
     const children = pending.items.filter(child => child.parent_id === item.id);
     const decision = item.handling === "decision" && item.kind === "manual_edit";
     return <article className={`pending-work-card ${item.handling || "blocked"}`} key={item.id}>
       <header><strong>{pendingWorkLabel(item)}</strong><span>{({ deferred: "留待下次", running: "进行中", blocked: "需补充条件", decision: "需要你决定", local: "可本地恢复", manual: "可续核", review: "可复审", resume: "可续接" } as Record<string, string>)[item.handling || ""] || "待核对"}</span></header>
-      <p className="pending-work-reason">{item.reason}</p>
+      <p className="pending-work-reason">{item.remaining_chapter_no ? `已完成到第${item.completed_through}章；还需完成第${item.remaining_chapter_no}${item.intent?.end_chapter_no && item.intent.end_chapter_no !== item.remaining_chapter_no ? `—${item.intent.end_chapter_no}` : ""}章。原任务范围和要求保留在下方详情。` : readableWorkReason(item)}</p>
       <div className="pending-work-actions">
         {item.can_process && item.handling !== "running" && <button type="button" className="primary" disabled={busy} onClick={() => onWork(item, "process")}>{pendingWorkLabel(item, true)}</button>}
         {!item.can_process && item.handling !== "running" && <button type="button" disabled={busy} onClick={() => onWork(item, "inspect")}>{decision ? "核对修改并决定" : "查看恢复条件"}</button>}
@@ -2422,7 +2540,7 @@ function CollaborationBoard({ value, busy, onProcessAll, onWork, onReject, onReo
         {item.can_reject === true && item.handling !== "running" && <button type="button" className="pending-reject-action" disabled={busy} onClick={() => onReject(item)}>{item.reject_label || "拒绝这项建议"}</button>}
       </div>
       {item.reject_blocked_reason && <p className="pending-decision-note">{item.reject_blocked_reason}</p>}
-      <details className="pending-work-diagnostic"><summary>下一步与诊断{children.length ? ` · ${children.length} 条关联记录` : ""}</summary><p>{item.next_action}</p>{item.reject_impact && <p>拒绝影响：{item.reject_impact}</p>}{children.map(child => <div key={child.id}><strong>{pendingWorkLabel(child)}</strong><p>{child.reason}</p><p>{child.next_action}</p></div>)}<small>本项已记录处理尝试 {Math.max(item.processing_attempts || 0, Number(item.source?.attempts || 0))} 次 · {item.id}</small></details>
+      <details className="pending-work-diagnostic"><summary>下一步与诊断{children.length ? ` · ${children.length} 条关联记录` : ""}</summary><p>{readableSourceText(item.next_action)}</p>{item.remaining_chapter_no && <p>原要求：{readableWorkReason(item)}</p>}{item.reject_impact && <p>拒绝影响：{item.reject_impact}</p>}{children.map(child => <div key={child.id}><strong>{pendingWorkLabel(child)}</strong><p>{readableWorkReason(child)}</p><p>{readableSourceText(child.next_action)}</p></div>)}<small>本项已记录处理尝试 {Math.max(item.processing_attempts || 0, Number(item.source?.attempts || 0))} 次</small></details>
     </article>;
   };
   const renderBatch = (batch: BatchSummary, mode: "resume" | "accept" | "inspect") => <article className="pending-work-card" key={batch.batch_id}>
@@ -2433,11 +2551,13 @@ function CollaborationBoard({ value, busy, onProcessAll, onWork, onReject, onReo
   return <section className="pending-board" aria-labelledby="pending-board-title">
     <header className="pending-board-heading"><div><h3 id="pending-board-title">待办与收尾 <span>{pending.count}</span></h3><p>按当前工作来源统计，关联诊断、批次和角色消息分别展示。</p></div><button type="button" className="primary" title="逐项处理可恢复的原任务；需要你决定或尝试耗尽时保留对应条件。" disabled={busy || !active.some(item => item.can_process)} onClick={onProcessAll}>{busy ? "任务处理中…" : "处理当前全部待办"}</button></header>
     {!value ? <p className="pending-empty" role="status">正在读取待办…</p> : !pending.count && <p className="pending-empty" role="status">当前没有需要处理的任务。{deferred.length ? `${deferred.length} 项留待下次，可在下方展开。` : ""}</p>}
-    {chapterNumbers.map(number => <section className="pending-chapter-group" key={number}><h4>{number ? `第 ${number} 章` : "项目收尾"}<span>{active.filter(item => (item.chapter_no || 0) === number).length} 项</span></h4>{active.filter(item => (item.chapter_no || 0) === number).sort((a, b) => rank(a) - rank(b)).map(renderWork)}</section>)}
+    {chapterNumbers.map(number => <section className="pending-chapter-group" key={number}><h4>{number ? `第 ${number} 章` : "项目收尾"}<span>{active.filter(item => chapterOf(item) === number).length} 项</span></h4>{active.filter(item => chapterOf(item) === number).sort((a, b) => rank(a) - rank(b)).map(renderWork)}</section>)}
     {pending.resumableBatches.length + pending.readyBatches.length + pending.pendingBatches.length > 0 && <details className="pending-board-disclosure"><summary>批次来源与保存断点 <span>{pending.resumableBatches.length + pending.readyBatches.length + pending.pendingBatches.length}</span></summary><p>每个批次保留自己的产物与审核来源；不会叠加成当前工作数量，也不代表全书正史进度。</p>{pending.resumableBatches.map(batch => renderBatch(batch, "resume"))}{pending.readyBatches.map(batch => renderBatch(batch, "accept"))}{pending.pendingBatches.map(batch => renderBatch(batch, "inspect"))}</details>}
     {deferred.length > 0 && <details className="pending-board-disclosure"><summary>留到下次的事项 <span>{deferred.length}</span></summary>{deferred.map(renderWork)}</details>}
-    {pending.messages.length > 0 && <details className="pending-board-disclosure"><summary>Agent 协作讨论 <span>{pending.messages.length}</span></summary><p>这里保留角色交接和待回应问题，具体处理与运行记录见下方「Agent」。</p>{pending.messages.map(item => <article className="pending-discussion" key={item.message_id}><header><strong>{item.chapter_no ? `第 ${item.chapter_no} 章 · ` : ""}{messageTypeLabel(item.message_type)}</strong><span>{roleLabel(item.sender_role)} → {roleLabel(item.recipient_role)}</span></header><p>{item.claim}</p></article>)}</details>}
-    {pending.rejected.length > 0 && <details className="pending-board-disclosure"><summary>已拒绝的建议与工作 <span>{pending.rejected.length}</span></summary><p>拒绝记录保留；恢复安排保留原任务处理次数，不立即执行，也不表示问题已经解决。</p>{pending.rejected.map(item => <article className="pending-discussion" key={item.id}><header><strong>{item.chapter_no ? `第 ${item.chapter_no} 章 · ` : ""}{pendingWorkLabel(item)}</strong><span>已拒绝，保留记录</span></header><p>{item.rejection?.reason || item.reason}</p>{item.reject_impact && <p>{item.reject_impact}</p>}<div className="pending-work-actions"><button type="button" disabled={busy} onClick={() => onReopen(item)}>恢复安排</button></div><small>{item.id}</small></article>)}</details>}
+    {pending.suggestions.length > 0 && <details className="pending-board-disclosure"><summary>可选建议与恢复记录 <span>{pending.suggestions.length}</span></summary><p>这些建议不单独阻断写作，也不计入待审核数量。相关审核读到完整来源时可同次整理；你也可以选择不采用并留档。</p>{pending.suggestions.map(renderWork)}</details>}
+    {pending.messages.length > 0 && <details className="pending-board-disclosure"><summary>Agent 协作讨论 <span>{pending.messages.length}</span></summary><p>这里是尚未收尾的角色交接记录；需要你作决定的事项会在待办中单独列出。</p>{pending.messages.map(item => <article className="pending-discussion" key={item.message_id}><header><strong>{item.chapter_no ? `第 ${item.chapter_no} 章 · ` : ""}{messageTypeLabel(item.message_type)}</strong><span>{roleLabel(item.sender_role)} → {roleLabel(item.recipient_role)}</span></header><p>{readableSourceText(item.claim)}</p></article>)}</details>}
+    {pending.historicalBatches.length > 0 && <details className="pending-board-disclosure"><summary>已被当前成果接管的批次历史 <span>{pending.historicalBatches.length}</span></summary>{pending.historicalBatches.map(batch => <article className="pending-discussion" key={batch.batch_id}><header><strong>第 {batch.start_chapter_no}—{batch.end_chapter_no} 章</strong><span>仅历史记录</span></header><p>{batch.history_reason}</p><BatchStateDetails batch={batch} /></article>)}</details>}
+    {pending.rejected.length > 0 && <details className="pending-board-disclosure"><summary>已拒绝的建议与工作 <span>{pending.rejected.length}</span></summary><p>拒绝记录保留；恢复安排保留原任务处理次数，不立即执行，也不表示问题已经解决。</p>{pending.rejected.map(item => <article className="pending-discussion" key={item.id}><header><strong>{item.chapter_no ? `第 ${item.chapter_no} 章 · ` : ""}{pendingWorkLabel(item)}</strong><span>已拒绝，保留记录</span></header><p>{item.rejection?.reason || item.reason}</p>{item.reject_impact && <p>{item.reject_impact}</p>}<div className="pending-work-actions"><button type="button" disabled={busy} onClick={() => onReopen(item)}>恢复安排</button></div></article>)}</details>}
   </section>;
 }
 
@@ -2461,18 +2581,32 @@ function CanonMigrationDialog({ migration, busy, onClose, onApply }: { migration
   </Modal>;
 }
 
+function ChapterTree({ items, outline, ...props }: { items: TreeItem[]; outline?: Dashboard["chapter_outline"]; onOpen: (item: TreeItem) => void; active?: string; opening?: string | null }) {
+  const [expanded, setExpanded] = useState(false);
+  const containsActive = Boolean(props.active && items.some(item => item.relative_path === props.active));
+  useEffect(() => { if (containsActive) setExpanded(true); }, [props.active, containsActive]);
+  const volumes = outline?.state === "active" ? outline.volumes : [];
+  const groups = volumes.map(volume => ({ label: `第 ${volume.volume_no} 篇 · ${volume.chapter_start}～${volume.chapter_end} 章`,
+    items: items.filter(item => item.chapter_no && item.chapter_no >= volume.chapter_start && item.chapter_no <= volume.chapter_end) }));
+  const remaining = items.filter(item => !groups.some(group => group.items.includes(item)));
+  const starts = [...new Set(remaining.map(item => Math.floor(((item.chapter_no || 1) - 1) / 10) * 10 + 1))].sort((a, b) => a - b);
+  for (const first of starts) groups.push({ label: `第 ${first}～${first + 9} 章`, items: remaining.filter(item => (item.chapter_no || 1) >= first && (item.chapter_no || 1) <= first + 9) });
+  return <section className="tree-section" aria-label="按篇章查看正文"><button className="tree-label" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}><span>{expanded ? "⌄" : "›"}</span>章节<small>{items.length}</small></button>{expanded && <div className="chapter-tree-groups">{groups.map(group => <TreeSection key={group.label} {...group} {...props} />)}</div>}</section>;
+}
+
 function TreeSection({ label, items, onOpen, active, opening }: { label: string; items: TreeItem[]; onOpen: (item: TreeItem) => void; active?: string; opening?: string | null }) {
   const [expanded, setExpanded] = useState(label === "章节" || label === "核心文档");
+  const containsActive = Boolean(active && items.some(item => item.relative_path === active));
+  useEffect(() => { if (containsActive) setExpanded(true); }, [active, containsActive]);
   return (
     <section className="tree-section">
-      <button className="tree-label" onClick={() => setExpanded(!expanded)}><span>{expanded ? "⌄" : "›"}</span>{label}<small>{items.length}</small></button>
+      <button className="tree-label" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}><span>{expanded ? "⌄" : "›"}</span>{label}<small>{items.length}</small></button>
       {expanded && <div className="tree-items">
         {items.length === 0 && <p className="empty-mini">暂无内容</p>}
         {items.map((item) => (
-          <button key={item.id} className={active === item.relative_path ? "active" : ""} onClick={() => void onOpen(item)} title={item.relative_path} aria-busy={opening === item.relative_path} disabled={opening === item.relative_path}>
+          <button key={item.id} className={active === item.relative_path ? "active" : ""} onClick={() => void onOpen(item)} title={item.label || documentLabel(item.relative_path)} aria-busy={opening === item.relative_path} disabled={opening === item.relative_path}>
             <span>{item.kind === "chapter" ? "§" : item.kind === "review" ? "✓" : "◇"}</span>
             <em>{item.label}</em>
-            {opening === item.relative_path && <small>打开中…</small>}
           </button>
         ))}
       </div>}
@@ -2495,19 +2629,13 @@ function EditorPanel(props: {
   onDelete: () => void;
   onAnnotate: () => void;
   onListen: () => void;
-  onCompare: (versionId: string) => void;
   onStopCompare: () => void;
-  onResolve: (annotationId: string) => void;
-  inspectorVisible: boolean;
-  inspectorWidth: number;
-  onResizeInspector: (event: ReactPointerEvent<HTMLDivElement>) => void;
   theme: "dark" | "light";
   prefillEnabled: boolean;
   prefillDelayMs: number;
   prefillLength: PrefillLength;
   onPrefill: (content: string, cursorOffset: number, length: PrefillLength) => Promise<PrefillResult>;
 }) {
-  const [side, setSide] = useState<"comments" | "versions">("comments");
   const [showPrefill, setShowPrefill] = useState(false);
   const [uploadCandidate, setUploadCandidate] = useState<DocumentUploadCandidate | null>(null);
   const [uploadError, setUploadError] = useState("");
@@ -2552,7 +2680,7 @@ function EditorPanel(props: {
   return (
     <div className={`editor-layout ${props.document.read_only ? "has-canon-banner" : ""} ${showPrefill ? "has-prefill" : ""}`}>
       <div className="document-toolbar">
-        <div><strong>{props.document.relative_path}</strong><span>{props.isDirty ? "尚未保存" : "已同步"}</span>{uploadError && !uploadCandidate && <span className="form-error" role="alert">{uploadError}</span>}</div>
+        <div><strong>{documentLabel(props.document.relative_path)}</strong><span>{props.isDirty ? "尚未保存" : "已同步"}</span>{uploadError && !uploadCandidate && <span className="form-error" role="alert">{uploadError}</span>}</div>
         <div>
           {props.prefillEnabled && props.document.relative_path.endsWith(".draft.md") && <button className={showPrefill ? "active" : ""} onClick={() => setShowPrefill((value) => !value)}>预填续写</button>}
           <button onClick={props.onListen}>听读 / 转语音</button>
@@ -2571,7 +2699,7 @@ function EditorPanel(props: {
       </Modal>}
       {props.document.read_only && <div className="canon-banner"><strong>正史保护</strong>{props.document.reason}</div>}
       {showPrefill && <div className="prefill-bar"><div><strong>预填续写已开启</strong><span>停顿后显示灰字候选；Tab 接受、Esc 忽略。候选不会自动保存，正文一旦变化就会作废。</span></div><button onClick={() => setShowPrefill(false)}>关闭</button></div>}
-      <div className={`editor-body ${props.inspectorVisible ? "inspector-visible" : "inspector-hidden"}`} style={{ "--inspector-width": `${props.inspectorWidth}px` } as CSSProperties}>
+      <div className="editor-body">
         <div className="monaco-wrap">
           {props.compareContent !== null ? (
             <>
@@ -2595,7 +2723,7 @@ function EditorPanel(props: {
                     await new Promise((resolve) => window.setTimeout(resolve, state.delay));
                     if (sequence !== prefillSequence.current || !prefillState.current.enabled) return { items: [] };
                     const content = model.getValue();
-                    const cursorOffset = model.getOffsetAt(position);
+                    const cursorOffset = Array.from(content.slice(0, model.getOffsetAt(position))).length;
                     const result = await state.request(content, cursorOffset, state.length);
                     if (sequence !== prefillSequence.current || model.getValue() !== content || result.cursor_offset !== cursorOffset) return { items: [] };
                     return { items: [{ insertText: result.insertion, range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column) }] };
@@ -2608,8 +2736,16 @@ function EditorPanel(props: {
             /></Suspense>
           )}
         </div>
-        {props.inspectorVisible && <>
-        <ResizeHandle className="inspector-resize" label="调整批注与版本栏宽度" onResizeStart={props.onResizeInspector} />
+
+      </div>
+    </div>
+  );
+}
+
+function DocumentInspector(props: { document: DocumentData | null; onCompare: (versionId: string) => void; onResolve: (annotationId: string) => void }) {
+  const [side, setSide] = useState<"comments" | "versions">("comments");
+  if (!props.document) return <p className="empty-mini">打开一份文档后，这里会显示它的批注和历史版本。</p>;
+  return (
         <aside className="inspector">
           <div className="inspector-tabs"><button className={side === "comments" ? "active" : ""} onClick={() => setSide("comments")}>批注</button><button className={side === "versions" ? "active" : ""} onClick={() => setSide("versions")}>版本</button></div>
           {side === "comments" ? (
@@ -2634,9 +2770,6 @@ function EditorPanel(props: {
             </div>
           )}
         </aside>
-        </>}
-      </div>
-    </div>
   );
 }
 
@@ -2685,14 +2818,40 @@ function ChapterPanel({ workspace, request, onPrompt }: { workspace: Record<stri
   </div>;
 }
 
+function resultIndices(result: unknown, root: string): TreeItem[] {
+  const found = new Map<string, TreeItem>();
+  const prefix = root.replace(/\\/g, "/").replace(/\/$/, "") + "/";
+  const visit = (value: unknown, depth: number) => {
+    if (!value || typeof value !== "object" || depth > 5) return;
+    const item = value as Record<string, unknown>;
+    for (const key of ["review_path", "draft_path", "path"]) {
+      if (typeof item[key] !== "string") continue;
+      let path = item[key].replace(/\\/g, "/");
+      if (path.toLowerCase().startsWith(prefix.toLowerCase())) path = path.slice(prefix.length);
+      const match = path.match(/^(chapters|reviews)\/chapter_(\d{5})[^/]*\.md$/);
+      if (!match) continue;
+      const review = match[1] === "reviews";
+      found.set(path, { id: path, relative_path: path, kind: review ? "review" : "chapter", chapter_no: Number(match[2]),
+        label: `第 ${Number(match[2])} 章 · ${review ? "核对结果" : "查看正文"}` });
+    }
+    for (const key of ["result", "steps", "chapters", "results"]) {
+      const nested = item[key];
+      if (Array.isArray(nested)) nested.forEach(child => visit(child, depth + 1));
+      else visit(nested, depth + 1);
+    }
+  };
+  visit(result, 0);
+  return [...found.values()];
+}
+
 function ReviewPanel({ document, reviewDocument, tree, workspace, request, onOpen, onPrompt }: { document: DocumentData | null; reviewDocument: DocumentData | null; tree: ProjectTree | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; onOpen: (item: TreeItem) => void; onPrompt: (value: string) => void }) {
-  const reviews = tree?.groups.find((group) => group.id === "reviews")?.items || [];
+  const currentReview = workspace?.review as { path?: string; report?: { summary?: string; findings?: Array<{ evidence?: string; explanation?: string; repair_instruction?: string }> } } | undefined;
   const [panelResult, setPanelResult] = useState<Record<string, unknown> | null>(null);
   const [panelWorking, setPanelWorking] = useState(false);
   const panelSequence = useRef(0);
   const chapterMatch = document?.relative_path.match(/chapter_(\d+)(?:\.draft)?\.md$/);
   const reviewChapterMatch = reviewDocument?.relative_path.match(/chapter_(\d+)\.review\.md$/);
-  const chapterNo = Number(chapterMatch?.[1] || reviewChapterMatch?.[1] || 0);
+  const chapterNo = Number(workspace?.chapter_no || chapterMatch?.[1] || reviewChapterMatch?.[1] || 0);
   const sourceKey = `${chapterNo}:${document?.content_hash || ""}:${JSON.stringify(workspace?.record || {})}`;
   const currentPanelSource = useRef(sourceKey);
   currentPanelSource.current = sourceKey;
@@ -2710,69 +2869,14 @@ function ReviewPanel({ document, reviewDocument, tree, workspace, request, onOpe
   };
   const panelFindings = (panelResult?.merged_findings || []) as Array<Record<string, unknown>>;
   return <div className="scroll-panel review-panel">
-    <div className="section-heading"><p className="eyebrow">审查</p><h2>证据化审查</h2><p>每个扣分项都应指向正文、章节卡或正史依据；旧审查不能批准新版本。量表百分比是证据化规则符合度，模型自报把握度另列；分值需结合原文、必需审查覆盖和已证实问题判断。</p></div>
+    <div className="section-heading"><p className="eyebrow">审查</p><h2>本章检查</h2><p>先看本章实际问题；需要时展开对应依据或完整报告。</p></div>
     {workspace && <ChapterStatusStrip workspace={workspace} />}
-    {reviewDocument && <article className="markdown-preview review-document"><header><strong>{reviewDocument.relative_path}</strong><span>审查报告 · 只读</span></header><pre>{reviewDocument.content}</pre><small>审查报告单独显示；正文仍在编辑器中打开，不会被报告覆盖。</small></article>}
+    {reviewDocument && <details className="markdown-preview review-document"><summary>已选择的章节报告 · 展开完整内容</summary><pre>{readableRecordText(reviewDocument.content)}</pre></details>}
     {reviewChapterMatch && chapterMatch && Number(reviewChapterMatch[1]) !== chapterNo && <p className="form-hint">已打开第 {Number(reviewChapterMatch[1])} 章报告；本次预审和精修目标为编辑器中的第 {chapterNo} 章。</p>}
     {chapterNo > 0 && <section className="stack-section"><h3>Editor 多维预审 · 第 {chapterNo} 章</h3><p className="form-hint">Editor 分别检查连续性、人物、叙事和表达，再按证据去重；不会直接修改正文。</p><button disabled={panelWorking} onClick={() => void runPanel()}>{panelWorking ? "正在审查本章…" : "运行多维预审"}</button>{panelResult && <div>{panelFindings.length === 0 && <p className="empty-mini">没有发现可引用的问题。</p>}{panelFindings.map((finding, index) => <article className="thread-card" key={index}><strong>[{String(finding.severity || "info")}] {String(finding.category || "阅读体验")}</strong><p>原文：{String(finding.evidence || "未提供")}</p><p>影响：{String(finding.explanation || "未单独说明")}</p><small>修订方向：{String(finding.repair_instruction || "由作者决定是否调整")}</small></article>)}</div>}</section>}
     {chapterNo > 0 && <button className="wide-action" onClick={() => onPrompt(`请根据第 ${chapterNo} 章当前版本的 Editor 审查证据进入精修模式：先输出可审计的场景蓝图，再由 Writer 定点修订并让 Editor 重审新版本；不要验收。`)}>把审查意见交给 Writer 精修</button>}
-    <section className="stack-section"><h3>审查记录</h3>{reviews.length === 0 && <p className="empty-mini">还没有审查报告。</p>}{reviews.map((item) => <button className="review-link" key={item.id} onClick={() => void onOpen(item)}><span>✓</span><strong>{item.label}</strong><small>打开报告</small></button>)}</section>
-  </div>;
-}
+    {currentReview?.report && <section className="stack-section"><h3>本章核对要点</h3><p>{currentReview.report.summary}</p><details><summary>查看具体问题与修改依据 · {currentReview.report.findings?.length || 0} 项</summary>{currentReview.report.findings?.map((finding, index) => <article className="thread-card" key={index}><blockquote>{finding.evidence}</blockquote><p>{finding.explanation}</p><p>{finding.repair_instruction}</p></article>)}</details>{currentReview.path && <button onClick={() => onOpen({ id: currentReview.path!, relative_path: currentReview.path!, label: "本章完整报告", kind: "review", chapter_no: Number(workspace?.chapter_no || chapterNo) })}>选择本章完整报告</button>}</section>}
 
-function MemoryPanel({ dashboard, workspace, request, onRefresh }: { dashboard: Dashboard | null; workspace: Record<string, unknown> | null; request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; onRefresh: () => Promise<void> }) {
-  const [showAdd, setShowAdd] = useState(false);
-  const [kind, setKind] = useState("character");
-  const [name, setName] = useState("");
-  const [notes, setNotes] = useState("");
-  const [previewChapter, setPreviewChapter] = useState(1);
-  const [memoryPreview, setMemoryPreview] = useState<Record<string, unknown> | null>(null);
-  const [memoryWorking, setMemoryWorking] = useState(false);
-  const previewSequence = useRef(0);
-  useEffect(() => { previewSequence.current += 1; setMemoryPreview(null); }, [previewChapter, request]);
-  const generateMemoryPreview = async () => {
-    const sequence = ++previewSequence.current;
-    const chapter = previewChapter;
-    setMemoryWorking(true);
-    try {
-      const value = await request<Record<string, unknown>>("memory.preview", { chapter_no: chapter, user_accepted: true });
-      if (sequence === previewSequence.current) setMemoryPreview(value);
-    } finally { setMemoryWorking(false); }
-  };
-  const [voicePreferences, setVoicePreferences] = useState<Array<Record<string, unknown>>>([]);
-  const [voiceScope, setVoiceScope] = useState("project");
-  const [voiceTarget, setVoiceTarget] = useState("");
-  const [voiceStrength, setVoiceStrength] = useState("weak");
-  const [voiceText, setVoiceText] = useState("");
-  const loadVoicePreferences = useCallback(async () => {
-    const value = await request<{ preferences: Array<Record<string, unknown>> }>("preference.list", { active_only: false });
-    setVoicePreferences(value.preferences || []);
-  }, [request]);
-  useEffect(() => { void loadVoicePreferences(); }, [loadVoicePreferences]);
-  const save = async () => {
-    if (!name.trim()) return;
-    await request("bible.upsert", { kind, name, aliases: [], data: { notes } });
-    setName(""); setNotes(""); setShowAdd(false); await onRefresh();
-  };
-  const saveVoicePreference = async () => {
-    if (!voiceText.trim()) return;
-    const scope = voiceScope === "project" || !voiceTarget.trim() ? voiceScope : `${voiceScope}:${voiceTarget.trim()}`;
-    await request("preference.upsert", { text: voiceText.trim(), strength: voiceStrength, scope });
-    setVoiceText("");
-    setVoiceTarget("");
-    await loadVoicePreferences();
-    await onRefresh();
-  };
-  const previewData = ((memoryPreview?.preview as Record<string, unknown> | undefined)?.data || {}) as Record<string, unknown>;
-  return <div className="scroll-panel memory-panel">
-    <div className="section-heading"><p className="eyebrow">正史</p><h2>正史与故事圣经</h2><button onClick={() => setShowAdd(!showAdd)}>＋ 手动圣经条目</button></div>
-    {workspace && <ChapterStatusStrip workspace={workspace} />}
-    {showAdd && <div className="inline-form"><select value={kind} onChange={(event) => setKind(event.target.value)}><option value="character">人物</option><option value="location">地点</option><option value="organization">组织</option><option value="item">物品</option><option value="lore">世界观</option><option value="style">文风</option></select><input value={name} onChange={(event) => setName(event.target.value)} placeholder="名称" /><textarea value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="稳定设定、声线、禁忌或说明" /><button className="primary" onClick={() => void save()}>保存</button></div>}
-    <section className="stack-section"><h3>写作偏好与强制记忆</h3><p className="form-hint">“普通偏好”会按人物、场景和篇章相关度取用；“强制记忆”每次都交给 Writer，并由 Reviewer 核对。它们用于写作方式和长期要求，不会冒充小说正史。</p><div className="inline-form"><select value={voiceScope} onChange={(event) => setVoiceScope(event.target.value)}><option value="project">全书</option><option value="character">人物</option><option value="scene">场景</option><option value="arc">篇章</option></select>{voiceScope !== "project" && <input value={voiceTarget} onChange={(event) => setVoiceTarget(event.target.value)} placeholder={voiceScope === "character" ? "人物名" : voiceScope === "arc" ? "篇章名或编号" : "场景类型"} />}<select value={voiceStrength} onChange={(event) => setVoiceStrength(event.target.value)}><option value="weak">普通偏好：相关时使用</option><option value="hard">强制记忆：始终使用</option></select><textarea value={voiceText} onChange={(event) => setVoiceText(event.target.value)} placeholder="例如：女主紧张时会缩短句子，但不会直说害怕；认可片段……适用于女主视角。" /><button className="primary" onClick={() => void saveVoicePreference()}>保存</button></div><p className="form-hint">强制记忆过多时，墨流只会去除完全重复的副本，不会偷偷删改规则；容量接近上限时会在协作台提醒你暂停过期项或合并同义项。</p>{voicePreferences.map((item) => <article className="memory-card" key={String(item.preference_id)}><span>{String(item.scope)} · {String(item.strength) === "hard" ? "强制记忆" : "普通偏好"}</span><strong>{String(item.status) === "active" ? "正在使用" : "已暂停"}</strong><p>{String(item.text)}</p><div className="settings-inline-actions"><button onClick={async () => { await request("preference.set_status", { preference_id: item.preference_id, status: item.status === "active" ? "paused" : "active" }); await loadVoicePreferences(); }}>{item.status === "active" ? "暂停使用" : "恢复使用"}</button><button onClick={async () => { if (!(await window.inkflow.confirm("删除这条写作记忆吗？删除后，后续章节不会再使用它。"))) return; await request("preference.delete", { preference_id: item.preference_id }); await loadVoicePreferences(); await onRefresh(); }}>删除</button></div></article>)}</section>
-    <section className="stack-section canon-preview"><h3>正史变更预览</h3><p className="form-hint">只针对你已经接受且 Editor 审查已放行的当前草稿。先看事实与伏笔补丁，再决定是否提交 SQLite。</p><div className="settings-inline-actions"><input type="number" min={1} value={previewChapter} disabled={memoryWorking} onChange={(event) => setPreviewChapter(Number(event.target.value))} /><button disabled={memoryWorking} onClick={() => void generateMemoryPreview()}>生成预览</button></div>{memoryPreview && <article className="memory-card"><strong>第 {String((memoryPreview.preview as Record<string, unknown>).chapter_no)} 章 · 尚未提交</strong><p>新增或更新事实 {Array.isArray(previewData.facts) ? previewData.facts.length : 0} 条，线索变化 {Array.isArray(previewData.threads) ? previewData.threads.length : 0} 条，冲突 {Array.isArray(previewData.unresolved_conflicts) ? previewData.unresolved_conflicts.length : 0} 条。</p><details><summary>查看完整补丁</summary><pre>{JSON.stringify(previewData, null, 2)}</pre></details><button className="primary" disabled={memoryWorking} onClick={async () => { const preview = memoryPreview.preview as Record<string, unknown>; setMemoryWorking(true); try { await request("memory.commit_preview", { chapter_no: Number(preview.chapter_no), artifact_id: preview.artifact_id }); setMemoryPreview(null); await onRefresh(); } finally { setMemoryWorking(false); } }}>确认提交正史</button></article>}</section>
-    <section className="stack-section"><h3>人工故事圣经 <small>{dashboard?.bible_entries.length || 0}</small></h3>{dashboard?.bible_entries.map((entry) => <article className="memory-card" key={String(entry.entry_id)}><span>{kindLabel(String(entry.kind))}</span><strong>{String(entry.name)}</strong><p>{String(((entry.data || {}) as Record<string, unknown>).notes || "")}</p></article>)}</section>
-    <section className="stack-section"><h3>当前正史事实 <small>{dashboard?.facts.length || 0}</small></h3>{dashboard?.facts.slice(0, 30).map((fact) => <article className="fact-row" key={String(fact.fact_id)}><strong>{String(fact.subject)} · {String(fact.predicate)}</strong><p>{stringifyShort(fact.value)}</p><small>来源第 {String(fact.source_chapter)} 章</small></article>)}</section>
-    <section className="stack-section"><h3>开放线索 <small>{dashboard?.threads.length || 0}</small></h3>{dashboard?.threads.map((thread) => <article className="thread-card" key={String(thread.thread_id)}><strong>{String(thread.title)}</strong><p>{String(thread.description)}</p><small>{String(thread.status)} · 预计第 {String(thread.due_chapter || "—")} 章</small></article>)}</section>
   </div>;
 }
 
@@ -2788,7 +2892,26 @@ function CostSummary({ usage }: { usage?: CollaborationOverview["usage"] }) {
       </details></>;
 }
 
+function CacheScopeHistory({ groups }: { groups: CacheObservationGroup[] }) {
+  if (!groups.length) return null;
+  return <details><summary>历史接口与模型</summary><div className="cache-role-list">{groups.map(group => <details key={JSON.stringify([group.provider, group.endpoint, group.legacy_endpoint_host, group.model, group.role])}><summary>{roleLabel(group.role as AgentRole)} · {group.model} · {group.prompt_cache_hit_rate == null ? "缓存未知" : `${(group.prompt_cache_hit_rate * 100).toFixed(1)}%`} · {group.calls} 次</summary><p>{group.provider} · {group.endpoint || `${group.legacy_endpoint_host || "旧接口"}（历史记录缺少精确路由）`}{group.cache_unknown_calls ? `；${group.cache_unknown_calls} 次缓存用量未知，未计入比例。` : ""}</p>{group.by_contract.map(contract => <p key={JSON.stringify([contract.prompt_family, contract.system_contract_hash, contract.quality_hash, contract.thinking, contract.cache_policy, contract.message_layout])}>{contract.stage || "请求结构未记录"} · {contract.thinking === "enabled" ? "思考" : contract.thinking === "disabled" ? "非思考" : "思考状态未记录"} · {contract.calls} 次 · {contract.prompt_cache_hit_rate == null ? "缓存未知" : `${(contract.prompt_cache_hit_rate * 100).toFixed(1)}%`}{contract.response_models?.length ? ` · 服务返回模型：${contract.response_models.join("、")}` : ""}</p>)}</details>)}</div></details>;
+}
+
+function cachePolicyLabel(value?: string): string {
+  return value === "deepseek" ? "连续前缀复用" : value === "mimo" ? "稳定参考分组" : "通用接口";
+}
+
+function cacheTokenLabel(tokens: number, unknown: number | undefined, calls: number): string {
+  return calls && unknown === calls ? "未知" : `${tokens.toLocaleString()}${unknown ? "（已知部分）" : ""}`;
+}
+
 function CacheSummary({ usage }: { usage?: CollaborationOverview["usage"] }) {
+  if (!usage) return null;
+  const current = usage.current_model_cache;
+  return <article className="cache-summary"><header><strong>当前接口输入缓存</strong><span>{cachePolicyLabel(current?.cache_policy)}</span></header><p>{current?.available ? `${current.endpoint || "当前接口身份待核"}；按每个角色实际请求的模型分别观察。` : current?.warning || "当前接口分组尚未读取。"}</p><div className="cache-role-list">{AGENT_TUNING_META.map(meta => { const stats = current?.by_agent_role[meta.id]; return <div key={meta.id}><strong>{roleLabel(meta.id)}<small>{stats?.model || "模型待核"}</small></strong><CacheMeter calls={stats?.calls || 0} hitRate={stats?.prompt_cache_hit_rate} /></div>; })}</div><CacheScopeHistory groups={current?.history_groups || []} /><details><summary>旧累计与 DeepSeek 历史样本</summary><HistoricalCacheSummary usage={usage} /></details></article>;
+}
+
+function HistoricalCacheSummary({ usage }: { usage?: CollaborationOverview["usage"] }) {
   const hit = Number(usage?.prompt_cache_hit_tokens || 0);
   const miss = Number(usage?.prompt_cache_miss_tokens || 0);
   const total = hit + miss;
@@ -2805,9 +2928,9 @@ function CacheSummary({ usage }: { usage?: CollaborationOverview["usage"] }) {
   const roleKeys = ["coordinator", "writer", "editor", "reviewer", "memory_keeper", ...(roleUsage.unknown?.calls ? ["unknown"] : [])];
   const roles = roleKeys.map((role) => [role, roleUsage[role] || { calls: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }] as const);
   return <article className="cache-summary">
-    <header><strong>DeepSeek 输入缓存</strong><span>{recentRate === null ? "最近调用暂无报告" : `最近全部调用 ${recent?.reported_calls} 次 · ${recentRate}% 命中`}</span></header>
+    <header><strong>DeepSeek 历史样本</strong><span>{recentRate === null ? "最近调用暂无报告" : `最近全部调用 ${recent?.reported_calls} 次 · ${recentRate}% 命中`}</span></header>
     <p>{recentRate === null ? "最近请求没有可计算的缓存用量。" : `最近取样已复用 ${recent!.hit_tokens.toLocaleString()} tokens，未命中 ${recent!.miss_tokens.toLocaleString()} tokens。`}{recent?.unknown_calls ? `另有 ${recent.unknown_calls} 次用量未知。` : ""}{draftFamilies.length === 1 && draftFamilies[0][1].hit_rate != null ? ` 正文 Writer 同类请求 ${draftFamilies[0][1].calls} 次、命中 ${Math.round(draftFamilies[0][1].hit_rate! * 100)}%。` : ""} 全部调用混合规划、正文和审核，不能直接当作连续正文 Writer 命中率。</p>
-    <details><summary>查看最近分角色与历史累计</summary><p>{rate === null ? "旧记录没有完整缓存字段。" : `已记录模型结果累计命中 ${rate}%，复用 ${hit.toLocaleString()} tokens，未命中 ${miss.toLocaleString()} tokens。`} 稳定资料会放在变化的章节要求之前；实际命中由 DeepSeek 返回值确认。</p><div className="cache-role-list">{roles.map(([role, value]) => { const roleHit = Number(value.prompt_cache_hit_tokens || 0); const roleMiss = Number(value.prompt_cache_miss_tokens || 0); const roleTotal = roleHit + roleMiss; const roleRate = roleTotal ? Math.round((roleHit / roleTotal) * 100) : null; const recentRole = recent?.by_role?.[role]; return <div key={role}><strong>{labels[role] || role}</strong><span>{recentRole?.hit_rate != null ? `最近 ${Math.round(recentRole.hit_rate * 100)}% · ${recentRole.calls} 次` : recentRole?.calls ? `最近未知 · ${recentRole.calls} 次` : "最近无调用"}；累计 {value.calls ? roleRate === null ? `未知 · ${value.calls} 次` : `${roleRate}% · ${value.calls} 次` : "暂无调用"}</span></div>; })}</div></details>
+    <details><summary>查看最近分角色与历史累计</summary><p>{rate === null ? "旧记录没有完整缓存字段。" : `已记录模型结果累计命中 ${rate}%，复用 ${hit.toLocaleString()} tokens，未命中 ${miss.toLocaleString()} tokens。`} 稳定资料会放在变化的章节要求之前；实际命中取服务商返回值；此累计混合了不同接口与模型，不作同类比较。</p><div className="cache-role-list">{roles.map(([role, value]) => { const roleHit = Number(value.prompt_cache_hit_tokens || 0); const roleMiss = Number(value.prompt_cache_miss_tokens || 0); const roleTotal = roleHit + roleMiss; const roleRate = roleTotal ? Math.round((roleHit / roleTotal) * 100) : null; const recentRole = recent?.by_role?.[role]; return <div key={role}><strong>{labels[role] || role}</strong><span>{recentRole?.hit_rate != null ? `最近 ${Math.round(recentRole.hit_rate * 100)}% · ${recentRole.calls} 次` : recentRole?.calls ? `最近未知 · ${recentRole.calls} 次` : "最近无调用"}；累计 {value.calls ? roleRate === null ? `未知 · ${value.calls} 次` : `${roleRate}% · ${value.calls} 次` : "暂无调用"}</span></div>; })}</div></details>
     {performance && <details><summary>查看失败、重试与可比较记录</summary>
       <p>最近记录 {performance.calls} 次尝试、{performance.request_count} 项请求，其中 {performance.failed_calls} 次失败；已发送 {performance.sent_calls} 次、未发出 {performance.not_sent_calls} 次、发送状态未知 {performance.unknown_sent_calls} 次。已知原始输入 {showCount(performance.raw_input_tokens)} token，缓存 {showCount(performance.cached_input_tokens)}、未命中 {showCount(performance.uncached_input_tokens)}，输出 {showCount(performance.output_tokens)}。</p>
       <p>已记录尝试耗时 {performance.attempt_elapsed_ms == null ? "未知" : `${(performance.attempt_elapsed_ms / 1000).toFixed(1)} 秒`}；{performance.unknown_duration_calls} 次耗时、{performance.unknown_usage_calls} 次用量、{performance.unknown_cost_calls} 次费用未知。{performance.time_note} {performance.quality_note}</p>
@@ -2822,11 +2945,11 @@ type LiveRun = { id: string; steps: EngineEvent[]; method?: string; status: stri
 
 function LiveRunTimeline({ runs, onOpenReference }: { runs: LiveRun[]; onOpenReference: (reference: TraceReference) => void | Promise<void> }) {
   if (!runs.length) return null;
-  return <div className="run-list live-runs"><h3>实时运行过程</h3><p className="process-hint">这里展示公开的步骤、角色、模型、等待参数和文件引用；不会展示模型原始思考内容。</p>{runs.slice(0, 8).map((run) => <details className={`run-card live-run ${run.status}`} open={run.status === "running" || run.status === "waiting"} key={`live-${run.id}`}><summary><strong>{String(run.method ? methodLabel(run.method) : "墨流任务")}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : run.status === "waiting" ? "等待处理" : "进行中"}</span></summary><p>{run.summary}</p><ol className="live-timeline">{run.steps.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; const stepStatus = step.status || "info"; const role = String(step.role || metadata.agent_role || ""); const model = String(step.model || metadata.model || ""); const refs = step.references || []; const publicMetadata = Object.fromEntries(Object.entries(metadata).filter(([key]) => !isSensitivePresentationKey(key))); return <li className={`live-step ${stepStatus}`} key={`${step.timestamp || index}-${index}`}><div className="live-step-main"><span className="live-step-marker">{stepStatus === "completed" ? "✓" : stepStatus === "failed" ? "!" : stepStatus === "started" ? "…" : "·"}</span><div><strong>{eventLabel(step.type || step.stage)}</strong><p>{step.summary || step.stage || "过程"}</p><small>{step.timestamp ? formatTime(step.timestamp) : "刚刚"}{role ? ` · ${agentRoleLabel(role)}` : ""}{model ? ` · ${model}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small></div></div>{step.details && <p className="live-step-details">{step.details}</p>}{(metadata.timeout_seconds || metadata.max_tokens || typeof metadata.thinking === "boolean") && <small className="live-step-meta">请求参数：{metadata.timeout_seconds ? `超时 ${String(metadata.timeout_seconds)} 秒` : ""}{metadata.max_tokens ? ` · 输出上限 ${Number(metadata.max_tokens).toLocaleString()} tokens` : ""}{typeof metadata.thinking === "boolean" ? ` · 深度推理 ${metadata.thinking ? "开启" : "关闭"}` : ""}</small>}{refs.length > 0 && <div className="settings-inline-actions">{refs.map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {reference.relative_path}</button>)}</div>}{Object.keys(publicMetadata).length > 0 && <details><summary>查看本步公开记录</summary><pre className="compact-json">{JSON.stringify(publicMetadata, null, 2)}</pre></details>}</li>; })}</ol><small className="live-run-footnote">可复核文件由运行记录自动发现；点击文件按钮可在本地打开。</small></details>)}</div>;
+  return <div className="run-list live-runs"><h3>实时运行过程</h3><p className="process-hint">这里展示公开的步骤、角色、模型、等待参数和文件引用；不会展示模型原始思考内容。</p>{runs.slice(0, 8).map((run) => <details className={`run-card live-run ${run.status}`} open={run.status === "running" || run.status === "waiting"} key={`live-${run.id}`}><summary><strong>{String(run.method ? methodLabel(run.method) : "墨流任务")}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : run.status === "waiting" ? "等待处理" : "进行中"}</span></summary><p>{readableSourceText(run.summary)}</p><ol className="live-timeline">{publicProcessSteps(run.steps).map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; const stepStatus = step.status || "info"; const role = String(step.role || metadata.agent_role || ""); const model = String(step.model || metadata.model || ""); const refs = step.references || []; const publicMetadata = Object.fromEntries(Object.entries(metadata).filter(([key]) => !isSensitivePresentationKey(key))); return <li className={`live-step ${stepStatus}`} key={`${step.timestamp || index}-${index}`}><div className="live-step-main"><span className="live-step-marker">{stepStatus === "completed" ? "✓" : stepStatus === "failed" ? "!" : stepStatus === "started" ? "…" : "·"}</span><div><strong>{eventLabel(step.type || step.stage)}</strong><p>{readableSourceText(step.summary || step.stage || "过程")}</p><small>{step.timestamp ? formatTime(step.timestamp) : "刚刚"}{role ? ` · ${agentRoleLabel(role)}` : ""}{model ? ` · ${model}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small></div></div>{step.details && <p className="live-step-details">{readableSourceText(step.details)}</p>}{(metadata.timeout_seconds || metadata.max_tokens || typeof metadata.thinking === "boolean") && <small className="live-step-meta">请求参数：{metadata.timeout_seconds ? `超时 ${String(metadata.timeout_seconds)} 秒` : ""}{metadata.max_tokens ? ` · 输出上限 ${Number(metadata.max_tokens).toLocaleString()} tokens` : ""}{typeof metadata.thinking === "boolean" ? ` · 深度推理 ${metadata.thinking ? "开启" : "关闭"}` : ""}</small>}{refs.length > 0 && <div className="settings-inline-actions">{refs.map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {documentLabel(reference.relative_path)}</button>)}</div>}{Object.keys(publicMetadata).length > 0 && <details><summary>查看本步说明</summary><p className="record-summary">{readableRecord(displaySafeValue(publicMetadata))}</p></details>}</li>; })}</ol><small className="live-run-footnote">可复核文件由运行记录自动发现；点击文件按钮可在本地打开。</small></details>)}</div>;
 }
 
 function ReferenceDocumentViewer({ document, onClose }: { document: DocumentData; onClose: () => void }) {
-  return <article className="reference-viewer"><header><div><span className="reference-viewer-icon">↗</span><div><strong>运行记录 · 只读复核</strong><small>{document.relative_path}</small></div></div><button type="button" onClick={onClose}>关闭预览</button></header><pre>{document.content}</pre><footer>{document.reason || "文件来自本地 .inkflow 运行记录，只能在墨流内查看。"}</footer></article>;
+  return <article className="reference-viewer"><header><div><span className="reference-viewer-icon">↗</span><div><strong>运行记录 · 只读复核</strong><small>{documentLabel(document.relative_path)}</small></div></div><button type="button" onClick={onClose}>关闭预览</button></header><div className="record-summary">{readableRecordText(document.content)}</div><footer>{document.reason || "文件来自本地 .inkflow 运行记录，只能在墨流内查看。"}</footer></article>;
 }
 
 function workflowIcon(stage: string) {
@@ -2857,19 +2980,34 @@ function WorkflowProgressStrip({ runs }: { runs: LiveRun[] }) {
   return <section className="workflow-progress"><header><div><h3>本次工作流</h3><p>只显示公开阶段与明确结束记录；正史接受以当前章节为准。</p></div><strong>{latest ? (latest.status === "done" ? "本次已结束" : latest.status === "failed" ? "需处理" : latest.status === "waiting" ? "等待处理" : "进行中") : "等待任务"}</strong></header><ol>{steps.map(step => { const state = workflowStageState(events, step.key as "plan" | "write" | "review" | "accept" | "memory"); return <li className={`progress-stage ${state}`} key={step.key}><span className="progress-stage-icon">{workflowIcon(step.label)}</span><div><strong>{step.label}</strong><small>{state === "done" ? "有结束记录" : state === "active" ? latest?.status === "running" ? "正在处理" : "未确认结束" : "本次未记录"}</small></div></li>; })}</ol><p className="workflow-progress-note">阶段调用结束不等于审核通过；正文、审核与接受分别核对当前来源。</p></section>;
 }
 
+function RoleContextCards({ value }: { value: ContextStatus | null }) {
+  return <section className="role-context-cards" aria-label="各角色最近一次请求的上下文状态">
+    {value?.read_error && <p role="status" className="form-error">{value.read_error}</p>}
+    {!value?.roles?.length && <p className="form-hint">{value?.read_error ? "记录恢复后会继续显示。" : "正在读取角色状态…"}</p>}
+    {value?.roles?.map(role => {
+      const known = role.input_tokens !== null && role.used_percent !== null;
+      const hasInput = role.input_tokens !== null;
+      const compiledLimit = role.materials?.configured_hard_limit_tokens;
+      const compiledPercent = compiledLimit && role.materials?.estimated_tokens != null
+        ? 100 * role.materials.estimated_tokens / compiledLimit : null;
+      const state = role.request_state === "not_called" ? "尚未调用" : role.request_state === "unknown" ? "记录不可用"
+        : role.request_state === "completed" ? "最近一次请求" : role.request_state === "pending" ? "等待用量回报" : "最近未完成请求";
+      const hint = `${role.model} · ${state}${role.updated_at ? ` · ${formatTime(role.updated_at)}` : ""}\n${hasInput ? `${role.input_kind === "reported" ? "服务返回" : "本地估算"}输入 ${role.input_tokens!.toLocaleString()} 标记。` : "尚无输入记录。"}${known ? `本次容量 ${role.context_limit_tokens.toLocaleString()}，剩余 ${role.remaining_tokens?.toLocaleString()} 标记。` : `当前设置容量 ${role.context_limit_tokens.toLocaleString()}；旧请求占比未知。`}`;
+      const label = known ? `${role.input_kind === "estimated" ? "约 " : ""}${role.used_percent!.toFixed(1)}% 已用`
+        : "—";
+      return <article className="role-context-row" key={role.role}><header title={`${hint}${compiledPercent !== null ? `\n最近准备的资料约占当时容量 ${compiledPercent.toFixed(1)}%，不含完整请求的系统说明与输出；不是历史调用占比。` : ""}`}><strong>{roleLabel(role.role)}</strong><span aria-label={known ? label : hasInput ? "历史记录缺少当时容量，比例未计算" : state}>{label}</span></header>
+        <ContextMaterials projectRoot={value?.project_root} role={role.role} snapshot={role.materials}
+          emptyLabel={`${hint}\n${hasInput ? "本次没有保存分类明细；下次准备任务时会更新。" : role.request_state === "unknown" ? "用量记录暂时无法读取，请稍后查看。" : "这个角色尚未准备任务资料；参与工作后会显示组成。"}`} />
+      </article>;
+    })}
+  </section>;
+}
+
 function ContextCapacityCard({ value }: { value: ContextStatus | null }) {
-  if (!value) return <article className="context-capacity-card idle"><header><div><strong>Context 容量</strong><small>等待第一次编译</small></div><span>—</span></header><p>发送一次规划、写作或审查请求后，这里会显示当前占用和变化。</p></article>;
-  const hard = Math.max(1, Number(value.hard_limit_tokens || 1));
-  const soft = Math.max(1, Number(value.soft_limit_tokens || 1));
-  const estimated = Math.max(0, Number(value.estimated_tokens || 0));
-  const before = Math.max(estimated, Number(value.before_compression_tokens || estimated));
-  const delta = Math.max(0, before - estimated);
-  const previousChange = typeof value.change_since_previous_tokens === "number" ? value.change_since_previous_tokens : null;
-  const configuredSoft = Math.max(1, Number(value.configured_soft_limit_tokens || soft));
-  const configuredHard = Math.max(1, Number(value.configured_hard_limit_tokens || hard));
-  const hardPercent = Math.max(0, Math.min(100, Number(value.hard_usage_percent || (estimated / hard) * 100)));
-  const softPercent = Math.max(0, Math.min(100, (estimated / soft) * 100));
-  return <article className={`context-capacity-card ${value.status}`}><header><div><strong>Context 容量变化</strong><small>当前编译包 · {value.updated_at ? formatTime(value.updated_at) : "刚刚"}</small></div><span>{hardPercent.toFixed(1)}%</span></header><div className="context-capacity-track"><i style={{ width: `${hardPercent}%` }} /></div><div className="context-capacity-stats"><div><small>当前占用</small><strong>{estimated.toLocaleString()}</strong><span>/ {hard.toLocaleString()} tokens</span></div><div><small>软阈值</small><strong>{softPercent.toFixed(1)}%</strong><span>{soft.toLocaleString()} tokens</span></div><div><small>与上次编译</small><strong>{previousChange === null ? "首次" : `${previousChange > 0 ? "+" : ""}${previousChange.toLocaleString()}`}</strong><span>{value.previous_updated_at ? `上次 ${formatTime(value.previous_updated_at)}` : "等待下一轮"}</span></div><div><small>本轮压缩</small><strong>{delta ? `-${delta.toLocaleString()}` : "0"}</strong><span>{value.compression_applied ? "压缩后保留" : "未触发压缩"}</span></div></div><p>{value.compression_applied ? `编译前 ${before.toLocaleString()} → 编译后 ${estimated.toLocaleString()} tokens，减少 ${delta.toLocaleString()} tokens；硬约束资料保持不变。` : `本轮没有触发压缩：${estimated.toLocaleString()} tokens 仍在软阈值内。0 不是缺失，而是本轮无需压缩。当前任务预算为 ${soft.toLocaleString()} / ${hard.toLocaleString()}，设置预算为 ${configuredSoft.toLocaleString()} / ${configuredHard.toLocaleString()}。`}</p></article>;
+  return <article className="context-capacity-card"><RoleContextCards value={value} />
+    {value?.stale_reason && <p>{value.stale_reason}</p>}
+    {value && value.status !== "idle" && value.status !== "unavailable" && <details><summary>上次编译的资料容量</summary><p>输入资料约 {value.estimated_tokens.toLocaleString()} 标记，资料预算 {value.hard_limit_tokens.toLocaleString()} 标记。完整请求还包含系统说明及输出预留，以对应角色的请求记录为准。</p></details>}
+  </article>;
 }
 
 function retrievalCounts(value?: ContextStatus["retrieval_diagnostics"]) {
@@ -2892,7 +3030,7 @@ function ProcessPanel({ events, collaboration, context, provider, workspace, req
   const retrieval = context?.retrieval_diagnostics;
   const retrievalStats = retrievalCounts(retrieval);
   const openThreads = (collaboration?.threads || []).filter((thread) => ["open", "waiting", "escalated"].includes(String(thread.status))).length;
-  return <div className="scroll-panel process-panel"><div className="section-heading"><p className="eyebrow">协作台</p><h2>工作流与运行状态</h2><p>任务、Agent 讨论、上下文、检索、学习和费用信息集中查看；正文和版本仍留在各自工作区。</p></div>{workspace && <ChapterStatusStrip workspace={workspace} />}
+  return <div className="scroll-panel process-panel"><div className="section-heading"><p className="eyebrow">协作台</p><h2>工作流与运行状态</h2><p>任务、角色讨论、上下文、检索和费用信息集中查看；正文和版本仍留在各自工作区。</p></div>{workspace && <ChapterStatusStrip workspace={workspace} />}
      {referenceDocument && <ReferenceDocumentViewer document={referenceDocument} onClose={onCloseReference} />}
      <WorkflowProgressStrip runs={runs} />
      <ContextCapacityCard value={context} />
@@ -2906,18 +3044,17 @@ function ProcessPanel({ events, collaboration, context, provider, workspace, req
       <article><header><strong>检索诊断</strong><span>{retrieval ? `新增 ${retrievalStats.added} 条` : "暂无记录"}</span></header><p>{retrieval ? `从 ${retrievalStats.candidates} 条候选中取回 ${retrievalStats.retrieved} 条，其中 ${retrievalStats.alreadyLoaded} 条已在正史上下文，避免重复输入。这里不是模型缓存命中率。` : "完成一次章节上下文编译后显示本地检索情况。"}</p></article>
       <article><header><strong>正史变更</strong><span>验收后</span></header><p>记忆服务 的新增、更新和结束事实会先预览，再进入事务提交。</p></article>
       <article><header><strong>版本对比</strong><span>正文右侧</span></header><p>草稿、修改提案与历史快照均可打开 Diff，不静默覆盖旧版本。</p></article>
-      <article><header><strong>学习中心</strong><span>{learning.length} 条信号</span></header><p>{learning[0] ? `${learningLabel(learning[0].event_type)}${learning[0].chapter_no ? ` · 第 ${learning[0].chapter_no} 章` : ""}` : "记录接受、拒绝、撤回和重写，只用于本机优化。"}</p></article>
       <article><header><strong>费用记录</strong><span>不设固定金额上限</span></header><CostSummary usage={usage} /><p>当前模型：{String(provider?.model || "未配置")}。</p></article>
     </div>
-    {context && <div className="run-list"><h3>Context Packet 质量报告</h3><article className="run-card"><header><strong>预算分配</strong><span>输出预留 {Number((context as unknown as Record<string, unknown>).output_reserve_tokens || 0).toLocaleString()} tokens</span></header><div className="context-budget-list">{(context.budget_allocation || []).map((item) => <p key={item.key}><strong>{item.key} · {item.title}</strong><span>{item.estimated_tokens.toLocaleString()} tokens · {item.hard ? "固定保留" : "可压缩"} · {item.source_count} 来源</span></p>)}</div></article>{Boolean(retrieval?.discarded?.length) && <details className="run-card"><summary>查看未取回候选的前 {retrieval?.discarded?.length} 条原因</summary><pre className="compact-json">{JSON.stringify(retrieval?.discarded, null, 2)}</pre></details>}</div>}
-    <div className="run-list"><h3>真实调用与引用</h3>{!(collaboration?.trace_runs || []).length && <p className="empty-mini">运行写作、审查或记忆任务后，这里会显示每一步参考了什么、使用了哪个模型、产生了哪些文件。</p>}{(collaboration?.trace_runs || []).slice(0, 10).map((traceRun) => <details className="run-card" key={traceRun.run_id}><summary><strong>{operationLabel(traceRun.operation)}</strong><span>{traceRun.status === "completed" ? "已完成" : traceRun.status === "failed" ? "未完成" : traceRun.status}</span></summary><p>{traceRun.summary}</p><div className="settings-inline-actions">{traceRun.trace_reference?.exists && <button type="button" onClick={() => void onOpenReference(traceRun.trace_reference!)}>打开完整运行记录</button>}</div><ol>{traceRun.events.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; return <li key={`${step.timestamp}-${index}`}><div><strong>{step.stage}</strong> · {step.summary}</div><small>{formatTime(step.timestamp)} · {step.status}{metadata.model ? ` · 模型 ${String(metadata.model)}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small>{step.details && <p>{step.details}</p>}{(step.references || []).length > 0 && <div className="settings-inline-actions">{(step.references || []).map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {reference.relative_path}</button>)}</div>}{Object.keys(metadata).length > 0 && <details><summary>查看本步全部记录</summary><pre className="compact-json">{JSON.stringify(metadata, null, 2)}</pre></details>}</li>; })}</ol></details>)}</div>
+    {context && <div className="run-list"><h3>Context Packet 质量报告</h3><article className="run-card"><header><strong>预算分配</strong><span>输出预留 {Number((context as unknown as Record<string, unknown>).output_reserve_tokens || 0).toLocaleString()} tokens</span></header><div className="context-budget-list">{(context.budget_allocation || []).map((item) => <p key={item.key}><strong>{item.title}</strong><span>{item.estimated_tokens.toLocaleString()} tokens · {item.hard ? "固定保留" : "可压缩"} · {item.source_count} 来源</span></p>)}</div></article>{Boolean(retrieval?.discarded?.length) && <details className="run-card"><summary>查看未取回候选的前 {retrieval?.discarded?.length} 条原因</summary><p className="record-summary">{readableRecord(displaySafeValue(retrieval?.discarded))}</p></details>}</div>}
+    <div className="run-list"><h3>真实调用与引用</h3>{!(collaboration?.trace_runs || []).length && <p className="empty-mini">运行写作、审查或记忆任务后，这里会显示每一步参考了什么、使用了哪个模型、产生了哪些文件。</p>}{(collaboration?.trace_runs || []).slice(0, 10).map((traceRun) => <details className="run-card" key={traceRun.run_id}><summary><strong>{operationLabel(traceRun.operation)}</strong><span>{traceRun.status === "completed" ? "已完成" : traceRun.status === "failed" ? "未完成" : traceRun.status}</span></summary><p>{readableSourceText(traceRun.summary)}</p><div className="settings-inline-actions">{traceRun.trace_reference?.exists && <button type="button" onClick={() => void onOpenReference(traceRun.trace_reference!)}>打开完整运行记录</button>}</div><ol>{traceRun.events.map((step, index) => { const metadata = step.metadata || {}; const usage = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; return <li key={`${step.timestamp}-${index}`}><div><strong>{eventLabel(step.stage)}</strong> · {readableSourceText(step.summary)}</div><small>{formatTime(step.timestamp)} · {step.status}{metadata.model ? ` · 模型 ${String(metadata.model)}` : ""}{usage ? ` · 输入 ${Number(usage.prompt_tokens || usage.input_tokens || 0).toLocaleString()} / 输出 ${Number(usage.completion_tokens || usage.output_tokens || 0).toLocaleString()} tokens` : ""}</small>{step.details && <p>{readableSourceText(step.details)}</p>}{(step.references || []).length > 0 && <div className="settings-inline-actions">{(step.references || []).map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {documentLabel(reference.relative_path)}</button>)}</div>}{Object.keys(metadata).length > 0 && <details><summary>查看本步说明</summary><p className="record-summary">{readableRecord(displaySafeValue(metadata))}</p></details>}</li>; })}</ol></details>)}</div>
     <div className="run-list"><h3>定向讨论</h3>{(collaboration?.threads || []).slice(0, 8).map((thread) => { const current = threadUpdates[String(thread.thread_id)] || thread; const active = ["open", "waiting"].includes(String(current.status)); return <article className="run-card" key={String(thread.thread_id)}><header><strong>{String(thread.topic)}</strong><span>{String(current.status)} · 第 {String(current.current_round || 1)}/{String(current.max_rounds || 2)} 轮</span></header><p>{String(current.resolution || "等待目标 Agent 回答")}</p>{active && <button onClick={async () => { const value = await request<{ thread: Record<string, unknown> }>("collaboration.reply", { thread_id: thread.thread_id }); setThreadUpdates((items) => ({ ...items, [String(thread.thread_id)]: value.thread })); }}>让目标 Agent 回答</button>}{String(current.status) === "escalated" && <small>两轮后仍有分歧，已暂停分支并交给 Coordinator 向你提出最小问题。</small>}</article>; })}</div>
     <div className="run-list"><h3>任务计划</h3>{runs.length === 0 && <p className="empty-mini">发送需求后，这里显示本次任务的安排。</p>}{runs.slice(0, 8).map(run => {
     const planned = [...run.steps].reverse().find((step) => step.dispatch_plan?.steps?.length);
     const ticket = planned?.task_ticket || {};
     const dispatchSteps = planned?.dispatch_plan?.steps || [];
     const plan = dispatchSteps.length > 0 ? dispatchSteps.map((step) => `${agentRoleLabel(String(step.role || "engine"))} · ${operationLabel(String(step.operation || ""))}${step.gate ? `（${String(step.gate)}）` : ""}`) : run.method === "project.ideate" ? ["读取开书偏好", "构思故事方向与开篇", "展示方案，等待你选择"] : run.method === "provider.test" ? ["发送连接检查", "等待模型回答", "显示连接结果"] : ["读取任务范围与相关章节", "执行本次任务", "交付结果供你查看"];
-    return <article className={`run-card ${run.status}`} key={run.id}><header><strong>{String(ticket.objective || methodLabel(run.method))}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : run.status === "waiting" ? "等待处理" : "进行中"}</span></header>{Boolean(ticket.chapter_no) && <p>章节：第 {String(ticket.chapter_no)} 章{ticket.chapter_version ? ` · v${String(ticket.chapter_version)}` : ""}；验收模式：{acceptanceModeLabel(String(ticket.acceptance_confirmation_mode || "per_chapter"))}；授权来源：{authorizationLabel(String(ticket.authorization_source || "none"))}</p>}<ol>{plan.map((step, index) => <li key={`${index}-${step}`}><span>计划 {index + 1} · {step}</span></li>)}</ol><p>{run.summary}</p>{planned?.dispatch_plan?.stop_conditions?.length ? <details><summary>停止条件</summary><ul>{planned.dispatch_plan.stop_conditions.map((item) => <li key={item}>{item}</li>)}</ul></details> : null}<small>{run.method === "project.ideate" ? "结果位置：新建小说窗口" : run.method === "provider.test" ? "结果位置：模型设置窗口" : "结果位置：中间对话区；生成文件可从左侧小说结构打开"}</small></article>;
+    return <article className={`run-card ${run.status}`} key={run.id}><header><strong>{String(ticket.objective || methodLabel(run.method))}</strong><span>{run.status === "done" ? "已完成" : run.status === "failed" ? "未完成" : run.status === "cancelled" ? "已停止" : run.status === "waiting" ? "等待处理" : "进行中"}</span></header>{Boolean(ticket.chapter_no) && <p>章节：第 {String(ticket.chapter_no)} 章{ticket.chapter_version ? ` · v${String(ticket.chapter_version)}` : ""}；验收模式：{acceptanceModeLabel(String(ticket.acceptance_confirmation_mode || "per_chapter"))}；授权来源：{authorizationLabel(String(ticket.authorization_source || "none"))}</p>}<ol>{plan.map((step, index) => <li key={`${index}-${step}`}><span>计划 {index + 1} · {step}</span></li>)}</ol><p>{readableSourceText(run.summary)}</p>{planned?.dispatch_plan?.stop_conditions?.length ? <details><summary>停止条件</summary><ul>{planned.dispatch_plan.stop_conditions.map((item) => <li key={item}>{item}</li>)}</ul></details> : null}<small>{run.method === "project.ideate" ? "结果位置：新建小说窗口" : run.method === "provider.test" ? "结果位置：模型设置窗口" : "结果位置：中间对话区；生成文件可从左侧小说结构打开"}</small></article>;
   })}</div></div>;
 }
 
@@ -3050,7 +3187,7 @@ function ProcessPanelCompact({ events, collaboration, context, provider, workspa
     detailContent = <>
       <WorkflowProgressStrip runs={runs} />
       <LiveRunTimeline runs={runs} onOpenReference={onOpenReference} />
-      <section className="detail-section"><header><h4>真实调用与引用</h4><span>{traceRuns.length} 条</span></header>{traceRuns.length === 0 && <p className="empty-mini">完成一次写作、审查或记忆任务后显示。</p>}{traceRuns.slice(0, 10).map((traceRun) => <details className="run-card" key={traceRun.run_id}><summary><strong>{operationLabel(traceRun.operation)}</strong><span>{traceRun.status === "completed" ? "已完成" : traceRun.status === "failed" ? "未完成" : traceRun.status}</span></summary><p>{traceRun.summary}</p><div className="settings-inline-actions">{traceRun.trace_reference?.exists && <button type="button" onClick={() => void onOpenReference(traceRun.trace_reference!)}>打开运行记录</button>}</div><ol>{traceRun.events.map((step, index) => { const metadata = step.metadata || {}; const usageData = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; return <li key={`${step.timestamp}-${index}`}><div><strong>{step.stage}</strong> · {step.summary}</div><small>{formatTime(step.timestamp)} · {step.status}{metadata.model ? ` · ${String(metadata.model)}` : ""}{usageData ? ` · 输入 ${Number(usageData.prompt_tokens || usageData.input_tokens || 0).toLocaleString()} / 输出 ${Number(usageData.completion_tokens || usageData.output_tokens || 0).toLocaleString()}` : ""}</small>{step.details && <p>{step.details}</p>}{(step.references || []).length > 0 && <div className="settings-inline-actions">{(step.references || []).map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {reference.relative_path}</button>)}</div>}</li>; })}</ol></details>)}</section>
+      <section className="detail-section"><header><h4>真实调用与引用</h4><span>{traceRuns.length} 条</span></header>{traceRuns.length === 0 && <p className="empty-mini">完成一次写作、审查或记忆任务后显示。</p>}{traceRuns.slice(0, 10).map((traceRun) => <details className="run-card" key={traceRun.run_id}><summary><strong>{operationLabel(traceRun.operation)}</strong><span>{traceRun.status === "completed" ? "已完成" : traceRun.status === "failed" ? "未完成" : traceRun.status}</span></summary><p>{readableSourceText(traceRun.summary)}</p><div className="settings-inline-actions">{traceRun.trace_reference?.exists && <button type="button" onClick={() => void onOpenReference(traceRun.trace_reference!)}>打开运行记录</button>}</div><ol>{traceRun.events.map((step, index) => { const metadata = step.metadata || {}; const usageData = metadata.usage && typeof metadata.usage === "object" ? metadata.usage as Record<string, unknown> : null; return <li key={`${step.timestamp}-${index}`}><div><strong>{eventLabel(step.stage)}</strong> · {readableSourceText(step.summary)}</div><small>{formatTime(step.timestamp)} · {step.status}{metadata.model ? ` · ${String(metadata.model)}` : ""}{usageData ? ` · 输入 ${Number(usageData.prompt_tokens || usageData.input_tokens || 0).toLocaleString()} / 输出 ${Number(usageData.completion_tokens || usageData.output_tokens || 0).toLocaleString()}` : ""}</small>{step.details && <p>{readableSourceText(step.details)}</p>}{(step.references || []).length > 0 && <div className="settings-inline-actions">{(step.references || []).map((reference) => <button type="button" key={reference.absolute_path} disabled={!reference.exists} onClick={() => void onOpenReference(reference)}>打开 {documentLabel(reference.relative_path)}</button>)}</div>}</li>; })}</ol></details>)}</section>
     </>;
   } else if (detail === "tasks") {
     detailContent = <section className="detail-section">
@@ -3097,13 +3234,13 @@ function ProcessPanelCompact({ events, collaboration, context, provider, workspa
     </section>;
   } else if (detail === "agents") {
     detailContent = <>
-      <section className="detail-section"><header><h4>结构化消息</h4><span>{messages.length} 条</span></header>{messages.length === 0 && <p className="empty-mini">暂时没有需要处理的 Agent 消息。</p>}{messages.slice(0, 16).map((message) => <article className="detail-message" key={message.message_id}><div><strong>{agentRoleLabel(String(message.sender_role))} → {agentRoleLabel(String(message.recipient_role))}</strong><small>{formatTime(message.created_at)} · {collaborationStatusLabel(String(message.status))}</small></div><p>{message.claim}</p>{message.requested_response && <p className="detail-lead"><strong>要求返回：</strong>{message.requested_response}</p>}<details className="detail-disclosure"><summary>查看输入与证据</summary><dl className="message-audit-grid"><div><dt>章节版本</dt><dd>{message.chapter_no ? `第 ${message.chapter_no} 章${message.chapter_version ? ` · v${message.chapter_version}` : ""}` : "全局任务"}</dd></div><div><dt>Context Packet</dt><dd>{message.context_packet_id || "本步未绑定"}</dd></div><div><dt>输入 / 证据来源</dt><dd>{message.evidence_refs?.length ? message.evidence_refs.join("、") : "无额外文件引用"}</dd></div><div><dt>消息类型</dt><dd>{message.message_type}</dd></div></dl></details></article>)}</section>
+      <section className="detail-section"><header><h4>结构化消息</h4><span>{messages.length} 条</span></header>{messages.length === 0 && <p className="empty-mini">暂时没有需要处理的 Agent 消息。</p>}{messages.slice(0, 16).map((message) => <article className="detail-message" key={message.message_id}><div><strong>{agentRoleLabel(String(message.sender_role))} → {agentRoleLabel(String(message.recipient_role))}</strong><small>{formatTime(message.created_at)} · {collaborationStatusLabel(String(message.status))}</small></div><p>{message.claim}</p>{message.requested_response && <p className="detail-lead"><strong>要求返回：</strong>{message.requested_response}</p>}<details className="detail-disclosure"><summary>查看输入与证据</summary><dl className="message-audit-grid"><div><dt>章节版本</dt><dd>{message.chapter_no ? `第 ${message.chapter_no} 章${message.chapter_version ? ` · v${message.chapter_version}` : ""}` : "全局任务"}</dd></div><div><dt>输入资料</dt><dd>{message.context_packet_id ? "已绑定这一步使用的资料" : "本步未绑定额外资料"}</dd></div><div><dt>输入 / 证据来源</dt><dd>{message.evidence_refs?.length ? message.evidence_refs.map(reference => readableSourceText(reference)).join("、") : "无额外文件引用"}</dd></div><div><dt>消息类型</dt><dd>{message.message_type}</dd></div></dl></details></article>)}</section>
       <section className="detail-section"><header><h4>定向讨论</h4><span>{openThreads} 待处理</span></header>{threads.slice(0, 10).map((thread) => { const current = threadUpdates[String(thread.thread_id)] || thread; const active = ["open", "waiting"].includes(String(current.status)); return <article className="detail-thread" key={String(thread.thread_id)}><header><strong>{String(thread.topic)}</strong><span>{String(current.status)} · {String(current.current_round || 1)}/{String(current.max_rounds || 2)} 轮</span></header><p>{String(current.resolution || "等待目标 Agent 回答")}</p>{threadErrors[String(thread.thread_id)] && <p className="form-error" role="status">回应未完成：{threadErrors[String(thread.thread_id)]}。已有成果保留，可先查看任务记录中的恢复条件。</p>}{active && <button type="button" disabled={threadPending[String(thread.thread_id)]} onClick={() => void replyToThread(thread.thread_id)}>{threadPending[String(thread.thread_id)] ? "正在等待回应…" : "让目标 Agent 回答"}</button>}{threadErrors[String(thread.thread_id)] && <button type="button" onClick={() => onNavigate("project")}>查看恢复条件与任务记录</button>}{String(current.status) === "escalated" && <small>已交给 Coordinator 向你提出最小问题。</small>}</article>; })}</section>
     </>;
   } else if (detail === "context") {
     detailContent = <>
       <ContextCapacityCard value={context} />
-      {context && <section className="detail-section"><header><h4>预算分配</h4><span>输出预留 {Number((context as unknown as Record<string, unknown>).output_reserve_tokens || 0).toLocaleString()} tokens</span></header><div className="context-budget-list">{(context.budget_allocation || []).map((item) => <p key={item.key}><strong>{item.key} · {item.title}</strong><span>{item.estimated_tokens.toLocaleString()} tokens · {item.hard ? "固定保留" : "可压缩"} · {item.source_count} 来源</span></p>)}</div>{context.warnings.length > 0 && <ul className="detail-warning-list">{context.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}</section>}
+      {context && <section className="detail-section"><header><h4>预算分配</h4><span>输出预留 {Number((context as unknown as Record<string, unknown>).output_reserve_tokens || 0).toLocaleString()} tokens</span></header><div className="context-budget-list">{(context.budget_allocation || []).map((item) => <p key={item.key}><strong>{item.title}</strong><span>{item.estimated_tokens.toLocaleString()} tokens · {item.hard ? "固定保留" : "可压缩"} · {item.source_count} 来源</span></p>)}</div>{context.warnings.length > 0 && <ul className="detail-warning-list">{context.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}</section>}
       <button type="button" className="subtle-button" onClick={() => setDetail("retrieval")}>查看检索诊断 <span aria-hidden="true">→</span></button>
     </>;
   } else if (detail === "retrieval") {
@@ -3118,15 +3255,15 @@ function ProcessPanelCompact({ events, collaboration, context, provider, workspa
       </div>
       {retrieval && <p className="detail-lead">其余 {retrievalStats.notRetrieved} 条未取回，按相关性与本次预算筛选；初始上限 {retrieval.initial_top_k || 0} 条。下面仅展示前 {retrieval.discarded?.length || 0} 条原因，不是舍弃总数。</p>}
       {context?.warnings?.length ? <ul className="detail-warning-list">{context.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul> : null}
-      {retrieval?.adaptive_factors && <details className="detail-disclosure"><summary>查看筛选依据</summary><pre className="compact-json">{JSON.stringify(retrieval.adaptive_factors, null, 2)}</pre></details>}
-      {retrieval?.discarded?.length ? <details className="detail-disclosure"><summary>查看未取回候选的前 {retrieval.discarded.length} 条原因</summary><pre className="compact-json">{JSON.stringify(retrieval.discarded, null, 2)}</pre></details> : null}
+      {retrieval?.adaptive_factors && <details className="detail-disclosure"><summary>查看筛选依据</summary><p className="record-summary">{readableRecord(displaySafeValue(retrieval.adaptive_factors))}</p></details>}
+      {retrieval?.discarded?.length ? <details className="detail-disclosure"><summary>查看未取回候选的前 {retrieval.discarded.length} 条原因</summary><p className="record-summary">{readableRecord(displaySafeValue(retrieval.discarded))}</p></details> : null}
     </section>;
   } else if (detail === "canon") {
-    detailContent = <section className="detail-section"><header><h4>正史入口</h4><span>验收后提交</span></header><p className="detail-lead">记忆服务 只读取已接受正文，先生成补丁预览，再经过事务提交。</p><div className="detail-metrics"><DetailMetric label="已接受章节" value={String(workspace?.accepted_chapters ?? workspace?.acceptedChapterCount ?? "—")} /><DetailMetric label="开放线索" value={String(workspace?.open_threads ?? "—")} /></div><button type="button" className="subtle-button" onClick={() => onNavigate("memory")}>打开正史与记忆 <span aria-hidden="true">→</span></button></section>;
+    detailContent = <section className="detail-section"><header><h4>正史入口</h4><span>验收后提交</span></header><p className="detail-lead">记忆服务 只读取已接受正文，先生成补丁预览，再经过事务提交。</p><div className="detail-metrics"><DetailMetric label="已接受章节" value={String(workspace?.accepted_chapters ?? workspace?.acceptedChapterCount ?? "—")} /><DetailMetric label="开放线索" value={String(workspace?.open_threads ?? "—")} /></div><button type="button" className="subtle-button" onClick={() => onNavigate("review")}>查看本章审查与记忆交接 <span aria-hidden="true">→</span></button></section>;
   } else if (detail === "versions") {
     detailContent = <section className="detail-section"><header><h4>版本入口</h4><span>保留旧版</span></header><p className="detail-lead">新草稿生成新版本；正文、审查和差异查看在各自工作区完成。</p><div className="detail-link-grid"><button type="button" onClick={() => onNavigate("editor")}>正文与草稿 <span aria-hidden="true">→</span></button><button type="button" onClick={() => onNavigate("review")}>审查与差异 <span aria-hidden="true">→</span></button></div></section>;
   } else if (detail === "learning") {
-    detailContent = <section className="detail-section"><header><h4>反馈记录</h4><span>{learning.length} 条</span></header>{learning.length === 0 && <p className="empty-mini">完成接受、拒绝或重写后，这里会出现反馈。</p>}{learning.slice(0, 20).map((item) => <article className="detail-list-row" key={item.event_id}><div><strong>{learningLabel(item.event_type)}{item.chapter_no ? ` · 第 ${item.chapter_no} 章` : ""}</strong><small>{formatTime(item.created_at)}</small></div><details><summary>数据</summary><pre className="compact-json">{JSON.stringify(item.payload, null, 2)}</pre></details></article>)}</section>;
+    detailContent = <section className="detail-section"><header><h4>反馈记录</h4><span>{learning.length} 条</span></header>{learning.length === 0 && <p className="empty-mini">完成接受、拒绝或重写后，这里会出现反馈。</p>}{learning.slice(0, 20).map((item) => <article className="detail-list-row" key={item.event_id}><div><strong>{learningLabel(item.event_type)}{item.chapter_no ? ` · 第 ${item.chapter_no} 章` : ""}</strong><small>{formatTime(item.created_at)}</small></div><details><summary>数据</summary><p className="record-summary">{readableRecord(displaySafeValue(item.payload))}</p></details></article>)}</section>;
   } else if (detail === "usage") {
     detailContent = <><CacheSummary usage={usage} /><section className="detail-section"><header><h4>运行环境</h4><span>{String(provider?.model || "未配置")}</span></header><div className="detail-metrics"><DetailMetric label="已记录调用次数" value={usage?.calls || 0} /><DetailMetric label="已记录总 Token" value={(usage?.total_tokens || 0).toLocaleString()} /></div><CostSummary usage={usage} /><p className="detail-lead">历史缓存统计来自运行记录，新费用账本从启用后逐请求记录；服务商未回报时显示“未知”，不会把未知当成未命中。</p></section></>;
   }
@@ -3144,8 +3281,7 @@ function ProcessPanelCompact({ events, collaboration, context, provider, workspa
       <ProcessSummaryCard icon="⌁" title="检索" value={retrieval ? `+${retrievalStats.added}` : "—"} status={retrieval ? `${retrievalStats.retrieved} 条取回 · ${retrievalStats.alreadyLoaded} 条已在上下文` : "等待编译"} onOpen={() => setDetail("retrieval")} />
       <ProcessSummaryCard icon="▣" title="正史" value="预览" status="验收后提交" onOpen={() => setDetail("canon")} />
       <ProcessSummaryCard icon="⇄" title="版本" value="保留" status="正文区查看" onOpen={() => setDetail("versions")} />
-      <ProcessSummaryCard icon="✦" title="学习" value={learning.length} status={learning.length ? "有新反馈" : "等待反馈"} onOpen={() => setDetail("learning")} />
-      <ProcessSummaryCard icon="◐" title="调用" value={usage?.calls || 0} status={usage?.recent_deepseek_cache?.hit_rate != null ? `最近 ${Math.round(usage.recent_deepseek_cache.hit_rate * 100)}% 缓存` : "查看统计"} onOpen={() => setDetail("usage")} />
+      <ProcessSummaryCard icon="◐" title="调用" value={usage?.calls || 0} status={usage?.current_model_cache?.available ? "分接口与模型观察" : "查看统计"} onOpen={() => setDetail("usage")} />
     </div>
     {detail && <ProcessDetailPane title={detailTitle[detail]} subtitle={detailSubtitle[detail]} onBack={() => setDetail(null)} detailRef={detailRef}>{detailContent}</ProcessDetailPane>}
   </div>;
@@ -3276,14 +3412,25 @@ type CreationPreset = {
   context_soft_tokens: number;
   context_hard_tokens: number;
   review_verification_mode: string;
-  agent_generation: Pick<AgentGenerationProfiles, EverydayAgentRole>;
+  agent_generation: AgentGenerationProfiles;
+  agent_context_budgets: AgentContextBudgets;
+};
+
+type ModelParameterCapabilities = {
+  reasoning_effort?: boolean;
+  reasoning_effort_map?: Record<string, string>;
+  sampling_parameters?: Partial<Record<"temperature" | "top_p" | "top_k", boolean>>;
+  sampling_without_reasoning_only?: boolean;
+  sampling_constraints?: { temperature?: number[]; top_p?: number[]; thinking_temperature?: number; thinking_top_p?: number; thinking_temperature_ignored?: boolean; thinking_top_p_min?: number; non_thinking_top_p?: number };
 };
 
 const SETTINGS_PRESETS: CreationPreset[] = [
-  { id: "balanced", name: "专业均衡", note: "适合多数长篇项目", reasoning_effort: "high", inquiry_frequency: "medium", context_soft_tokens: 256000, context_hard_tokens: 512000, review_verification_mode: "evidence", agent_generation: DEFAULT_AGENT_GENERATION },
-  { id: "stable", name: "稳健连载", note: "降低发散，优先连续与证据", reasoning_effort: "high", inquiry_frequency: "high", context_soft_tokens: 384000, context_hard_tokens: 512000, review_verification_mode: "assisted", agent_generation: { coordinator: { temperature: 0.15, top_p: 0.72, top_k: null }, writer: { temperature: 0.62, top_p: 0.88, top_k: null }, editor: { temperature: 0.1, top_p: 0.65, top_k: null } } },
-  { id: "explore", name: "灵感探索", note: "构思与正文保留更大空间", reasoning_effort: "max", inquiry_frequency: "medium", context_soft_tokens: 384000, context_hard_tokens: 512000, review_verification_mode: "evidence", agent_generation: { coordinator: { temperature: 0.35, top_p: 0.9, top_k: null }, writer: { temperature: 1.05, top_p: 0.98, top_k: null }, editor: { temperature: 0.22, top_p: 0.8, top_k: null } } },
-  { id: "economy", name: "节省模式", note: "缩小上下文和额外核验", reasoning_effort: "medium", inquiry_frequency: "low", context_soft_tokens: 128000, context_hard_tokens: 256000, review_verification_mode: "evidence", agent_generation: { coordinator: { temperature: 0.2, top_p: 0.75, top_k: null }, writer: { temperature: 0.72, top_p: 0.9, top_k: null }, editor: { temperature: 0.12, top_p: 0.7, top_k: null } } },
+  { id: "economy", name: "节省", note: "直接相关资料；写作与协调直答，审核思考", reasoning_effort: "medium", inquiry_frequency: "low", context_soft_tokens: 160000, context_hard_tokens: 256000, review_verification_mode: "evidence", agent_generation: { ...DEFAULT_AGENT_GENERATION, writer: { temperature: 0.8, top_p: 0.85, top_k: null }, editor: { temperature: 0.15, top_p: 0.75, top_k: null } },
+    agent_context_budgets: { coordinator: { soft: 80000, hard: 128000 }, writer: { soft: 160000, hard: 256000 }, editor: { soft: 160000, hard: 256000 }, reviewer: { soft: 128000, hard: 192000 }, memory_keeper: { soft: 128000, hard: 208000 } } },
+  { id: "balanced", name: "平衡", note: "你的容量基准；各角色思考，双倍等待", reasoning_effort: "high", inquiry_frequency: "low", context_soft_tokens: 384000, context_hard_tokens: 512000, review_verification_mode: "assisted", agent_generation: { ...DEFAULT_AGENT_GENERATION, writer: { temperature: 1, top_p: 0.9, top_k: null }, editor: { temperature: 0.15, top_p: 0.75, top_k: null } },
+    agent_context_budgets: { coordinator: { soft: 160000, hard: 278000 }, writer: { soft: 256000, hard: 460000 }, editor: { soft: 240000, hard: 384000 }, reviewer: { soft: 192000, hard: 256000 }, memory_keeper: { soft: 208000, hard: 320000 } } },
+  { id: "quality", name: "高质量", note: "关联前文必读；各角色思考，不限生成时间", reasoning_effort: "max", inquiry_frequency: "medium", context_soft_tokens: 384000, context_hard_tokens: 640000, review_verification_mode: "assisted", agent_generation: { ...DEFAULT_AGENT_GENERATION, writer: { temperature: 1, top_p: 0.95, top_k: null }, editor: { temperature: 0.1, top_p: 0.7, top_k: null }, reviewer: { temperature: 0.1, top_p: 0.7, top_k: null }, memory_keeper: { temperature: 0.1, top_p: 0.7, top_k: null } },
+    agent_context_budgets: { coordinator: { soft: 192000, hard: 320000 }, writer: { soft: 384000, hard: 640000 }, editor: { soft: 320000, hard: 512000 }, reviewer: { soft: 288000, hard: 448000 }, memory_keeper: { soft: 320000, hard: 512000 } } },
 ];
 
 const PROVIDER_OPTIONS = [
@@ -3297,18 +3444,17 @@ const PROVIDER_OPTIONS = [
   { id: "custom", name: "自定义", note: "其他 OpenAI 兼容服务", baseUrl: "", models: [] },
 ] as const;
 
-type SettingsSection = "story_settings" | "author" | "appearance" | "layout" | "models" | "creation" | "voice" | "context" | "review" | "learning" | "advanced";
+type SettingsSection = "story_settings" | "author" | "appearance" | "models" | "creation" | "voice" | "context" | "review" | "repair" | "advanced";
 const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string; note: string }> = [
   { id: "story_settings", label: "本书设定", note: "人物、场景、道具与自定义资料模块" },
   { id: "author", label: "作者习惯与记忆", note: "跨书习惯、本书偏好和来源历史" },
   { id: "appearance", label: "外观", note: "主题、配色与密度" },
-  { id: "layout", label: "布局", note: "面板、位置与宽度" },
   { id: "models", label: "模型", note: "连接、参数与效率" },
   { id: "creation", label: "创作", note: "预设、询问与预填" },
   { id: "voice", label: "语音", note: "输入、朗读与设备" },
   { id: "context", label: "上下文", note: "预算与记忆检索" },
   { id: "review", label: "审查", note: "证据与核验方式" },
-  { id: "learning", label: "学习", note: "本地反馈与内测数据" },
+  { id: "repair", label: "版本修复", note: "版本、连接与组件状态" },
   { id: "advanced", label: "高级", note: "本机开发能力" },
 ];
 
@@ -3349,21 +3495,54 @@ function agentContextBudgetsFromProvider(value: unknown): AgentContextBudgets {
   })) as AgentContextBudgets;
 }
 
-function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, layout, preferences, onLayoutChange, onLayoutPreset, onPreferencesChange, onClose, onSaved, onVoiceSaved }: {
+function modelSettingsForm(provider: Record<string, unknown> | null) {
+  return { request_timeout_seconds: Number(provider?.request_timeout_seconds ?? 180), planning_timeout_seconds: Number(provider?.planning_timeout_seconds ?? 600), collaboration_preset: String(provider?.collaboration_preset || "everyday"), quality_preset: String(provider?.quality_preset || "custom"), quality_custom_context: provider?.quality_custom_context !== false, provider_kind: String(provider?.provider_kind || "deepseek"), api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), hook_strategy: String(provider?.hook_strategy || "most_chapters"), chapter_length_tolerance: Number(provider?.chapter_length_tolerance ?? 0.1), review_min_confidence: Number(provider?.review_min_confidence ?? 0.8), acceptance_confirmation_mode: String(provider?.acceptance_confirmation_mode || "auto_after_review"), planning_publication_mode: String(provider?.planning_publication_mode || "auto_after_review"), planning_window_chapters: Number(provider?.planning_window_chapters ?? 10), dialogue_history_mode: String(provider?.dialogue_history_mode || "auto"), dialogue_history_interval: Number(provider?.dialogue_history_interval || 1), dialogue_history_limit: Number(provider?.dialogue_history_limit || 100), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), context_budget_mode: String(provider?.context_budget_mode || "unified"), agent_context_budgets: agentContextBudgetsFromProvider(provider?.agent_context_budgets), max_output_tokens: Number(provider?.max_output_tokens || 32000), automatic_output_tokens: provider?.automatic_output_tokens === true, input_price_per_million: Number(provider?.input_price_per_million || 0), output_price_per_million: Number(provider?.output_price_per_million || 0), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_experience_detail: String(provider?.review_experience_detail || "standard"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), manual_edit_review_enabled: provider?.manual_edit_review_enabled !== false, agent_generation: agentGenerationFromProvider(provider?.agent_generation), role_models: roleModelsFromProvider(provider?.role_models) };
+}
+
+function SuggestionShortcutSettings({ preferences, onChange }: { preferences: UiPreferences; onChange: (patch: Partial<UiPreferences>) => void }) {
+  const [recording, setRecording] = useState(false);
+  const [feedback, setFeedback] = useState("");
+  useEffect(() => setRecording(false), [preferences.suggestionShortcut, preferences.suggestionShortcutEnabled]);
+  return <div className="suggestion-shortcut-settings">
+    <label className="setting-check"><input type="checkbox" checked={preferences.suggestionShortcutEnabled} disabled={!preferences.suggestionShortcut} onChange={event => onChange({ suggestionShortcutEnabled: event.target.checked })} />快捷键填入第一条建议 <small>只在显示下一步提示词时生效</small></label>
+    <div className="settings-inline-actions"><span>当前键位：<kbd>{suggestionShortcutLabel(preferences.suggestionShortcut)}</kbd></span><button type="button" aria-pressed={recording} onBlur={() => setRecording(false)} onClick={() => { setFeedback(""); setRecording(value => !value); }} onKeyDown={event => {
+      if (!recording || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+      if (event.key === "Tab") { setRecording(false); return; }
+      event.preventDefault(); event.stopPropagation();
+      if (event.repeat) return;
+      if (event.key === "Escape") { setRecording(false); setFeedback("已取消录制，原键位保留。"); return; }
+      if (["Control", "Alt", "Shift", "Meta"].includes(event.key)) return;
+      const shortcut = suggestionShortcutFromKey(event.nativeEvent);
+      if (!shortcut) { setFeedback("请用 Ctrl、Alt 或 Meta 搭配字母、数字或功能键。Enter 组合只支持 Alt+Enter，常用编辑键和系统保留键不能使用。"); return; }
+      onChange({ suggestionShortcut: shortcut, suggestionShortcutEnabled: true });
+      setRecording(false); setFeedback(`已保存 ${suggestionShortcutLabel(shortcut)}；回到聊天区后只填入建议。`);
+    }}>{recording ? "请按新的组合键…" : preferences.suggestionShortcut ? "更改键位" : "录制快捷键"}</button><button type="button" disabled={!preferences.suggestionShortcut && !recording} onClick={() => { setRecording(false); onChange({ suggestionShortcut: "", suggestionShortcutEnabled: false }); setFeedback("快捷键已清空并停用，建议按钮仍可使用。"); }}>清空并停用</button></div>
+    <p className="form-hint">默认 Alt+Enter。已有未发送内容时不覆盖；填入后由你检查并发送。录制时按 Esc 取消；未设置键位时须先录制。</p>
+    {feedback && <p className="form-hint" role="status">{feedback}</p>}
+  </div>;
+}
+
+function SettingsDialog({ initialSection = "appearance", projectRoot, provider, voiceSettings, voiceStatus, preferences, onPreferencesChange, onClose, onSaved, onVoiceSaved }: {
+  initialSection?: SettingsSection;
   projectRoot: string;
   provider: Record<string, unknown> | null;
   voiceSettings: VoiceSettings | null;
   voiceStatus: VoiceStatus | null;
-  layout: WorkspaceLayout;
   preferences: UiPreferences;
-  onLayoutChange: (change: Partial<WorkspaceLayout>) => void;
-  onLayoutPreset: (preset: WorkspacePreset) => void;
   onPreferencesChange: (value: UiPreferences | ((current: UiPreferences) => UiPreferences)) => void;
   onClose: () => void;
   onSaved: (value: Record<string, unknown>) => void;
   onVoiceSaved: (settings: VoiceSettings, status: VoiceStatus) => void;
 }) {
-  const [form, setForm] = useState({ provider_kind: String(provider?.provider_kind || "deepseek"), api_key: "", base_url: String(provider?.base_url || "https://api.deepseek.com"), model: String(provider?.model || "deepseek-v4-flash"), reasoning_effort: String(provider?.reasoning_effort || "high"), inquiry_frequency: String(provider?.inquiry_frequency || "medium"), hook_strategy: String(provider?.hook_strategy || "most_chapters"), chapter_length_tolerance: Number(provider?.chapter_length_tolerance ?? 0.1), review_min_confidence: Number(provider?.review_min_confidence ?? 0.8), acceptance_confirmation_mode: String(provider?.acceptance_confirmation_mode || "auto_after_review"), planning_publication_mode: String(provider?.planning_publication_mode || "auto_after_review"), planning_window_chapters: Number(provider?.planning_window_chapters ?? 10), dialogue_history_mode: String(provider?.dialogue_history_mode || "auto"), dialogue_history_interval: Number(provider?.dialogue_history_interval || 1), dialogue_history_limit: Number(provider?.dialogue_history_limit || 100), context_soft_tokens: Number(provider?.context_soft_tokens || 256000), context_hard_tokens: Number(provider?.context_hard_tokens || 512000), context_budget_mode: String(provider?.context_budget_mode || "unified"), agent_context_budgets: agentContextBudgetsFromProvider(provider?.agent_context_budgets), max_output_tokens: Number(provider?.max_output_tokens || 32000), input_price_per_million: Number(provider?.input_price_per_million || 0), output_price_per_million: Number(provider?.output_price_per_million || 0), review_verification_mode: String(provider?.review_verification_mode || "evidence"), review_experience_detail: String(provider?.review_experience_detail || "standard"), review_local_nli_model: String(provider?.review_local_nli_model || ""), review_judge_model: String(provider?.review_judge_model || ""), retrieval_embedding_model: String(provider?.retrieval_embedding_model || ""), retrieval_reranker_model: String(provider?.retrieval_reranker_model || ""), powershell_enabled: Boolean(provider?.powershell_enabled), manual_edit_review_enabled: provider?.manual_edit_review_enabled !== false, agent_generation: agentGenerationFromProvider(provider?.agent_generation), role_models: roleModelsFromProvider(provider?.role_models) });
+  const [form, setForm] = useState(() => modelSettingsForm(provider));
+  const modelBaseline = useRef(modelSettingsForm(provider));
+  useEffect(() => {
+    if (!provider) return;
+    const previous = modelBaseline.current;
+    const incoming = modelSettingsForm(provider);
+    modelBaseline.current = incoming;
+    setForm(current => mergeSettings(incoming, settingsDiff(current, previous)));
+  }, [provider]);
   const [voiceForm, setVoiceForm] = useState<VoiceSettings>(voiceSettings || {
     voice_enabled: false, voice_input_enabled: true, voice_output_enabled: true, voice_auto_read: false, voice_auto_send: false,
     voice_default_profile: "narrator_female", voice_speed: 1, voice_volume: 1, voice_pause_scale: 1, voice_input_device: "", voice_output_device: "",
@@ -3373,18 +3552,18 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   const [error, setError] = useState("");
   const [working, setWorking] = useState(false);
   const [result, setResult] = useState("");
-  const [section, setSection] = useState<SettingsSection>("appearance");
+  const [section, setSection] = useState<SettingsSection>(initialSection);
   const [search, setSearch] = useState("");
   const [remoteModels, setRemoteModels] = useState<string[]>([]);
-  const [learningSettings, setLearningSettings] = useState({ enabled: true });
-  const [learningNotice, setLearningNotice] = useState("");
+  const [keyRevision, setKeyRevision] = useState(0);
   const [voiceDevices, setVoiceDevices] = useState<MediaDeviceInfo[]>([]);
   const [mossInstalling, setMossInstalling] = useState(false);
   const [edgeInstalling, setEdgeInstalling] = useState(false);
   const [asrInstalling, setAsrInstalling] = useState(false);
   const [voiceDeleting, setVoiceDeleting] = useState(false);
+  const [voiceMoving, setVoiceMoving] = useState(false);
   const [usageSummary, setUsageSummary] = useState<CollaborationOverview["usage"] | null>(null);
-  const [limitPreview, setLimitPreview] = useState<{ model_limits?: { context_tokens?: number; max_output_tokens?: number }; role_output_limits?: Partial<Record<AgentRole, { model_limits: { context_tokens?: number; max_output_tokens?: number } }>>; capabilities?: { reasoning_effort?: boolean; top_k?: boolean; sampling_constraints?: { temperature?: number[]; top_p?: number[]; thinking_temperature?: number; thinking_top_p?: number } } } | null>(null);
+  const [limitPreview, setLimitPreview] = useState<{ model_limits?: { context_tokens?: number; max_output_tokens?: number }; role_output_limits?: Partial<Record<AgentRole, { model_limits: { context_tokens?: number; max_output_tokens?: number }; capabilities?: ModelParameterCapabilities }>>; capabilities?: ModelParameterCapabilities } | null>(null);
   const [limitPreviewError, setLimitPreviewError] = useState("");
   const roleModelsKey = JSON.stringify(form.role_models);
   useEffect(() => {
@@ -3403,13 +3582,6 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   const settingsSaveInFlightRef = useRef(false);
   const voiceFormDirtyRef = useRef(false);
   const initialVoiceSettingsRef = useRef<VoiceSettings | null>(voiceSettings);
-  const learningSettingsDirtyRef = useRef(false);
-  useEffect(() => {
-    if (!projectRoot) return;
-    void window.inkflow.request<{ enabled: boolean }>("learning.settings.get", { project_root: projectRoot }).then((value) => {
-      if (!learningSettingsDirtyRef.current) setLearningSettings(value);
-    }).catch(() => undefined);
-  }, [projectRoot]);
   useEffect(() => {
     if (!projectRoot) { setUsageSummary(null); return; }
     void window.inkflow.request<CollaborationOverview["usage"]>("usage.overview", { project_root: projectRoot })
@@ -3499,12 +3671,20 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
   // 所有设置控件都用函数式更新，连续点击或拖动时不会拿到上一次渲染的旧值。
   const updateForm = (patch: Partial<typeof form>) => setForm((value) => ({ ...value, ...patch }));
   const updatePreferences = (patch: Partial<UiPreferences>) => onPreferencesChange((value) => ({ ...value, ...patch }));
-  const updateLearningSettings = (patch: Partial<typeof learningSettings>) => {
-    learningSettingsDirtyRef.current = true;
-    setLearningSettings((value) => ({ ...value, ...patch }));
-  };
   const updateAgentGeneration = (role: AgentRole, patch: Partial<AgentGeneration>) => setForm((value) => ({ ...value, agent_generation: { ...value.agent_generation, [role]: { ...value.agent_generation[role], ...patch } } }));
   const updateAgentContextBudget = (role: AgentRole, patch: Partial<{ soft: number; hard: number }>) => setForm((value) => ({ ...value, agent_context_budgets: { ...value.agent_context_budgets, [role]: { ...value.agent_context_budgets[role], ...patch } } }));
+  const saveProvider = async () => {
+    if (!provider) throw new Error("模型设置尚未读取完成，请稍后保存。");
+    const submitted = { ...form, automatic_output_tokens: true };
+    await withDeadline(window.inkflow.request<Record<string, unknown>>("provider.configure", settingsDiff(submitted, modelBaseline.current)), 15000, "保存未及时返回，请重新打开设置核对。");
+    const actual = await window.inkflow.request<Record<string, unknown>>("provider.status", {});
+    const incoming = modelSettingsForm(actual);
+    modelBaseline.current = incoming;
+    setForm(current => mergeSettings(incoming, settingsDiff(current, submitted)));
+    setKeyRevision(value => value + 1);
+    onSaved(actual);
+    return actual;
+  };
   const persist = async () => {
     if (settingsSaveInFlightRef.current) return;
     settingsSaveInFlightRef.current = true;
@@ -3528,19 +3708,10 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
         }
       }
       try {
-        const saved = await withDeadline(window.inkflow.request<Record<string, unknown>>("provider.configure", { ...form }), 15000, "本机保存没有及时返回。请重新打开设置核对保存结果后再试。");
-        setForm((value) => ({ ...value, api_key: "" }));
-        onSaved({ ...provider, ...saved });
+        await saveProvider();
+
       } catch (cause) {
-        failures.push(`模型设置未更新：${errorMessage(cause)}`);
-      }
-      if (projectRoot) {
-        try {
-          await withDeadline(window.inkflow.request("learning.settings.update", { project_root: projectRoot, ...learningSettings }), 15000, "学习设置保存超时，请重新打开设置核对。");
-          learningSettingsDirtyRef.current = false;
-        } catch (cause) {
-          failures.push(`学习设置未更新：${errorMessage(cause)}`);
-        }
+        failures.push(`模型设置：${errorMessage(cause)}`);
       }
       setResult(failures.length ? `已尝试保存；${failures.join("；")}` : "设置已保存。");
     } catch (cause) {
@@ -3551,18 +3722,23 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
       setWorking(false);
     }
   };
-  const saveModelSettings = async () => {
+  const saveModelSettings = async (probe = false) => {
     if (settingsSaveInFlightRef.current) return;
     settingsSaveInFlightRef.current = true;
     setWorking(true); setError(""); setResult("");
     try {
-      const saved = await withDeadline(window.inkflow.request<Record<string, unknown>>("provider.configure", { ...form }), 15000, "本机保存没有及时返回。请重新打开设置核对保存结果后再试。");
-      setForm((value) => ({ ...value, api_key: "" }));
-      onSaved({ ...provider, ...saved });
+      await saveProvider();
+
+      if (probe) {
+        const checked = await withDeadline(window.inkflow.request<{ connected: boolean; message: string }>("provider.test", { project_root: projectRoot }), 65000, "生成连接检查超时，请查看本次连接记录。");
+        if (!checked.connected) throw new Error(checked.message);
+        setResult(checked.message);
+        return;
+      }
       try {
         const value = await withDeadline(window.inkflow.request<{ models: string[] }>("provider.models", {}), 15000, "读取模型列表超时");
         setRemoteModels(value.models);
-        setResult(`模型设置已保存，读取到 ${value.models.length} 个模型。`);
+        setResult(`设置已保存，列表含 ${value.models.length} 个模型；生成连接尚未验证。`);
       } catch (cause) {
         setResult(`模型设置已保存；模型列表暂时读取失败，可直接使用已填写的模型名称。原因：${errorMessage(cause)}`);
       }
@@ -3573,29 +3749,28 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
       setWorking(false);
     }
   };
-  const activePreset = SETTINGS_PRESETS.find((preset) => preset.reasoning_effort === form.reasoning_effort && preset.inquiry_frequency === form.inquiry_frequency && preset.context_soft_tokens === form.context_soft_tokens && preset.context_hard_tokens === form.context_hard_tokens)?.id;
+  const activePreset = form.quality_custom_context || form.quality_preset === "custom" ? "custom" : form.quality_preset;
   const inferredProvider = form.provider_kind;
-  const settingKeywords: Record<SettingsSection, string> = { story_settings: "本书 设定 人物 场景 道具 世界 模板 资料 记录 证据 分类", author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", layout: "布局 面板 宽度 左右", models: "模型 服务商 API 密钥 价格 费用 能力 列表", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", learning: "学习 反馈 偏好 恢复 经验", advanced: "高级 temperature top p top k PowerShell" };
+  const settingKeywords: Record<SettingsSection, string> = { story_settings: "本书 设定 人物 场景 道具 世界 模板 资料 记录 证据 分类", author: "作者 习惯 偏好 记忆 跨书 来源 历史 满意", appearance: "主题 黑白 系统 配色 颜色 密度", models: "模型 服务商 API 密钥 价格 费用 能力 列表 等待 超时 秒数", creation: "创作 预设 询问 预填 续写 验收 确认 自动 近期规划 章节数 智能提示词 下一步 建议 快捷键 键位 录制", voice: "语音 普通话 朗读 麦克风 声音 克隆 设备 TTS ASR", context: "上下文 token 检索 RAG embedding reranker top k", review: "审查 Reviewer 证据 NLI 裁判 多维", repair: "版本 修复 引擎 连接 组件 更新", advanced: "高级 temperature top p top k PowerShell" };
   const visibleSections = SETTINGS_SECTIONS.filter((item) => `${item.label}${item.note}${settingKeywords[item.id]}`.toLowerCase().includes(search.trim().toLowerCase()));
   const chooseProvider = (id: string) => {
     const choice = PROVIDER_OPTIONS.find((item) => item.id === id);
-    if (!choice) return;
+    if (!choice || id === form.provider_kind) return;
     setRemoteModels([]);
-    setForm((value) => ({ ...value, provider_kind: id, base_url: choice.baseUrl || value.base_url, model: Array.from(choice.models)[0] || value.model }));
+    setForm((value) => ({ ...value, provider_kind: id, base_url: choice.baseUrl || value.base_url, model: Array.from(choice.models)[0] || value.model, api_key: "" }));
   };
   const applyCreationPreset = (preset: CreationPreset) => setForm((value) => ({
     ...value,
+    quality_preset: preset.id,
+    quality_custom_context: false,
     reasoning_effort: preset.reasoning_effort,
     inquiry_frequency: preset.inquiry_frequency,
     context_soft_tokens: preset.context_soft_tokens,
     context_hard_tokens: preset.context_hard_tokens,
     review_verification_mode: preset.review_verification_mode,
-    agent_generation: {
-      ...value.agent_generation,
-      coordinator: { ...preset.agent_generation.coordinator },
-      writer: { ...preset.agent_generation.writer },
-      editor: { ...preset.agent_generation.editor },
-    },
+    context_budget_mode: "custom",
+    agent_context_budgets: structuredClone(preset.agent_context_budgets),
+    agent_generation: structuredClone(preset.agent_generation),
   }));
   const updateVoiceForm = (patch: Partial<VoiceSettings>) => {
     voiceFormDirtyRef.current = true;
@@ -3611,18 +3786,37 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
     }
   };
   const installEdge = async () => {
-    const confirmed = await window.inkflow.confirm("将安装 Edge 在线语音连接组件及少量依赖，不下载语音模型。朗读时会上传选中的文字，音频返回后保存在本机；安装不会自动把任何功能切换到 Edge。确认安装吗？");
+    const confirmed = await window.inkflow.confirm("更新或安装 Edge 在线朗读连接组件及少量依赖，缓存放在本机专用目录；录音和声音档案保留，不下载语音模型。朗读时会上传选中的文字，音频返回本机。确认继续吗？");
     if (!confirmed) return;
     setEdgeInstalling(true); setError("");
     try {
       const status = await window.inkflow.request<VoiceStatus>("voice.edge.install", { confirmation: "install_edge_online_voice" });
       onVoiceSaved(voiceSettings || initialVoiceSettingsRef.current || voiceForm, status);
-      setResult(status.edge?.installed ? "Edge 连接组件已安装；请单独选择要由它朗读的功能。" : "Edge 连接组件已在后台安装，可以关闭设置继续使用墨流。完成后会通知你。");
+      setResult(status.edge?.installing ? "Edge 连接组件正在后台更新，完成后会通知你。" : status.edge?.connection_ready ? "Edge 连接组件已准备好。" : "连接组件更新未完成，请查看下面的具体进度。");
       setEdgeInstalling(Boolean(status.edge?.installing));
     } catch (cause) {
       setEdgeInstalling(false);
       setError(errorMessage(cause));
     }
+  };
+  const moveVoiceStorage = async () => {
+    const parent = await window.inkflow.chooseFolder("选择新的语音资料存放磁盘或文件夹");
+    if (!parent) return;
+    const destination = `${parent.replace(/[\\/]+$/, "")}/InkFlow-voice`;
+    if (!await window.inkflow.confirm(`把语音资料、已安装模型和连接组件复制到 ${destination}？核对后切换使用新位置，原目录保留。录音或更新正在进行时暂不迁移。`)) return;
+    setVoiceMoving(true); setError(""); setResult("正在复制并核对语音资料，完成前请暂缓录音与朗读…");
+    try {
+      const value = await window.inkflow.request<{ settings: VoiceSettings; status: VoiceStatus; message: string }>("voice.storage.move", { destination, confirmation: "move_voice_storage" });
+      const previous = initialVoiceSettingsRef.current || voiceSettings || voiceForm;
+      initialVoiceSettingsRef.current = value.settings;
+      setVoiceForm(current => {
+        const merged = mergeSettings(value.settings, settingsDiff(current, previous));
+        voiceFormDirtyRef.current = Object.keys(settingsDiff(merged, value.settings)).length > 0;
+        return merged;
+      });
+      onVoiceSaved(value.settings, value.status); setResult(value.message);
+    } catch (cause) { setResult(""); setError(errorMessage(cause)); }
+    finally { setVoiceMoving(false); }
   };
   const installMoss = async () => {
     const moss = voiceStatus?.moss;
@@ -3693,13 +3887,19 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
     ? form.agent_context_budgets[role]
     : { soft: form.context_soft_tokens, hard: form.context_hard_tokens };
   const modelLimits = limitPreview?.model_limits;
-  const unsupportedEffort = form.provider_kind === "mimo" || limitPreview?.capabilities?.reasoning_effort === false;
-  const sampling = limitPreview?.capabilities?.sampling_constraints;
-  const temperatureCeiling = sampling?.temperature?.[1] ?? (form.provider_kind === "mimo" ? 1.5 : 2);
-  const outputCeiling = Math.min(form.context_hard_tokens, modelLimits?.max_output_tokens ?? Infinity);
+  const roleCapabilities = (role: AgentRole) => limitPreview?.role_output_limits?.[role]?.capabilities ?? limitPreview?.capabilities;
+  const unsupportedEffort = AGENT_TUNING_META.every(meta => roleCapabilities(meta.id)?.reasoning_effort === false);
+  const effortLabel = (value: string) => {
+    const labels: Record<string, string> = { low: "低", medium: "中", high: "高", max: "最高" };
+    const actual = [...new Set(AGENT_TUNING_META.flatMap(meta => {
+      const capabilities = roleCapabilities(meta.id);
+      return capabilities?.reasoning_effort ? [capabilities.reasoning_effort_map?.[value] || value] : [];
+    }))];
+    return actual.length === 1 && actual[0] !== value ? `${labels[value]}（当前模型按${labels[actual[0]] || actual[0]}执行）` : labels[value];
+  };
   const roleLimits = (role: AgentRole) => limitPreview?.role_output_limits?.[role]?.model_limits;
-  const roleOutput = (role: AgentRole) => Math.min(form.max_output_tokens, roleBudget(role).hard,
-    roleLimits(role)?.context_tokens ?? Infinity, roleLimits(role)?.max_output_tokens ?? Infinity);
+  const roleOutput = (role: AgentRole) => Math.min(roleBudget(role).hard,
+    roleLimits(role)?.context_tokens ?? Infinity, roleLimits(role)?.max_output_tokens ?? form.max_output_tokens);
   const limitPreviewWarning = limitPreviewError && <p className="form-error" role="status">模型额度预览未完成：{limitPreviewError}。已填写内容保留，保存时仍会校验。</p>;
   return <Modal title="设置" subtitle="选择左侧项目；复杂信息按需展开。" onClose={onClose} className="settings-modal">
     <form className="settings-shell" onSubmit={(event) => { event.preventDefault(); void persist(); }}>
@@ -3710,87 +3910,86 @@ function SettingsDialog({ projectRoot, provider, voiceSettings, voiceStatus, lay
       <div className="settings-content">
         {section === "appearance" && <SettingsPane title="外观" note="明暗主题与强调色只保存在这台电脑。">
           <SettingGroup title="主题"><div className="choice-row three">{(["dark", "light", "system"] as ThemeMode[]).map((mode) => <button type="button" key={mode} className={preferences.theme === mode ? "active" : ""} onClick={() => updatePreferences({ theme: mode })}>{mode === "dark" ? "黑色" : mode === "light" ? "白色" : "跟随系统"}</button>)}</div></SettingGroup>
-          <SettingGroup title="墨宝动作" note="工作时自动切换；跟随系统的减少动态效果设置。"><MascotShowcase /></SettingGroup>
           <SettingGroup title="配色"><div className="palette-grid">{(["lime", "jade", "blue", "violet", "amber", "rose"] as AccentPalette[]).map((accent) => <button type="button" key={accent} data-palette={accent} className={preferences.accent === accent ? "active" : ""} onClick={() => updatePreferences({ accent })}><i />{({ lime: "青柠", jade: "青玉", blue: "湖蓝", violet: "紫罗兰", amber: "琥珀", rose: "胭脂" } as Record<AccentPalette, string>)[accent]}</button>)}</div></SettingGroup>
           <SettingGroup title="界面密度"><div className="choice-row"><button type="button" className={preferences.density === "comfortable" ? "active" : ""} onClick={() => updatePreferences({ density: "comfortable" })}>舒适</button><button type="button" className={preferences.density === "compact" ? "active" : ""} onClick={() => updatePreferences({ density: "compact" })}>紧凑</button></div></SettingGroup>
         </SettingsPane>}
-        {section === "layout" && <SettingsPane title="布局" note="正文始终占据剩余空间；关闭面板不会删除任何内容。"><WorkspaceLayoutPane layout={layout} onChange={onLayoutChange} onPreset={onLayoutPreset} onReset={() => onLayoutChange({ ...defaultWorkspaceLayout })} /></SettingsPane>}
+        {section === "repair" && <VersionRepair projectRoot={projectRoot} onVoiceSaved={onVoiceSaved} />}
         {section === "models" && <SettingsPane title="模型" note="先选服务商，再填写该服务商当前有效的模型 ID。">
           <div className="provider-grid">{PROVIDER_OPTIONS.map((item) => <button type="button" key={item.id} className={inferredProvider === item.id ? "active" : ""} onClick={() => chooseProvider(item.id)}><strong>{item.name}</strong><span>{item.note}</span></button>)}</div>
-          <div className={`provider-status ${provider?.api_key_configured ? "ready" : "missing"}`}><strong>{provider?.api_key_configured ? "模型密钥已保存" : "尚未保存模型密钥"}</strong><span>{provider?.api_key_configured ? `凭据来源：${credentialLabel(String(provider?.api_key_storage || ""))}` : "密钥只交给本机引擎，并保存在系统凭据库。"}</span></div>
-          <div className="settings-fields"><label>模型名称<input list="provider-models" value={form.model} onChange={(event) => updateForm({ model: event.target.value })} placeholder="填写平台当前模型 ID" /><datalist id="provider-models">{[...new Set([...(PROVIDER_OPTIONS.find(item => item.id === form.provider_kind)?.models || []), ...remoteModels])].map((model) => <option key={model} value={model} />)}</datalist></label><label>接口地址<input value={form.base_url} onChange={(event) => updateForm({ base_url: event.target.value })} /></label><label>更换密钥 <small>{provider?.api_key_configured ? "留空继续使用当前服务商的已有密钥" : "本机模型可以留空"}</small><input type="password" autoComplete="new-password" value={form.api_key} onChange={(event) => updateForm({ api_key: event.target.value })} placeholder="不会回显" /></label></div>
-           <div className="settings-inline-actions"><button type="button" disabled={working} onClick={() => void saveModelSettings()}>保存并读取模型列表</button><span>先保存模型配置，再尝试读取列表；读取失败不会撤销已保存的 Key。</span></div>
-          {form.provider_kind === "mimo" && <div className="mimo-connection-options"><p className="form-hint">普通接口与 Token Plan 使用不同地址和凭据。sk 密钥用于普通接口，tp/ttp 凭据用于 Token Plan；切换地址后请填写对应密钥并重新检查连接。</p><div className="settings-inline-actions"><button type="button" onClick={() => updateForm({ base_url: "https://api.xiaomimimo.com/v1", api_key: "" })}>普通 API</button><button type="button" onClick={() => updateForm({ base_url: "https://token-plan-cn.xiaomimimo.com/v1", api_key: "" })}>Token Plan</button></div><p className="form-hint">MiMo 思考请求由服务端使用 temperature 1.0 / top_p 0.95，不支持 reasoning_effort 档位；下方采样设置只用于非思考请求。此处不新增思考开关，也不修改原任务快照或角色模型。</p></div>}
+          <SavedApiKey provider={form.provider_kind} revision={keyRevision} />
+          <div className="settings-fields"><label>模型名称<input list="provider-models" value={form.model} onChange={(event) => updateForm({ model: event.target.value })} placeholder="填写平台当前模型 ID" /><datalist id="provider-models">{[...new Set([...(PROVIDER_OPTIONS.find(item => item.id === form.provider_kind)?.models || []), ...remoteModels])].map((model) => <option key={model} value={model} />)}</datalist></label><label>接口地址<input value={form.base_url} onChange={(event) => updateForm({ base_url: event.target.value })} /></label><label>更换密钥 <small>留空沿用该服务商已保存的密钥</small><input type="password" autoComplete="new-password" value={form.api_key} onChange={(event) => updateForm({ api_key: event.target.value })} placeholder="留空沿用已保存密钥" /></label></div>
+           <div className="settings-inline-actions"><button type="button" disabled={working || !provider} onClick={() => void saveModelSettings()}>保存并读取模型列表</button><button type="button" disabled={working || !provider} onClick={() => void saveModelSettings(true)}>检查生成连接</button><span>读取列表与生成连接分别检查。</span></div>
+          {form.provider_kind === "mimo" && <div className="mimo-connection-options"><p className="form-hint">普通 API 与 Token Plan 使用各自的地址和密钥。</p><div className="settings-inline-actions"><button type="button" onClick={() => updateForm({ base_url: "https://api.xiaomimimo.com/v1" })}>普通 API</button><button type="button" onClick={() => updateForm({ base_url: "https://token-plan-cn.xiaomimimo.com/v1" })}>Token Plan</button></div><p className="form-hint">MiMo 思考请求使用平台采样参数；下方参数用于非思考请求。</p></div>}
           <SettingGroup title="生成参数与实际效率" note="按角色设置；统计来自当前小说的真实调用。">
-            <div className="model-efficiency-head"><div><strong>{form.model || "未选择模型"}</strong><span>{unsupportedEffort ? "当前接口不支持思考强度档位" : `思考 ${form.reasoning_effort}`} · 输出设置 {form.max_output_tokens.toLocaleString()} tokens</span></div><button type="button" disabled={!projectRoot} onClick={() => void refreshUsage()}>刷新统计</button></div>
-            <div className="settings-fields two"><label>单次输出上限 <small>{modelLimits?.max_output_tokens ? `模型已核实上限 ${modelLimits.max_output_tokens.toLocaleString()} tokens` : "模型上限未核实，按已配置上下文约束；服务端仍会校验"}</small><input type="number" min={1} max={outputCeiling} step={1} value={form.max_output_tokens} onChange={(event) => updateForm({ max_output_tokens: Number(event.target.value) })} /></label><label>缓存解释<input readOnly value={form.provider_kind === "deepseek" ? "按相同输入前缀自动复用" : "按服务商返回值统计"} /></label></div>
+            <div className="model-efficiency-head"><div><strong>{form.model || "未选择模型"}</strong><span>{unsupportedEffort ? "当前接口不支持思考强度档位" : `思考 ${effortLabel(form.reasoning_effort)}`} · 输出自动适配 · {cachePolicyLabel(usageSummary?.current_model_cache?.cache_policy || String(provider?.cache_policy || "standard"))}</span></div><button type="button" disabled={!projectRoot} onClick={() => void refreshUsage()}>刷新统计</button></div>
+            <details className="detail-disclosure"><summary>高级等待设置</summary><p className="form-hint">每次请求的等待上限；修改用于新任务，进行中与原任务续接沿用原设置。</p><div className="settings-fields two"><label>普通请求最长等待（秒）<input type="number" min={1} step={1} value={form.request_timeout_seconds} onChange={(event) => updateForm({ request_timeout_seconds: Number(event.target.value) })} /></label><label>规划请求最长等待（秒）<input type="number" min={1} step={1} value={form.planning_timeout_seconds} onChange={(event) => updateForm({ planning_timeout_seconds: Number(event.target.value) })} /></label></div></details>
             {limitPreviewWarning}
-            <p className="form-hint">输入扣除前，默认模型可用输出至多 {Math.min(form.max_output_tokens, outputCeiling).toLocaleString()} tokens。每次请求再取本步骤额度、输出设置、角色上下文剩余额度和已核实模型上限的较小值；完整输入包含规则与 JSON Schema。保存不会扩张正在运行任务的原配置。</p>
-            <p className="form-hint">日常使用 Coordinator + Writer + Editor；Reviewer 与 Memory Keeper 按当前任务模式参加。保存角色模型或参数不会启用角色，也不会改变正在运行的任务。角色模型 ID 必须受当前服务商支持。</p>
-            <section className="agent-tuning compact">{AGENT_TUNING_META.map((meta) => { const values = form.agent_generation[meta.id]; const roleStats = usageSummary?.by_agent_role?.[meta.id]; const budget = roleBudget(meta.id); const hit = roleStats?.prompt_cache_hit_rate; const miss = typeof hit === "number" ? 1 - hit : null; return <details key={meta.id} open={meta.id === "writer"}><summary><span><strong>{meta.label}</strong><small>{meta.note}</small></span><span>{roleStats?.calls ? `${roleStats.calls} 次 · 命中 ${typeof hit === "number" ? `${(hit * 100).toFixed(1)}%` : "未报告"}` : "暂无调用"}</span></summary><div className="agent-efficiency-grid"><div><small>输入 / 输出</small><strong>{roleStats ? `${roleStats.prompt_tokens.toLocaleString()} / ${roleStats.completion_tokens.toLocaleString()}` : "—"}</strong></div><div><small>命中 / 未命中</small><strong>{roleStats && typeof hit === "number" ? `${(hit * 100).toFixed(1)}% / ${((miss || 0) * 100).toFixed(1)}%` : "服务商未报告"}</strong></div><div><small>上下文预算</small><strong>{`${Math.round(budget.soft / 1000)}k / ${Math.round(budget.hard / 1000)}k`}</strong></div><div><small>输入扣除前输出额度</small><strong>{roleOutput(meta.id).toLocaleString()} tokens</strong></div><div><small>平均实际输出</small><strong>{roleStats?.calls ? `${Math.round(roleStats.completion_tokens / roleStats.calls).toLocaleString()} tokens` : "—"}</strong></div></div><div className="agent-tuning-grid"><label>角色模型 <small>留空继承默认模型，共用当前服务商接口和密钥</small><input list="provider-models" value={form.role_models[meta.id]} placeholder={form.model} onChange={(event) => setForm((value) => ({ ...value, role_models: { ...value.role_models, [meta.id]: event.target.value } }))} /></label><label>温度 <small>0～{temperatureCeiling}{form.provider_kind === "mimo" ? "，仅非思考请求使用" : ""}</small><input type="number" min={0} max={temperatureCeiling} step={0.05} value={values.temperature} onChange={(event) => updateAgentGeneration(meta.id, { temperature: Number(event.target.value) })} /></label><label>Top P <small>0.01～1{form.provider_kind === "mimo" ? "，仅非思考请求使用" : ""}</small><input type="number" min={0.01} max={1} step={0.01} value={values.top_p} onChange={(event) => updateAgentGeneration(meta.id, { top_p: Number(event.target.value) })} /></label><label>Top K <small>{form.provider_kind === "mimo" ? "当前接口不支持" : "接口支持时发送"}</small><input disabled={form.provider_kind === "mimo" || limitPreview?.capabilities?.top_k === false} type="number" min={1} max={200} step={1} value={values.top_k ?? ""} placeholder="自动" onChange={(event) => updateAgentGeneration(meta.id, { top_k: event.target.value === "" ? null : Number(event.target.value) })} /></label></div><button type="button" className="text-button" onClick={() => updateAgentGeneration(meta.id, DEFAULT_AGENT_GENERATION[meta.id])}>恢复该 Agent 默认值</button></details>; })}</section>
-            <p className="form-hint">温度和 Top P 影响输出取样，不改变输入缓存是否命中。缓存要靠相同前缀复用；墨流会把稳定规则放在前面，把本章任务放在末尾。未报告缓存数据的调用不会被误算成 0%。</p>
+            <section className="agent-tuning compact">{AGENT_TUNING_META.map((meta) => { const values = form.agent_generation[meta.id]; const capabilities = roleCapabilities(meta.id); const sampling = capabilities?.sampling_constraints; const temperatureRange = sampling?.temperature ?? [0, 2]; const topPRange = sampling?.top_p ?? [0, 1]; const samplingNote = capabilities?.sampling_without_reasoning_only || sampling?.thinking_temperature !== undefined ? "，仅非思考请求使用" : ""; const temperatureNote = sampling?.thinking_temperature_ignored ? "，思考时不采用" : samplingNote; const topPNote = sampling?.thinking_top_p_min !== undefined ? `，思考至少${sampling.thinking_top_p_min}；非思考固定${sampling.non_thinking_top_p}` : samplingNote; const roleStats = usageSummary?.current_model_cache?.by_agent_role[meta.id]; const budget = roleBudget(meta.id); const hit = roleStats?.prompt_cache_hit_rate; const miss = typeof hit === "number" ? 1 - hit : null; return <details key={meta.id}><summary><span><strong title={meta.note}>{roleLabel(meta.id)}</strong><small>{roleStats?.calls ? `当前模型 ${roleStats.calls} 次` : "暂无当前分组记录"}</small></span><CacheMeter calls={roleStats?.calls || 0} hitRate={hit} /></summary><p className="form-hint">{roleStats ? `${roleStats.endpoint || "接口身份待核"} · ${roleStats.model}` : "当前接口分组尚未读取。"}{roleStats?.cache_unknown_calls ? `；${roleStats.cache_unknown_calls} 次缓存用量未知，未计入比例。` : ""}</p><div className="agent-efficiency-grid"><div><small>输入 / 输出</small><strong>{roleStats?.calls ? `${cacheTokenLabel(roleStats.prompt_tokens, roleStats.input_unknown_calls, roleStats.calls)} / ${cacheTokenLabel(roleStats.completion_tokens, roleStats.output_unknown_calls, roleStats.calls)}` : "—"}</strong></div><div><small>命中 / 未命中</small><strong>{roleStats && typeof hit === "number" ? `${(hit * 100).toFixed(1)}% / ${((miss || 0) * 100).toFixed(1)}%` : "服务商未报告"}</strong></div><div><small>上下文预算</small><strong>{`${Math.round(budget.soft / 1000)}k / ${Math.round(budget.hard / 1000)}k`}</strong></div><div><small>输入扣除前输出额度</small><strong>{roleOutput(meta.id).toLocaleString()} tokens</strong></div><div><small>平均实际输出</small><strong>{roleStats?.average_completion_tokens != null ? `${Math.round(roleStats.average_completion_tokens).toLocaleString()} tokens` : roleStats?.calls ? "未知" : "—"}</strong></div></div><CacheScopeHistory groups={(usageSummary?.current_model_cache?.history_groups || []).filter(group => group.role === meta.id)} /><div className="agent-tuning-grid"><label>角色模型 <small>留空继承默认模型，共用当前服务商接口和密钥</small><input list="provider-models" value={form.role_models[meta.id]} placeholder={form.model} onChange={(event) => setForm((value) => ({ ...value, role_models: { ...value.role_models, [meta.id]: event.target.value } }))} />{form.role_models[meta.id] && <span className="role-model-choice">{![form.model, ...remoteModels, ...(PROVIDER_OPTIONS.find(item => item.id === form.provider_kind)?.models || [])].includes(form.role_models[meta.id]) && <small role="status">尚未在当前服务商列表确认</small>}<button type="button" className="text-button" onClick={() => setForm(value => ({ ...value, role_models: { ...value.role_models, [meta.id]: "" } }))}>继承默认模型</button></span>}</label><label>温度 <small>{capabilities?.sampling_parameters?.temperature === false ? "当前模型不采用，已保存值保留" : `${temperatureRange[0]}～${temperatureRange[1]}${temperatureNote}`}</small><input disabled={capabilities?.sampling_parameters?.temperature === false} type="number" min={temperatureRange[0]} max={temperatureRange[1]} step={0.05} value={values.temperature} onChange={(event) => updateAgentGeneration(meta.id, { temperature: Number(event.target.value) })} /></label><label>Top P <small>{capabilities?.sampling_parameters?.top_p === false ? "当前模型不采用，已保存值保留" : `${topPRange[0]}～${topPRange[1]}${topPNote}`}</small><input disabled={capabilities?.sampling_parameters?.top_p === false} type="number" min={topPRange[0]} max={topPRange[1]} step={0.01} value={values.top_p} onChange={(event) => updateAgentGeneration(meta.id, { top_p: Number(event.target.value) })} /></label><label>Top K <small>{capabilities?.sampling_parameters?.top_k === false ? "当前模型不采用，已保存值保留" : "当前模型支持时发送"}</small><input disabled={capabilities?.sampling_parameters?.top_k === false} type="number" min={1} max={200} step={1} value={values.top_k ?? ""} placeholder="自动" onChange={(event) => updateAgentGeneration(meta.id, { top_k: event.target.value === "" ? null : Number(event.target.value) })} /></label></div><button type="button" className="text-button" onClick={() => updateAgentGeneration(meta.id, DEFAULT_AGENT_GENERATION[meta.id])}>恢复该 Agent 默认值</button></details>; })}</section>
           </SettingGroup>
-          <SettingGroup title="费用估算" note="单价单位为人民币 / 百万 Token，仅用于估算，不设置消费上限。两项均大于 0 时采用手填价格；否则仅官方 DeepSeek 已知型号在价格快照有效期内使用高峰参考价，其他情况显示未知。旧设置若填写了外币单价，请先换算为人民币。"><div className="settings-fields two"><label>输入单价 / 百万 Token<input type="number" min={0} step={0.01} value={form.input_price_per_million} onChange={(event) => updateForm({ input_price_per_million: Number(event.target.value) })} /></label><label>输出单价 / 百万 Token<input type="number" min={0} step={0.01} value={form.output_price_per_million} onChange={(event) => updateForm({ output_price_per_million: Number(event.target.value) })} /></label></div></SettingGroup>
         </SettingsPane>}
-        {section === "creation" && <SettingsPane title="创作" note="预设会同时调整上下文、询问策略、审查模式和三个角色的生成参数。">
-          <div className="preset-grid">{SETTINGS_PRESETS.map((preset) => <button type="button" key={preset.id} className={activePreset === preset.id ? "active" : ""} onClick={() => applyCreationPreset(preset)}><strong>{activePreset === preset.id ? "✓ " : ""}{preset.name}</strong><span>{preset.note}</span><small>{preset.context_soft_tokens / 10000} 万常用上下文</small></button>)}</div>
-          <SettingGroup title="近期规划" note="未指定章节范围时，默认连续规划的未来章节数；已接受正文只作为衔接依据。"><label>默认近期规划章数<input type="number" min={1} max={50} step={1} value={form.planning_window_chapters} onChange={(event) => updateForm({ planning_window_chapters: Math.min(50, Math.max(1, Math.round(Number(event.target.value) || 1))) })} /></label></SettingGroup>
-          <SettingGroup title="规划正式发布" note="只影响三层规划审核通过后何时成为正式版；审核失败或候选中断始终保持原版。"><label>发布方式<select value={form.planning_publication_mode} onChange={(event) => updateForm({ planning_publication_mode: event.target.value })}><option value="auto_after_review">审核通过后自动发布</option><option value="confirm_after_review">审核通过后等我确认</option></select></label><p className="form-hint">旧版保留或删除始终另行选择；删除前还会展示准确对象并再次确认。</p></SettingGroup>
-          <div className="settings-fields two"><label>思考强度{unsupportedEffort && <small>当前接口不支持档位，保留原设置供其他接口使用</small>}<select disabled={unsupportedEffort} value={form.reasoning_effort} onChange={(event) => updateForm({ reasoning_effort: event.target.value })}>{unsupportedEffort ? <option value={form.reasoning_effort}>当前接口不支持强度档位</option> : <><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最高</option></>}</select></label><label>主动询问<select value={form.inquiry_frequency} onChange={(event) => updateForm({ inquiry_frequency: event.target.value })}><option value="low">只问必需信息</option><option value="medium">把握较低时询问</option><option value="high">重要创作分岔也询问</option><option value="ultra">有明显未知项就询问</option></select></label></div>
+        {section === "creation" && <SettingsPane title="创作" note="分别选择协作方式和创作档位，保存后用于新任务。">
+          <SettingGroup title="协作方式"><div className="preset-grid collaboration-presets">{[
+            { id: "everyday", name: "日常协作", note: "协调、写作与编辑", count: 3 },
+            { id: "adaptive", name: "按需加强", note: "按任务增加审查或记忆专项", count: 4 },
+            { id: "full_specialist", name: "全面协作", note: "编辑、连续性与记忆分工核对", count: 5 },
+          ].map(item => <button type="button" key={item.id} aria-pressed={form.collaboration_preset === item.id} className={form.collaboration_preset === item.id ? "active" : ""} onClick={() => updateForm({ collaboration_preset: item.id })}><strong>{item.name}</strong><span>{item.note}</span><small>{item.count} 个 Agent</small></button>)}</div></SettingGroup>
+          <SettingGroup title="质量与消耗" note="选择准备与核对的投入程度，保留本书写法。"><div className="preset-grid">{SETTINGS_PRESETS.map((preset) => <button type="button" key={preset.id} aria-pressed={activePreset === preset.id} className={activePreset === preset.id ? "active" : ""} onClick={() => applyCreationPreset(preset)}><strong>{preset.name}</strong><span>{preset.note}</span><small>写作 {preset.agent_context_budgets.writer.soft / 10000} 万 · 审读 {preset.agent_context_budgets.editor.soft / 10000} 万常用容量</small></button>)}<button type="button" aria-pressed={activePreset === "custom"} className={activePreset === "custom" ? "active" : ""} onClick={() => updateForm({ quality_custom_context: true })}><strong>自定义</strong><span>沿用上一档策略，只开放容量调整</span><small>不重置重试、阅读或写作策略</small></button></div></SettingGroup>
+          <SettingGroup title="近期规划" note="未指定范围时，默认向后规划的章节数。"><label>默认近期规划章数<input type="number" min={1} max={50} step={1} value={form.planning_window_chapters} onChange={(event) => updateForm({ planning_window_chapters: Math.min(50, Math.max(1, Math.round(Number(event.target.value) || 1))) })} /></label></SettingGroup>
+          <SettingGroup title="规划正式发布" note="选择规划审核通过后是否自动采用。"><label>发布方式<select value={form.planning_publication_mode} onChange={(event) => updateForm({ planning_publication_mode: event.target.value })}><option value="auto_after_review">审核通过后自动发布</option><option value="confirm_after_review">审核通过后等我确认</option></select></label><p className="form-hint">旧版保留或删除始终另行选择；删除前还会展示准确对象并再次确认。</p></SettingGroup>
+          <div className="settings-fields two"><label>思考强度{unsupportedEffort && <small>当前接口不支持档位，保留原设置供其他接口使用</small>}<select disabled={unsupportedEffort} value={form.reasoning_effort} onChange={(event) => updateForm({ reasoning_effort: event.target.value })}>{unsupportedEffort ? <option value={form.reasoning_effort}>当前接口不支持强度档位</option> : <>{["low", "medium", "high", "max"].map(value => <option key={value} value={value}>{effortLabel(value)}</option>)}</>}</select></label><label>主动询问<select value={form.inquiry_frequency} onChange={(event) => updateForm({ inquiry_frequency: event.target.value })}><option value="low">只问必需信息</option><option value="medium">把握较低时询问</option><option value="high">重要创作分岔也询问</option><option value="ultra">有明显未知项就询问</option></select></label></div>
           <SettingGroup title="章节检查"><div className="settings-fields two"><label>结尾钩子<select value={form.hook_strategy} onChange={(event) => updateForm({ hook_strategy: event.target.value })}><option value="most_chapters">大多数章节保留期待</option><option value="key_chapters">重点章节使用明确钩子</option><option value="natural_afterglow">自然余味优先</option></select></label><label>字数容差 <small>上下 {(form.chapter_length_tolerance * 100).toFixed(0)}%</small><input type="range" min={0.05} max={0.3} step={0.05} value={form.chapter_length_tolerance} onChange={(event) => updateForm({ chapter_length_tolerance: Number(event.target.value) })} /></label><label>自动通过最低审查符合度 <small>{(Math.max(0.8, form.review_min_confidence) * 100).toFixed(0)}%</small><input type="range" min={0.8} max={1} step={0.05} value={Math.max(0.8, form.review_min_confidence)} onChange={(event) => updateForm({ review_min_confidence: Number(event.target.value) })} /></label></div><p className="form-hint">默认字数±10%。自动通过须必需项无硬问题、来源证据齐全且加权符合度达到设置值（至少80%）。百分比不是正确概率；缺资料先补审，不让 Writer 为漏读改稿。</p></SettingGroup>
-          <SettingGroup title="验收确认策略" note="只改变何时取得你的授权；Editor 审查通过、正文哈希和记忆服务事务门禁始终保留。"><label>确认方式<select value={form.acceptance_confirmation_mode} onChange={(event) => updateForm({ acceptance_confirmation_mode: event.target.value })}><option value="auto_after_review">Editor 审查通过后自动验收（默认）</option><option value="batch_once">批次提交前确认一次</option><option value="per_chapter">逐章确认</option></select></label><p className="form-hint">“自动验收”只在当前版本没有硬问题且 Editor 审查通过时生效；尚未完成的审查不会伪装成通过。切换设置只影响之后的操作。</p></SettingGroup>
+          <SettingGroup title="验收确认策略" note="选择草稿审核通过后如何验收。"><label>确认方式<select value={form.acceptance_confirmation_mode} onChange={(event) => updateForm({ acceptance_confirmation_mode: event.target.value })}><option value="auto_after_review">Editor 审查通过后自动验收（默认）</option><option value="batch_once">批次提交前确认一次</option><option value="per_chapter">逐章确认</option></select></label><p className="form-hint">“自动验收”只在当前版本没有硬问题且 Editor 审查通过时生效；尚未完成的审查不会伪装成通过。切换设置只影响之后的操作。</p></SettingGroup>
           <SettingGroup title="预填续写" note="启用后，编辑停顿会调用当前 Writer 模型，因此可能产生费用。"><label className="setting-check"><input type="checkbox" checked={preferences.prefillEnabled} onChange={(event) => updatePreferences({ prefillEnabled: event.target.checked })} />允许在编辑器中手动开启灰字预填候选</label><div className="settings-fields two"><label>等待时间 <small>{preferences.prefillDelayMs} 毫秒</small><input type="range" min="300" max="3000" step="100" value={preferences.prefillDelayMs} onChange={(event) => updatePreferences({ prefillDelayMs: Number(event.target.value) })} /></label><label>候选长度<select value={preferences.prefillLength} onChange={(event) => updatePreferences({ prefillLength: event.target.value as PrefillLength })}><option value="short">短句</option><option value="medium">一小段</option><option value="long">长段落</option></select></label></div></SettingGroup>
-          <SettingGroup title="智能提示词" note="输入框上方的快捷按钮根据最近对话和项目阶段提供下一步建议。"><label className="setting-check"><input type="checkbox" checked={preferences.suggestedPromptsEnabled} onChange={(event) => updatePreferences({ suggestedPromptsEnabled: event.target.checked })} />显示下一步提示词 <small>自动快捷建议在本地生成，不额外调用付费模型；关闭后隐藏整行快捷按钮</small></label></SettingGroup>
-          <SettingGroup title="对话历史" note="记录只写入项目里的 DIALOGUE.md，不保存原始思维链、API Key 或模型内部推理。"><div className="settings-fields two"><label>保存方式<select value={form.dialogue_history_mode} onChange={(event) => updateForm({ dialogue_history_mode: event.target.value })}><option value="auto">主动保存（自动写入）</option><option value="manual">被动保存（只在对话历史里手动保存）</option><option value="both">两者都有</option></select></label><label>最多保留 <small>条记录</small><input type="number" min={5} max={1000} value={form.dialogue_history_limit} onChange={(event) => updateForm({ dialogue_history_limit: Number(event.target.value) })} /></label></div><div className="settings-fields"><label>自动保存间隔 <small>每 N 轮写入一次</small><input type="number" min={1} max={50} value={form.dialogue_history_interval} disabled={form.dialogue_history_mode === "manual"} onChange={(event) => updateForm({ dialogue_history_interval: Number(event.target.value) })} /></label></div><p className="form-hint">主动保存会在满 N 轮时写入一次；“两者都有”同时开放对话历史里的手动保存。超出保留上限时只删除最旧的记录，不会改动正史。</p></SettingGroup>
+          <SettingGroup title="智能提示词" note="输入框上方的快捷按钮根据最近对话和项目阶段提供下一步建议。"><label className="setting-check"><input type="checkbox" checked={preferences.suggestedPromptsEnabled} onChange={(event) => updatePreferences({ suggestedPromptsEnabled: event.target.checked })} />显示下一步提示词 <small>执行结束后由Coordinator结合实际结果生成建议，会计入当前任务模型用量；关闭后不生成建议</small></label><SuggestionShortcutSettings preferences={preferences} onChange={updatePreferences} /></SettingGroup>
+          <SettingGroup title="对话历史" note="对话保存在本书项目中。"><div className="settings-fields two"><label>保存方式<select value={form.dialogue_history_mode} onChange={(event) => updateForm({ dialogue_history_mode: event.target.value })}><option value="auto">主动保存（自动写入）</option><option value="manual">被动保存（只在对话历史里手动保存）</option><option value="both">两者都有</option></select></label><label>最多保留 <small>条记录</small><input type="number" min={5} max={1000} value={form.dialogue_history_limit} onChange={(event) => updateForm({ dialogue_history_limit: Number(event.target.value) })} /></label></div><div className="settings-fields"><label>自动保存间隔 <small>每 N 轮写入一次</small><input type="number" min={1} max={50} value={form.dialogue_history_interval} disabled={form.dialogue_history_mode === "manual"} onChange={(event) => updateForm({ dialogue_history_interval: Number(event.target.value) })} /></label></div><p className="form-hint">主动保存会在满 N 轮时写入一次；“两者都有”同时开放对话历史里的手动保存。超出保留上限时只删除最旧的记录，不会改动正史。</p></SettingGroup>
         </SettingsPane>}
         {section === "voice" && <SettingsPane title="语音" note="按用途选择已就绪的语音组件；安装完成不会自动切换。">
           <div className={`provider-status ${voiceStatus?.ready_for_output ? "ready" : "missing"}`}><strong>{voiceStatus?.message || "正在读取本地语音状态"}</strong><span>{voiceStatus?.backend ? `当前引擎：${voiceStatus.backend}` : "保存设置不会自动下载模型；依赖与模型由安装环节单独处理。"}</span></div>
-          <SettingGroup title="各功能使用的语音组件" note="Edge 在线朗读会将目标文字发送到微软服务，音频保存在本机；第三方接入没有永久免费或长期可用保证。">
+          <SettingGroup title="各功能使用的语音组件" note="Edge 会把朗读文字发送至微软，音频保存在本机。">
             <div className="settings-fields two">
               <label>语音输入<select value={voiceForm.voice_input_engine} onChange={(event) => updateVoiceForm({ voice_input_engine: event.target.value as VoiceSettings["voice_input_engine"] })}><option value="off">未选用</option><option value="local">本地 SenseVoice</option><option value="browser">浏览器实时识别</option></select></label>
               <label>对话回复朗读<select value={voiceForm.voice_dialogue_engine} onChange={(event) => updateVoiceForm({ voice_dialogue_engine: event.target.value as VoiceSettings["voice_dialogue_engine"] })}><option value="off">未选用</option><option value="edge">Edge 在线自然语音</option><option value="moss">本地 MOSS</option></select></label>
               <label>普通文本转语音<select value={voiceForm.voice_text_engine} onChange={(event) => updateVoiceForm({ voice_text_engine: event.target.value as VoiceSettings["voice_text_engine"] })}><option value="off">未选用</option><option value="edge">Edge 在线自然语音</option><option value="moss">本地 MOSS</option></select></label>
               <label>正文与草稿听读<select value={voiceForm.voice_novel_engine} onChange={(event) => updateVoiceForm({ voice_novel_engine: event.target.value as VoiceSettings["voice_novel_engine"] })}><option value="off">未选用</option><option value="edge">Edge 在线自然语音</option><option value="moss">本地 MOSS</option></select></label>
-            </div><p className="form-hint">Edge：{voiceStatus?.packages?.edge_tts ? "已就绪" : "当前程序尚未安装"}；MOSS：{voiceStatus?.moss?.tts_ready ? "已就绪" : "未就绪"}；SenseVoice：{voiceStatus?.asr?.asr_ready ? "已就绪" : "未就绪"}。语音对话的文字回复仍使用模型设置中的对话模型。</p>
+            </div><p className="form-hint">Edge：{voiceStatus?.edge?.connection_ready ? "已就绪" : voiceStatus?.edge?.needs_update ? "需要更新连接组件" : "当前程序尚未安装"}；MOSS：{voiceStatus?.moss?.tts_ready ? "已就绪" : "未就绪"}；SenseVoice：{voiceStatus?.asr?.asr_ready ? "已就绪" : "未就绪"}。语音对话的文字回复仍使用模型设置中的对话模型。</p>
           </SettingGroup>
           <SettingGroup title="总开关"><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_enabled} onChange={(event) => updateVoiceForm({ voice_enabled: event.target.checked })} />启用语音功能</label><div className="settings-fields two"><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_input_enabled} disabled={!voiceStatus?.ready_for_input} onChange={(event) => updateVoiceForm({ voice_input_enabled: event.target.checked })} />语音下达命令与聊天</label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_output_enabled} onChange={(event) => updateVoiceForm({ voice_output_enabled: event.target.checked })} />对话与正文朗读</label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_auto_send} disabled={!voiceStatus?.ready_for_input} onChange={(event) => updateVoiceForm({ voice_auto_send: event.target.checked })} />识别后直接发送 <small>关闭时只填入输入框</small></label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_auto_read} onChange={(event) => updateVoiceForm({ voice_auto_read: event.target.checked })} />自动朗读 AI 回答</label></div></SettingGroup>
           <SettingGroup title="默认声音与听感"><div className="settings-fields two"><label>默认声音<select value={voiceForm.voice_default_profile} onChange={(event) => updateVoiceForm({ voice_default_profile: event.target.value })}><option value="narrator_female">女声旁白</option><option value="female_bright">明快女声</option><option value="female_warm">温柔女声</option><option value="narrator_male">男声旁白</option><option value="male_calm">沉静男声</option><option value="male_firm">坚定男声</option></select></label><label>计算设备<select value={voiceForm.voice_compute_device} onChange={(event) => updateVoiceForm({ voice_compute_device: event.target.value as VoiceSettings["voice_compute_device"] })}><option value="auto">自动（MOSS 优先使用可用 CUDA，失败时显示原因）</option><option value="cpu">只用 CPU（较慢）</option><option value="cuda">NVIDIA CUDA</option></select></label><label>语速 <output>{voiceForm.voice_speed.toFixed(2)}</output><input type="range" min="0.75" max="1.35" step="0.05" value={voiceForm.voice_speed} onChange={(event) => updateVoiceForm({ voice_speed: Number(event.target.value) })} /></label><label>音量 <output>{voiceForm.voice_volume.toFixed(2)}</output><input type="range" min="0.25" max="1.5" step="0.05" value={voiceForm.voice_volume} onChange={(event) => updateVoiceForm({ voice_volume: Number(event.target.value) })} /></label><label>自然停顿 <output>{voiceForm.voice_pause_scale.toFixed(2)}</output><input type="range" min="0.6" max="1.8" step="0.1" value={voiceForm.voice_pause_scale} onChange={(event) => updateVoiceForm({ voice_pause_scale: Number(event.target.value) })} /><small>按逗号、句号、问号、换段自动留白；1.0 为自然节奏</small></label></div></SettingGroup>
           <SettingGroup title="设备偏好" note="不选择时使用 Windows 默认设备。"><div className="settings-inline-actions"><button type="button" onClick={() => void refreshVoiceDevices()}>读取可用设备</button><span>首次读取会触发系统麦克风权限提示。</span></div><div className="settings-fields two"><label>麦克风<select value={voiceForm.voice_input_device} onChange={(event) => updateVoiceForm({ voice_input_device: event.target.value })}><option value="">Windows 默认麦克风</option>{voiceDevices.filter((item) => item.kind === "audioinput").map((item, index) => <option value={item.deviceId} key={item.deviceId}>{item.label || `麦克风 ${index + 1}`}</option>)}</select></label><label>播放设备<select value={voiceForm.voice_output_device} onChange={(event) => updateVoiceForm({ voice_output_device: event.target.value })}><option value="">Windows 默认扬声器</option>{voiceDevices.filter((item) => item.kind === "audiooutput").map((item, index) => <option value={item.deviceId} key={item.deviceId}>{item.label || `扬声器 ${index + 1}`}</option>)}</select></label></div></SettingGroup>
           <p className="form-hint">朗读与语音输入是两个独立本地组件。安装都在后台进行，完成或失败会显示系统通知；已有录音、声音档案和听读结果不会被覆盖。</p>
-          <SettingGroup title="普通话语音输入" note="用于麦克风命令与聊天；浏览器实时听写不可用时自动使用本地识别。"><div className="settings-inline-actions"><button type="button" disabled={asrInstalling || voiceDeleting || Boolean(voiceStatus?.asr?.asr_ready)} onClick={() => void installAsr()}>{asrInstalling ? "安装中…" : voiceStatus?.asr?.asr_ready ? "语音输入已就绪" : voiceInstallProgress.asr?.retryable ? "重新安装语音输入" : "安装语音输入"}</button><button type="button" className="danger" disabled={voiceDeleting} onClick={() => void deleteVoiceComponent("sherpa")}>删除语音输入</button><span>{voiceStatus?.asr?.storage_size_mb ? `已占用 ${voiceStatus.asr.storage_size_mb.toFixed(1)}MB` : "预计下载约 470MB"}</span></div><VoiceInstallProgressCard value={voiceInstallProgress.asr} />{voiceStatus?.asr?.last_error && !voiceInstallProgress.asr?.summary && <p className="form-error">{voiceStatus.asr.last_error}</p>}</SettingGroup>
-          <SettingGroup title="Edge 在线语音" note="安装包已包含连接组件；语音生成在网上进行，不下载或运行本地语音模型。">
+          <SettingGroup title="普通话语音输入" note="把麦克风录音转成文字。"><div className="settings-inline-actions"><button type="button" disabled={asrInstalling || voiceDeleting || Boolean(voiceStatus?.asr?.asr_ready)} onClick={() => void installAsr()}>{asrInstalling ? "安装中…" : voiceStatus?.asr?.asr_ready ? "语音输入已就绪" : voiceInstallProgress.asr?.retryable ? "重新安装语音输入" : "安装语音输入"}</button><button type="button" className="danger" disabled={voiceDeleting} onClick={() => void deleteVoiceComponent("sherpa")}>删除语音输入</button><span>{voiceStatus?.asr?.storage_size_mb ? `已占用 ${voiceStatus.asr.storage_size_mb.toFixed(1)}MB` : "预计下载约 470MB"}</span></div><VoiceInstallProgressCard value={voiceInstallProgress.asr} />{voiceStatus?.asr?.last_error && !voiceInstallProgress.asr?.summary && <p className="form-error">{voiceStatus.asr.last_error}</p>}</SettingGroup>
+          <SettingGroup title="Edge 在线语音" note="使用在线朗读，需联网。">
             <div className="settings-inline-actions">
-              <button type="button" disabled={edgeInstalling || voiceDeleting || Boolean(voiceStatus?.edge?.installed)} onClick={() => void installEdge()}>{edgeInstalling ? "安装中…" : voiceStatus?.edge?.installed ? "Edge 组件已就绪" : voiceInstallProgress.edge?.retryable ? "重新安装 Edge 组件" : "安装 Edge 连接组件"}</button>
+              <button type="button" disabled={edgeInstalling || voiceDeleting} onClick={() => void installEdge()}>{edgeInstalling ? "安装中…" : voiceStatus?.edge?.needs_update ? "更新 Edge 连接组件" : voiceStatus?.edge?.connection_ready ? "检查并更新 Edge 连接组件" : voiceInstallProgress.edge?.retryable ? "重新安装 Edge 组件" : "安装 Edge 连接组件"}</button>
               <button type="button" className="danger" disabled={voiceDeleting || !voiceStatus?.edge?.has_local_files} onClick={() => void deleteVoiceComponent("edge")}>删除 Edge 组件</button>
               <span>{voiceStatus?.edge?.storage_size_mb ? `已占用 ${voiceStatus.edge.storage_size_mb.toFixed(1)}MB` : "只下载连接组件，不下载模型"}</span>
-            </div><VoiceInstallProgressCard value={voiceInstallProgress.edge} />{voiceStatus?.edge?.last_error && !voiceInstallProgress.edge?.summary && <p className="form-error">{voiceStatus.edge.last_error}</p>}
+            </div><VoiceInstallProgressCard value={voiceInstallProgress.edge} />{voiceStatus?.edge?.needs_update && <p className="form-hint">{voiceStatus.edge.compatibility_message}</p>}{voiceStatus?.edge?.last_error && !voiceInstallProgress.edge?.summary && <p className="form-error">{voiceStatus.edge.last_error}</p>}
           </SettingGroup>
-          <SettingGroup title="MOSS 标准组件（默认）" note="点击安装后在这里显示依赖、模型、完成或失败四种状态。"><div className="settings-inline-actions"><button type="button" disabled={mossInstalling || voiceDeleting || Boolean(voiceStatus?.moss?.tts_ready)} onClick={() => void installMoss()}>{mossInstalling ? "安装中…" : voiceStatus?.moss?.tts_ready ? "MOSS 已就绪" : voiceInstallProgress.moss?.retryable ? "重新安装 MOSS" : "安装 MOSS"}</button><button type="button" className="danger" disabled={voiceDeleting} onClick={() => void deleteVoiceComponent("moss")}>删除 MOSS</button><span>{voiceStatus?.moss?.storage_size_mb ? `已占用 ${voiceStatus.moss.storage_size_mb.toFixed(1)}MB` : "预计下载约 2.7GB"}</span></div><VoiceInstallProgressCard value={voiceInstallProgress.moss} />{voiceStatus?.moss?.last_error && !voiceInstallProgress.moss?.summary && <p className="form-error">{voiceStatus.moss.last_error}</p>}</SettingGroup>
-          <SettingGroup title="声音调试与资源" note="这些参数只影响本机音频生成，不修改正文或正史。"><div className="settings-fields two"><label>输出采样率<select value={voiceForm.voice_sample_rate} onChange={(event) => updateVoiceForm({ voice_sample_rate: Number(event.target.value) })}><option value={16000}>16 kHz（省空间）</option><option value={22050}>22.05 kHz</option><option value={24000}>24 kHz（推荐）</option><option value={44100}>44.1 kHz（更大文件）</option><option value={48000}>48 kHz（更大文件）</option></select></label><label>每段最多字数 <small>{voiceForm.voice_segment_chars} 字</small><input type="range" min="120" max="800" step="20" value={voiceForm.voice_segment_chars} onChange={(event) => updateVoiceForm({ voice_segment_chars: Number(event.target.value) })} /></label><label>短音频缓存 <small>{voiceForm.voice_cache_limit_mb} MB</small><input type="range" min="128" max="4096" step="128" value={voiceForm.voice_cache_limit_mb} onChange={(event) => updateVoiceForm({ voice_cache_limit_mb: Number(event.target.value) })} /></label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_debug} onChange={(event) => updateVoiceForm({ voice_debug: event.target.checked })} />开启语音调试日志 <small>只记录运行状态，不记录录音内容</small></label></div><p className="form-hint">分段越短越容易暂停和恢复，但文件数量会增加；缓存达到上限时会自动清理最早的短音频。</p></SettingGroup>
-          <details className="voice-technical"><summary>组件与模型信息</summary><p>语音输入：{voiceForm.voice_input_engine}</p><p>对话朗读：{voiceForm.voice_dialogue_engine}</p><p>文本朗读：{voiceForm.voice_text_engine}</p><p>正文听读：{voiceForm.voice_novel_engine}</p><p>本地目录：{voiceStatus?.data_root || "尚未读取"}</p></details>
+          <SettingGroup title="MOSS 标准组件（默认）" note="安装进度与结果会显示在这里。"><div className="settings-inline-actions"><button type="button" disabled={mossInstalling || voiceDeleting || Boolean(voiceStatus?.moss?.tts_ready)} onClick={() => void installMoss()}>{mossInstalling ? "安装中…" : voiceStatus?.moss?.tts_ready ? "MOSS 已就绪" : voiceInstallProgress.moss?.retryable ? "重新安装 MOSS" : "安装 MOSS"}</button><button type="button" className="danger" disabled={voiceDeleting} onClick={() => void deleteVoiceComponent("moss")}>删除 MOSS</button><span>{voiceStatus?.moss?.storage_size_mb ? `已占用 ${voiceStatus.moss.storage_size_mb.toFixed(1)}MB` : "预计下载约 2.7GB"}</span></div><VoiceInstallProgressCard value={voiceInstallProgress.moss} />{voiceStatus?.moss?.last_error && !voiceInstallProgress.moss?.summary && <p className="form-error">{voiceStatus.moss.last_error}</p>}</SettingGroup>
+          <SettingGroup title="声音调试与资源" note="调整语速、音量和声音资源。"><div className="settings-fields two"><label>输出采样率<select value={voiceForm.voice_sample_rate} onChange={(event) => updateVoiceForm({ voice_sample_rate: Number(event.target.value) })}><option value={16000}>16 kHz（省空间）</option><option value={22050}>22.05 kHz</option><option value={24000}>24 kHz（推荐）</option><option value={44100}>44.1 kHz（更大文件）</option><option value={48000}>48 kHz（更大文件）</option></select></label><label>每段最多字数 <small>{voiceForm.voice_segment_chars} 字</small><input type="range" min="120" max="800" step="20" value={voiceForm.voice_segment_chars} onChange={(event) => updateVoiceForm({ voice_segment_chars: Number(event.target.value) })} /></label><label>短音频缓存 <small>{voiceForm.voice_cache_limit_mb} MB</small><input type="range" min="128" max="4096" step="128" value={voiceForm.voice_cache_limit_mb} onChange={(event) => updateVoiceForm({ voice_cache_limit_mb: Number(event.target.value) })} /></label><label className="setting-check"><input type="checkbox" checked={voiceForm.voice_debug} onChange={(event) => updateVoiceForm({ voice_debug: event.target.checked })} />开启语音调试日志 <small>只记录运行状态，不记录录音内容</small></label></div><p className="form-hint">分段越短越容易暂停和恢复，但文件数量会增加；缓存达到上限时会自动清理最早的短音频。</p></SettingGroup>
+          <SettingGroup title="语音资料保存位置" note="迁移录音、声音档案和组件，核对后切换。"><p>{voiceStatus?.data_root || "正在读取当前保存位置…"}</p><button type="button" disabled={voiceMoving || voiceDeleting || edgeInstalling || asrInstalling || mossInstalling} onClick={() => void moveVoiceStorage()}>{voiceMoving ? "正在迁移与核对…" : "更改保存位置"}</button><p className="form-hint">选择磁盘或父文件夹后，会新建专用语音文件夹；原目录保留，目标已有内容时不会覆盖。以后下载和安装使用新位置。</p></SettingGroup>
+          <details className="voice-technical"><summary>组件与模型信息</summary><p>本地听写：{voiceForm.voice_input_engine === "local" ? "SenseVoice" : voiceForm.voice_input_engine === "browser" ? "浏览器听写" : "未启用"}</p><p>在线朗读连接：{voiceStatus?.edge?.version ? `Edge ${voiceStatus.edge.version}` : "尚未读取"}</p><p>组件状态：{voiceStatus?.edge?.connection_ready ? "当前协议可用" : "需要检查连接组件"}</p></details>
         </SettingsPane>}
-        {section === "context" && <SettingsPane title="上下文与检索" note="参与角色可共用一套预算，也可按职责分别设置；硬事实固定保留，普通资料按相关度压缩。">
+        {section === "context" && <SettingsPane title="上下文与检索" note="调整各角色可读取的资料容量。">
           {limitPreviewWarning}
+          {!form.quality_custom_context && form.quality_preset !== "custom" && <p className="form-hint">容量来自当前档位。<button type="button" onClick={() => updateForm({ quality_custom_context: true })}>沿用当前策略，自定义容量</button></p>}
+          <fieldset className="context-budget-fields" disabled={!form.quality_custom_context && form.quality_preset !== "custom"}>
           <div className="settings-fields"><label>预算方式<select value={form.context_budget_mode} onChange={(event) => updateForm({ context_budget_mode: event.target.value })}><option value="unified">统一：参与角色共用</option><option value="custom">自定义：按角色分别设置</option></select></label></div>
           {form.context_budget_mode === "unified" ? <div className="settings-fields two"><label>统一常用上下文<input type="number" min={1} max={Math.min(form.context_hard_tokens, modelLimits?.context_tokens ?? Infinity)} value={form.context_soft_tokens} onChange={(event) => updateForm({ context_soft_tokens: Number(event.target.value) })} /></label><label>统一最大上下文<input type="number" min={1} max={modelLimits?.context_tokens} value={form.context_hard_tokens} onChange={(event) => updateForm({ context_hard_tokens: Number(event.target.value) })} /></label></div> : <section className="agent-tuning compact">{AGENT_TUNING_META.map((meta) => { const budget = form.agent_context_budgets[meta.id]; return <details key={meta.id} open={meta.id === "writer"}><summary><span><strong>{meta.label}</strong><small>{meta.note}</small></span><span>{Math.round(budget.soft / 1000)}k / {Math.round(budget.hard / 1000)}k</span></summary><div className="agent-tuning-grid"><label>常用上下文<input type="number" min={1} max={Math.min(budget.hard, roleLimits(meta.id)?.context_tokens ?? Infinity)} value={budget.soft} onChange={(event) => updateAgentContextBudget(meta.id, { soft: Number(event.target.value) })} /></label><label>最大上下文<input type="number" min={1} max={roleLimits(meta.id)?.context_tokens} value={budget.hard} onChange={(event) => updateAgentContextBudget(meta.id, { hard: Number(event.target.value) })} /></label></div></details>; })}</section>}
-          <SettingGroup title="混合记忆检索" note="精确查询和本地 BM25 始终可用；召回数量按任务、人物、伏笔与剩余预算动态计算。"><div className="settings-fields two"><label>语义召回模型 <small>可选</small><input value={form.retrieval_embedding_model} onChange={(event) => updateForm({ retrieval_embedding_model: event.target.value })} placeholder="BAAI/bge-m3" /></label><label>精排模型 <small>可选</small><input value={form.retrieval_reranker_model} onChange={(event) => updateForm({ retrieval_reranker_model: event.target.value })} placeholder="BAAI/bge-reranker-v2-m3" /></label></div><p className="form-hint">留空不会下载模型。生成参数里的 Top K 默认也留空，只有接口支持且你明确设置时才发送。</p></SettingGroup>
+          </fieldset>
+          <SettingGroup title="混合记忆检索" note="按当前情节查找相关资料，可选本地语义模型。"><div className="settings-fields two"><label>语义召回模型 <small>可选</small><input value={form.retrieval_embedding_model} onChange={(event) => updateForm({ retrieval_embedding_model: event.target.value })} placeholder="BAAI/bge-m3" /></label><label>精排模型 <small>可选</small><input value={form.retrieval_reranker_model} onChange={(event) => updateForm({ retrieval_reranker_model: event.target.value })} placeholder="BAAI/bge-reranker-v2-m3" /></label></div><p className="form-hint">可选模型留空时，继续使用本地文字检索。</p></SettingGroup>
         </SettingsPane>}
         {section === "review" && <SettingsPane title="Editor · 审查" note="Editor 给出证据化报告，不直接改正文。">
-          <SettingGroup title="手动修改自动核对" note="默认开启。只核对实际变化的设定、正文与草稿；后台处理，有冲突才提示。关闭后暂停自动审核，已存在的问题和正史保护仍保留。"><label className="setting-check"><input type="checkbox" checked={form.manual_edit_review_enabled} onChange={event => updateForm({ manual_edit_review_enabled: event.target.checked })} />开启手动修改后台核对</label></SettingGroup>
-          <div className="settings-fields"><label>核验模式<select value={form.review_verification_mode} onChange={(event) => updateForm({ review_verification_mode: event.target.value })}><option value="evidence">基础：本地证据门禁</option><option value="assisted">增强：纠错并逐条核验</option><option value="strict">严格：争议时调用裁判</option></select></label><label>阅读体验建议<select value={form.review_experience_detail} onChange={(event) => updateForm({ review_experience_detail: event.target.value })}><option value="concise">精简：只提最重要一项</option><option value="standard">标准：优先 1～3 项</option><option value="detailed">详细：完整说明但不扩大硬门禁</option></select></label><label>本地中文 NLI <small>留空关闭</small><input value={form.review_local_nli_model} onChange={(event) => updateForm({ review_local_nli_model: event.target.value })} placeholder="本机模型路径或名称" /></label><label>争议裁判模型 <small>留空关闭</small><input value={form.review_judge_model} onChange={(event) => updateForm({ review_judge_model: event.target.value })} placeholder="当前兼容接口中的模型 ID" /></label></div><p className="form-hint">钩子的未知项、延后回应和开放问题本身不算表达不清；Editor 只阻止有证据的剧情硬冲突、知识越界和无法成立的因果。</p>
+          <SettingGroup title="手动修改自动核对" note="后台核对改动，有冲突时提醒。关闭后暂停自动核对。"><label className="setting-check"><input type="checkbox" checked={form.manual_edit_review_enabled} onChange={event => updateForm({ manual_edit_review_enabled: event.target.checked })} />开启手动修改后台核对</label></SettingGroup>
+          <div className="settings-fields"><label>核验模式<select value={form.review_verification_mode} onChange={(event) => updateForm({ review_verification_mode: event.target.value })}><option value="evidence">基础：本地证据门禁</option><option value="assisted">增强：纠错并逐条核验</option><option value="strict">严格：争议时调用裁判</option></select></label><label>阅读体验建议<select value={form.review_experience_detail} onChange={(event) => updateForm({ review_experience_detail: event.target.value })}><option value="concise">精简：只提最重要一项</option><option value="standard">标准：优先 1～3 项</option><option value="detailed">详细：完整说明但不扩大硬门禁</option></select></label><label>本地中文 NLI <small>留空关闭</small><input value={form.review_local_nli_model} onChange={(event) => updateForm({ review_local_nli_model: event.target.value })} placeholder="本机模型路径或名称" /></label><label>争议裁判模型 <small>留空关闭</small><input value={form.review_judge_model} onChange={(event) => updateForm({ review_judge_model: event.target.value })} placeholder="当前兼容接口中的模型 ID" /></label></div><p className="form-hint">审查以正文和证据为准，保留合理留白。</p>
         </SettingsPane>}
-        {section === "learning" && <SettingsPane title="本地反馈与恢复经验" note="在本书记录有来源的反馈和处理结果，供后续相关任务参考。">
-          <SettingGroup title="反馈记录" note={projectRoot ? "当前项目" : "打开项目后可设置"}><label className="setting-check"><input type="checkbox" disabled={!projectRoot} checked={learningSettings.enabled} onChange={(event) => updateLearningSettings({ enabled: event.target.checked })} />记录接受、拒绝、撤回、重写、偏好和检索反馈</label></SettingGroup>
-          <p className="form-hint">具体偏好在“作者习惯与记忆”管理；失败恢复与已尝试动作在协作台查看。暂停后不新增隐式反馈，既有记录和必要审计保留。</p>
-          {learningNotice && <p className="form-success">{learningNotice}</p>}
-        </SettingsPane>}
-        {section === "story_settings" && <SettingsPane title="本书设定" note="持续维护小说资料，模块和记录立即保存；正文与正史保留独立审核。"><StorySettings key={projectRoot} projectRoot={projectRoot} /></SettingsPane>}
+        {section === "story_settings" && <SettingsPane title="本书设定" note="分层管理设定，随章节维护。"><StorySettings key={projectRoot} projectRoot={projectRoot} /></SettingsPane>}
         {section === "author" && <SettingsPane title="作者习惯与记忆" note="管理长期习惯，保留每本书自己的声音。"><AuthorPreferences projectRoot={projectRoot} /></SettingsPane>}
-        {section === "advanced" && <SettingsPane title="高级" note="普通创作不需要修改这里。模型参数已归到模型页，语音参数只在语音页出现一次。">
-          <SettingGroup title="高级电脑操作" note="默认关闭。开启后每条命令仍会弹窗展示并等待你单独确认；命令使用当前 Windows 账户权限，可能读写项目目录以外的文件、联网或启动应用。"><label className="setting-check"><input type="checkbox" checked={form.powershell_enabled} onChange={(event) => updateForm({ powershell_enabled: event.target.checked })} />允许墨流提出 PowerShell 操作请求</label></SettingGroup>
+        {section === "advanced" && <SettingsPane title="高级" note="其他进阶选项。">
+          <SettingGroup title="高级电脑操作" note="默认关闭。允许提出读写文件、联网和启动应用的命令；每条执行前仍须确认。"><label className="setting-check"><input type="checkbox" checked={form.powershell_enabled} onChange={(event) => updateForm({ powershell_enabled: event.target.checked })} />允许墨流提出 PowerShell 操作请求</label></SettingGroup>
         </SettingsPane>}
       </div>
-      <footer className="settings-actions">{result && <span className="form-success">✓ {result}</span>}{error && <span className="form-error">{error}</span>}<button type="button" onClick={onClose}>关闭</button><button className="primary" type="submit" disabled={working}>{working ? "正在保存…" : "保存设置"}</button></footer>
+      <footer className="settings-actions">{result && <span className="form-success">✓ {result}</span>}{error && <span className="form-error">{error}</span>}<button type="button" onClick={onClose}>关闭</button><button className="primary" type="submit" disabled={working || !provider}>{working ? "正在保存…" : "保存设置"}</button></footer>
     </form>
   </Modal>;
 }
@@ -3809,57 +4008,16 @@ function VoiceInstallProgressCard({ value }: { value: VoiceInstallProgress | nul
   return <div className={`voice-install-progress ${value.status}`}><header><strong>{stage}</strong><span>{Math.max(0, Math.min(100, value.progress)).toFixed(0)}%</span></header><div><i style={{ width: `${Math.max(0, Math.min(100, value.progress))}%` }} /></div><p>{value.error || value.summary}{value.downloaded_mb > 0 ? ` · 当前写入约 ${value.downloaded_mb.toFixed(0)}MB` : ""}</p>{value.status === "failed" && <small>{value.retryable ? "可以直接点击重新安装，稳定缓存会复用已经下载的文件。" : "请根据上方原因处理后再试。"}</small>}</div>;
 }
 
-function WorkspaceLayoutPane({ layout, onChange, onPreset, onReset }: { layout: WorkspaceLayout; onChange: (change: Partial<WorkspaceLayout>) => void; onPreset: (preset: WorkspacePreset) => void; onReset: () => void }) {
-  const presets: Array<{ id: WorkspacePreset; name: string; note: string }> = [
-    { id: "balanced", name: "均衡", note: "导航、对话和正文同时可见" },
-    { id: "writing", name: "专注写作", note: "收起对话与批注，正文最大化" },
-    { id: "planning", name: "规划协作", note: "加宽 Coordinator 对话，保留导航" },
-    { id: "review", name: "审查对照", note: "AI 置右，批注与版本保持展开" },
-  ];
-  const setWidth = (target: WorkspaceResizeTarget, value: number) => {
-    const key = target === "navigation" ? "navigationWidth" : target === "assistant" ? "assistantWidth" : "inspectorWidth";
-    onChange({ [key]: clampWorkspaceWidth(target, value) });
-  };
-  return <div className="layout-pane">
-    <section className="layout-presets"><div><strong>快速布局</strong><small>切换后仍可继续微调</small></div><div className="layout-preset-grid">{presets.map((preset) => <button key={preset.id} type="button" onClick={() => onPreset(preset.id)}><strong>{preset.name}</strong><span>{preset.note}</span></button>)}</div></section>
-    <section className="layout-settings-section">
-      <div className="layout-settings-heading"><strong>显示哪些面板</strong><small>关闭不会删除内容，随时可从顶部“布局”重新打开。</small></div>
-      <div className="layout-toggles">
-        <label><input type="checkbox" checked={layout.navigationVisible} onChange={(event) => onChange({ navigationVisible: event.target.checked })} /><span><strong>小说结构</strong><small>文档树、上下文容量与协作看板</small></span></label>
-        <label><input type="checkbox" checked={layout.assistantVisible} onChange={(event) => onChange({ assistantVisible: event.target.checked })} /><span><strong>Coordinator 对话</strong><small>自然语言协作与工作流入口</small></span></label>
-        <label><input type="checkbox" checked={layout.inspectorVisible} onChange={(event) => onChange({ inspectorVisible: event.target.checked })} /><span><strong>批注与版本</strong><small>正文编辑器右侧的检查面板</small></span></label>
-      </div>
-    </section>
-    <section className="layout-settings-section">
-      <div className="layout-settings-heading"><strong>对话位置</strong><small>让对话跟随你的阅读与输入习惯。</small></div>
-      <div className="layout-position-switch">{(["left", "right", "bottom", "floating"] as WorkspaceLayout["assistantPosition"][]).map(position => <button type="button" key={position} className={layout.assistantPosition === position ? "active" : ""} onClick={() => onChange({ assistantPosition: position })}>{({ left: "正文左侧", right: "正文右侧", bottom: "正文下方", floating: "自由浮动" })[position]}</button>)}</div>
-      <p className="form-hint">浮动面板可拖动标题上的“移动”按钮，并从右下角调整大小；也可使用方向键微调位置。独立对话窗口可以自由移动到其他屏幕，每个窗口保留自己的对话和待答卡。</p>
-    </section>
-    <section className="layout-settings-section">
-      <div className="layout-settings-heading"><strong>精确宽度</strong><small>也可以直接拖拽工作区中的发光分隔线。</small></div>
-      <div className="layout-sliders">
-        <label>小说结构 <output>{layout.navigationWidth}px</output><input type="range" min="180" max="420" value={layout.navigationWidth} onChange={(event) => setWidth("navigation", Number(event.target.value))} /></label>
-        <label>Coordinator 对话 <output>{layout.assistantWidth}px</output><input type="range" min="320" max="760" value={layout.assistantWidth} onChange={(event) => setWidth("assistant", Number(event.target.value))} /></label>
-        <label>批注与版本 <output>{layout.inspectorWidth}px</output><input type="range" min="170" max="420" value={layout.inspectorWidth} onChange={(event) => setWidth("inspector", Number(event.target.value))} /></label>
-      </div>
-    </section>
-    <div className="dialog-actions"><button type="button" onClick={onReset}>恢复默认布局</button></div>
-  </div>;
-}
-
-function ResizeHandle({ className, label, onResizeStart }: { className: string; label: string; onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void }) {
-  return <div className={`resize-handle ${className}`} role="separator" aria-orientation="vertical" aria-label={label} onPointerDown={onResizeStart}><span /></div>;
-}
-
 function SearchDialog({ request, result, setResult, onClose, onOpen }: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>; result: Record<string, unknown> | null; setResult: (value: Record<string, unknown> | null) => void; onClose: () => void; onOpen: (path: string) => void }) {
   const [query, setQuery] = useState("");
   const matches = (result?.matches || []) as Array<Record<string, unknown>>;
-  return <Modal title="搜索整本小说" subtitle="搜索设定、规划、正文和审查报告，不读取 .inkflow 内部库。" onClose={onClose}><form className="search-form" onSubmit={async (event) => { event.preventDefault(); if (query.trim()) setResult(await request("document.search", { query })); }}><input autoFocus value={query} onChange={(e) => setQuery(e.target.value)} placeholder="人物、地点、伏笔或一句原文" /><button className="primary">搜索</button></form><div className="search-results">{matches.map((item, index) => <button key={index} onClick={() => onOpen(String(item.relative_path))}><strong>{String(item.relative_path)} · 第 {String(item.line)} 行</strong><p>{String(item.preview)}</p></button>)}{result && matches.length === 0 && <p className="empty-mini">没有找到匹配内容。</p>}</div></Modal>;
+  return <Modal title="搜索整本小说" subtitle="搜索设定、规划、正文和审查报告，不读取 .inkflow 内部库。" onClose={onClose}><form className="search-form" onSubmit={async (event) => { event.preventDefault(); if (query.trim()) setResult(await request("document.search", { query })); }}><input autoFocus value={query} onChange={(e) => setQuery(e.target.value)} placeholder="人物、地点、伏笔或一句原文" /><button className="primary">搜索</button></form><div className="search-results">{matches.map((item, index) => <button key={index} onClick={() => onOpen(String(item.relative_path))}><strong>{documentLabel(String(item.relative_path))} · 第 {String(item.line)} 行</strong><p>{String(item.preview)}</p></button>)}{result && matches.length === 0 && <p className="empty-mini">没有找到匹配内容。</p>}</div></Modal>;
 }
 
 function QuestionDialog({ questions, onClose, onSubmit }: { questions: QuestionCard[]; onClose: () => void; onSubmit: (answer: string) => void }) {
   const [answers, setAnswers] = useState<Record<string, string[]>>({});
   const [otherText, setOtherText] = useState<Record<string, string>>({});
+  const freeTextOnly = (question: QuestionCard) => !question.options.some(option => option.kind !== "other");
   const choose = (question: QuestionCard, option: QuestionOption) => {
     setAnswers((current) => {
       const selected = current[question.id] || [];
@@ -3868,6 +4026,7 @@ function QuestionDialog({ questions, onClose, onSubmit }: { questions: QuestionC
     });
   };
   const isComplete = questions.every((question) => {
+    if (freeTextOnly(question)) return Boolean(otherText[question.id]?.trim());
     const selected = answers[question.id] || [];
     if (selected.length === 0) return false;
     const other = question.options.find((option) => option.kind === "other");
@@ -3878,14 +4037,14 @@ function QuestionDialog({ questions, onClose, onSubmit }: { questions: QuestionC
     const lines = ["我来回答刚才的问题："];
     questions.forEach((question, index) => {
       const selected = answers[question.id] || [];
-      const labels = question.options.filter((option) => selected.includes(option.id)).map((option) => option.kind === "other" ? `其他：${otherText[question.id].trim()}` : option.label);
+      const labels = freeTextOnly(question) ? [otherText[question.id].trim()] : question.options.filter((option) => selected.includes(option.id)).map((option) => option.kind === "other" ? `其他：${otherText[question.id].trim()}` : option.label);
       lines.push(`${index + 1}. ${question.question}`);
       lines.push(`我的回答：${labels.join("；")}`);
     });
     lines.push("请结合这些答案继续理解原来的目标；如果此前已经明确要求执行且信息足够，就继续原任务，否则先总结你理解到的方案。");
     onSubmit(lines.join("\n"));
   };
-  return <div className="modal-backdrop question-backdrop"><section className="modal question-dialog" role="dialog" aria-modal="true" aria-labelledby="question-title"><button className="modal-close" onClick={onClose}>×</button><p className="eyebrow">墨流想先弄清楚</p><h2 id="question-title">回答几个关键选择</h2><p className="modal-subtitle">没有标准答案。选择最接近的方向，或使用每题最后的“其他”自己填写。</p><div className="question-list">{questions.map((question, index) => <fieldset className="question-card" key={question.id}><legend><span>{index + 1}</span><div><small>{question.header}</small><strong>{question.question}</strong></div></legend>{question.why_it_matters && <p className="question-why">为什么问：{question.why_it_matters}</p>}<div className="question-options">{question.options.map((option) => { const checked = (answers[question.id] || []).includes(option.id); return <div className={`question-option ${checked ? "selected" : ""}`} key={option.id}><label><input type={question.selection === "multiple" ? "checkbox" : "radio"} name={question.id} checked={checked} onChange={() => choose(question, option)} /><span><strong>{option.label}{option.recommended ? " · 建议" : ""}</strong>{option.description && <small>{option.description}</small>}</span></label>{option.kind === "other" && checked && <textarea autoFocus value={otherText[question.id] || ""} onChange={(event) => setOtherText((value) => ({ ...value, [question.id]: event.target.value }))} placeholder="用自己的话回答，越具体越容易贴近你的想法。" />}</div>; })}</div>{question.selection === "multiple" && <small className="multiple-hint">这一题可以选择多个答案。</small>}</fieldset>)}</div><div className="dialog-actions"><button onClick={onClose}>暂不回答</button><button className="primary" disabled={!isComplete} onClick={submit}>提交回答并继续</button></div></section></div>;
+  return <div className="modal-backdrop question-backdrop"><section className="modal question-dialog" role="dialog" aria-modal="true" aria-labelledby="question-title"><button className="modal-close" onClick={onClose}>×</button><p className="eyebrow">墨流想先弄清楚</p><h2 id="question-title">{questions.every(freeTextOnly) ? "还需要补充的信息" : questions.length === 1 ? "选择接下来的方向" : "一起确定几个关键选择"}</h2><p className="modal-subtitle">{questions.every(freeTextOnly) ? "直接写下你的想法，已有要求不必重复。" : "看看各方案会带来什么变化，选择更贴近你想法的方向，也可以自行补充。"}</p><div className="question-list">{questions.map((question, index) => <fieldset className="question-card" key={question.id}><legend><span>{index + 1}</span><div><small>{question.header}</small><strong>{question.question}</strong></div></legend>{question.why_it_matters && <p className="question-why">为什么问：{question.why_it_matters}</p>}{freeTextOnly(question) ? <textarea aria-label={question.question} autoFocus={index === 0} value={otherText[question.id] || ""} onChange={event => setOtherText(current => ({ ...current, [question.id]: event.target.value }))} placeholder="直接填写你的想法" /> : <div className="question-options">{question.options.map((option) => { const checked = (answers[question.id] || []).includes(option.id); return <div className={`question-option ${checked ? "selected" : ""}`} key={option.id}><label><input type={question.selection === "multiple" ? "checkbox" : "radio"} name={question.id} checked={checked} onChange={() => choose(question, option)} /><span><strong>{option.label}{option.recommended ? " · 建议" : ""}</strong>{option.description && <small>{option.description}</small>}</span></label>{option.kind === "other" && checked && <textarea autoFocus value={otherText[question.id] || ""} onChange={(event) => setOtherText((value) => ({ ...value, [question.id]: event.target.value }))} placeholder="用自己的话回答，越具体越容易贴近你的想法。" />}</div>; })}</div>}{!freeTextOnly(question) && question.selection === "multiple" && <small className="multiple-hint">这一题可以选择多个答案。</small>}</fieldset>)}</div><div className="dialog-actions"><button onClick={onClose}>暂不回答</button><button className="primary" disabled={!isComplete} onClick={submit}>提交回答并继续</button></div></section></div>;
 }
 
 function UpdateDialog({ info, onClose }: { info: UpdateInfo; onClose: () => void }) {
@@ -3900,7 +4059,7 @@ function UpdateDialog({ info, onClose }: { info: UpdateInfo; onClose: () => void
     } finally { setWorking(false); }
   };
   const sourceLabel = local.source === "embedded" ? "发布包内置更新源" : local.source === "github" ? "GitHub Releases" : local.source === "environment" ? "自定义公开更新源" : "尚未配置";
-  return <Modal title="软件更新" subtitle="新版会自动下载，并在关闭或重启墨流时安装；小说正文、正史数据库和本地项目不会被删除。" onClose={onClose}><section className={`update-card ${local.status || "ready"}`}><div><small>当前版本</small><strong>{local.currentVersion || "0.7.0"}</strong></div><div><small>可用版本</small><strong>{local.availableVersion || "—"}</strong></div><div><small>更新来源</small><strong>{sourceLabel}</strong></div>{typeof local.progress === "number" && <div className="update-progress"><span style={{ width: `${Math.max(0, Math.min(local.progress, 100))}%` }} /></div>}<p>{local.message || "墨流会自动检查新版本，也可以在这里立即检查。"}</p></section>{local.status === "not_configured" && <p className="form-hint">私密仓库的下载需要账号令牌，不适合写进大众软件。仓库或独立发布仓库公开后，只需在构建时配置发布源即可启用在线更新。</p>}<div className="dialog-actions"><button onClick={onClose}>关闭</button>{!new Set(["available", "downloading", "downloaded"]).has(String(local.status)) && <button className="primary" disabled={working || local.status === "not_configured" || local.status === "checking"} onClick={() => void action("check")}>{local.status === "checking" ? "正在检查…" : "检查新版本"}</button>}{local.status === "available" && <button className="primary" disabled>正在准备自动下载…</button>}{local.status === "downloading" && <button className="primary" disabled>正在下载 {Math.round(Number(local.progress || 0))}%</button>}{local.status === "downloaded" && <button className="primary" disabled={working} onClick={() => void action("install")}>重启并安装</button>}</div></Modal>;
+  return <Modal title="软件更新" subtitle="新版会自动下载，并在关闭或重启墨流时安装；小说正文、正史数据库和本地项目不会被删除。" onClose={onClose}><section className={`update-card ${local.status || "ready"}`}><div><small>当前版本</small><strong>{local.currentVersion || "读取中"}</strong></div><div><small>可用版本</small><strong>{local.availableVersion || "—"}</strong></div><div><small>更新来源</small><strong>{sourceLabel}</strong></div>{typeof local.progress === "number" && <div className="update-progress"><span style={{ width: `${Math.max(0, Math.min(local.progress, 100))}%` }} /></div>}<p>{local.message || "墨流会自动检查新版本，也可以在这里立即检查。"}</p></section>{local.status === "not_configured" && <p className="form-hint">私密仓库的下载需要账号令牌，不适合写进大众软件。仓库或独立发布仓库公开后，只需在构建时配置发布源即可启用在线更新。</p>}<div className="dialog-actions"><button onClick={onClose}>关闭</button>{!new Set(["available", "downloading", "downloaded"]).has(String(local.status)) && <button className="primary" disabled={working || local.status === "not_configured" || local.status === "checking"} onClick={() => void action("check")}>{local.status === "checking" ? "正在检查…" : "检查新版本"}</button>}{local.status === "available" && <button className="primary" disabled>正在准备自动下载…</button>}{local.status === "downloading" && <button className="primary" disabled>正在下载 {Math.round(Number(local.progress || 0))}%</button>}{local.status === "downloaded" && <button className="primary" disabled={working} onClick={() => void action("install")}>重启并安装</button>}</div></Modal>;
 }
 
 function SelectionDialog({ selection, busy, onClose, onSubmit }: { selection: SelectionDraft; busy: boolean; onClose: () => void; onSubmit: (mode: "comment" | "revise", comment: string) => void }) {
@@ -3963,12 +4122,58 @@ function ConversationHistoryDialog({ projectRoot, onOpenConversation, entries, m
   </Modal>;
 }
 
-function LiveRunCard({ summary, steps = [] }: { summary?: string; steps?: EngineEvent[] }) {
+function processElapsed(startedAt: string, end: number): string {
+  const seconds = Math.max(0, Math.floor((end - Date.parse(startedAt)) / 1000) || 0);
+  return seconds < 60 ? `${seconds}秒` : `${Math.floor(seconds / 60)}分${seconds % 60}秒`;
+}
+
+function publicProcessSteps(steps: EngineEvent[]): EngineEvent[] {
+  const visible: EngineEvent[] = [];
+  for (const step of steps) {
+    if (!step.summary || /provider[_ .-]?reasoning|reasoning_content|thinking_content|raw_thought|usage\.updated/i.test(`${step.type || ""} ${step.stage || ""}`)) continue;
+    const previous = visible.at(-1);
+    if (step.type === "model.stream.progress" && previous?.type === step.type
+      && step.run_id === previous.run_id && step.role === previous.role && step.model === previous.model
+      && typeof step.metadata?.phase === "string" && step.metadata.phase === previous.metadata?.phase
+      && Number(step.metadata.elapsed_ms) >= Number(previous.metadata?.elapsed_ms)) {
+      visible[visible.length - 1] = step;
+    } else visible.push(step);
+  }
+  return visible;
+}
+
+function ProcessDisclosure({ startedAt, finishedAt, status = "running", steps, reasoning = [] }: { startedAt: string; finishedAt?: string; status?: string; steps: EngineEvent[]; reasoning?: string[] }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (finishedAt) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [finishedAt]);
+  const label = !finishedAt ? "正在思考与处理" : /waiting|interrupted/.test(status) ? "等待下一步" : status === "failed" ? "本次未完成" : status === "cancelled" ? "已停止" : "处理完成";
+  const visible = publicProcessSteps(steps);
+  return <details className="process-disclosure">
+    <summary><span className="process-triangle" aria-hidden="true">▶</span><span>{label} · 用时 {processElapsed(startedAt, finishedAt ? Date.parse(finishedAt) : now)}</span></summary>
+    <div className="process-body">
+      <p className="process-hint">这里会更新本次做了什么、参考了哪些依据，以及目前进度。</p>
+      {reasoning.length > 0 && <ul className="reasoning-list">{reasoning.map((line, index) => <li key={index}>{line}</li>)}</ul>}
+      <ol>{visible.map((step, index) => <li key={index}>
+        <small>{step.timestamp ? formatTime(step.timestamp) : ""}{step.role ? ` · ${agentRoleLabel(step.role)}` : ""} · {step.status === "completed" ? "本步完成" : step.status === "failed" ? "本步未完成" : step.status === "started" ? "处理中" : "公开记录"}</small>
+        <p>{readableSourceText(step.summary || "")}</p>
+        {collectPublicSummaries(step.metadata).map((line, number) => <p className="process-reason" key={number}>{line}</p>)}
+      </li>)}</ol>
+      {!visible.length && <p>正在理解请求，尚未返回新的公开判断。</p>}
+      <p className="process-hint">本次会话保留这些步骤；重开项目后可在协作台查看保存的运行记录。</p>
+    </div>
+  </details>;
+}
+
+function LiveRunCard({ summary, steps = [], startedAt }: { summary?: string; steps?: EngineEvent[]; startedAt: string }) {
   const current = [...steps].reverse().find(step => step.type !== "usage.updated");
   const stage = current?.stage || current?.type || "";
   const role = current?.role || String(current?.metadata?.agent_role || "");
   // Writer 也负责大纲和计划；只有明确的正文阶段才显示正在写正文。
-  const focus = /detail/.test(stage) ? "正在展开剧情细纲，梳理人物动机和事件因果…"
+  const focus = /^model\.stream\./.test(stage) ? current?.summary || "正在接收模型返回…"
+    : /detail/.test(stage) ? "正在展开剧情细纲，梳理人物动机和事件因果…"
     : /outline/.test(stage) ? "正在整理故事大纲…"
     : /plan[.-]supplement|plan[.-]ensure/.test(stage) ? "正在补齐近期章节计划…"
     : /plan/.test(stage) ? "正在整理近期章节计划…"
@@ -3983,9 +4188,10 @@ function LiveRunCard({ summary, steps = [] }: { summary?: string; steps?: Engine
     : role === "writer" ? "正在处理当前创作任务…"
     : "正在理解你的想法…";
   return <article className="message assistant pending live-run-card" aria-live="polite">
-    <span className="avatar" aria-hidden="true">墨</span>
+    <span className="avatar mobao-message-avatar"><MobaoAvatar animate mood={current?.status === "failed" ? "frustrated" : busyMascotMood(steps, current?.run_id || null)} /></span>
     <div>
       <p>{current?.status === "failed" ? summary || "遇到问题，正在检查能否继续。" : focus}</p>
+      <ProcessDisclosure startedAt={startedAt} steps={steps} />
     </div>
   </article>;
 }
@@ -4010,13 +4216,14 @@ function visibleResult(result: unknown): { summary: string; details?: string; re
   if (!result || typeof result !== "object") return { summary: "任务完成，可以从右侧工作台查看结果。", reasoning: [] };
   const value = result as Record<string, unknown>;
   const reasoning = collectPublicSummaries(result);
-  const safeDetails = JSON.stringify(displaySafeValue(value), null, 2);
+  const safeDetails = readableRecord(displaySafeValue(value));
+  if (value.failure_kind === "model_connection") return { summary: `${String(value.reply || value.title)}\n${String(value.next_action || "")}`, reasoning, details: safeDetails };
   if (value.workflow_failure || value.gate || value.stop_reason) {
     return { summary: `尚未完成：${String(value.workflow_failure || value.gate || value.stop_reason)}${value.next_action ? `\n下一步：${String(value.next_action)}` : ""}`, reasoning, details: safeDetails };
   }
   if (["waiting_user", "waiting_condition", "failed", "interrupted"].includes(String(value.status || ""))) {
     const nested = value.result && typeof value.result === "object" ? visibleResult(value.result).summary : "";
-    const state = value.status === "waiting_user" ? "等待你的选择" : value.status === "failed" ? "本次未完成" : "已保留断点";
+    const state = value.status === "waiting_user" ? "等待你的选择" : value.status === "failed" ? "本次未完成" : "等待条件满足后继续";
     const summary = String(value.reply || value.reason || value.summary || nested || state);
     const nextStep = value.next_step && typeof value.next_step === "object" ? (value.next_step as Record<string, unknown>).reason : "";
     const impact = value.impact && typeof value.impact === "object" ? value.impact as Record<string, unknown> : null;
@@ -4028,11 +4235,17 @@ function visibleResult(result: unknown): { summary: string; details?: string; re
     const warnings = Array.isArray(value.warnings) ? value.warnings.map(String).join("；") : "";
     return { summary: `第 ${String(value.chapter_no)} 章已通过审核并收进正文，相关记忆已保存。${warnings ? `另有待处理项：${warnings}` : "本次操作已完成。"}`, reasoning, details: safeDetails };
   }
+  if (value.status === "planned") {
+    const revision = typeof value.revision_no === "number" && Number.isInteger(value.revision_no) && value.revision_no > 0 ? value.revision_no : null;
+    const range = Array.isArray(value.future_range) && value.future_range.length === 2 && value.future_range.every(item => typeof item === "number" && Number.isInteger(item) && item > 0) && value.future_range[0] <= value.future_range[1] ? value.future_range : null;
+    const chapters = range ? `，后续安排为第 ${range[0]}${range[0] === range[1] ? "" : `～${range[1]}`} 章` : "";
+    return { summary: `${revision ? `第 ${revision} 版规划已正式生效` : "章节规划已更新"}${chapters}。${revision ? "可以按当前规划继续写作。" : String(value.next_action || "")}`, reasoning, details: safeDetails };
+  }
   if (value.status === "needs_input" && value.chapter_no) {
     if (value.changed && value.version) {
       return { summary: `第 ${String(value.chapter_no)} 章已生成修订 v${String(value.version)}，但还没得到你的认可。${String(value.next_action || "请查看正文后选择通过或写下拒绝原因。")}`, reasoning, details: safeDetails };
     }
-    return { summary: `第 ${String(value.chapter_no)} 章还需处理：${String(value.reason || "局部修订尚未通过复核")} 已保留当前正史与修订记录。`, reasoning, details: safeDetails };
+    return { summary: `第 ${String(value.chapter_no)} 章还需处理：${String(value.reason || "局部修订尚未通过复核")}`, reasoning, details: safeDetails };
   }
   if (value.status === "resolved" && value.chapter_no) {
     return { summary: `第 ${String(value.chapter_no)} 章已核对${value.changed ? `，局部修订为 v${String(value.version)}` : "，原文无需改动"}。${String(value.reason || "")}`, reasoning, details: safeDetails };
@@ -4079,19 +4292,15 @@ function isSensitivePresentationKey(key: string): boolean {
     || normalized === "thinking";
 }
 function errorMessage(cause: unknown): string {
-  const message = (cause instanceof Error ? cause.message : String(cause))
+  const message = readableSourceText(cause instanceof Error ? cause.message : String(cause))
     .replace(/^Error invoking remote method ['"]engine:request['"]:\s*Error:\s*/i, "")
     .replace(/^Error:\s*/i, "")
     .trim();
-  if (/墨流本地引擎已退出/.test(message)) return "本地写作引擎意外中断。已经落盘的规划和正文仍然保留；下一次操作会自动重启引擎，请在协作台确认最后完成的阶段后重试未完成部分。";
-  if (/影响：/.test(message) && /下一步：/.test(message)) return message;
+  if (/墨流本地引擎已退出/.test(message)) return "本地写作引擎意外中断。下一次操作会自动重启引擎；请先在任务记录确认最后完成的步骤，再续接未完成部分。";
+  if (/\bConnectError\b/.test(message)) return message.replace(/\bConnectError\b/g, "未能连接到模型服务，本步尚未取得结果。请检查网络或服务状态，恢复后从这一步继续。");
+  if (/^(?:本次操作未完成\s*)?['"]stop_reason['"](?:\s|$)/.test(message)) return "审查结果已经返回，但墨流读取暂停原因时出错了。这是任务衔接的程序问题，需要修复结果读取后从本章审查继续。";
   if (/pip-unpack|No such file or directory.*\.whl|临时目录中的下载文件/.test(message)) return "语音组件安装时，Windows 临时下载文件失效。墨流已清理本次暂存目录；请回到语音设置点击重新安装，稳定缓存会复用已下载文件。";
-  if (/MOSS|Edge|语音组件|依赖安装|模型下载/.test(message)) return `${message}\n已有录音、声音档案和生成音频不会被删除。请在语音设置查看进度或重试。`;
-  if (/API Key|密钥|模型接口|服务商/.test(message)) return `${message}\n影响：当前模型任务未完成，小说文件和正史未改变。下一步：打开设置检查服务商、模型名称和密钥。`;
-  if (/版本|哈希|正文已变化|重新审查/.test(message)) return `${message}\n影响：系统已停止使用旧审查或旧正文继续提交。已保存：当前草稿版本仍在。下一步：打开当前章重新审查，再决定是否验收。`;
-  if (/章节卡|尚未生成.*规划|缺少.*规划/.test(message)) return `${message}\n影响：Writer 没有可靠的章节约束，因此没有继续写作。下一步：先生成或补齐当前篇章规划。`;
-  if (/超时|网络|连接/.test(message)) return `${message}\n影响：本次远程调用没有正常返回；已经落盘的本地版本不会被删除。下一步：在协作台查看任务状态，再选择重试。`;
-  return `${message}\n影响：本次操作已停止；已有正文和正史保持当前状态。下一步：在协作台查看最后阶段，并按提示重试或调整输入。`;
+  return message.replace(/\n(?:已保留|已保存)：[^\n]*/g, "").replace(/\n影响：(?:本次操作已停止[；。]?|当前模型任务未完成[，。]?)[^\n]*/g, "");
 }
 async function withDeadline<T>(request: Promise<T>, ms: number, message: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -4099,8 +4308,8 @@ async function withDeadline<T>(request: Promise<T>, ms: number, message: string)
   finally { if (timer) clearTimeout(timer); }
 }
 function currentChapter(path?: string): number | null { const match = path?.match(/chapter_(\d+)/); return match ? Number(match[1]) : null; }
-function tabLabel(tab: Tab): string { return ({ project: "项目", editor: "正文", chapter: "章工位", review: "审查", memory: "记忆", references: "参考", listen: "听读", process: "协作台" })[tab]; }
-function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "run.cancelled": "任务已停止", "run.waiting_user": "等待你回答", "run.waiting_condition": "等待条件", "recovery.waiting": "自动等待项目空闲", "workflow.waiting_user": "等待你回答", "workflow.waiting_condition": "已保存断点", "model.recovering": "模型步骤自修复", "run.steered": "已接收人工引导", "workflow.started": "工作流启动", "workflow.planned": "真实任务单", "workflow.completed": "工作流完成", "workflow.conflict": "正在处理分歧", "controller.routing": "理解与路由", "coordinator.model.started": "Coordinator 请求模型", "writer.started": "Writer 请求模型", "writer.completed": "Writer 完成", "editor.started": "Editor 开始审查", "reviewer.started": "开始审查", "workflow.stage": "工作流阶段", "outline.model": "Writer 生成独立大纲", "voice.moss.install.queued": "MOSS 已进入后台安装", "voice.asr.install.queued": "语音输入已进入后台安装", "voice.moss.install.progress": "MOSS 安装进度", "voice.asr.install.progress": "语音输入安装进度", "voice.moss.install.failed": "MOSS 安装失败", "voice.asr.install.failed": "语音输入安装失败", "provider.testing": "模型连接" } as Record<string, string>)[value || ""] || value || "过程"; }
+function tabLabel(tab: Tab): string { return ({ project: "项目", editor: "正文", chapter: "章工位", review: "审查", references: "参考", listen: "听读", process: "协作台" })[tab]; }
+function eventLabel(value?: string): string { return ({ "run.started": "任务开始", "run.completed": "任务完成", "run.failed": "任务失败", "run.cancelled": "任务已停止", "run.waiting_user": "等待你回答", "run.waiting_condition": "等待条件", "recovery.waiting": "自动等待项目空闲", "workflow.waiting_user": "等待你回答", "workflow.waiting_condition": "已保存断点", "model.stream.progress": "模型接收进度", "model.stream.finished": "模型接收结束", "model.stream.interrupted": "模型连接中断", "model.recovering": "模型步骤自修复", "run.steered": "已接收人工引导", "workflow.started": "工作流启动", "workflow.planned": "真实任务单", "workflow.completed": "工作流完成", "workflow.conflict": "正在处理分歧", "controller.routing": "理解与路由", "coordinator.model.started": "Coordinator 请求模型", "writer.started": "Writer 请求模型", "writer.completed": "Writer 完成", "editor.started": "Editor 开始审查", "reviewer.started": "开始审查", "workflow.stage": "工作流阶段", "outline.model": "Writer 生成独立大纲", "voice.moss.install.queued": "MOSS 已进入后台安装", "voice.asr.install.queued": "语音输入已进入后台安装", "voice.moss.install.progress": "MOSS 安装进度", "voice.asr.install.progress": "语音输入安装进度", "voice.moss.install.failed": "MOSS 安装失败", "voice.asr.install.failed": "语音输入安装失败", "provider.testing": "模型连接" } as Record<string, string>)[value || ""] || (value && /^[a-z_]+[.:-]/i.test(value) ? /^writer/.test(value) ? "写作处理" : /^(?:editor|reviewer|review)/.test(value) ? "审查核对" : /^memory/.test(value) ? "记忆整理" : /^coordinator|controller|session/.test(value) ? "任务协调" : "处理过程" : value) || "处理过程"; }
 function agentRoleLabel(value: string): string { return ({ coordinator: "调度", writer: "创作", editor: "编辑", reviewer: "专项审查", memory_keeper: "记忆整理", engine: "工作引擎", user: "你" } as Record<string, string>)[value] || value; }
 function operationLabel(value: string): string { return ({ "plan.generate": "生成四级规划", "plan.outline": "生成独立章节大纲", "settings.update": "修改运行设置", "chapter.write": "生成章节草稿", "chapter.review_mode": "按任务模式审查当前版本", "chapter.revise": "修订为新版本", "chapter.accept": "提交已通过版本的正史补丁", "batch.draft_loop": "逐章写作、审查与临时连续性", "batch.accept_loop": "按顺序提交通过章节", "arc.audit": "复审篇章承诺" } as Record<string, string>)[value] || value; }
 function authorizationLabel(value: string): string { return ({ none: "未取得", current_request: "当前明确操作", per_chapter_click: "逐章点击", batch_preapproval: "批次一次确认", settings_auto_accept: "设置中的自动验收" } as Record<string, string>)[value] || value; }
@@ -4134,7 +4343,7 @@ function processRuns(events: EngineEvent[]) {
 }
 function statusLabel(value: string): string { return ({ open: "待处理", resolved: "已处理", dismissed: "已忽略", orphaned: "原文已变化" } as Record<string, string>)[value] || value; }
 function kindLabel(value: string): string { return ({ character: "人物", location: "地点", organization: "组织", item: "物品", lore: "世界观", style: "文风" } as Record<string, string>)[value] || value; }
-function stringifyShort(value: unknown): string { return typeof value === "string" ? value : JSON.stringify(value, null, 0); }
+function stringifyShort(value: unknown): string { return readableValue(value); }
 function formatTime(value: string): string { const parsed = new Date(value); return Number.isNaN(parsed.valueOf()) ? value : parsed.toLocaleString("zh-CN", { hour12: false }); }
 function referenceTitle(value: Record<string, unknown>): string { const source = String(value.source || ""); try { const url = new URL(source); return url.hostname; } catch { return source.split(/[\\/]/).pop() || String(value.reference_id); } }
 

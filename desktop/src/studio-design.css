@@ -2,14 +2,44 @@
 :root { --bg: #15191e; --panel: #1a2027; --panel-2: #222a33; --panel-3: #2a333f; --line: #37414d; --line-soft: #2a333e; --text: #f0ece4; --muted: #abaeae; --faint: #838b93; --shadow: 0 20px 70px #0005; }
 :root[data-theme="light"] { --bg: #f5f2ec; --panel: #fffcf7; --panel-2: #eeeae2; --panel-3: #e6e0d6; --text: #30353b; --muted: #69717a; --faint: #7c8289; --line: #d8d3ca; --line-soft: #e9e4db; --shadow: 0 20px 70px #3331; }
 button { border-radius: 9px; }
+.preset-grid.collaboration-presets { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.context-budget-fields { min-width: 0; padding: 0; margin: 0; border: 0; }
+.context-budget-fields:disabled input, .context-budget-fields:disabled select { opacity: .6; cursor: not-allowed; }
+@media (max-width: 700px) { .preset-grid.collaboration-presets { grid-template-columns: 1fr; } }
 button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 input, textarea, select { background: var(--bg); border-radius: 10px; }
-.topbar { grid-template-columns: 210px minmax(180px, 1fr) auto; background: var(--panel); padding-right: 14px; }
-.wordmark { gap: 8px; }
-.wordmark > img { width: 43px; height: 43px; }
-.wordmark strong { letter-spacing: .18em; }
-.wordmark small { letter-spacing: .25em; }
+.saved-api-key { display: grid; gap: 6px; margin-block: 12px; font-size: 14px; }
+.saved-api-key small { color: var(--muted); font-weight: 400; }
+.saved-api-key-field { display: flex; gap: 8px; min-width: 0; }
+.saved-api-key-field input { flex: 1; min-width: 0; font-family: ui-monospace, monospace; }
+.saved-api-key-field button { flex-shrink: 0; }
+.agent-tuning.compact > details > summary { gap: 18px; padding: 16px 18px; align-items: center; }
+.agent-tuning.compact > details > summary > span:first-child { min-width: 0; flex: 1; }
+.agent-tuning.compact > details > summary > span:first-child small { color: var(--muted); margin-top: 4px; }
+.cache-meter { display: grid; gap: 7px; width: 142px; flex-shrink: 0; }
+.cache-meter-value { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.cache-meter-value strong { font-variant-numeric: tabular-nums; font-size: 21px; color: var(--text); }
+.cache-meter-value small { font-size: 11px; color: var(--muted); font-weight: 400; }
+.cache-meter-track { display: block; height: 6px; border-radius: 8px; overflow: hidden; background: var(--line-soft); }
+.cache-meter-track > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #6fa4a8, #8fc9bc); }
+.cache-meter.unknown .cache-meter-track { background: repeating-linear-gradient(110deg, var(--line-soft) 0 5px, transparent 5px 10px); }
+@media (max-width: 560px) { .cache-meter { width: 110px; } .agent-tuning.compact > details > summary { padding: 12px; } }
+.app-shell > .topbar { grid-template-columns: minmax(0, 1fr) auto; background: var(--panel); padding-inline: 18px 14px; }
 .top-actions button { border-color: transparent; background: transparent; color: var(--muted); padding: 8px; }
+.left-rail > .workspace-panel-content { display: flex; flex-direction: column; }
+.left-rail > .workspace-panel-content > * { flex-shrink: 0; }
+.rail-context { margin: auto 10px 0; padding-block: 16px 12px; }
+.rail-context .context-budget { margin: 0; padding: 0; border: 0; background: transparent; }
+.rail-context .context-budget > summary { display: list-item; padding: 8px; color: var(--muted); font-size: 12px; cursor: pointer; }
+.rail-context .role-context-cards { padding: 0 8px; }
+.role-context-cards > header { display: grid; gap: 5px; }
+.role-context-cards small { display: block; font-size: 11px; line-height: 1.5; color: var(--muted); }
+.role-context-row { padding-block: 12px; border-bottom: 1px solid var(--line-soft); }
+.role-context-row:last-child { border-bottom: 0; }
+.role-context-row > header { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; font-size: 12px; }
+.role-context-row > header > span { color: var(--accent); white-space: nowrap; }
+.role-context-row p { margin: 6px 0; font-size: 11px; color: var(--muted); }
+.role-context-row small { overflow-wrap: anywhere; }
 
 
 .left-rail { background: var(--panel); padding: 18px 10px; }
@@ -153,7 +183,7 @@ input, textarea, select { background: var(--bg); border-radius: 10px; }
 .message > div, .editor-toolbar > div { min-width: 0; }
 .message-text { overflow-wrap: anywhere; }
 .floating-chat-controls { flex-wrap: wrap; }
-.floating-chat-controls > button, .conversation-layout-select { flex-shrink: 0; white-space: nowrap; }
+.floating-chat-controls > button { flex-shrink: 0; white-space: nowrap; }
 .editor-toolbar { flex-wrap: wrap; gap: 9px; }
 .editor-toolbar > div { flex-wrap: wrap; }
 @media (max-width: 1100px) { .pending-board { padding: 16px; } }
@@ -171,3 +201,25 @@ input, textarea, select { background: var(--bg); border-radius: 10px; }
 .pending-rejection-dialog textarea { min-height: 88px; margin-top: 7px; font-size: 13px; line-height: 1.6; }
 .pending-rejection-impact { padding: 10px 0; border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
 .mimo-connection-options { margin: 12px 0; }
+
+.context-materials { --context-color-task: #c5a46c; --context-color-canon: #80a4b6; --context-color-settings: #98ae8d; --context-color-planning: #a795bc; --context-color-prose: #b99a91; --context-color-voice: #7faeaa; --context-color-dialogue: #c29f7a; --context-color-threads: #a4a9c7; --context-color-rules: #9ba9a7; --context-color-reference: #9bacae; --context-color-other: #657780; position: relative; margin-top: 6px; }
+.context-composition { display: flex; height: 14px; overflow: hidden; border-radius: 5px; margin: 8px 0 4px; background: var(--line-soft); }
+.context-composition > button { flex-shrink: 0; min-width: 0; height: 100%; padding: 0; border: 0; border-radius: 0; cursor: pointer; }
+.context-composition > button:hover, .context-composition > button:focus-visible { filter: brightness(1.2); outline: 1px solid var(--text); outline-offset: -2px; }
+.context-empty { background: var(--line-soft); }
+.context-empty > button { width: 100%; background: var(--context-color-other); opacity: .45; cursor: help; }
+.context-segment-tooltip { position: absolute; bottom: calc(100% + 4px); left: 0; right: 0; z-index: 4; padding: 9px; border: 1px solid var(--line-soft); border-radius: 8px; background: var(--panel-2); box-shadow: 0 4px 18px #0003; font-size: 11px; line-height: 1.6; pointer-events: none; overflow-wrap: anywhere; }
+.context-segment-tooltip span { display: block; color: var(--muted); }
+.context-material-prose { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow-y: auto; margin-top: 8px; padding: 10px; background: var(--bg); border-radius: 8px; font-size: 12px; line-height: 1.8; }
+.context-material-list { margin-top: 8px; padding: 8px; border: 1px solid var(--line-soft); border-radius: 7px; font-size: 11px; max-height: 260px; overflow-y: auto; }
+.context-material-list summary { cursor: pointer; color: var(--muted); }
+.context-material-list > button { display: grid; gap: 3px; width: 100%; padding: 7px 0; text-align: left; background: transparent; color: var(--text); border: 0; border-bottom: 1px solid var(--line-soft); border-radius: 0; font-size: 11px; overflow-wrap: anywhere; }
+.context-material-list > button:last-child { border-bottom: 0; }
+.context-material-list > button:hover, .context-material-list > button:focus-visible { color: var(--accent); }
+.context-material-list > button small { color: var(--muted); }
+
+.suggestion-shortcut-hint { margin-left: 6px; color: var(--faint); font: inherit; font-size: 10px; }
+.suggestion-fill-status { margin: 0; padding: 0 12px 7px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.suggestion-shortcut-settings { margin-top: 12px; padding-top: 3px; border-top: 1px solid var(--line-soft); }
+.suggestion-shortcut-settings kbd { padding: 2px 5px; border: 1px solid var(--line-soft); border-radius: 4px; color: var(--text); font: inherit; }
+.suggestion-shortcut-settings button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }

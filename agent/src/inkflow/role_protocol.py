@@ -24,7 +24,7 @@ MODE_ROLES: Mapping[CollaborationMode, tuple[AgentRole, ...]] = MappingProxyType
 MODE_CHECK_OWNERS: Mapping[CollaborationMode, Mapping[str, AgentRole]] = MappingProxyType({
     "everyday": MappingProxyType({"general": "editor", "memory": "editor"}),
     "review_boost": MappingProxyType({
-        "general": "editor", "logic_continuity": "reviewer", "memory": "editor"
+        "expression": "editor", "logic_continuity": "reviewer", "memory": "editor"
     }),
     "memory_boost": MappingProxyType({"general": "editor", "memory": "memory_keeper"}),
     "full_specialist": MappingProxyType({
@@ -32,6 +32,16 @@ MODE_CHECK_OWNERS: Mapping[CollaborationMode, Mapping[str, AgentRole]] = Mapping
     }),
 })
 ACTIVE_COLLABORATION_MODES = tuple(MODE_ROLES)
+READ_ONLY_COLLABORATION_ACTIONS = frozenset({
+    "chat", "discuss", "status", "help", "exit", "pending_work", "settings_update",
+    "checkpoint_list", "checkpoint_create", "rollback_preview", "planning_history_view",
+})
+
+
+def specialist_for_action(action: str) -> AgentRole:
+    """Structured operations have known duties; free-form intent uses Coordinator's choice."""
+    return "memory_keeper" if (action.startswith(("memory.", "story_settings.", "manual_edits."))
+        or action in {"story_settings_manage", "story_setting_edit", "memory", "memory_preview"}) else "reviewer"
 _LEGACY_EDITOR_NAMES = frozenset({"reviewer", "reviewer_verifier", "reviewer_judge"})
 
 

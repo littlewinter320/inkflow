@@ -20,9 +20,123 @@ HARD_RULES = {
 _SAME_CHAPTER_CONFLICT_NOTE = "本章双处逐字引文待核"
 
 
+def resolve_review_quote_refs(output: Any, quotes: dict[str, dict[str, str]], *, chapter_no: int | None = None) -> Any:
+    """Resolve explicit choices from this call's source-bound excerpts, never fuzzy-match claims."""
+    data = output.model_dump(mode="json")
+    def resolve(value: str, source_id: str) -> str:
+        entry = quotes.get(value)
+        return entry["quote"] if entry and entry["source_id"] == source_id else value
+    focus = data.get("focus_observation")
+    if focus:
+        for field in ("goal_evidence", "change_evidence"):
+            focus[field] = resolve(focus[field], "当前正文")
+    for item in [*data.get("source_comparisons", []), *data.get("assessments", [])]:
+        entry = quotes.get(item["source_evidence"])
+        if entry and entry["source_id"] != "当前正文":
+            item["source_id"] = entry["source_id"]
+        item["chapter_evidence"] = resolve(item["chapter_evidence"], "当前正文")
+        item["source_evidence"] = resolve(item["source_evidence"], item["source_id"])
+    for item in [*data.get("findings", []), *data.get("deviations", [])]:
+        item["evidence"] = resolve(item["evidence"], "当前正文")
+        entry = quotes.get(item.get("reference_evidence", ""))
+        allowed = item.get("canon_refs") or ["当前正文"]
+        if entry and entry["source_id"] in allowed:
+            item["reference_evidence"] = entry["quote"]
+    for check in data.get("context_use_audit", {}).get("setting_checks", []):
+        check["setting_quote"] = resolve(check["setting_quote"], check["record_id"])
+        check["chapter_quote"] = resolve(check["chapter_quote"], "当前正文")
+    patch = data.get("memory_patch")
+    boundary = chapter_no or (patch or {}).get("chapter_no")
+    for proposal in [*data.get("setting_updates", []), *(patch or {}).get("setting_updates", [])]:
+        for reference in proposal.get("evidence_refs", []):
+            entry = quotes.get(reference.get("quote", ""))
+            number = reference.get("chapter_no")
+            if not entry or not isinstance(number, int) or not boundary or number > boundary:
+                continue
+            source = entry["source_id"]
+            if ((number == boundary and source == "当前正文")
+                    or source == f"chapter:{number:05d}"
+                    or (source.startswith("batch:") and source.endswith(f":chapter:{number:05d}"))):
+                reference["quote"] = entry["quote"]
+    if patch:
+        def resolve_reference(item: dict[str, Any]) -> None:
+            entry = quotes.get(item.get("quote", ""))
+            chapter = item.get("source_chapter")
+            if not entry or not isinstance(chapter, int) or chapter > patch["chapter_no"]:
+                return
+            source = entry["source_id"]
+            if ((chapter == patch["chapter_no"] and source == "当前正文")
+                    or source == f"chapter:{chapter:05d}"
+                    or (source.startswith("batch:") and source.endswith(f":chapter:{chapter:05d}"))):
+                item["quote"] = entry["quote"]
+        for item in patch.get("facts", []):
+            item["evidence"] = resolve(item["evidence"], "当前正文")
+            for reference in item.get("evidence_refs", []):
+                resolve_reference(reference)
+        for operation in patch.get("operations", []):
+            for reference in operation.get("evidence", []):
+                resolve_reference(reference)
+    return type(output).model_validate(data)
+
+
+def restore_review_quote_choices(registry: dict[str, dict[str, str]], sources: dict[str, str]) -> dict[str, dict[str, str]]:
+    """Rebuild only hash-identical excerpts; caller must verify the saved task and source identity."""
+    wanted = {(entry["source_id"], entry["quote_hash"]) for entry in registry.values()}
+    found: dict[tuple[str, str], str] = {}
+    for source_id, body in sources.items():
+        if not any(source == source_id for source, _ in wanted):
+            continue
+        for line in body.splitlines():
+            line = line.strip()
+            for start in range(0, len(line) if len(line) > 400 else 1, 200):
+                quote = line[start:start + 400]
+                identity = (source_id, content_hash(quote))
+                if identity in wanted:
+                    found[identity] = quote
+    return {key: {"source_id": entry["source_id"], "quote": found[identity]}
+            for key, entry in registry.items()
+            if (identity := (entry["source_id"], entry["quote_hash"])) in found}
+
+
 def packet_sources(packet: ContextPacket) -> dict[str, str]:
     sources: dict[str, str] = {}
     for section in packet.sections:
+        if section.key == "CSET":
+            try:
+                payload = json.loads(section.content)
+            except ValueError:
+                continue
+            for collection in payload.get("collections", []):
+                for record in collection.get("records", []):
+                    if record["record_id"] in section.source_ids:
+                        sources[record["record_id"]] = json.dumps(record["values"], ensure_ascii=False)
+            continue
+        if section.key in {"B2", "E0"}:
+            try:
+                payload = json.loads(section.content)
+            except ValueError:
+                continue
+            indexed = {item["chapter_no"]: item for item in payload
+                       if isinstance(item, dict) and isinstance(item.get("chapter_no"), int)} if isinstance(payload, list) else {}
+            for ref in section.source_ids:
+                match = re.fullmatch(r"batch-memory:.+:chapter:(\d+)", ref)
+                if match and int(match.group(1)) in indexed:
+                    sources[ref] = json.dumps(indexed[int(match.group(1))], ensure_ascii=False, indent=2)
+            continue
+        if section.title in {"不可违反的硬正史", "当前人物状态与知识边界", "相关历史索引"}:
+            try:
+                payload = json.loads(section.content)
+            except ValueError:
+                continue
+            indexed = {str(item["事实编号"]): item for item in payload
+                       if isinstance(item, dict) and item.get("事实编号")} if isinstance(payload, list) else {}
+            for ref in section.source_ids:
+                if ref in indexed:
+                    sources[ref] = sources.get(ref, "") + "\n" + json.dumps(indexed[ref], ensure_ascii=False, indent=2)
+            continue
+        if section.key == "E1":
+            # Derived ending summaries cannot supply a chapter's literal prose evidence.
+            continue
         if section.key == "F0" or (section.key == "F" and section.title == "分层混合检索结果"):
             try:
                 payload = json.loads(section.content)
@@ -52,6 +166,80 @@ def packet_sources(packet: ContextPacket) -> dict[str, str]:
             scoped = chapter_chunks.get(int(chapter_match.group(1))) if chapter_match else None
             sources[ref] = sources.get(ref, "") + "\n" + (scoped or section.content)
     return sources
+
+
+def setting_review_gaps(output: Any, content: str, packet: ContextPacket) -> list[str]:
+    """Require a source-bound readback, never infer that a tool call read a setting."""
+    section = next((item for item in packet.sections if item.key == "CSET"), None)
+    if section is None:
+        return []
+    try:
+        payload = json.loads(section.content)
+    except ValueError:
+        return ["设定资料格式无法读取，尚不能确认核对范围"]
+    records = {record["record_id"]: record for collection in payload.get("collections", [])
+               for record in collection.get("records", [])}
+    checks = getattr(output.context_use_audit, "setting_checks", [])
+    seen, gaps = set(), []
+    for check in checks:
+        record = records.get(check.record_id)
+        if record is None or check.record_id in seen:
+            gaps.append("设定核对包含未装入或重复的条目；空模板不能记作已审核")
+            continue
+        seen.add(check.record_id)
+        if check.record_revision != record.get("revision"):
+            gaps.append(f"设定《{record['title']}》核对的修订号与本次读取不一致")
+        values = json.dumps(record["values"], ensure_ascii=False)
+        if not check.setting_quote.strip() or not evidence_matches(check.setting_quote, values):
+            gaps.append(f"设定《{record['title']}》的核对原句未定位")
+        if check.disposition in {"compatible", "conflict"} and (
+                not check.chapter_quote.strip() or not evidence_matches(check.chapter_quote, content)):
+            gaps.append(f"设定《{record['title']}》缺少本章对照原句")
+        if check.disposition in {"conflict", "needs_evidence"}:
+            gaps.append(f"设定《{record['title']}》仍待核对：{check.reason}")
+        if record.get("status") in {"stale_evidence", "configuration_changed"} and check.disposition == "compatible":
+            gaps.append(f"设定《{record['title']}》来源已变化，不能沿用旧的通过结论")
+        if record.get("classification_issues") and check.disposition == "compatible":
+            gaps.append(f"设定《{record['title']}》存在归类问题：" + "；".join(record["classification_issues"]))
+    gaps.extend(f"尚未核对设定《{record['title']}》的本章适用性" for key, record in records.items() if key not in seen)
+    for collection in payload.get("coverage", []):
+        gaps.extend(f"用户约定《{item['title']}》未装入：{item['reason']}" for item in collection.get("omitted", []) if item.get("required"))
+    return gaps
+
+
+def mode_output_requirements(packet: ContextPacket) -> dict:
+    sources = packet_sources(packet)
+    section = next((item for item in packet.sections if item.key == "CSET"), None)
+    payload = json.loads(section.content) if section else {}
+    return {"source_comparisons": [key for key in ("book:requirements", "OUTLINE.md", "STORY_DETAIL.md", "RECENT_PLAN.md") if key in sources],
+        "setting_checks": [{"record_id": record["record_id"], "record_revision": record["revision"], "title": record["title"]}
+            for collection in payload.get("collections", []) for record in collection.get("records", [])],
+        "instruction": "每份原文分别对照；设定条目逐项核对，不适用时明确说明，不省略。编号和修订号照抄，结论和引文由实际阅读判断，不编造已读或通过。"}
+
+
+def mode_output_model(packet: ContextPacket, *, primary: bool) -> type:
+    """Require structural coverage in the existing Provider format retry, before a second review."""
+    from pydantic import create_model, model_validator
+    from .schemas import ModeCheckOutput
+    if not primary:
+        return ModeCheckOutput
+    sources = packet_sources(packet)
+    requirements = mode_output_requirements(packet)
+    required = set(requirements["source_comparisons"])
+    records = {item["record_id"]: item["record_revision"] for item in requirements["setting_checks"]}
+    def coverage(output):
+        seen = [check.record_id for check in output.context_use_audit.setting_checks]
+        missing = required - {resolve_packet_source_id(item.source_id, sources) for item in output.source_comparisons}
+        if missing or set(records) - set(seen) or len(seen) != len(set(seen)):
+            raise ValueError("本次结构覆盖不完整：source_comparisons须分别包含 " + "、".join(sorted(required))
+                + "；setting_checks须逐条包含且不重复 " + "、".join(records))
+        if any(records.get(check.record_id) != check.record_revision for check in output.context_use_audit.setting_checks):
+            raise ValueError("设定核对编号与修订号须复制本次实际读取条目，不能串用或补造。")
+        return output
+    model = create_model("ModeCheckOutput", __base__=ModeCheckOutput,
+        __validators__={"current_coverage": model_validator(mode="after")(coverage)})
+    model.__doc__ = ModeCheckOutput.__doc__
+    return model
 
 
 def evidence_matches(evidence: str, content: str) -> bool:

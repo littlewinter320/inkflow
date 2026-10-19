@@ -24,7 +24,7 @@ def workflow_failure_reason(result: Any) -> str:
         return str(result["gate"])
     resumable_boundary = result.get("resumable") is True and result.get("status") == "interrupted"
     if not resumable_boundary and (
-        result.get("status") in {"failed", "gate_stop", "needs_revision", "interrupted"}
+        result.get("status") in ("failed", "gate_stop", "needs_revision", "interrupted")
         or result.get("stop_reason")
     ):
         return str(result.get("stop_reason") or result.get("detail") or result.get("summary") or "任务未完成")
@@ -44,11 +44,13 @@ def workflow_result_status(result: Any) -> str:
     status = result.get("status")
     if result.get("post_commit_status") == "waiting_condition":
         return "waiting_condition"
-    if result.get("verdict") in {"unknown", "patch", "replan", "revise", "insufficient_context"}:
+    if result.get("verdict") in ("unknown", "patch", "replan", "revise", "insufficient_context"):
         return "waiting_condition"
     if status == "needs_input":
         return "waiting_user"
-    if status in {"waiting_user", "waiting_condition"}:
+    if status == "needs_evidence":
+        return "waiting_condition"
+    if status in ("waiting_user", "waiting_condition"):
         return str(status)
     if result.get("resumable") is True and status == "interrupted":
         return "waiting_condition"
@@ -73,6 +75,30 @@ def workflow_result_status(result: Any) -> str:
 def content_hash(value: str | bytes) -> str:
     raw = value.encode("utf-8") if isinstance(value, str) else value
     return hashlib.sha256(raw).hexdigest()
+
+
+def source_display_name(project: Any, source: str) -> str:
+    """Describe a user-facing reference without changing its stored identity."""
+    normalized = source.replace("\\", "/")
+    if normalized.startswith("story-setting:"):
+        from .story_settings import StorySettingsService
+        service = StorySettingsService(project)
+        record = service._get(normalized.split(":", 1)[1], "record")
+        collection = service._get(record["collection_id"], "collection") if record else None
+        return f"{collection['name'] if collection else '设定参考'}：{record['title']}" if record else "需要定位的设定参考条目"
+    name = Path(normalized).name
+    known = {"BOOK.md": "本书设定", "OUTLINE.md": "全书大纲", "STORY_DETAIL.md": "卷细纲",
+        "RECENT_PLAN.md": "近期章节规划", "PLAN.md": "旧版近期规划", "STATE.md": "正史与故事状态", "DIALOGUE.md": "对话记录"}
+    if name in known:
+        return known[name]
+    match = re.search(r"chapter_(\d+)", name)
+    if match:
+        kind = "审查报告" if normalized.startswith("reviews/") else "草稿" if "draft" in name else "正文"
+        return f"第{int(match[1])}章{kind}"
+    if normalized.startswith("planning/history/"):
+        from .planning_cleanup import planning_document_label
+        return planning_document_label(normalized)
+    return "后台核对记录" if ".inkflow/" in normalized or re.search(r"[a-f0-9]{16,}", name) else name
 
 
 def effective_character_count(content: str) -> int:

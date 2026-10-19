@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, Notification, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, Notification, screen, shell } from "electron";
 import { AppUpdater, NsisUpdater, autoUpdater } from "electron-updater";
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -6,9 +6,16 @@ import { appendFileSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync,
 import path from "node:path";
 import readline from "node:readline";
 
-const applicationId = app.isPackaged ? "cn.inkflow.desktop" : "cn.inkflow.desktop.dev";
+const isDevelopment = !app.isPackaged || Boolean(process.env.VITE_DEV_SERVER_URL
+  && existsSync(path.resolve(__dirname, "..", "..", "agent", "src", "inkflow", "app_server.py")));
+const applicationId = isDevelopment ? "cn.inkflow.desktop.dev" : "cn.inkflow.desktop";
 const applicationName = "墨流 InkFlow";
 if (process.platform === "win32") app.setAppUserModelId(applicationId);
+for (const [name, stream] of [["stdout", process.stdout], ["stderr", process.stderr]] as const) {
+  stream.on("error", (cause: NodeJS.ErrnoException) => {
+    logLifecycle("stdio.unavailable", { stream: name, code: cause.code || "unknown" });
+  });
+}
 
 // Lifecycle metadata only; never record prompts, novel text, keys or request payloads.
 function logLifecycle(event: string, details: Record<string, unknown> = {}): void {
@@ -119,9 +126,9 @@ class UpdateManager {
     const embeddedConfig = path.join(process.resourcesPath, "app-update.yml");
     const source: UpdateState["source"] = configuredUrl
       ? "environment"
-      : app.isPackaged && existsSync(embeddedConfig)
+      : !isDevelopment && existsSync(embeddedConfig)
         ? "embedded"
-        : app.isPackaged
+        : !isDevelopment
           ? "github"
           : "none";
     this.state = {
@@ -170,7 +177,7 @@ class UpdateManager {
   status(): UpdateState { return { ...this.state }; }
 
   async check(): Promise<UpdateState> {
-    if (!app.isPackaged) return this.setState({ status: "not_configured", message: "开发模式不执行在线更新；请构建安装版后检查。" });
+    if (isDevelopment) return this.setState({ status: "not_configured", message: "开发模式不执行在线更新；请构建安装版后检查。" });
     if (!this.updater) return this.state;
     await this.updater.checkForUpdates();
     return this.state;
@@ -467,6 +474,18 @@ class EngineBridge {
     return conversationId ? [...this.pending.values()].filter(item => item.conversationId === conversationId).length : this.pending.size;
   }
 
+  pendingWorkCount(conversationId?: string): number {
+    const reads = new Set(["project.open", "project.status", "project.tree", "collaboration.overview", "collaboration.list",
+      "context.status", "context.details", "task.status", "task.list", "document.read", "document.read_reference", "document.version.read", "document.search",
+      "settings.get", "computer.actions.list", "voice.status", "voice.settings.get", "voice.job.list", "voice.job.status", "voice.profile.list", "voice.roles.get", "project.trash.list", "project.canon_migration.status",
+      "story_settings.list", "story_settings.records", "story_settings.templates", "manual_edits.status", "memory.audit"]);
+    // Unknown requests still protect exit; only known status and read requests are passive.
+    return [...this.pending.values()].filter(item => (!conversationId || item.conversationId === conversationId)
+      && !reads.has(item.method) && item.method !== "run.cancel"
+      && !(item.method === "preferences.manage" && ["list", "usage", "history"].includes(item.action))
+      && !(item.method === "workflow.run" && ["checkpoint_list", "rollback_preview"].includes(item.action))).length;
+  }
+
   pendingMethods(): string[] {
     // Method names are enough to diagnose a stale read request without
     // logging user text, file paths, API credentials, or request parameters.
@@ -521,14 +540,12 @@ class EngineBridge {
         message?: string;
         code?: string;
         impact?: string;
-        preserved?: string;
         actions?: Array<{ label?: string }>;
       };
       const lines = [
         error.title && error.title !== error.message ? error.title : "",
         error.message || error.code || "墨流引擎请求失败。",
-        error.impact ? `影响：${error.impact}` : "",
-        error.preserved ? `已保留：${error.preserved}` : "",
+        error.impact || "",
         error.actions?.length ? `下一步：${error.actions.map((item) => item.label).filter(Boolean).join("；")}` : "",
       ].filter(Boolean);
       pending.reject(new Error(lines.join("\n")));
@@ -544,7 +561,7 @@ class EngineBridge {
   }
 
   private command(): { executable: string; args: string[]; cwd: string; env?: Record<string, string> } {
-    if (app.isPackaged) {
+    if (!isDevelopment) {
       const executable = path.join(process.resourcesPath, "engine", "inkflow-engine.exe");
       if (!existsSync(executable)) throw new Error(`找不到墨流本地引擎：${executable}`);
       return { executable, args: [], cwd: path.dirname(executable) };
@@ -565,15 +582,18 @@ class EngineBridge {
 }
 
 let mainWindow: BrowserWindow | null = null;
-const conversationWindows = new Map<number, { projectRoot: string; conversationId: string }>();
+type WorkspacePanelId = "navigation" | "assistant" | "inspector";
+const conversationWindows = new Map<number, { projectRoot: string; conversationId: string; panel?: WorkspacePanelId; ownerId?: number; relativePath?: string; shared?: boolean; returnHidden?: boolean }>();
+const workspaceStates = new Map<number, Record<string, unknown>>();
 let bridge: EngineBridge | null = null;
+let voiceDataDirectory = "";
 let updates: UpdateManager | null = null;
 let confirmationPending = false;
 let closeConfirmationPending = false;
 let closeAuthorized = false;
 
 function applicationIconPath(): string {
-  return app.isPackaged
+  return !isDevelopment
     ? path.join(process.resourcesPath, "icon.ico")
     : path.resolve(__dirname, "..", "resources", "icon.ico");
 }
@@ -583,7 +603,7 @@ function developmentLaunchDetails(): { target: string; args: string } {
 }
 
 function applicationRelaunchCommand(): string {
-  if (app.isPackaged) return `"${process.execPath}"`;
+  if (!isDevelopment) return `"${process.execPath}"`;
   // A pinned development window must start Vite as well as the application.
   // Launching electron.exe alone opens Electron's default welcome screen.
   const launch = developmentLaunchDetails();
@@ -613,11 +633,14 @@ function rememberConversationWindow(projectRoot: string, conversationId: string)
   renameSync(temporary, file);
 }
 
-function loadWorkspace(window: BrowserWindow, conversationId?: string): void {
+function loadWorkspace(window: BrowserWindow, conversationId?: string, panel?: WorkspacePanelId): void {
   const developmentUrl = process.env.VITE_DEV_SERVER_URL;
+  const query: Record<string, string> = { ...(conversationId ? { conversation_id: conversationId } : {}), ...(panel ? { workspace_panel: panel } : {}) };
+  const url = developmentUrl ? new URL(developmentUrl) : null;
+  for (const [key, value] of Object.entries(query)) url?.searchParams.set(key, value);
   const loading = developmentUrl
-    ? window.loadURL(conversationId ? `${developmentUrl}/?conversation_id=${encodeURIComponent(conversationId)}` : developmentUrl)
-    : window.loadFile(path.join(__dirname, "..", "dist", "index.html"), conversationId ? { query: { conversation_id: conversationId } } : {});
+    ? window.loadURL(url!.toString())
+    : window.loadFile(path.join(__dirname, "..", "dist", "index.html"), { query });
   void loading.then(() => {
     if (window.isDestroyed()) return;
     if (window.isMinimized()) window.restore();
@@ -633,7 +656,7 @@ function loadWorkspace(window: BrowserWindow, conversationId?: string): void {
       detail: `${redactEngineDiagnostics(String(cause))}\n启动记录保存在 ${path.join(app.getPath("userData"), "logs")}。`,
       buttons: ["重新载入", "查看启动日志"], defaultId: 0, cancelId: 1,
     }).then(({ response }) => {
-      if (response === 0 && !window.isDestroyed()) loadWorkspace(window, conversationId);
+      if (response === 0 && !window.isDestroyed()) loadWorkspace(window, conversationId, panel);
       else void shell.openPath(path.join(app.getPath("userData"), "logs"));
     }).catch(() => undefined);
   });
@@ -650,22 +673,68 @@ function createConversationWindow(projectRoot: string, requestedId?: string): { 
   }
   rememberConversationWindow(projectRoot, conversationId);
   const window = new BrowserWindow({
-    width: 1160, height: 820, minWidth: 960, minHeight: 650,
+    width: 620, height: 820, minWidth: 320, minHeight: 300,
     title: "墨流 · 独立对话", icon: applicationIconPath(), backgroundColor: "#11110f", show: true, autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
-  conversationWindows.set(window.id, { projectRoot, conversationId });
+  conversationWindows.set(window.id, { projectRoot, conversationId, panel: "assistant" });
   let closeConfirmed = false; let asking = false;
   window.on("close", event => {
-    if (closeConfirmed || !bridge?.pendingCount(conversationId)) return;
+    if (closeConfirmed || !bridge?.pendingWorkCount(conversationId)) return;
     event.preventDefault();
     if (asking) return;
     asking = true;
     void dialog.showMessageBox(window, { type: "question", title: "这份对话还有请求未返回", message: "关闭窗口后，当前任务仍会在后台继续，已保存的记录保留。", detail: "重新打开对话历史可核对结果；关闭主工作区会按全应用退出流程处理所有任务。", buttons: ["继续查看", "关闭这份窗口"], defaultId: 0, cancelId: 0, noLink: true }).then(result => { if (result.response === 1 && !window.isDestroyed()) { closeConfirmed = true; window.close(); } }).finally(() => { asking = false; });
   });
   window.once("closed", () => conversationWindows.delete(window.id));
-  loadWorkspace(window, conversationId);
+  loadWorkspace(window, conversationId, "assistant");
   return { conversationId };
+}
+
+function createWorkspacePanel(owner: BrowserWindow, projectRoot: string, panel: WorkspacePanelId, relativePath?: string, requested?: Electron.Rectangle): void {
+  const existing = [...conversationWindows].find(([, item]) => item.ownerId === owner.id && item.panel === panel && sameProjectRoot(item.projectRoot, projectRoot));
+  const opened = existing ? BrowserWindow.fromId(existing[0]) : null;
+  if (opened && !opened.isDestroyed()) { if (opened.isMinimized()) opened.restore(); opened.focus(); return; }
+  const display = screen.getDisplayMatching(requested || owner.getBounds()).workArea;
+  const minimumWidth = panel === "assistant" ? 280 : panel === "navigation" ? 180 : 200;
+  const width = Math.min(Math.max(minimumWidth, requested?.width || (panel === "assistant" ? 620 : 460)), display.width);
+  const height = Math.min(Math.max(240, requested?.height || 760), display.height);
+  const bounds = owner.getBounds();
+  const window = new BrowserWindow({
+    x: Math.max(display.x, Math.min(display.x + display.width - width, requested?.x ?? bounds.x + 48)), y: Math.max(display.y, Math.min(display.y + display.height - height, requested?.y ?? bounds.y + 48)),
+    width, height, minWidth: Math.min(minimumWidth, display.width), minHeight: Math.min(240, display.height), title: `墨流 · ${{ navigation: "小说结构", assistant: "墨宝对话", inspector: "批注与版本" }[panel]}`,
+    icon: applicationIconPath(), backgroundColor: "#11110f", show: true, autoHideMenuBar: true,
+    webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true },
+  });
+  const conversationId = conversationWindows.get(owner.id)?.conversationId || "main";
+  conversationWindows.set(window.id, { projectRoot, conversationId, panel, ownerId: owner.id, relativePath, shared: true });
+  let dragOrigin: Electron.Rectangle | null = null;
+  const notifyDrag = (phase: "move" | "drop" | "cancel") => {
+    if (owner.isDestroyed() || window.isDestroyed() || owner.isMinimized() && phase === "move") return;
+    owner.webContents.send("workspace:event", { type: "native-drag", panel, projectRoot, phase: owner.isMinimized() ? "cancel" : phase,
+      rect: window.getContentBounds(), origin: owner.getContentBounds(), point: screen.getCursorScreenPoint(), scale: owner.webContents.getZoomFactor() });
+  };
+  const cancelDrag = () => { if (dragOrigin) { dragOrigin = null; if (!window.isDestroyed()) window.setOpacity(1); notifyDrag("cancel"); } };
+  // Windows 'moved' ends the native drag; a pause during 'move' is not a drop.
+  window.on("will-move", () => { if (!dragOrigin && process.platform === "win32") { dragOrigin = window.getBounds(); window.setOpacity(.84); } });
+  window.on("move", () => { if (dragOrigin) notifyDrag("move"); });
+  window.on("moved", () => {
+    if (!dragOrigin) return;
+    const current = window.getBounds(), original = dragOrigin; dragOrigin = null; window.setOpacity(1);
+    const cancelled = current.x === original.x && current.y === original.y || window.isMaximized() || window.snapped;
+    notifyDrag(cancelled ? "cancel" : "drop");
+  });
+  window.on("will-resize", cancelDrag); window.on("blur", cancelDrag); window.on("minimize", cancelDrag);
+  const returned = () => {
+    const hidden = conversationWindows.get(window.id)?.returnHidden === true;
+    conversationWindows.delete(window.id);
+    owner.removeListener("closed", ownerClosed);
+    if (!owner.isDestroyed()) owner.webContents.send("workspace:event", { type: "returned", panel, projectRoot, hidden });
+  };
+  const ownerClosed = () => { if (!window.isDestroyed()) window.close(); workspaceStates.delete(owner.id); };
+  window.once("closed", returned);
+  owner.once("closed", ownerClosed);
+  loadWorkspace(window, conversationId, panel);
 }
 
 function createWindow(): void {
@@ -798,9 +867,10 @@ function createWindow(): void {
     unresponsivePromptShown = false;
   });
   affectedWindow.on("close", (event) => {
-    const pending = bridge?.pendingCount() || 0;
-    logLifecycle("window.close-requested", { pending, pending_methods: bridge?.pendingMethods() || [] });
-    if (closeAuthorized || pending === 0) return;
+    const pending = bridge?.pendingWorkCount() || 0;
+    const allPending = bridge?.pendingCount() || 0;
+    logLifecycle("window.close-requested", { pending: allPending, active_pending: pending, pending_methods: bridge?.pendingMethods() || [] });
+    if (closeAuthorized || allPending === 0) return;
     event.preventDefault();
     if (closeConfirmationPending) return;
     closeConfirmationPending = true;
@@ -809,16 +879,17 @@ function createWindow(): void {
       closeConfirmationPending = false;
       return;
     }
-    void dialog.showMessageBox(closingWindow, {
+    const confirmation = pending === 0 ? Promise.resolve({ response: 1 }) : dialog.showMessageBox(closingWindow, {
       type: "warning",
-      title: "墨流有请求尚未返回",
-      message: `还有 ${pending} 项本地请求尚未返回。退出会取消这些请求。`,
-      detail: "请求未返回不一定代表仍在写作。若当前工作里有正在运行的创作或安装，请先核对进度；已保存的正文、草稿和候选会保留。返回墨流不会重复发送请求。",
+      title: "墨流还有工作尚未结束",
+      message: `还有 ${pending} 项工作尚未结束。退出会停止这些工作。`,
+      detail: "请先在任务记录核对正在进行的生成、安装或写入。返回墨流会继续当前任务，不会重新发送请求。",
       buttons: ["返回墨流，继续运行", "停止并退出"],
       defaultId: 0,
       cancelId: 0,
       noLink: true,
-    }).then(async ({ response }) => {
+    });
+    void confirmation.then(async ({ response }) => {
       if (response !== 1 || closingWindow.isDestroyed()) return;
       const stoppingBridge = bridge;
       try {
@@ -862,10 +933,14 @@ function createWindow(): void {
     if (!source || (source !== mainWindow && !conversationWindows.has(source.id))) throw new Error("这个窗口没有本地引擎访问权限。");
     const conversationId = conversationWindows.get(source.id)?.conversationId || "main";
     const result = await bridge?.request(method, { ...params, conversation_id: conversationId });
+    if (method === "voice.settings.get" || method === "voice.settings.configure" || method === "voice.storage.move") {
+      const settings = (method === "voice.storage.move" ? (result as { settings?: unknown })?.settings : result) as { voice_data_dir?: string } | undefined;
+      voiceDataDirectory = settings?.voice_data_dir || "";
+    }
     const context = conversationWindows.get(source.id);
     if (context && method === "project.open" && typeof params.project_root === "string" && context.projectRoot !== params.project_root) {
       context.projectRoot = params.project_root;
-      try { rememberConversationWindow(context.projectRoot, context.conversationId); }
+      try { if (!context.shared) rememberConversationWindow(context.projectRoot, context.conversationId); }
       catch { logLifecycle("conversation-windows.write.failed"); }
     }
     return result;
@@ -876,6 +951,59 @@ function createWindow(): void {
     return createConversationWindow(projectRoot ? resolveInkFlowProject(projectRoot) : "", conversationId);
   });
   ipcMain.handle("app:conversation-windows", (_event, projectRoot: string) => recentConversationWindows(projectRoot));
+  ipcMain.handle("workspace:open", (event, projectRoot: string, panel: WorkspacePanelId, relativePath?: string, value?: unknown) => {
+    const source = BrowserWindow.fromWebContents(event.sender);
+    if (!source || (source !== mainWindow && !conversationWindows.has(source.id)) || !["navigation", "assistant", "inspector"].includes(panel) || typeof projectRoot !== "string" || !projectRoot) throw new Error("请先打开小说，再移动这个面板。");
+    if (conversationWindows.get(source.id)?.shared) throw new Error("请先回到主工作台，再打开独立面板。");
+    let requested: Electron.Rectangle | undefined;
+    if (value !== undefined) {
+      const rect = value as Electron.Rectangle;
+      if (!rect || typeof rect !== "object" || ![rect.x, rect.y, rect.width, rect.height].every(item => typeof item === "number" && Number.isFinite(item)) || rect.width <= 0 || rect.height <= 0) throw new Error("面板的落位尺寸无效，请重新拖动。");
+      const origin = source.getContentBounds(), scale = source.webContents.getZoomFactor();
+      requested = { x: Math.round(origin.x + rect.x * scale), y: Math.round(origin.y + rect.y * scale), width: Math.round(rect.width * scale), height: Math.round(rect.height * scale) };
+    }
+    createWorkspacePanel(source, resolveInkFlowProject(projectRoot), panel, typeof relativePath === "string" ? relativePath : undefined, requested);
+  });
+  ipcMain.handle("workspace:return", (event, panel?: WorkspacePanelId, hide = false) => {
+    const source = BrowserWindow.fromWebContents(event.sender);
+    if (panel && source && (source === mainWindow || conversationWindows.has(source.id))) {
+      if (!["navigation", "assistant", "inspector"].includes(panel)) throw new Error("这个面板不能返回工作台。");
+      const opened = [...conversationWindows].find(([, item]) => item.ownerId === source.id && item.panel === panel);
+      if (opened) opened[1].returnHidden = hide === true;
+      const window = opened ? BrowserWindow.fromId(opened[0]) : null;
+      if (window && !window.isDestroyed()) window.close();
+      return;
+    }
+    const context = source ? conversationWindows.get(source.id) : null;
+    if (!source || !context?.panel) return;
+    context.returnHidden = hide === true;
+    const owner = context.ownerId ? BrowserWindow.fromId(context.ownerId) : mainWindow;
+    if (owner && !owner.isDestroyed()) { if (owner.isMinimized()) owner.restore(); owner.focus(); }
+    source.close();
+  });
+  ipcMain.handle("workspace:state", (event, value: unknown) => {
+    const source = BrowserWindow.fromWebContents(event.sender);
+    if (!source || (source !== mainWindow && !conversationWindows.has(source.id)) || conversationWindows.get(source.id)?.shared || !value || typeof value !== "object") return;
+    const state = value as Record<string, unknown>;
+    if (typeof state.projectRoot !== "string" || !state.projectRoot || !Array.isArray(state.messages) || state.messages.length > 200) return;
+    workspaceStates.set(source.id, state);
+    for (const [id, context] of conversationWindows) {
+      if (context.ownerId !== source.id || !context.shared) continue;
+      const window = BrowserWindow.fromId(id);
+      if (!window || window.isDestroyed()) continue;
+      if (!sameProjectRoot(context.projectRoot, state.projectRoot)) window.close();
+      else window.webContents.send("workspace:event", { type: "state", state });
+    }
+  });
+  ipcMain.handle("workspace:command", (event, command: string, value: string, relativePath?: string) => {
+    const source = BrowserWindow.fromWebContents(event.sender), context = source ? conversationWindows.get(source.id) : null;
+    const allowed = context?.panel === "assistant" ? ["chat"] : context?.panel === "navigation" ? ["document"] : ["compare", "annotation"];
+    if (!context?.shared || !context.ownerId || !allowed.includes(command) || typeof value !== "string" || value.length > 100_000) throw new Error("这个面板不能执行这项操作，请回到主工作台处理。");
+    const owner = BrowserWindow.fromId(context.ownerId);
+    if (!owner || owner.isDestroyed()) throw new Error("主工作台已关闭，请重新打开小说。");
+    if (["document", "compare"].includes(command)) { if (owner.isMinimized()) owner.restore(); owner.focus(); }
+    owner.webContents.send("workspace:event", { type: "command", command, value, relativePath, projectRoot: context.projectRoot });
+  });
   ipcMain.handle("dialog:confirm", async (event, message: string) => {
     const window = BrowserWindow.fromWebContents(event.sender);
     if (!window || window.isDestroyed() || (window !== mainWindow && !conversationWindows.has(window.id)) || confirmationPending || typeof message !== "string" || !message.trim()) return false;
@@ -953,21 +1081,26 @@ function createWindow(): void {
     });
     return result.canceled ? null : result.filePaths[0];
   });
-  ipcMain.handle("voice:save-recording", (_event, bytes: Uint8Array, extension = "webm") => {
+  ipcMain.handle("voice:save-recording", (_event, bytes: Uint8Array, extension = "webm", snapshotId?: string) => {
+    if (!bytes?.byteLength || bytes.byteLength > 50 * 1024 * 1024) throw new Error("录音为空或过长，请分段录制。");
+    if (snapshotId !== undefined && !/^[a-f0-9-]{36}$/.test(snapshotId)) throw new Error("本次录音的身份无效，请重新开始录音。");
     const safeExtension = ["wav", "webm", "ogg", "mp3", "m4a"].includes(extension) ? extension : "webm";
-    const folder = path.join(app.getPath("userData"), "voice-input");
+    const folder = voiceDataDirectory ? path.join(voiceDataDirectory, "cache", "voice-input") : process.platform === "win32" && existsSync("D:/") ? "D:/墨流/cache/voice-input" : path.join(app.getPath("userData"), "voice-input");
     mkdirSync(folder, { recursive: true });
-    const target = path.join(folder, `recording-${randomUUID()}.${safeExtension}`);
+    const target = path.join(folder, `${snapshotId ? "snapshot" : "recording"}-${snapshotId || randomUUID()}.${safeExtension}`);
     writeFileSync(target, Buffer.from(bytes));
     return target;
   });
-  ipcMain.handle("voice:audio-url", (_event, target: string) => {
+  ipcMain.handle("voice:audio-url", async (_event, target: string) => {
     const resolved = path.resolve(target);
+    const voiceSettings = await bridge?.request("voice.settings.get") as { voice_data_dir?: string } | undefined;
     const allowedRoots = [
       app.getPath("userData"),
       app.getPath("temp"),
       path.join(process.env.LOCALAPPDATA || app.getPath("userData"), "InkFlow"),
       path.join(process.env.APPDATA || app.getPath("userData"), "InkFlow"),
+      "D:/墨流/cache/voice-input",
+      ...(voiceSettings?.voice_data_dir ? [voiceSettings.voice_data_dir] : []),
     ].map((item) => path.resolve(item));
     const allowed = allowedRoots.some((root) => {
       const relative = path.relative(root, resolved);
@@ -995,7 +1128,8 @@ function createWindow(): void {
   ipcMain.handle("app:launch-context", event => {
     const source = BrowserWindow.fromWebContents(event.sender);
     const context = source ? conversationWindows.get(source.id) : undefined;
-    return { projectRoot: context ? context.projectRoot || null : projectArgument(), conversationId: context?.conversationId || "main" };
+    const nativePanels = source ? [...conversationWindows.values()].filter(item => item.ownerId === source.id && item.shared && item.panel).map(item => item.panel!) : [];
+    return { projectRoot: context ? context.projectRoot || null : projectArgument(), conversationId: context?.conversationId || "main", panel: context?.panel, relativePath: context?.relativePath, shared: context?.shared, sharedState: context?.shared && context.ownerId ? workspaceStates.get(context.ownerId) : undefined, nativePanels };
   });
   ipcMain.handle("app:update-status", () => updates?.status());
   ipcMain.handle("app:update-check", () => updates?.check());
@@ -1034,7 +1168,7 @@ if (!singleInstance) {
     if (root) mainWindow.webContents.send("app:open-project", root);
   });
   app.whenReady().then(() => {
-    logLifecycle("app.started", { version: app.getVersion(), packaged: app.isPackaged });
+    logLifecycle("app.started", { version: app.getVersion(), packaged: !isDevelopment });
     createWindow();
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();

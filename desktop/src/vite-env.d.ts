@@ -7,6 +7,11 @@ interface Window {
     request<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>;
     openConversationWindow(projectRoot: string, conversationId?: string): Promise<{ conversationId: string }>;
     conversationWindows(projectRoot: string): Promise<Array<{ conversationId: string; projectRoot: string; openedAt: string }>>;
+    openWorkspacePanel(projectRoot: string, panel: "navigation" | "assistant" | "inspector", relativePath?: string, bounds?: { x: number; y: number; width: number; height: number }): Promise<void>;
+    returnWorkspacePanel(panel?: "navigation" | "assistant" | "inspector", hide?: boolean): Promise<void>;
+    publishWorkspaceState(state: InkFlowEvent): Promise<void>;
+    workspaceCommand(command: "document" | "compare" | "chat" | "annotation", value: string, relativePath?: string): Promise<void>;
+    onWorkspaceEvent(listener: (event: InkFlowEvent) => void): () => void;
     confirm(message: string): Promise<boolean>;
     chooseFolder(title: string): Promise<string | null>;
     recentProjects(): Promise<Array<{ root: string; title: string; openedAt: string }>>;
@@ -16,11 +21,11 @@ interface Window {
     moveProject(root: string, targetParent: string): Promise<{ source: string; destination: string }>;
     chooseFile(title: string): Promise<string | null>;
     chooseAudio(title: string): Promise<string | null>;
-    saveVoiceRecording(bytes: Uint8Array, extension?: string): Promise<string>;
+    saveVoiceRecording(bytes: Uint8Array, extension?: string, snapshotId?: string): Promise<string>;
     audioUrl(target: string): Promise<string>;
     openPath(target: string): Promise<string>;
     showItem(target: string): Promise<void>;
-    launchContext(): Promise<{ projectRoot: string | null; conversationId: string }>;
+    launchContext(): Promise<{ projectRoot: string | null; conversationId: string; panel?: "navigation" | "assistant" | "inspector"; relativePath?: string; shared?: boolean; sharedState?: InkFlowEvent; nativePanels?: Array<"navigation" | "assistant" | "inspector"> }>;
     updateStatus(): Promise<InkFlowEvent>;
     checkUpdate(): Promise<InkFlowEvent>;
     downloadUpdate(): Promise<InkFlowEvent>;

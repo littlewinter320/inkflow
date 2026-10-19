@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { LocalWavRecorder } from "./voiceRecording";
+import { LocalWavRecorder, voiceInputFailure } from "./voiceRecording";
 
 type Request = <T,>(method: string, params?: Record<string, unknown>) => Promise<T>;
 
@@ -32,6 +32,7 @@ export type VoiceSettings = {
   voice_segment_chars: number;
   voice_cache_limit_mb: number;
   voice_debug: boolean;
+  voice_data_dir?: string;
 };
 
 export type VoiceStatus = {
@@ -45,6 +46,12 @@ export type VoiceStatus = {
   backend?: string;
   edge?: {
     installed: boolean;
+    connection_ready?: boolean;
+    needs_update?: boolean;
+    compatibility_message?: string;
+    version?: string;
+    latest_version?: string;
+    update_available?: boolean;
     packages_dir: string;
     storage_size_mb: number;
     has_local_files?: boolean;
@@ -357,7 +364,7 @@ function VoiceCloneDialog({ projectRoot, request, onClose, onCreated, onNotice, 
       setAudioPath("");
       setRecording(true);
     } catch (cause) {
-      onError(cause instanceof Error ? cause.message : "无法使用麦克风，请检查 Windows 权限。");
+      onError(voiceInputFailure(cause));
     }
   };
 

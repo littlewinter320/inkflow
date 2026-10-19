@@ -25,6 +25,55 @@ SCHEMA = "story-settings-v1"
 MARKER = "story_settings_type"
 
 
+def setting_structured_sources(project, read_sources: dict[str, str]) -> dict[str, Any]:
+    """Omit only proven duplicate projections; source texts and storage stay intact."""
+    from types import SimpleNamespace
+    from .planning_pipeline import PlanningNeedsAttention, load_active_planning, v2_execution_bundle
+    from .project import render_book_brief
+
+    brief = project.db.get_brief()
+    plan = project.db.get_current_plan_bundle()
+    notes = {"plan": "未来规划是假设，不是已发生正史。"}
+    result = {"book_brief": brief.model_dump(mode="json"),
+              "plan": plan.model_dump(mode="json") if plan else None, "source_notes": notes}
+    if read_sources.get("BOOK.md") == render_book_brief(brief):
+        result["book_brief"] = {"duplicate_projection_omitted": True, "source": "BOOK.md",
+                                "source_hash": content_hash(read_sources["BOOK.md"])}
+        notes["book_brief"] = "书籍契约与已装入的BOOK原文精确相同，内容只读取该原文。"
+    else:
+        notes["book_brief"] = "BOOK原文缺失或与数据库契约不完全相同，保留完整契约供对照，未省略差异。"
+    if plan is None:
+        notes["plan"] += " 数据库没有结构化规划。"
+        return result
+    try:
+        # The loader's failure notification must not write pending work from a projection helper.
+        view = SimpleNamespace(root=project.root, record_pending_work=lambda **_: None)
+        active = load_active_planning(view)
+        if active is None:
+            notes["plan"] += " 未找到完整生效的三层规划证明，保留数据库规划全文，未省略。"
+            return result
+        manifest, outline, detail, window = active
+        hashes = {name: manifest[key] for name, key in (
+            ("OUTLINE.md", "outline_hash"), ("STORY_DETAIL.md", "volume_detail_hash"),
+            ("RECENT_PLAN.md", "recent_plan_hash"))}
+        if any(name not in read_sources or content_hash(read_sources[name]) != expected
+               for name, expected in hashes.items()):
+            notes["plan"] += " 已装入的规划原文与当前生效来源不一致，保留数据库规划全文，未省略差异。"
+            return result
+        expected = v2_execution_bundle(project, manifest, outline, detail, window)
+        if plan.model_dump(mode="json") != expected.model_dump(mode="json"):
+            notes["plan"] += " 数据库执行视图含不同于生效原文投影的内容，保留全文，未省略独有内容。"
+            return result
+        result["plan"] = {"duplicate_projection_omitted": True, "source": "planning/active-v2.json",
+                          "revision_no": manifest.get("revision_no", 1), "trace_id": manifest["trace_id"],
+                          "volume_no": manifest["volume_no"], "chapter_window": manifest["chapter_window"],
+                          "source_hashes": hashes}
+        notes["plan"] += " 数据库执行视图与生效三层规划精确相同，正文内容只读取已装入的三份原文。"
+    except (PlanningNeedsAttention, OSError, ValueError, KeyError, TypeError, StopIteration):
+        notes["plan"] += " 生效规划未能完整核验或发布尚未完成，保留数据库规划全文与原文，未省略差异。"
+    return result
+
+
 def _fields(*items: tuple[str, str, str]) -> list[dict[str, Any]]:
     return [{"key": key, "label": label, "description": description, "default": ""}
             for key, label, description in items]
@@ -119,6 +168,70 @@ def _roles(values: Any, allowed: set[str], label: str) -> list[str]:
     return sorted(set(values))
 
 
+def has_setting_content(value: Any) -> bool:
+    """Blank template fields are not a setting; zero and False can be meaningful."""
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return any(has_setting_content(item) for item in value.values())
+    if isinstance(value, list):
+        return any(has_setting_content(item) for item in value)
+    return value is not None
+
+
+def user_supplied_setting_values(text: str, values: dict[str, Any]) -> bool:
+    """Only a literal user field object proves a Coordinator copied all values."""
+    if not isinstance(values, dict) or not values:
+        return False
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            supplied, _ = decoder.raw_decode(text[match.start():])
+        except ValueError:
+            continue
+        if supplied == values or isinstance(supplied, dict) and supplied.get("values") == values:
+            return True
+    return False
+
+
+def setting_classification_issues(collection: dict[str, Any], values: dict[str, Any]) -> list[str]:
+    if collection.get("template_id") != "world":
+        return []
+    changes = values.get("changes")
+    if isinstance(changes, str) and re.search(
+            r"(?:单章|每章|总字数|篇幅|字数).{0,20}[0-9一二三四五六七八九十百千万]+\s*字|"
+            r"(?:第一卷|第1卷).{0,8}[0-9一二三四五六七八九十百]+\s*章|"
+            r"(?:规划|预计|完结|全书).{0,20}[0-9一二三四五六七八九十百]+\s*[章卷]", changes):
+        return ["世界变化中混入了章节数量或字数安排。这些属于本书写作要求，应对照当前规划核实；世界变化只记录故事里发生的变化。"]
+    return []
+
+
+def book_requirement_collection(brief: Any, book_text: str) -> dict[str, Any]:
+    """Read-only projection: reuse setting readback without inventing stored records."""
+    records = [{"record_id": "book-rule-" + content_hash(str(index) + rule)[:24],
+        "revision": 1, "title": f"本书要求第{index}条", "values": {"requirement": rule},
+        "epistemic_status": "user_constraint", "authority": "user_requirement",
+        "status": "current" if rule in book_text else "stale_evidence",
+        "evidence_refs": [{"source_kind": "planning", "path": "BOOK.md", "quote": rule,
+            "source_hash": content_hash(book_text), "source_current": rule in book_text}]}
+        for index, rule in enumerate(brief.user_rules, 1) if rule.strip()]
+    return {"collection_id": "book-required-reading", "name": "本书必读要求", "category": "写作要求",
+        "template_id": "constraint", "recording_allowed": False, "read_only": True,
+        "instructions": "逐条阅读原话，按适用范围及当前要求核对。必读不等于把每项偏好都升级为硬约束；不适用也须说明原因。章节数量、字数和文风属于作者要求，世界法律与制度属于故事内规则，分别对照。",
+        "records": records}
+
+
+def collection_requires_recheck(collection: dict[str, Any], recorded_revision: int) -> bool:
+    if recorded_revision == collection["revision"]:
+        return False
+    before = next((event.get("before") for event in collection.get("history", [])
+                   if event.get("revision") == recorded_revision + 1), None)
+    if before is None:
+        return True
+    return any(before.get(key) != collection.get(key) for key in
+               ("instructions", "fields", "read_roles", "write_roles", "template_id"))
+
+
 class StorySettingsService:
     def __init__(self, project: Any):
         # Local import avoids making studio's existing document helpers circular.
@@ -129,6 +242,20 @@ class StorySettingsService:
     @staticmethod
     def templates() -> list[dict[str, Any]]:
         return deepcopy(_TEMPLATES)
+
+    def ensure_defaults(self) -> None:
+        """Initialize the two user-requested foundations without touching existing records."""
+        with project_write_lock_sync(self.project.root):
+            for template_id, name in (("character", "人物设定"), ("world", "世界设定")):
+                identity = "setting-base-" + template_id
+                if self._get(identity, "collection") is not None:
+                    continue
+                template = next(item for item in _TEMPLATES if item["template_id"] == template_id)
+                self._save(None, {MARKER: "collection", "schema": SCHEMA, "collection_id": identity,
+                    "name": name, "category": template["category"], "template_id": template_id,
+                    "instructions": template["description"], "fields": deepcopy(template["fields"]),
+                    "read_roles": sorted(READ_ROLES), "write_roles": sorted(WRITE_ROLES),
+                    "builtin": True, "auto_record": True, "status": "active"}, actor="user", action="initialize_base")
 
     def _all(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
         with self.db.connect() as connection:
@@ -149,11 +276,46 @@ class StorySettingsService:
         return next((item for item in self._all(include_archived=True)
                      if item.get(MARKER) == item_type and item.get(key) == item_id), None)
 
-    def list_collections(self, include_archived: bool = False) -> list[dict[str, Any]]:
+    def list_collections(self, include_archived: bool = False, *, include_review_links: bool = False) -> list[dict[str, Any]]:
         items = self._all(include_archived=include_archived)
-        return [{**item, "records": [record for record in items if record.get(MARKER) == "record"
-                                    and record["collection_id"] == item["collection_id"]]}
-                for item in items if item.get(MARKER) == "collection"]
+        if include_review_links:
+            records = {item["record_id"]: item for item in items if item.get(MARKER) == "record"}
+            collections = {item["collection_id"]: item for item in items if item.get(MARKER) == "collection"}
+            cache: dict = {}
+            for item in records.values():
+                item["review_links"] = []
+                collection = collections.get(item["collection_id"])
+                live = self._context_record(item, collection, None, cache) if collection else None
+                if live and item["status"] != "archived":
+                    item["status"] = live["status"]
+                    item["classification_issues"] = live.get("classification_issues", [])
+            with self.project.db.connect() as connection:
+                rows = connection.execute("""SELECT r.chapter_no,r.chapter_version,
+                    json_extract(r.data_json,'$.source_hash') AS source_hash,
+                    json_extract(r.data_json,'$.context_use_audit.setting_checks') AS checks,
+                    c.version AS current_version,c.content_hash AS current_hash
+                    FROM reviews r JOIN chapters c ON c.chapter_no=r.chapter_no
+                    WHERE json_valid(r.data_json) AND json_extract(r.data_json,'$.context_use_audit.setting_checks') IS NOT NULL
+                    ORDER BY r.id DESC LIMIT 80""").fetchall()
+            for row in rows:
+                for check in json.loads(row["checks"] or "[]"):
+                    record = records.get(check.get("record_id"))
+                    if record is not None and len(record["review_links"]) < 3:
+                        record["review_links"].append({**check, "chapter_no": row["chapter_no"],
+                            "current": check.get("record_revision") == record["revision"]
+                                and record["status"] not in {"stale_evidence", "configuration_changed", "archived"}
+                                and row["chapter_version"] == row["current_version"] and row["source_hash"] == row["current_hash"]})
+        result = []
+        for item in items:
+            if item.get(MARKER) != "collection":
+                continue
+            records = [record for record in items if record.get(MARKER) == "record"
+                       and record["collection_id"] == item["collection_id"]]
+            names = [re.sub(r"\s+", "", record["title"]).casefold() for record in records if record["status"] != "archived"]
+            for record in records:
+                record["duplicate_name"] = record["status"] != "archived" and names.count(re.sub(r"\s+", "", record["title"]).casefold()) > 1
+            result.append({**item, "records": records})
+        return result
 
     def records(self, collection_id: str, include_archived: bool = False) -> list[dict[str, Any]]:
         if self._get(collection_id, "collection") is None:
@@ -190,9 +352,9 @@ class StorySettingsService:
         return {**stored, "entry_status": entry_status, "updated_at": now, "changed": True}
 
     def save_collection(self, *, name: str, collection_id: str | None = None, template_id: str | None = None,
-                        category: str = "", instructions: str = "", fields: list[dict[str, Any]] | None = None,
+                        category: str = "", instructions: str | None = None, fields: list[dict[str, Any]] | None = None,
                         read_roles: list[str] | None = None, write_roles: list[str] | None = None,
-                        expected_revision: int | None = None, actor: str = "user") -> dict[str, Any]:
+                        expected_revision: int | None = None, actor: str = "user", auto_record: bool | None = None) -> dict[str, Any]:
         if actor != "user":
             raise ProjectError("设定合集的负责内容与权限由用户定义，模型不能自行扩大。")
         with project_write_lock_sync(self.project.root):
@@ -200,6 +362,10 @@ class StorySettingsService:
             if collection_id and old is None:
                 raise ProjectError("设定合集不存在。")
             _revision(old, expected_revision)
+            if auto_record is not None and type(auto_record) is not bool:
+                raise ProjectError("自动记录须选择开启或关闭。")
+            if old and old.get("builtin") and auto_record is False:
+                raise ProjectError("人物与世界是基础设定，默认持续维护；可以修改具体记录说明。")
             template_id = template_id if template_id is not None else (old or {}).get("template_id", "")
             template = next((item for item in _TEMPLATES if item["template_id"] == template_id), None)
             if template_id and template is None:
@@ -222,10 +388,12 @@ class StorySettingsService:
                 "name": _text(name, "设定名称", 120, required=True),
                 "category": _text(category or (old or {}).get("category", (template or {}).get("category", "自定义")), "设定分类", 100),
                 "template_id": template_id,
-                "instructions": _text(instructions if old else instructions or (template or {}).get("description", ""), "记录任务", 6000),
+                "instructions": _text(instructions if instructions is not None else (old or {}).get("instructions", (template or {}).get("description", "")), "记录任务", 6000),
                 "fields": checked_fields,
                 "read_roles": _roles(read_roles if read_roles is not None else (old or {}).get("read_roles", sorted(READ_ROLES)), READ_ROLES, "读取角色"),
                 "write_roles": _roles(write_roles if write_roles is not None else (old or {}).get("write_roles", sorted(WRITE_ROLES)), WRITE_ROLES, "记录角色"),
+                "builtin": bool((old or {}).get("builtin")),
+                "auto_record": auto_record if auto_record is not None else (old or {}).get("auto_record", True),
                 "status": "active"}
             return self._save(old, data, actor=actor, action="configure_collection")
 
@@ -236,6 +404,8 @@ class StorySettingsService:
             old = self._get(collection_id, "collection")
             if old is None:
                 raise ProjectError("设定合集不存在。")
+            if old.get("builtin"):
+                raise ProjectError("人物与世界是基础设定，不能删除；可以编辑内容和记录说明。")
             _revision(old, expected_revision)
             return self._save(old, {**old, "status": "archived"}, actor=actor, action="archive_collection")
 
@@ -345,7 +515,13 @@ class StorySettingsService:
                 raise ProjectError("设定合集不存在或已移出使用。")
             if actor != "user" and actor not in collection["write_roles"]:
                 raise ProjectError("用户未允许此角色记录这份设定。")
+            if actor != "user" and not collection.get("auto_record", True):
+                raise ProjectError("这项设定已关闭自动记录，已有内容仍可查看；本次未自动补写。")
             old = self._get(record_id, "record") if record_id else None
+            if actor in REVIEW_ROLES and old is None and any(
+                    re.sub(r"\s+", "", item["title"]).casefold() == re.sub(r"\s+", "", title or name).casefold()
+                    for item in self.records(collection_id)):
+                raise ProjectError("这份设定已有同名条目，请读取其编号和修订号后补充；不会再新建重复记录。")
             if record_id and old is None and not re.fullmatch(r"setting-record-[A-Za-z0-9_-]{1,100}", record_id):
                 raise ProjectError("新增设定记录编号无效。")
             if record_id and ((old is None and operation != "new") or (old is not None and old["collection_id"] != collection_id)):
@@ -356,6 +532,11 @@ class StorySettingsService:
                 raise ProjectError("设定性质须为设想、客观记录、信念、传闻或用户约定。")
             if not isinstance(values, dict) or not values or any(key not in {field["key"] for field in collection["fields"]} for key in values):
                 raise ProjectError("记录内容须使用用户定义的字段。")
+            if actor in REVIEW_ROLES and old and operation == "supplement":
+                # A partial correction may clear one field while retaining the record.
+                values = {**old["values"], **values}
+            if not has_setting_content(values):
+                raise ProjectError("这条设定还没有填写内容。请至少填写一项；空条目不会保存或发起审查。")
             try:
                 encoded = json.dumps(values, ensure_ascii=False, allow_nan=False)
                 json.loads(encoded)
@@ -365,20 +546,24 @@ class StorySettingsService:
                 raise ProjectError("单条设定记录最多 16000 字，请拆分条目。")
             raw_refs = evidence_refs if evidence_refs is not None else evidence
             refs = self._evidence(raw_refs if raw_refs is not None else (old or {}).get("evidence_refs", []))
-            if actor in REVIEW_ROLES and (operation == "new" or not refs):
-                raise ProjectError("审查与记忆角色只能进行带原文依据的补充或纠正；新创作设定由 Writer 提案。")
+            if actor in REVIEW_ROLES:
+                if not refs:
+                    raise ProjectError("审查与记忆角色记录设定必须提供可定位的原文依据。")
+                canon_reference = epistemic_status in {"objective", "belief", "rumor"} and all(ref["source_kind"] == "canonical" for ref in refs)
+                book_requirement = epistemic_status == "user_constraint" and all(
+                    ref["source_kind"] == "planning" and ref.get("path") == "BOOK.md" for ref in refs)
+                if old is None and not (canon_reference or book_requirement):
+                    raise ProjectError("首次整理须引用已接受正文，或以用户约定性质引用当前书籍要求；新创作设想仍由 Writer 提出。")
             if actor == "writer":
                 epistemic_status = "hypothesis"
             if actor in REVIEW_ROLES and old and operation == "supplement":
-                values = {**old["values"], **values}
-                encoded = json.dumps(values, ensure_ascii=False, allow_nan=False)
-                if len(encoded) > 16000:
-                    raise ProjectError("补充后的单条设定超过 16000 字，请拆分记录。")
                 combined = []
                 for ref in [*old["evidence_refs"], *refs]:
                     if ref not in combined:
                         combined.append(ref)
                 refs = self._evidence(combined)
+            if actor != "user" and setting_classification_issues(collection, values):
+                raise ProjectError(setting_classification_issues(collection, values)[0])
             data = {MARKER: "record", "schema": SCHEMA, "record_id": record_id or f"setting-record-{uuid.uuid4().hex}",
                 "collection_id": collection_id, "title": _text(title or name or (old or {}).get("title", ""), "记录名称", 160, required=True),
                 "values": deepcopy(values), "evidence_refs": refs, "epistemic_status": epistemic_status,
@@ -387,8 +572,9 @@ class StorySettingsService:
                 "collection_revision": collection["revision"]}
             if old is not None:
                 # Re-saving identical content must not manufacture an edit or clear approval.
-                keys = ("title", "values", "evidence_refs", "epistemic_status", "source_chapter", "collection_revision")
-                if all(old.get(key) == data.get(key) for key in keys) and old["status"] != "archived":
+                keys = ("title", "values", "evidence_refs", "epistemic_status", "source_chapter")
+                if (all(old.get(key) == data.get(key) for key in keys) and old["status"] != "archived"
+                        and not collection_requires_recheck(collection, old["collection_revision"])):
                     return {**old, "changed": False}
                 if actor == "writer" and old["status"] in {"verified_reference", "user_kept_hypothesis"}:
                     raise ProjectError("Writer 不能改写已核对设定；请另建设想候选，由审查或记忆角色有据补充。")
@@ -426,11 +612,15 @@ class StorySettingsService:
                 raise ProjectError("设定记录不存在或已移出使用。")
             _revision(old, expected_revision)
             collection = self._get(old["collection_id"], "collection")
+            if not has_setting_content(old.get("values")):
+                raise ProjectError("这条设定尚未填写，不能标记为核对通过；请先补充具体内容。")
             if collection is None or collection["status"] != "active" or actor not in collection["read_roles"]:
                 raise ProjectError("此角色无权复核已移出或未授权读取的设定。")
-            if collection["revision"] != old["collection_revision"] and not source_fingerprint:
+            if collection_requires_recheck(collection, old["collection_revision"]) and not source_fingerprint:
                 raise ProjectError("记录任务或字段已经调整，复核须绑定当前合集与来源指纹。")
             refs = self._evidence(old["evidence_refs"])
+            if decision == "verified_reference" and setting_classification_issues(collection, old["values"]):
+                raise ProjectError(setting_classification_issues(collection, old["values"])[0])
             if decision == "verified_reference" and old["epistemic_status"] in {"objective", "belief", "rumor"} and not refs:
                 raise ProjectError("声称已有依据的设定仍缺原文，不能仅凭通过报告认证。")
             data = {**old, "status": decision, "collection_revision": collection["revision"],
@@ -497,8 +687,11 @@ class StorySettingsService:
         item["evidence_refs"] = refs
         if any(not ref["source_current"] for ref in refs):
             item["status"] = "stale_evidence"
-        elif record["collection_revision"] != collection["revision"]:
+        elif collection_requires_recheck(collection, record["collection_revision"]):
             item["status"] = "configuration_changed"
+        item["classification_issues"] = setting_classification_issues(collection, record["values"])
+        if item["classification_issues"] and item["status"] not in {"stale_evidence", "configuration_changed"}:
+            item["status"] = "needs_classification"
         return item
 
     def retrieval_records(self, *, chapter_no: int, actor: str) -> list[dict[str, Any]]:
@@ -517,46 +710,61 @@ class StorySettingsService:
                                    "authority": "reference_only"})
         return result
 
-    def context(self, chapter_no: int | None = None, query: str = "", actor: str = "writer", max_chars: int = 16000) -> str:
+    def context_payload(self, chapter_no: int | None = None, query: str = "", actor: str = "writer", max_chars: int = 16000) -> dict[str, Any]:
         if actor not in READ_ROLES:
             raise ProjectError("读取设定的角色不被允许。")
-        sections = []
+        sections, coverage = [], []
         remaining = max(1000, min(int(max_chars), 64000))
         query = query.casefold()
-        omitted = False
-        cache: dict[tuple[Any, ...], tuple[str, dict[str, Any]]] = {}
-        # ponytail: bounded linear reference selection; use existing retrieval ranking if collections outgrow this cap.
-        collections = sorted(self.list_collections(), key=lambda item: not (item["name"].casefold() in query))
+        cache: dict = {}
+        collections = sorted(self.list_collections(), key=lambda item: (
+            not any(record.get("epistemic_status") == "user_constraint" for record in item["records"]),
+            item["name"].casefold() not in query))
         for collection in collections:
+            # Do not expose names or contents that this role cannot read.
             if actor not in collection["read_roles"]:
                 continue
+            audit = {"collection_id": collection["collection_id"], "name": collection["name"],
+                     "selected_record_ids": [], "omitted": [], "empty_records": 0}
+            coverage.append(audit)
             payload = {key: value for key, value in collection.items()
                        if key not in {"history", "records", "updated_at", "entry_status"}}
+            payload["classification_path"] = [part.strip() for part in collection["category"].split("/") if part.strip()]
             payload["records"] = []
-            if len(json_dumps(payload)) > remaining:
-                omitted = True
-                continue
-            records = sorted(collection["records"], key=lambda item: not (item["title"].casefold() in query))
-            for record in records:
-                item = self._context_record(record, collection, chapter_no, cache)
-                if item is None:
+            payload["recording_allowed"] = collection.get("auto_record", True) and actor in collection["write_roles"]
+            eligible = []
+            for record in collection["records"]:
+                if not has_setting_content(record.get("values")):
+                    audit["empty_records"] += 1
                     continue
+                item = self._context_record(record, collection, chapter_no, cache)
+                if item is not None:
+                    eligible.append(item)
+            # User requirements must not lose their budget to ordinary references.
+            eligible.sort(key=lambda item: (item.get("epistemic_status") != "user_constraint", item["title"].casefold() not in query))
+            audit["available_record_count"] = len(eligible)
+            audit["record_index"] = [{"record_id": item["record_id"], "title": item["title"], "revision": item["revision"]} for item in eligible[:32]]
+            for item in eligible:
                 trial = {**payload, "records": [*payload["records"], item]}
-                if len(json_dumps(trial)) > remaining:
-                    omitted = True
+                if len(json_dumps(trial, indent=None)) > remaining and item.get("epistemic_status") != "user_constraint":
+                    audit["omitted"].append({"record_id": item["record_id"], "title": item["title"],
+                        "reason": "超过本次资料预算", "required": item.get("epistemic_status") == "user_constraint"})
                     continue
                 payload = trial
-            text = json_dumps(payload)
-            sections.append(text)
-            remaining -= len(text)
-        if omitted:
-            sections.append("部分设定未装入本次上下文；未显示不表示不存在，必要时按合集或来源补读。")
-        if not sections:
-            return ""
-        return ("# 本书可持续设定参考（不等于正史）\n"
-            "合集定义记录职责与字段。Writer 新内容仅作设想；审查和记忆补充须定位来源，再判断语义。"
-            "正史冲突、来源过期、资料不足分别处理；用户保留设想不解除正文门禁。"
-            "客观状态先对照已接受正文，信念、传闻、未定与未来设想不能混存。\n" + "\n".join(sections))
+                audit["selected_record_ids"].append(item["record_id"])
+            audit["status"] = "loaded" if payload["records"] else "not_loaded" if eligible else "empty"
+            if not eligible:
+                audit["reason"] = "本章范围内尚无具体内容；模板字段不算设定，也不算已审查。"
+            text = json_dumps(payload, indent=None)
+            if len(text) <= remaining or any(item.get("epistemic_status") == "user_constraint" for item in payload["records"]):
+                sections.append(payload)
+                remaining -= len(text)
+        return {"authority": "参考与用户约定，不是已发生正史",
+            "instructions": "模板只定义记录方式。空合集不宣称设定审查通过，也不凭空补写。逐条核对已装入记录的适用性、当前正文及规划；未装入不等于不存在。用户约定按当前明确要求优先，设想、信念和传闻不能当客观事实。相关条目缺失时报告具体缺口，复用同次输出提出有来源的设定候选；无关模板不用强行填满。",
+            "coverage": coverage, "collections": sections}
+
+    def context(self, chapter_no: int | None = None, query: str = "", actor: str = "writer", max_chars: int = 16000) -> str:
+        return json_dumps(self.context_payload(chapter_no, query, actor, max_chars), indent=None)
 
     def impact_summary(self, collection_id: str | None = None) -> dict[str, Any]:
         collections = self.list_collections(include_archived=True)

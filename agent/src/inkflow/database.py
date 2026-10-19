@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import uuid
 from collections import Counter
@@ -959,7 +960,7 @@ class ProjectDatabase:
     def latest_review_record(self, chapter_no: int) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
-                """SELECT id, chapter_version, data_json, path, role_protocol_version, review_role
+                """SELECT id, chapter_version, data_json, path, created_at, role_protocol_version, review_role
                 FROM reviews WHERE chapter_no=? ORDER BY id DESC LIMIT 1""",
                 (chapter_no,),
             ).fetchone()
@@ -979,7 +980,7 @@ class ProjectDatabase:
         return {
             "id": int(row["id"]), "chapter_version": int(row["chapter_version"]),
             "report": ReviewReport.model_validate_json(row["data_json"]),
-            "path": str(row["path"]), "review_role": stored["review_role"],
+            "path": str(row["path"]), "created_at": str(row["created_at"]), "review_role": stored["review_role"],
             "canonical_role": stored["review_role"], "mode_bundle": mode_bundle,
         }
 
@@ -2181,6 +2182,7 @@ class ProjectDatabase:
         remedies = {
             "source_reread": "必要资料缺失时，按当前对象与事件拆短查询，定点回读有效原文，再由原责任角色核对。",
             "claim_attribution": "指控未获支持时，先定位各自来源引文，区分状态变化、人物观点和排他矛盾；不据此改正文或降低资料权重。",
+            "local_revision": "正文问题按定位原句局部替换，对照实际差异并交原审核角色检查；原文未变或问题仍在时，依据残留问题调整该局部因果，不重复同一补丁。",
         }
         cases = []
         seen = set()
@@ -2206,6 +2208,8 @@ class ProjectDatabase:
             cases.append({"event_id": event["event_id"], "chapter_no": event["chapter_no"],
                 "role": payload.get("role"), "status": "verified" if verified else "unresolved",
                 "action": payload["action"], "guidance": remedies[payload["action"]],
+                "issue_categories": payload.get("issue_categories", []),
+                "method_feedback": payload.get("method_feedback", ""),
                 "gap_count": payload.get("gap_count", 0)})
             if len(cases) == 5:
                 break
@@ -2216,7 +2220,7 @@ class ProjectDatabase:
             "canon_commits": counts["canon_commit"],
             "legacy_unclassified": counts["legacy_unclassified"],
             "recovery_cases": cases,
-            "recovery_policy": "只参考处理方法，不复用旧章资料或事实，不提高硬门槛。未解决案例不是成功经验；本次仍查源并核门禁，沿原授权和预算限次恢复。",
+            "recovery_policy": "只在当前任务出现同类问题时参考处理方法，不复用旧章资料或事实，不提高硬门槛。优先核对实际改动和残留原因，不重复无效替换。未解决案例不是成功经验；本次仍查源并核门禁，沿原授权和预算限次恢复。",
             "notice": "只把用户明确偏好、比较或选区修订视为写法反馈；机器审核、正史提交和旧版来源不作为文风样本。",
         }
 
@@ -2321,7 +2325,10 @@ class ProjectDatabase:
         key = strategy_key.strip()
         if not key:
             raise ValueError("学习策略名称不能为空")
-        bounded = max(-1.0, min(1.0, float(reward)))
+        value = float(reward)
+        if not math.isfinite(value):
+            raise ValueError("学习反馈必须是有效数值，未知结果不能当作加分。")
+        bounded = max(-1.0, min(1.0, value))
         with self.connect() as connection:
             connection.execute(
                 """
@@ -2360,11 +2367,17 @@ class ProjectDatabase:
         }
 
     def save_preference_pair(self, chosen_artifact_id: str, rejected_artifact_id: str, features: dict[str, float]) -> str:
-        if chosen_artifact_id == rejected_artifact_id:
+        if not chosen_artifact_id or not rejected_artifact_id or chosen_artifact_id == rejected_artifact_id:
             raise ValueError("偏好比较的两个候选不能相同")
         pair_id = f"pair-{uuid.uuid4().hex}"
         clean_features = {str(key): float(value) for key, value in features.items()}
+        if any(not math.isfinite(value) for value in clean_features.values()):
+            raise ValueError("比较特征含无效数值，没有计入学习。")
         with self.connect() as connection:
+            rows = connection.execute("SELECT artifact_id,artifact_type,role,chapter_no FROM agent_artifacts WHERE artifact_id IN (?,?)",
+                (chosen_artifact_id, rejected_artifact_id)).fetchall()
+            if len(rows) != 2 or any(rows[0][key] != rows[1][key] for key in ("artifact_type", "role", "chapter_no")):
+                raise ValueError("请比较同一用途、责任角色和章节的两份真实候选；不存在或不相关的记录不能计作偏好。")
             connection.execute(
                 "INSERT INTO preference_pairs VALUES (?,?,?,?,?)",
                 (pair_id, chosen_artifact_id, rejected_artifact_id, json_dumps(clean_features, indent=None), utc_now()),

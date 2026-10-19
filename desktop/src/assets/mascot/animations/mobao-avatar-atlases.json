@@ -1,0 +1,101 @@
+{
+  "idle": {
+    "file": "mobao-avatar-idle.atlas.png",
+    "poster": "mobao-avatar-idle.poster.png",
+    "frames": 80,
+    "columns": 8,
+    "rows": 10,
+    "fps": 12,
+    "frameOffset": 0,
+    "source": "mobao-alpha-idle.atlas.png",
+    "crop_side": 207
+  },
+  "thinking": {
+    "file": "mobao-avatar-thinking.atlas.png",
+    "poster": "mobao-avatar-thinking.poster.png",
+    "frames": 60,
+    "columns": 8,
+    "rows": 8,
+    "fps": 12,
+    "frameOffset": 0,
+    "source": "mobao-alpha-thinking.atlas.png",
+    "crop_side": 208
+  },
+  "success": {
+    "file": "mobao-avatar-success.atlas.png",
+    "poster": "mobao-avatar-success.poster.png",
+    "frames": 36,
+    "columns": 8,
+    "rows": 5,
+    "fps": 12,
+    "frameOffset": 0,
+    "source": "mobao-clean-show-summary.sheet.png",
+    "crop_side": 177
+  },
+  "rest": {
+    "file": "mobao-avatar-rest.atlas.png",
+    "poster": "mobao-avatar-rest.poster.png",
+    "frames": 30,
+    "columns": 8,
+    "rows": 4,
+    "fps": 12,
+    "frameOffset": 0,
+    "source": "mobao-clean-pause-exhausted.sheet.png",
+    "crop_side": 152
+  },
+  "writing": {
+    "file": "mobao-avatar-writing.atlas.png",
+    "poster": "mobao-avatar-writing.poster.png",
+    "frames": 80,
+    "columns": 8,
+    "rows": 10,
+    "fps": 12,
+    "frameOffset": 0,
+    "source": "mobao-alpha-writing.atlas.png",
+    "crop_side": 213
+  },
+  "reviewing": {
+    "file": "mobao-avatar-reviewing.atlas.png",
+    "poster": "mobao-avatar-reviewing.poster.png",
+    "frames": 80,
+    "columns": 8,
+    "rows": 10,
+    "fps": 12,
+    "frameOffset": 0,
+    "source": "mobao-alpha-reviewing.atlas.png",
+    "crop_side": 238
+  },
+  "waiting": {
+    "file": "mobao-avatar-waiting.atlas.png",
+    "poster": "mobao-avatar-waiting.poster.png",
+    "frames": 36,
+    "columns": 8,
+    "rows": 5,
+    "fps": 12,
+    "frameOffset": 0,
+    "source": "mobao-clean-waiting-user.sheet.png",
+    "crop_side": 181
+  },
+  "frustrated": {
+    "file": "mobao-avatar-frustrated.atlas.png",
+    "poster": "mobao-avatar-frustrated.poster.png",
+    "frames": 16,
+    "columns": 8,
+    "rows": 2,
+    "fps": 12,
+    "frameOffset": 0,
+    "source": "mobao-emotions-v1.atlas.png",
+    "crop_side": 300
+  },
+  "angry": {
+    "file": "mobao-avatar-angry.atlas.png",
+    "poster": "mobao-avatar-angry.poster.png",
+    "frames": 16,
+    "columns": 8,
+    "rows": 2,
+    "fps": 12,
+    "frameOffset": 0,
+    "source": "mobao-emotions-v1.atlas.png",
+    "crop_side": 299
+  }
+}
