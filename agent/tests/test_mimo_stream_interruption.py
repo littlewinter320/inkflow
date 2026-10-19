@@ -130,6 +130,21 @@ def test_stop_cannot_hide_later_service_parser_or_text_errors():
     asyncio.run(scenario())
 
 
+def test_service_error_preserves_safe_reason_without_reasoning_or_credentials():
+    async def scenario():
+        state = {}
+        tail = event({"error": {"code": "server_busy", "message":
+            "Service temporarily busy tp-privatecredential123 ttp-teamcredential456"}})
+        with pytest.raises(httpx.RemoteProtocolError):
+            await receive(InterruptedBytes(event(choice(reasoning=PRIVATE_REASONING)) + tail), state)
+        diagnostic = state["diagnostic"]
+        assert "Service temporarily busy" in diagnostic["service_error"]
+        assert "privatecredential" not in json.dumps(diagnostic) and "teamcredential" not in json.dumps(diagnostic)
+        assert PRIVATE_REASONING not in json.dumps(state, ensure_ascii=False)
+        assert state["completed"] is False and state["content"] == ""
+    asyncio.run(scenario())
+
+
 def test_cancellation_after_stop_still_cancels_and_closes_the_stream():
     async def scenario():
         waiting, state = asyncio.Event(), {}

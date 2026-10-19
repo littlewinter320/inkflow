@@ -418,8 +418,10 @@ async def _mimo_stream_response(client: httpx.AsyncClient, url: str, *, headers:
             except json.JSONDecodeError as exc:
                 raise httpx.RemoteProtocolError("MiMo 流式响应包含无效片段，未采用不完整内容。") from exc
             if isinstance(chunk, dict) and chunk.get("error"):
+                from .trace import _redact_error
+                message = _redact_error(_safe_error_message(httpx.Response(200, json=chunk)))
+                diagnostic["service_error"] = message[:240]
                 if _mimo_permanent_stream_error(chunk["error"]):
-                    message = _safe_error_message(httpx.Response(200, json=chunk))
                     raise _MimoPermanentStreamError(f"小米 MiMo 流式响应返回请求错误：{message}")
                 raise httpx.RemoteProtocolError("MiMo 流式响应未正常返回，未采用不完整内容。")
             if not isinstance(chunk, dict):

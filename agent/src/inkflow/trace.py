@@ -340,5 +340,5 @@ def _redact_error(value: str) -> str:
 
     text = value[:2_000]
     text = re.sub(r"(?i)(bearer\s+|api[_ -]?key\s*[:=]\s*)[^\s,;]+", r"\1[已隐藏]", text)
-    text = re.sub(r"(?i)sk-[A-Za-z0-9_-]{8,}", "[已隐藏密钥]", text)
+    text = re.sub(r"(?i)(?:sk|ttp|tp)-[A-Za-z0-9_-]{8,}", "[已隐藏密钥]", text)
     return text or "未知错误"
