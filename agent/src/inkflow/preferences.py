@@ -265,6 +265,7 @@ def preference_section(database):
 
 
 def capture_observations(database, observations, message, run_id):
+    """保存可溯源反馈；相同偏好只复用身份，避免审计来源更新反复使书稿审查失效。"""
     saved = []
     for observation in observations:
         quote = observation.source_quote.strip()
@@ -313,7 +314,10 @@ def capture_observations(database, observations, message, run_id):
                                   strength=existing["strength"], status="active" if active else existing["status"])
                     if not active:
                         values["topic"] = existing.get("topic", "")
-                item = change_item(connection, level=level, **values)
+                # 新一句相同反馈不是新写作约束；原来源仍保留，本轮反馈在下方单独记账。
+                unchanged = existing is not None and all(existing.get(key) == values.get(key)
+                    for key in ("text", "scope", "strength", "status", "topic"))
+                item = existing if unchanged else change_item(connection, level=level, **values)
                 saved.append(item)
         else:
             known = database.list_preferences(active_only=False)
@@ -335,7 +339,10 @@ def capture_observations(database, observations, message, run_id):
                               strength=existing["strength"], status="active" if active else existing["status"])
                 if not active:
                     values["topic"] = existing.get("topic", "")
-            item = database.upsert_preference(**values)
+            # 只在内容、适用范围、强度或状态真的改变时升版本，不用新run_id制造来源变化。
+            unchanged = existing is not None and all(existing.get(key) == values.get(key)
+                for key in ("text", "scope", "strength", "status", "topic"))
+            item = existing if unchanged else database.upsert_preference(**values)
             saved.append(item)
         _record_preference_feedback(database, observation, item, run_id)
     return saved

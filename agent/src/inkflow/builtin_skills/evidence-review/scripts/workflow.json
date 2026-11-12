@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "executor": "chapter_tools",
+  "actions": [
+    "review",
+    "review_accept"
+  ],
+  "description": "审核调用内部按原协作模式分配表达、连续性与记忆责任；只审不自动改稿。",
+  "steps": [
+    {
+      "id": "review",
+      "tool": "chapter.review_mode",
+      "when": "review_needed",
+      "required": true,
+      "instruction": "只审核当前章当前版本，按本次分工核正文与记忆候选；判断引用实际来源，缺证先补核。只审查不改稿，不把模型通过当正式接受；同版有效结果复用。"
+    },
+    {
+      "id": "accept",
+      "tool": "chapter.accept",
+      "when": "ready_to_accept",
+      "required": true,
+      "actions": [
+        "review_accept"
+      ],
+      "depends_on": [
+        "review"
+      ],
+      "instruction": "仅在原目标明确包含接受、当前正文与来源版本一致、必要审核及记忆条件满足时，交原引擎正式接受；不以技能或模型自述代替门禁，已提交结果不重复写入。"
+    }
+  ]
+}

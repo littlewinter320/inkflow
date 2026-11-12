@@ -125,6 +125,15 @@ def capture_task_settings(
     settings: Settings, *, novel_id: str, task_id: str | None = None, source: str = "task_start",
     role_protocol_version: int | None = None, collaboration_mode: str | None = None,
 ) -> dict[str, Any]:
+    # 新任务冻结前读取作者指定的档位预算；自定义与旧任务快照保留原值。
+    if source == "task_start" and settings.retrieval_policy_version >= 3 and not settings.quality_custom_context:
+        from .config import creation_preset_mappings
+        preset = creation_preset_mappings(settings).get(settings.quality_preset)
+        if preset:
+            settings = replace(settings, agent_context_budgets=preset["agent_context_budgets"],
+                               context_budget_mode=preset["context_budget_mode"],
+                               context_soft_tokens=preset["context_soft_tokens"],
+                               context_hard_tokens=preset["context_hard_tokens"])
     if collaboration_mode == "adaptive":
         settings = replace(settings, collaboration_preset="adaptive")
         collaboration_mode = None
@@ -145,6 +154,9 @@ def capture_task_settings(
     }
     snapshot["snapshot_hash"] = content_hash(_canonical(snapshot))
     validate_task_settings_snapshot(snapshot, novel_id=novel_id)
+    # 技能资源另存不可变旁库，不给严格签名的v2配置追加字段；恢复不能读取现行目录替换。
+    from .skill_runtime import freeze_skill_library
+    freeze_skill_library(snapshot, settings.workspace_root)
     return snapshot
 
 
@@ -196,9 +208,16 @@ def validate_task_settings_snapshot(
     # New optional configuration must never be backfilled into a hashed old snapshot.
     required_fields = TASK_SETTINGS_FIELDS - {"planning_publication_mode", "role_models", "manual_edit_review_enabled",
                                             "quality_preset", "quality_custom_context", "collaboration_preset",
-                                            "writer_task_attempt_limit", "automatic_output_tokens"}
+                                            "writer_task_attempt_limit", "automatic_output_tokens", "thinking_policy_version", "agent_thinking",
+                                            "openai_recommended_reasoning",
+                                            "disable_model_reasoning",
+                                            "mimo_retry_policy_version", "retrieval_policy_version", "prompt_cache_layout_version",
+                                            "context_input_limit_tokens"}
     if not isinstance(values, dict) or not required_fields <= set(values) <= TASK_SETTINGS_FIELDS | {"role_settings_version"}:
         raise TaskSettingsError("任务配置字段与快照版本不一致，不能补入当前默认值。")
+    # 新任务必须保存作者指定的发送上限；只有旧布局允许该字段原本不存在。
+    if type(values.get("prompt_cache_layout_version")) is int and values["prompt_cache_layout_version"] >= 20 and "context_input_limit_tokens" not in values:
+        raise TaskSettingsError("任务配置缺少原最大输入量，不能用当前设置回填。")
     _check_endpoint(values)
     expected = content_hash(_canonical({key: value for key, value in snapshot.items() if key != "snapshot_hash"}))
     if snapshot["snapshot_hash"] != expected:
@@ -215,7 +234,7 @@ def _frozen_values_match(values: dict[str, Any], restored: dict[str, Any]) -> bo
     """Check every explicit frozen value; added roles use static defaults, never live settings."""
     for name, expected in values.items():
         actual = restored.get(name)
-        if name in {"agent_generation", "agent_context_budgets"}:
+        if name in {"agent_generation", "agent_context_budgets", "agent_thinking"}:
             if not isinstance(actual, dict):
                 return False
             actual = {role: {key: actual.get(role, {}).get(key) for key in fields}
@@ -235,6 +254,14 @@ def restore_task_settings(
     summary = validate_task_settings_snapshot(snapshot, novel_id=novel_id)
     try:
         raw_values = dict(snapshot["settings"])
+        # Old hashes remain untouched and resume with the policy they originally used.
+        raw_values.setdefault("thinking_policy_version", 1)
+        # 旧任务未批准增加网络次数，恢复时必须继续原有等待和尝试边界。
+        raw_values.setdefault("mimo_retry_policy_version", 1)
+        # 旧断点继续原有召回数量与资料排序，不能因升级改变原审查输入身份。
+        raw_values.setdefault("retrieval_policy_version", 1)
+        # 旧任务的原输入及付费回执依赖旧排列；只在新任务采用稳定来源布局。
+        raw_values.setdefault("prompt_cache_layout_version", 1)
         # A signed old envelope may identify old role keys without repeating the settings tag.
         if "role_settings_version" not in raw_values and snapshot.get("role_protocol_version") == 1:
             raw_values["role_settings_version"] = 1
@@ -244,7 +271,7 @@ def restore_task_settings(
         raise TaskSettingsError("任务配置快照包含无效设置，无法恢复。") from exc
     if not _frozen_values_match(values, settings.to_mapping()):
         raise TaskSettingsError("当前程序会改变已有任务配置中的明确取值，不能用当前设置替代。")
-    return TaskSettingsScope(
+    scope = TaskSettingsScope(
         schema_version=summary["schema_version"],
         task_id=summary["task_id"], novel_id=summary["novel_id"],
         snapshot_hash=summary["snapshot_hash"], captured_at=summary["captured_at"],
@@ -252,3 +279,7 @@ def restore_task_settings(
         collaboration_mode=summary["collaboration_mode"], settings=settings,
         collaboration_selection_required=summary.get("collaboration_selection_required", False),
     )
+    if settings.prompt_cache_layout_version >= 22:
+        from .skill_runtime import frozen_library
+        frozen_library(scope)
+    return scope

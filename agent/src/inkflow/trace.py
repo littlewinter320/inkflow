@@ -138,6 +138,7 @@ class TraceRecorder:
         self, project_root: str | Path, operation: str, trace_level: str = "full",
         *, role_protocol_version: int | None = None,
     ):
+        """为一次运行建立日志，只在内存记录命名和角色归属所需的索引。"""
         self.project_root = Path(project_root).resolve()
         stamp = utc_now().replace(":", "").replace("+00:00", "Z").replace("-", "")
         self.run_id = f"{stamp}-{operation}-{uuid.uuid4().hex[:8]}"
@@ -147,7 +148,11 @@ class TraceRecorder:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.events_path = self.run_dir / "events.jsonl"
         self.trace_path = self.run_dir / "trace.md"
-        self.events: list[TraceEvent] = []
+        self._event_count = 0
+        self._completed_by_stage: dict[str, int] = {}
+        self._started_roles: dict[str, str] = {}
+        atomic_write_text(self.trace_path, f"# 墨流运行记录 · {operation}\n\n"
+            f"> run_id: `{self.run_id}`  \n> trace_level: `{trace_level}`\n")
         self.record("run", "started", f"开始 {operation}")
 
     def record(
@@ -159,6 +164,7 @@ class TraceRecorder:
         metadata: dict[str, Any] | None = None,
         *, public: bool = True,
     ) -> None:
+        """追加本步审计，并将可公开的阶段发布给工作台。"""
         event = TraceEvent(
             timestamp=utc_now(),
             stage=stage,
@@ -167,10 +173,14 @@ class TraceRecorder:
             details=details,
             metadata=_canonical_role_metadata({**(metadata or {}), **({"internal": True} if not public else {})}),
         )
-        self.events.append(event)
         with self.events_path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(asdict(event), ensure_ascii=False) + "\n")
-        self._render()
+        self._event_count += 1
+        if status == "completed":
+            self._completed_by_stage[stage] = self._completed_by_stage.get(stage, 0) + 1
+        elif status == "started":
+            self._started_roles[stage] = event.metadata.get("agent_role") or ""
+        self._append_markdown(event)
         runtime = active_runtime.get()
         if runtime and public and not event.metadata.get("internal") and not stage.endswith("provider_reasoning"):
             runtime.publish({"type": "workflow.stage", "trace_id": self.run_id,
@@ -182,7 +192,7 @@ class TraceRecorder:
     def record_conflict(self, conflict: ConflictRecord) -> None:
         """Persist the focused evidence locally; publish only an actionable summary."""
         safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", conflict.conflict_id)[:80]
-        record_path = self.run_dir / f"conflict-{safe_id}-{len(self.events) + 1:03d}.json"
+        record_path = self.run_dir / f"conflict-{safe_id}-{self._event_count + 1:03d}.json"
         atomic_write_text(record_path, json_dumps(conflict.model_dump(mode="json")))
         self.record(
             "workflow.conflict",
@@ -198,7 +208,9 @@ class TraceRecorder:
             },
         )
 
-    def record_model(self, stage: str, result: ProviderResult[Any], decision_summary: str, *, public: bool = True) -> None:
+    def record_model(self, stage: str, result: ProviderResult[Any], decision_summary: str, *, public: bool = True,
+                     result_summary: str | None = None) -> None:
+        """记录模型交付，用同阶段的最近一次发起记录确定责任角色。"""
         metadata = {
             "model": result.model,
             "response_id": result.response_id,
@@ -208,22 +220,16 @@ class TraceRecorder:
         if public_summary:
             metadata["public_reasoning_summary"] = public_summary
         if isinstance(getattr(result.data, "summary", None), str):
-            metadata["decision_summary"] = result.data.summary
+            metadata["decision_summary"] = result.data.summary if result_summary is None else result_summary
         if self.trace_level == "full":
-            ordinal = 1 + sum(event.stage == stage and event.status == "completed" for event in self.events)
+            ordinal = 1 + self._completed_by_stage.get(stage, 0)
             output_path = self.run_dir / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', stage)}.{ordinal}.output.json"
             # Structured deliverable only; never persist hidden reasoning_content.
             atomic_write_text(output_path, json_dumps(result.data.model_dump(mode="json")))
             metadata["output_path"] = str(output_path)
-        started = next(
-            (
-                event for event in reversed(self.events)
-                if event.stage == stage and event.status == "started"
-            ),
-            None,
-        )
-        if started and started.metadata.get("agent_role"):
-            metadata["agent_role"] = started.metadata["agent_role"]
+        started_role = self._started_roles.get(stage)
+        if started_role:
+            metadata["agent_role"] = started_role
         elif result.agent_role:
             metadata["agent_role"] = result.agent_role
         for recovery in result.usage.get("recovery_events", []):
@@ -251,6 +257,8 @@ class TraceRecorder:
         max_tokens: int,
         timeout_seconds: float | None = None,
         thinking: bool | None = None,
+        thinking_purpose: str = "routine",
+        thinking_instruction: str = "",
     ) -> None:
         """Record a public model-call boundary before waiting for the provider.
 
@@ -262,7 +270,9 @@ class TraceRecorder:
         metadata: dict[str, Any] = {
             "model": model,
             "agent_role": agent_role,
-            "max_tokens": int(max_tokens),
+            "max_tokens": None,
+            "request_output_limit": None,
+            "output_policy": "provider_default",
         }
         if timeout_seconds is not None:
             metadata["timeout_seconds"] = float(timeout_seconds)
@@ -273,15 +283,24 @@ class TraceRecorder:
         if scope is not None:
             from .provider import _request_wait_policy
             policy_role = "editor" if agent_role in {"reviewer_verifier", "reviewer_judge"} else agent_role
-            effective_thinking = scope.settings.thinking_for(policy_role, True if thinking is None else thinking)
+            effective_thinking = scope.settings.thinking_for(policy_role, True if thinking is None else thinking,
+                purpose=thinking_purpose, instruction=thinking_instruction)
             metadata["thinking"] = effective_thinking
-            # This is the purpose budget; the Provider still clips the actual
-            # payload against its complete input and frozen user/model limits.
-            metadata["max_tokens"] = scope.settings.generation_output_budget(policy_role, max_tokens, effective_thinking)
+            metadata["thinking_purpose"] = thinking_purpose
+            metadata["reasoning_effort_requested"] = scope.settings.thinking_effort(role=policy_role, model_override=model)
+            metadata["reasoning_effort_supported"] = scope.settings.parameter_capabilities(model)["reasoning_effort"]
+            if scope.settings.request_output_limit(0, policy_role, model) is not None:
+                # 实际额度在完整输入核算后由request.started给出，准备阶段不假装已经发送。
+                metadata["output_policy"] = "model_capacity"
+                metadata["output_capability_tokens"] = scope.settings.request_output_limit(0, policy_role, model)
+            if scope.settings.provider_kind == "anthropic":
+                metadata["output_policy"] = "provider_required_model_limit"
+                metadata["max_tokens"] = scope.settings.output_reservation_upper(policy_role, model_override=model)
+                metadata["request_output_limit"] = metadata["max_tokens"]
             wait_policy = _request_wait_policy(scope.settings, policy_role, timeout_seconds)
             metadata.update(wait_policy)
             metadata["timeout_seconds"] = wait_policy["request_timeout_seconds"]
-        self.record(stage, "started", "已提交模型请求，等待结构化结果", metadata=metadata)
+        self.record(stage, "started", "正在准备这一步，还没发给模型。", metadata=metadata)
 
     def record_model_failed(
         self,
@@ -305,34 +324,28 @@ class TraceRecorder:
         )
 
     def finish(self, status: str = "completed", summary: str = "运行完成") -> None:
+        """记录运行最后一次状态，供日志和工作台使用。"""
         self.record("run", status, summary)
 
-    def _render(self) -> None:
+    def _append_markdown(self, event: TraceEvent) -> None:
+        """追加可阅读的本步记录，避免长任务每一步重写整份日志。"""
+        icon = {"completed": "✅", "started": "▶️", "failed": "❌", "warning": "⚠️"}.get(
+            event.status, "ℹ️"
+        )
         lines = [
-            f"# 墨流运行记录 · {self.operation}",
             "",
-            f"> run_id: `{self.run_id}`  ",
-            f"> trace_level: `{self.trace_level}`",
+            "<details>",
+            f"<summary>{icon} {event.stage} · {event.summary}</summary>",
             "",
+            f"时间：{event.timestamp}",
         ]
-        for event in self.events:
-            icon = {"completed": "✅", "started": "▶️", "failed": "❌", "warning": "⚠️"}.get(
-                event.status, "ℹ️"
-            )
-            lines.extend(
-                [
-                    "<details>",
-                    f"<summary>{icon} {event.stage} · {event.summary}</summary>",
-                    "",
-                    f"时间：{event.timestamp}",
-                ]
-            )
-            if event.details:
-                lines.extend(["", event.details])
-            if event.metadata:
-                lines.extend(["", "```json", json_dumps(event.metadata), "```"])
-            lines.extend(["", "</details>", ""])
-        atomic_write_text(self.trace_path, "\n".join(lines).rstrip() + "\n")
+        if event.details:
+            lines.extend(["", event.details])
+        if event.metadata:
+            lines.extend(["", "```json", json_dumps(event.metadata), "```"])
+        lines.extend(["", "</details>", ""])
+        with self.trace_path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write("\n".join(lines))
 
 
 def _redact_error(value: str) -> str:

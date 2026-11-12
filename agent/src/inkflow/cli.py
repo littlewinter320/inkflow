@@ -17,7 +17,7 @@ from .errors import InkFlowError
 from .provider import create_provider
 from .schemas import BookBrief
 from .terminal_session import TerminalSession
-from .runtime import ensure_run_runtime
+from .runtime import COMPLETION_ATTEMPT_LIMIT, ensure_run_runtime
 from .project import InkFlowProject
 from .studio import StudioService, bind_active_collaboration
 from .task_settings import active_task_settings, use_task_settings
@@ -72,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     continue_until.add_argument("root")
     continue_until.add_argument("--target-characters", type=int)
     continue_until.add_argument("--target-chapter", type=int)
-    continue_until.add_argument("--max-revision-rounds", type=int, default=1)
+    continue_until.add_argument("--max-revision-rounds", type=int, default=COMPLETION_ATTEMPT_LIMIT)
     continue_until.add_argument("--instruction", default="")
     continue_until.set_defaults(handler=_continue_until)
 
@@ -81,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch_draft.add_argument("--start-chapter", type=int, required=True)
     batch_draft.add_argument("--end-chapter", type=int, required=True)
     batch_draft.add_argument("--instruction", default="")
-    batch_draft.add_argument("--max-revision-rounds", type=int, default=2)
+    batch_draft.add_argument("--max-revision-rounds", type=int, default=COMPLETION_ATTEMPT_LIMIT)
     batch_draft.set_defaults(handler=_batch_draft)
 
     batch_repair = sub.add_parser("batch-repair", help="修订既有临时批次并逐章重审")

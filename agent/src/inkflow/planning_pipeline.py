@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import json
+import sqlite3
 import re
 import sqlite3
 from uuid import uuid4
@@ -18,13 +19,17 @@ from typing import Any
 
 from .errors import InkFlowError, ValidationGateError
 from .project import InkFlowProject, render_book_brief
+from .prompts import PUBLIC_RESULT_LANGUAGE
 from .project_lock import project_write_lock, project_write_lock_sync
 from .schemas import (ArcPlan, ArcSummary, BookOutlineV2, BookPlan, ChapterCard,
                       PlanBundle, PlanningReviewV2, RollingPlanV2, VolumeCompass,
-                      VolumeDetailV2, VolumePlan)
+                      VolumeDetailV2, VolumePlan, PromiseAlignmentPatch, PromiseAlignmentReviewV2,
+                      AcceptedContinuityPatch)
 from .trace import TraceRecorder
+from .runtime import COMPLETION_ATTEMPT_LIMIT
 from .task_settings import active_task_settings, capture_task_settings, validate_task_settings_snapshot
 from .utils import SOURCE_RECOVERY_TOKEN_LIMIT, atomic_write_text, content_hash, estimate_tokens, utc_now
+from .prompts import PROMISE_PLANNING_CONTRACT
 
 
 _WRITER_SYSTEM = """你是墨流 Writer。依照任务指明的层级写小说规划，只输出要求的 JSON。
@@ -41,10 +46,17 @@ _EDITOR_SYSTEM = """你是墨流当前模式负责规划审核的角色，只输
 _EDITOR_SYSTEM += """\n判事实矛盾前做共存检验：逐字引用的两件事若发生在不同日期、不同纸张或不同人物视角，能够同时为真，就不是事实矛盾。读者可能误解、缺一句交代、线索暂未解释或人物对动作的主观解读，也不等于剧情不可能；只在 summary 给出改善建议。事实类 revise 须有已接受事实冲突、关键人物确无途径获知信息、关键物件确实凭空回归等排他性依据；在 finding 中说明为何不能同时成立。另有独立的用户任务覆盖检查：用户明确要求打破某种反复出现的行动结构，而候选多数章节仍照旧循环，也判 revise，即使没有事实矛盾；须引用用户原话与多个候选章节的原句，说明最小重组范围。若仅能说“可能”“容易”“建议明确”“未说明”，但无事实冲突或明确要求未兑现的证据，应判 pass 并保留建议。"""
 
 _WRITER_SYSTEM += """\n近期规划要让前章行动造成后章的新选择或代价。安静的生活章节可以保留，但若用户明确要求打破重复，不能只更换问话对象、公告或纸张，再让人物回到原处记录；在整个窗口里改变至少一条行动路径、人物关系、风险或可证实的局面。不要为制造变化凭空送来决定性证据，优先让人物以已有材料作不同选择并承担后果。"""
+_WRITER_SYSTEM += PROMISE_PLANNING_CONTRACT
+_WRITER_SYSTEM += "\n同一thread_id跨大纲、卷细纲和章节窗口代表同一份完整PromisePlan，所有定义字段必须逐字一致。下层的具体推进写入promise_beats.expected_change，不得另写一份同ID但条件或里程碑不同的合同；新承诺才使用新编号。"
+_EDITOR_SYSTEM += PROMISE_PLANNING_CONTRACT
 _EDITOR_SYSTEM += """\n事实共存不等于任务完成。另从窗口起点到终点比较人物目标、障碍、实际选择与后果；当用户明确要求突破重复，而连续数章只是换人问话、看通知、回铺整理且没有推进目标或改变局面时，可判 revise，并引用这些章节的原句说明重复模式及最小重组范围。不要要求每章都有高潮，也不要因为单章安静就否决慢热叙事。"""
 _EDITOR_SYSTEM += """\n若判 pass，summary 要说清窗口收尾相比起点发生了什么由人物行动造成的局面变化或代价。单纯多得一条消息、又记了一张纸、把材料换地方藏，不自动等于任务要求的剧情推进；人物仍可保持谨慎，关键是谨慎带来新关系、新阻力或新的可执行选择。找不到这种变化而用户明确要打破重复时，应判 revise 并指出最小受影响章节段，不要用“线索逐步增多”代替实际后果。"""
 _EDITOR_SYSTEM += """\n交卷前专门核对全篇关键物件与人物的终态：同一物件若写成仍失踪/不归还，又写成主角拿到或被人放回，须解释是否确为不同物件，否则判 revise；“最后一次出现”若在不同卷重复，也须判 revise 并引用前后原句。不能只审核每段局部合理性。"""
 _EDITOR_SYSTEM += """\n区分已完成状态的回述与再次首次发生：“已经写上”等状态表述不能仅凭叙述所在时段推断成刚发生。须引用实际重复行动或排他的发生时间；普通拿取、携带、收纳的省略仍按前述共存规则判断。修订意见只要求改变有据问题及必要衔接，不能为了单处问题重写整层。"""
+
+# 三层规划复用公开说明要求；原始字段、内容版本与发布核验继续保持原合同。
+_WRITER_SYSTEM += PUBLIC_RESULT_LANGUAGE
+_EDITOR_SYSTEM += PUBLIC_RESULT_LANGUAGE
 
 
 class PlanningNeedsAttention(ValidationGateError):
@@ -57,6 +69,138 @@ class PlanningNeedsAttention(ValidationGateError):
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+
+def _apply_planning_patch(candidate: Any, patch: AcceptedContinuityPatch) -> Any:
+    """复用唯一原句替换，仅派生当前候选；完整Schema及规划对象身份仍须通过。"""
+    from .engine import _apply_unique_replacements
+    updated = type(candidate).model_validate_json(_apply_unique_replacements(
+        candidate.model_dump_json(indent=2), [(edit.target_excerpt, edit.replacement) for edit in patch.edits]))
+    identities = ("volume_no", "chapter_start", "chapter_end", "anchor_chapter")
+    if any(getattr(candidate, key, None) != getattr(updated, key, None) for key in identities):
+        raise ValidationGateError("局部规划补丁改变了卷号、正史锚点或范围，原候选保留。")
+    if ([item.chapter_no for item in getattr(candidate, "chapters", [])]
+            != [item.chapter_no for item in getattr(updated, "chapters", [])]
+            or [item.thread_id for item in candidate.promises] != [item.thread_id for item in updated.promises]):
+        raise ValidationGateError("局部规划补丁改变了章节或承诺身份，原候选保留。")
+    return updated
+
+
+def outline_promise_update_requested(text: str) -> bool:
+    """识别作者明确同步大纲伏笔定义的窄范围；查看、讨论和否定不授予修改权限。"""
+    if re.search(r"先只看|只查看|讨论|不要执行|不执行|是否|能不能|要不要", text):
+        return False
+    verb = r"(?:同步|统一|校正|修订|修改|对齐)"
+    return any("大纲" in clause and re.search(r"(?:伏笔|承诺).{0,8}(?:定义|合同|条件)", clause)
+        and (re.search(verb + r".{0,20}大纲", clause) or re.search(r"大纲.{0,30}" + verb, clause))
+        and not re.search(r"(?:不|别|无需|不用|不必|暂不)(?:要|再)?" + verb, clause)
+        for clause in re.split(r"[，,。！？；\n]", text))
+
+
+def _planning_effective_instruction(instruction: str) -> str:
+    """去掉终端内部恢复标记，保留用户已累计的完整有效要求。"""
+    text = instruction.strip()
+    marker = "恢复未完成的规划。"
+    return text[len(marker):].strip() if text.startswith(marker) else text
+
+
+def _planning_instruction_delta(instruction: str, previous: str) -> tuple[str, str]:
+    """只把本次追加的要求视作修订；失败重进时不重演已经绑定的创意。"""
+    effective = _planning_effective_instruction(instruction)
+    previous = previous.strip()
+    ordinary_resume = not effective or bool(re.fullmatch(
+        r"(?:请)?(?:继续|恢复|重试|续接)(?:刚才|原来|原|这个|该)?(?:未完成的|中断的)?(?:规划|任务|断点)?[。！!]?",
+        effective,
+    ))
+    if ordinary_resume:
+        return previous, ""
+    if effective == previous:
+        return effective, ""
+    # generate_plan 会在用户累计要求之后补固定范围句，新增要求因此位于尾句之前。
+    # 只在两边尾句完全相同且符合该执行器格式时排除它，范围本身仍保留在完整身份中。
+    comparable, previous_comparable = effective, previous
+    tail = previous.rsplit("\n", 1)[-1]
+    if (re.fullmatch(
+        r"(?:重排第 \d+～\d+ 章近期规划，以第 \d+ 章正史为锚；沿用生效大纲，进入下一卷时仅补齐该卷细纲并审核，不重写正史或全书方向。"
+        r"|重排第 \d+ 到 \d+ 章的生效近期规划。)", tail,
+    ) and effective.endswith("\n" + tail) and previous.endswith("\n" + tail)):
+        comparable, previous_comparable = effective[:-(len(tail) + 1)], previous[:-(len(tail) + 1)]
+    # 终端只在旧要求后追加这条显式标记；不按关键词删用户原话，未知写法仍交原修订门禁。
+    prefix = previous_comparable + "\n本次继续时新增要求："
+    if previous_comparable and comparable.startswith(prefix):
+        return effective, comparable[len(prefix):].strip()
+    return effective, effective
+
+
+def _planning_saved_instruction(run: Path) -> str:
+    """新运行使用有效要求快照，旧运行仅回退它实际保存的根目标。"""
+    return (_read(run / "task-effective-intent.txt") or _read(run / "task-root-intent.txt")).strip()
+
+
+def _complete_planning_resume_source(
+    selected: Path, prior_runs: list[Path], basis: dict[str, Any], instruction: str,
+    *, min_review_confidence: float,
+) -> tuple[Path, dict[str, Any]]:
+    """同要求的半次续接可回到唯一完整来源链，绝不拼接不同运行的层级。"""
+    stages = ("outline", "volume-detail", "chapter-window")
+    selected_intent = _planning_saved_instruction(selected)
+    effective, delta = _planning_instruction_delta(instruction, selected_intent)
+    existing = {f"{stage}-candidate.json": content_hash(_read(selected / f"{stage}-candidate.json"))
+                for stage in stages if (selected / f"{stage}-candidate.json").is_file()}
+    if delta or len(existing) == len(stages) or not selected_intent:
+        return selected, {}
+    root = _read(selected / "task-root-intent.txt").strip()
+    matches: list[tuple[Path, dict[str, str]]] = []
+    # 必须整条候选链都在同一个旧运行中，且最新半成品已有的全部依赖逐字相同。
+    for prior in prior_runs:
+        if prior == selected or _planning_saved_instruction(prior) != effective:
+            continue
+        try:
+            if (json.loads(_read(prior / "resume-base.json")) != basis
+                    or _read(prior / "task-root-intent.txt").strip() != root):
+                continue
+            hashes = {f"{stage}-candidate.json": content_hash(_read(prior / f"{stage}-candidate.json"))
+                      for stage in stages if (prior / f"{stage}-candidate.json").is_file()}
+            if len(hashes) != len(stages) or any(hashes.get(name) != value for name, value in existing.items()):
+                continue
+            # 保留的大纲不必重新审；生成过的卷细纲与窗口须各自有真实通过回执。
+            for stage in ("volume-detail", "chapter-window"):
+                checked = PlanningReviewV2.model_validate_json(_read(prior / f"{stage}-review.json"))
+                if checked.verdict != "pass" or checked.confidence < min_review_confidence:
+                    break
+            else:
+                matches.append((prior, hashes))
+        except (ValueError, TypeError, OSError):
+            continue
+    if not matches:
+        # 已有回执证明它曾承接过窗口，但本目录未落盘完整窗口时，缺少唯一祖先便停下。
+        # 不能把丢失的承接关系当作“从未生成”，再次花费 Writer 次数。
+        events = _read(selected / "events.jsonl").splitlines()
+        resumed_window = False
+        for line in events:
+            try:
+                event = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if event.get("stage") in {"chapter-window.resume", "chapter-window.review-reuse"}:
+                resumed_window = True
+                break
+        if resumed_window:
+            raise PlanningNeedsAttention("上次已承接的章节窗口缺少唯一完整来源证明。",
+                                         "核对原候选依赖后续接；保留已用次数，不重新生成章节窗口。")
+        return selected, {}
+    # 两套不同的完整窗口不能仅凭“较新/较旧”猜选；须先由原任务核清来源。
+    identities = {json.dumps(hashes, sort_keys=True) for _, hashes in matches}
+    if len(identities) != 1:
+        raise PlanningNeedsAttention("找到多条不同的完整规划来源，无法唯一续接。",
+                                     "核对原任务的完整候选链；保留现有结果，不拼接或重新生成章节。")
+    source, hashes = matches[0]
+    return source, {"partial_run_id": selected.name, "source_run_id": source.name,
+                    "basis_hash": content_hash(json.dumps(basis, ensure_ascii=False, sort_keys=True)),
+                    "effective_instruction_hash": content_hash(effective),
+                    "partial_candidate_hashes": existing, "source_candidate_hashes": hashes,
+                    "source_review_hashes": {f"{stage}-review.json": content_hash(_read(source / f"{stage}-review.json"))
+                                             for stage in ("volume-detail", "chapter-window")}}
 
 
 def _recent_planning_state(state: str, anchor: int) -> str:
@@ -162,6 +306,44 @@ def _stage_text(value: Any) -> str:
     return json.dumps(value.model_dump(mode="json"), ensure_ascii=False, indent=2)
 
 
+def _restore_planning_review_quotes(review: PlanningReviewV2, candidate: str, source: str) -> tuple[PlanningReviewV2, list[dict[str, Any]]]:
+    """唯一连续原句仅差引号或中文句末分段显示时取回原文；不接受省略、改字或拼接。"""
+    display = str.maketrans({'“': '"', '”': '"'})
+    def display_text(text: str) -> tuple[str, list[int]]:
+        """只折叠中文句末与下一汉字间的纯换行，保留原始字符位置供逐字取回。"""
+        breaks = {position for match in re.finditer(r"(?<=[。！？；])\r?\n(?:\r?\n)*(?=[\u3400-\u9fff])", text)
+                  for position in range(match.start(), match.end())}
+        positions = [position for position in range(len(text)) if position not in breaks]
+        return "".join(text[position] for position in positions).translate(display), positions
+    evidence, proofs = [], []
+    for index, item in enumerate(review.evidence):
+        changes = {}
+        for field, texts in (("candidate_excerpt", [candidate]),
+                             ("source_excerpt", [source, candidate] if review.verdict == "revise" else [source])):
+            quote = getattr(item, field)
+            if not quote or any(quote in text for text in texts):
+                continue
+            matches = []
+            target, _ = display_text(quote)
+            for text in texts:
+                normalized, positions = display_text(text)
+                start = normalized.find(target)
+                while start >= 0:
+                    matches.append((text, positions[start], positions[start + len(target) - 1] + 1))
+                    start = normalized.find(target, start + 1)
+            # 取回的是含分段的完整连续原文；空格、字词、其他标点、重复位置和拼接仍拒绝。
+            if len(matches) != 1:
+                continue
+            text, start, end = matches[0]
+            actual = text[start:end]
+            changes[field] = actual
+            proofs.append({"evidence_index": index, "field": field, "source_hash": content_hash(text),
+                           "start_offset": start, "end_offset": start + len(actual),
+                           "original_quote": quote, "source_quote": actual})
+        evidence.append(item.model_copy(update=changes) if changes else item)
+    return review.model_copy(update={"evidence": evidence}), proofs
+
+
 def _repeated_user_rejected_pattern(instruction: str, plan: RollingPlanV2) -> str:
     """Catch an explicit anti-repetition request that a model review waved through.
 
@@ -196,17 +378,23 @@ def _render_outline(value: BookOutlineV2) -> str:
     lines = [f"# {value.title}", "", "> 规划协议 v2 · 全书大纲；未来构想，不是已发生正史。", "", value.body.strip(), "", "## 卷级方向", ""]
     for volume in value.volumes:
         lines += [f"### 第 {volume.volume_no} 卷 · {volume.title}（第 {volume.chapter_start}～{volume.chapter_end} 章）", "", f"核心冲突：{volume.central_conflict}", "", f"阶段结果：{volume.outcome}", ""]
+    if value.promises:
+        lines += ["## 伏笔与钩子规划合同", "", json.dumps([item.model_dump(mode="json") for item in value.promises], ensure_ascii=False, indent=2), ""]
     return "\n".join(lines).strip() + "\n"
 
 
 def _render_detail(value: VolumeDetailV2) -> str:
     lines = [f"# 第 {value.volume_no} 卷 · {value.title}", "", f"> 规划协议 v2 · 卷细纲 · 第 {value.chapter_start}～{value.chapter_end} 章；未来构想，不是正史。", "", value.body.strip(), "", "## 粗略章节节拍", ""]
     lines.extend(f"- {item}" for item in value.rough_chapter_beats)
+    if value.promises:
+        lines += ["", "## 本卷伏笔与钩子规划合同", "", json.dumps([item.model_dump(mode="json") for item in value.promises], ensure_ascii=False, indent=2)]
     return "\n".join(lines).strip() + "\n"
 
 
 def _render_window(value: RollingPlanV2) -> str:
     lines = [f"# 第 {value.anchor_chapter}～{value.chapters[-1].chapter_no} 章近期规划", "", "> 规划协议 v2；已接受的衔接章只读，以下未来章节尚不是正史。", "", f"## 第 {value.anchor_chapter} 章 · 已接受正文衔接", "", value.anchor_summary.strip(), ""]
+    if value.promises:
+        lines += ["## 当前窗口新增承诺（未来规划）", "", json.dumps([item.model_dump(mode="json") for item in value.promises], ensure_ascii=False, indent=2), ""]
     for chapter in value.chapters:
         lines += [f"## 第 {chapter.chapter_no} 章 · {chapter.title}", "", chapter.body.strip(), ""]
         for field, label in (("time_location", "时地"), ("goal", "目标"), ("obstacle", "阻力"),
@@ -215,9 +403,150 @@ def _render_window(value: RollingPlanV2) -> str:
                 lines += [f"- {label}：{getattr(chapter, field)}"]
         if chapter.scenes:
             lines += ["- 场景：" + "；".join(chapter.scenes)]
+        if chapter.promise_beats:
+            lines += ["- 伏笔与钩子动作：" + json.dumps([item.model_dump(mode="json") for item in chapter.promise_beats], ensure_ascii=False)]
         if any((chapter.goal, chapter.scenes, chapter.hook_question, chapter.time_location)):
             lines.append("")
     return "\n".join(lines).strip() + "\n"
+
+
+def _promise_definition_conflicts(outline: BookOutlineV2, detail: VolumeDetailV2, window: RollingPlanV2) -> dict[str, list[dict[str, Any]]]:
+    """收集跨层同编号的真实定义冲突，不选择上层或下层，也不丢弃细化信息。"""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for level, owner in (("outline",outline),("volume-detail",detail),("chapter-window",window)):
+        for index, plan in enumerate(owner.promises):
+            groups.setdefault(plan.thread_id, []).append({"level":level,"index":index,"plan":plan.model_dump(mode="json")})
+    return {key:items for key,items in groups.items()
+            if len({json.dumps(item["plan"],ensure_ascii=False,sort_keys=True) for item in items}) > 1}
+
+
+def _apply_promise_alignment(outline: BookOutlineV2, detail: VolumeDetailV2, window: RollingPlanV2,
+        patch: PromiseAlignmentPatch, *, lock_volume: bool = False,
+        update_outline: bool = False) -> tuple[BookOutlineV2, VolumeDetailV2, RollingPlanV2, list[list[Any]]]:
+    """仅派生授权的冲突定义和节拍说明；大纲正文、范围、未受影响合同与章节正文不改。"""
+    from types import SimpleNamespace
+    from .story_promises import planning_promises
+    conflicts = _promise_definition_conflicts(outline,detail,window)
+    plans = {plan.thread_id:plan for plan in patch.plans}
+    declared = {plan.thread_id for owner in (outline,detail,window) for plan in owner.promises}
+    # 只允许补齐原合同实际引用的缺失父定义；不能借对齐创造无关编号。
+    required_parents = {parent for owner in (outline,detail,window) for plan in owner.promises
+                        for parent in plan.parent_thread_ids if parent not in declared}
+    required_parents.update(parent for plan in patch.plans if plan.thread_id in conflicts
+                           for parent in plan.parent_thread_ids if parent not in declared)
+    additions = set(plans) - set(conflicts)
+    if (len(plans) != len(patch.plans) or not set(conflicts) <= set(plans)
+            or not additions <= required_parents):
+        raise ValueError("承诺对齐须完整返回原冲突编号，新增定义仅限实际缺失的前置承诺，不得删漏或重复。")
+    original_outline_plans = {plan.thread_id:plan for plan in outline.promises}
+    if update_outline and lock_volume:
+        raise ValueError("同步大纲合同须与本次细纲候选联合核对，不能改锁定的生效细纲。")
+    if any(identity in original_outline_plans and plan.kind != original_outline_plans[identity].kind
+           for identity,plan in plans.items()):
+        raise ValueError("合同对齐不能改变既有承诺身份或类型。")
+    fixed = {} if update_outline else original_outline_plans
+    if lock_volume:
+        fixed.update({plan.thread_id:plan for plan in detail.promises})
+    if any(key in fixed and value != fixed[key] for key,value in plans.items()):
+        raise ValueError("承诺对齐不能修改全书大纲或已生效卷细纲的合同。")
+    outline_data = outline.model_dump(mode="json")
+    detail_data, window_data, paths = detail.model_dump(mode="json"), window.model_dump(mode="json"), []
+    targets = ([("outline",outline_data)] if update_outline else []) + [("volume-detail",detail_data),("chapter-window",window_data)]
+    for level, data in targets:
+        for index, plan in enumerate(data.get("promises",[])):
+            if plan["thread_id"] in plans:
+                replacement = plans[plan["thread_id"]].model_dump(mode="json")
+                if plan != replacement:
+                    data["promises"][index] = replacement
+                    paths.append([level,"promises",index])
+    # 新声明留在本次窗口候选，锁定的大纲及已生效细纲保持逐字不变。
+    for identity in sorted(additions):
+        index = len(window_data["promises"])
+        window_data["promises"].append(plans[identity].model_dump(mode="json"))
+        paths.append(["chapter-window","promises",index])
+    chapters = {item["chapter_no"]:index for index,item in enumerate(window_data["chapters"])}
+    seen = set()
+    for change in patch.beat_changes:
+        key = (change.chapter_no,change.beat_index)
+        if key in seen or change.chapter_no not in chapters or change.thread_id not in conflicts:
+            raise ValueError("承诺节拍补充超出原冲突范围或重复同一位置。")
+        seen.add(key)
+        index = chapters[change.chapter_no]
+        beats = window_data["chapters"][index].get("promise_beats",[])
+        if (change.beat_index >= len(beats) or beats[change.beat_index]["thread_id"] != change.thread_id
+                or beats[change.beat_index]["action"] != change.action):
+            raise ValueError("承诺节拍的章、索引、编号或动作身份不符，未移动或新增节拍。")
+        if beats[change.beat_index]["expected_change"] != change.expected_change:
+            beats[change.beat_index]["expected_change"] = change.expected_change
+            paths.append(["chapter-window","chapters",index,"promise_beats",change.beat_index,"expected_change"])
+    revised_outline = BookOutlineV2.model_validate(outline_data)
+    revised_detail, revised_window = VolumeDetailV2.model_validate(detail_data), RollingPlanV2.model_validate(window_data)
+    # 沿原严格合同核对统一哈希、引用目标及父承诺循环，不另建宽松的发布解释。
+    planning_promises(SimpleNamespace(book=revised_outline,current_volume=revised_detail,
+        current_arc=SimpleNamespace(promises=revised_window.promises,chapter_cards=revised_window.chapters)))
+    return revised_outline,revised_detail,revised_window,paths
+
+
+def _alignment_missing_parents(outline: BookOutlineV2, detail: VolumeDetailV2, window: RollingPlanV2,
+        patch: PromiseAlignmentPatch, *, lock_volume: bool = False, update_outline: bool = False) -> dict[str, list[str]]:
+    """核对完整候选及锁定定义的父合同，不能只检查冲突返回或拿历史索引充数。"""
+    effective = {plan.thread_id:plan for owner in (outline,detail,window) for plan in owner.promises}
+    effective.update({plan.thread_id:plan for plan in patch.plans})
+    if not update_outline:
+        effective.update({plan.thread_id:plan for plan in outline.promises})
+    if lock_volume:
+        effective.update({plan.thread_id:plan for plan in detail.promises})
+    return {plan.thread_id:missing for plan in effective.values()
+            if (missing := [parent for parent in plan.parent_thread_ids if parent not in effective])}
+
+
+def _merge_alignment_contract_repair(original: PromiseAlignmentPatch, repair: PromiseAlignmentPatch,
+        affected_ids: set[str], *, required_parents: set[str] | None = None) -> PromiseAlignmentPatch:
+    """仅替换指定坏定义及补齐已引用父合同，其余定义、节拍锁定并交原差异审核。"""
+    replacements = {plan.thread_id:plan for plan in repair.plans}
+    original_plans = {plan.thread_id:plan for plan in original.plans}
+    additions = required_parents or set()
+    if (len(replacements) != len(repair.plans) or set(replacements) != affected_ids | additions
+            or additions & set(original_plans)
+            or not affected_ids <= set(original_plans) or repair.beat_changes):
+        raise ValueError("合同补核只能返回指定原承诺和已引用的缺失父定义，不能改其他定义或节拍。")
+    if any(replacements[identity].kind != original_plans[identity].kind for identity in affected_ids):
+        raise ValueError("前置关系补核不能改变承诺身份或类型。")
+    return PromiseAlignmentPatch(plans=[replacements.get(plan.thread_id,plan) for plan in original.plans]
+                                 + [replacements[identity] for identity in sorted(additions)],
+                                 beat_changes=original.beat_changes)
+
+
+def _alignment_artifact_names() -> tuple[str, ...]:
+    """联合补审及原版副本是同一覆盖证明，确认发布和恢复必须整组保留。"""
+    return ("promise-alignment-candidate.json","promise-alignment-review.json","promise-alignment-proof.json",
+        "outline-before-alignment-candidate.json",
+        "promise-alignment-review-before-recheck.json","promise-alignment-review-recheck.json",
+        "promise-alignment-review-authority-recheck.json",
+        "promise-alignment-contract-repair.json","promise-alignment-parent-definitions.json",
+        "volume-detail-before-alignment-candidate.json","volume-detail-before-alignment-review.json",
+        "chapter-window-before-alignment-candidate.json","chapter-window-before-alignment-review.json") + tuple(
+        f"promise-alignment-semantic-{number}-{kind}.json" for number in range(1, COMPLETION_ATTEMPT_LIMIT + 1)
+        for kind in ("writer","candidate","review"))
+
+
+def _alignment_review_gaps(assessment: PromiseAlignmentReviewV2, binding: dict[str, Any],
+        patch_text: str, source_text: str, min_confidence: float, *, require_pass: bool = True) -> list[str]:
+    """核验差异报告的身份、完整对象及逐字依据；父定义也属于实际审核范围。"""
+    gaps: list[str] = []
+    identities = assessment.reviewed_thread_ids
+    if (any(getattr(assessment, key) != binding[key] for key in ("base_hash", "patch_hash", "result_hash"))
+            or len(identities) != len(set(identities)) or set(identities) != set(binding["reviewed_thread_ids"])):
+        gaps.append("复核记录与本次规划版本或待核伏笔没有对应上，需要先核对版本和对象")
+    review = assessment.review
+    if not review.evidence or any(item.candidate_excerpt not in patch_text or item.source_excerpt not in source_text
+                                  for item in review.evidence):
+        gaps.append("复核引用尚未与原规划和修改内容逐字对应，需要补齐原文依据")
+    if require_pass and review.verdict != "pass":
+        gaps.append("伏笔的前置条件、因果或回应安排还未通过复核，需要按保留的意见定点处理")
+    if review.confidence < min_confidence:
+        gaps.append("现有依据还不足以形成可靠结论，需要回到来源补核")
+    return gaps
 
 
 def _cleanup_suggestions(project: InkFlowProject) -> list[dict[str, str]]:
@@ -414,6 +743,9 @@ def load_active_planning(project: InkFlowProject, *, allow_document_edits: bool 
         outline = BookOutlineV2.model_validate_json(_read(source / "outline-candidate.json"))
         detail = VolumeDetailV2.model_validate_json(_read(source / "volume-detail-candidate.json"))
         window = RollingPlanV2.model_validate_json(_read(source / "chapter-window-candidate.json"))
+        for name,digest in manifest.get("promise_alignment_artifacts",{}).items():
+            if name not in _alignment_artifact_names() or content_hash(_read(source / name)) != digest:
+                raise ValueError("承诺差异补审覆盖证明缺失或变化")
         if ([window.anchor_chapter, window.chapters[-1].chapter_no] != manifest["chapter_window"]
                 or detail.volume_no != manifest["volume_no"]
                 or content_hash(_render_outline(outline)) != manifest["outline_hash"]
@@ -450,6 +782,9 @@ def v2_chapter_card(item: Any, brief: Any) -> ChapterCard:
         irreversible_delta=item.consequence or "不得撤销前章已发生事实；本章变化以近期规划原文为准",
         scenes=item.scenes or [item.body], information_release="只使用角色有途径获得的信息",
         hook_type="问题", hook_question=item.hook_question or item.body,
+        promise_beats=item.promise_beats,
+        foreshadow_advance=[f"{beat.thread_id}：{beat.expected_change}" for beat in item.promise_beats if beat.action != "payoff"],
+        payoff=[f"{beat.thread_id}：{beat.expected_change}" for beat in item.promise_beats if beat.action == "payoff"],
         target_words=brief.target_chapter_words,
         dependencies=[f"v2近期规划第{item.chapter_no}章", "已接受正史"],
     )
@@ -471,6 +806,10 @@ def v2_execution_bundle(project: InkFlowProject, manifest: dict[str, Any], outli
         escalation=["依据生效近期规划推进", "让人物选择产生可见后果"],
         midpoint_turn="随正文自然展开", climax=direction.outcome,
         aftermath="保留已发生结果", exit_bridge=direction.outcome, chapter_cards=cards,
+        promises=window.promises,
+        planted_threads=[beat.thread_id for item in window.chapters for beat in item.promise_beats if beat.action == "plant"],
+        advanced_threads=[beat.thread_id for item in window.chapters for beat in item.promise_beats if beat.action == "advance"],
+        payoff_threads=[beat.thread_id for item in window.chapters for beat in item.promise_beats if beat.action == "payoff"],
     )
     volume = VolumePlan(
         volume_no=detail.volume_no, title=detail.title, chapter_start=detail.chapter_start,
@@ -480,6 +819,7 @@ def v2_execution_bundle(project: InkFlowProject, manifest: dict[str, Any], outli
         midpoint_turn=detail.rough_chapter_beats[len(detail.rough_chapter_beats) // 2],
         climax=direction.outcome, cost_and_result=direction.outcome,
         next_volume_bridge=direction.outcome,
+        promises=detail.promises,
         arcs=[ArcSummary(arc_id=key, title=arc.title, chapter_start=first,
                          chapter_end=last, promise=arc.promise, end_state=arc.end_state)],
     )
@@ -490,6 +830,7 @@ def v2_execution_bundle(project: InkFlowProject, manifest: dict[str, Any], outli
         theme_question=direction.central_conflict, ending_direction=outline.volumes[-1].outcome,
         estimated_chapters=outline.volumes[-1].chapter_end,
         estimated_volumes=len(outline.volumes),
+        promises=outline.promises,
         volume_compass=[VolumeCompass(
             volume_no=item.volume_no, title=item.title, promise=item.central_conflict,
             start_state=item.central_conflict, end_state=item.outcome,
@@ -879,7 +1220,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                   + ("点名旧章：" + "、".join(f"第{number}章" for number in cited_order) if cited_order else "必要正史与设定均保留。"))
         project.record_pending_work(kind="context_source", reason=reason,
             source={"required_chapters": named, "boundary_chapter": anchor}, run_id=trace.run_id,
-            next_action="缩小必要点名范围或提高当前角色上下文容量后，从规划资料节点续接；不静默删去指定来源。",
+            next_action="缩小必要点名范围，使完整材料符合模型窗口与软件上限后，从规划资料节点续接；不静默删去指定来源。",
             status="waiting_condition")
         raise ValidationGateError(reason)
     thread_context, thread_evidence = await asyncio.to_thread(_planning_thread_evidence,
@@ -906,6 +1247,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         r"(?:继续|恢复|接着|重试|复核).{0,18}(?:未完成|没做完|中断|断点|保存的候选|失败|停在)",
         instruction,
     ) or re.search(r"断点.{0,8}续修", instruction))
+    update_outline_promises = focus == "future-detail" and outline_promise_update_requested(instruction)
     previous_run: Path | None = None
     previous_review_identity_matches = False
     recheck_saved_dependencies = False
@@ -930,6 +1272,12 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             active_outline = active[1]
         else:
             preserved_candidates["volume-detail"] = active[2]
+    if focus == "future-detail":
+        # 先同步细纲再续写时沿当前正史重锚近期窗口，只重做受影响的细纲与未来章节安排。
+        active = load_active_planning(project)
+        if active is None or end > active[1].volumes[-1].chapter_end:
+            raise ValidationGateError("同步细纲须有覆盖本次终点的正式大纲；不会自动改写全书规模。")
+        preserved_outline = active_outline = active[1]
     if focus == "chapter-window":
         active = load_active_planning(project)
         next_volume = next((volume for volume in active[1].volumes
@@ -990,7 +1338,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         for stage in ("outline", "volume-detail", "chapter-window"):
             required = ("candidate.json",) if ((focus == "chapter-window" and
                                                (stage == "outline" or stage == "volume-detail" and active_detail is not None))
-                                              or (focus == "volume-detail" and stage == "outline")) else ("candidate.json", "review.json")
+                                              or (focus in {"volume-detail", "future-detail"} and stage == "outline")) else ("candidate.json", "review.json")
             for suffix in required:
                 name = f"{stage}-{suffix}"
                 content = _read(approved_dir / name)
@@ -1004,9 +1352,16 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 atomic_write_text(trace.run_dir / name, content)
         trace.record("planning.reviewed_candidate", "completed", "用户明确采用同来源已审核候选；不重复调用模型",
                      metadata={"source_run_id": approved_run_id})
+        for name in _alignment_artifact_names():
+            if name in pending.get("artifact_hashes",{}):
+                content = _read(approved_dir / name)
+                if not content or content_hash(content) != pending["artifact_hashes"][name]:
+                    raise ValidationGateError("待发布承诺差异补审或原版覆盖证明已变化，未采用。")
+                atomic_write_text(trace.run_dir / name,content)
     if resume_requested:
         candidate_only_run: Path | None = None
         source_changed_run: Path | None = None
+        same_basis_runs: list[Path] = []
         nearby_saved_runs: list[str] = []
         identity_fields = {"snapshot_hash", "collaboration_mode", "review_role"}
         for prior in prior_runs:
@@ -1023,15 +1378,20 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             if has_candidate and same_range:
                 nearby_saved_runs.append(prior.name)
             if prior_basis == resume_basis and has_candidate:
-                previous_run = prior
-                previous_review_identity_matches = True
-                break
+                same_basis_runs.append(prior)
             if (candidate_only_run is None and has_candidate and same_snapshot and isinstance(prior_basis, dict)
                     and {key: value for key, value in prior_basis.items() if key not in identity_fields}
                     == {key: value for key, value in resume_basis.items() if key not in identity_fields}):
                 candidate_only_run = prior
             if source_changed_run is None and has_candidate and same_snapshot and same_range:
                 source_changed_run = prior
+        if same_basis_runs:
+            # 同范围内可能保存过不同追加要求；先找当前有效要求的原组，未命中才视作新要求。
+            requested_effective = _planning_effective_instruction(instruction)
+            matching_intents = [prior for prior in same_basis_runs
+                                if _planning_saved_instruction(prior) == requested_effective]
+            previous_run = (matching_intents or same_basis_runs)[0]
+            previous_review_identity_matches = True
         if previous_run is None and candidate_only_run is not None:
             previous_run = candidate_only_run
             trace.record("planning.candidate-recheck", "completed",
@@ -1054,27 +1414,54 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 "snapshot": scope.public_summary() if scope else None}, ensure_ascii=False, indent=2))
             trace.finish(status="waiting_condition", summary=reason)
             raise PlanningNeedsAttention(reason, action)
+        if previous_review_identity_matches and previous_run is not None:
+            # 上次续接可能在尚未复制窗口前停止；仅凭“最新目录”不能丢弃原完整窗口。
+            # 精确核对同要求、同来源以及半成品每个既有依赖，再整链选回单一旧运行。
+            previous_run, resume_source_proof = _complete_planning_resume_source(
+                previous_run, prior_runs, resume_basis, instruction,
+                min_review_confidence=min_review_confidence,
+            )
+            if resume_source_proof:
+                atomic_write_text(trace.run_dir / "planning-resume-source.json",
+                                  json.dumps(resume_source_proof, ensure_ascii=False, indent=2))
+                trace.record("planning.complete-source-resume", "completed",
+                             "半次续接的已有依赖与原完整候选链一致；整链承接原来源，不拼接层级",
+                             metadata=resume_source_proof)
     atomic_write_text(trace.run_dir / "resume-base.json", json.dumps(resume_basis, ensure_ascii=False))
     # A short follow-up such as "continue the saved candidate" does not erase
     # the creative goal that started the task. Keep one immutable root intent
     # across retries instead of nesting every previous prompt (and growing the
     # input/cache prefix on each attempt). The newest message still wins.
-    latest_instruction = instruction.strip()
+    root_intent = (
+        _read(approved_dir / "task-root-intent.txt").strip() if approved_run_id else
+        _read(previous_run / "task-root-intent.txt").strip()
+        if resume_requested and previous_run is not None and previous_run != active_source_run
+        else ""
+    ) or instruction.strip()
+    # 根目标与累计要求是两个身份：根目标永不改，累计要求记录已交给原任务的新增创意。
+    # 普通“继续”包含终端保存的旧目标，不能将其中“重排”等旧措辞再判作一次新修订。
+    if resume_requested and previous_run is not None and previous_run != active_source_run:
+        effective_instruction, latest_instruction = _planning_instruction_delta(
+            instruction, _planning_saved_instruction(previous_run) or root_intent,
+        )
+    else:
+        effective_instruction = _planning_effective_instruction(instruction)
+        latest_instruction = effective_instruction
     creative_revision = bool(re.search(
         r"(?:别再|不要再|不能再|换一种|改成|重排|重新安排).{0,70}"
         r"(?:剧情|人物|章节|规划|行动|节奏|走向|选择|问话|记录|重复)",
         latest_instruction,
     ))
-    root_intent = (
-        _read(previous_run / "task-root-intent.txt").strip()
-        if resume_requested and previous_run is not None and previous_run != active_source_run
-        else ""
-    ) or instruction.strip()
     atomic_write_text(trace.run_dir / "task-root-intent.txt", root_intent)
+    atomic_write_text(trace.run_dir / "task-effective-intent.txt", effective_instruction)
     if resume_requested and root_intent != instruction.strip():
         instruction = (f"【原任务仍有效的目标】\n{root_intent}\n"
                        f"【本次最新补充；如与原目标冲突，以本次为准】\n{instruction}")
-        trace.record("planning.intent-resume", "completed", "续接时保留原创作目标，并让本次补充优先")
+        trace.record("planning.intent-resume", "completed", "续接时保留原创作目标，仅本次新增要求触发修订",
+                     metadata={"source_run_id": previous_run.name if previous_run else "",
+                               "effective_instruction_hash": content_hash(effective_instruction),
+                               "new_instruction_hash": content_hash(latest_instruction),
+                               "has_new_instruction": bool(latest_instruction)})
 
     current_node = {"stage": "sources", "phase": "source_check"}
     def verify_canon() -> None:
@@ -1122,6 +1509,108 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             review = PlanningReviewV2.model_validate_json(_read(review_path))
             if review.verdict == "pass" and review.confidence >= min_review_confidence:
                 return model_type.model_validate_json(_read(candidate_path))
+        if (previous_review_identity_matches and previous_run is not None and previous_run != active_source_run
+                and not creative_revision and not recheck_saved_dependencies and stage not in preserved_candidates
+                and stage in {"outline","volume-detail","chapter-window"}):
+            prior_candidate,prior_review = previous_run / f"{stage}-candidate.json",previous_run / f"{stage}-review.json"
+            if prior_candidate.is_file() and prior_review.is_file():
+                checked = PlanningReviewV2.model_validate_json(_read(prior_review))
+                retained = model_type.model_validate_json(_read(prior_candidate))
+                before = previous_run / f"{stage}-before-alignment-candidate.json"
+                reviewed_candidate = model_type.model_validate_json(_read(before)) if before.is_file() else retained
+                dependencies = ("outline",) if stage == "volume-detail" else (("outline","volume-detail") if stage == "chapter-window" else ())
+                dependency_match = all(content_hash(_read(previous_run / f"{name}-candidate.json"))
+                    == content_hash(_read(trace.run_dir / f"{name}-candidate.json")) for name in dependencies)
+                returns = list(previous_run.glob(f"{stage}-writer-return-*.json"))
+                writer_origins: dict[Path, Path] = {}
+                def writer_matches(path: Path, seen: set[Path] | None = None) -> bool:
+                    """核验完整返回或补丁派生；旧续接漏带凭据时沿唯一同源复用链回到真实返回。"""
+                    seen = set() if seen is None else seen
+                    if path in seen:
+                        return False
+                    seen.add(path)
+                    returned = model_type.model_validate_json(_read(path))
+                    if returned != reviewed_candidate:
+                        return False
+                    base = path.with_name(path.name.replace("writer-return-", "writer-base-"))
+                    patch = path.with_name(path.name.replace("writer-return-", "writer-patch-"))
+                    if base.is_file() or patch.is_file():
+                        if not base.is_file() or not patch.is_file():
+                            return False
+                        rebuilt = _apply_planning_patch(model_type.model_validate_json(_read(base)),
+                            AcceptedContinuityPatch.model_validate_json(_read(patch)))
+                        if rebuilt != returned:
+                            return False
+                        writer_origins[path] = path
+                        return True
+                    # 缺两份sidecar不能伪装旧完整返回：须有实际完整模型输出，或唯一复用来源。
+                    number = path.stem.rsplit("-", 1)[-1]
+                    for raw in path.parent.glob(f"{stage}.writer.{number}.*.output.json"):
+                        try:
+                            if model_type.model_validate_json(_read(raw)) == returned:
+                                writer_origins[path] = path
+                                return True
+                        except ValueError:
+                            continue
+                    sources = {str(event.get("metadata", {}).get("source_run_id"))
+                        for line in _read(path.parent / "events.jsonl").splitlines()
+                        if (event := json.loads(line)).get("stage") == f"{stage}.review-reuse"
+                        and event.get("status") == "completed" and event.get("metadata", {}).get("source_run_id")}
+                    if len(sources) != 1:
+                        return False
+                    identity = sources.pop()
+                    if Path(identity).name != identity:
+                        return False
+                    origin = path.parent.parent / identity / path.name
+                    if (origin.parent.resolve().parent != path.parent.parent.resolve() or not origin.is_file()
+                            or content_hash(_read(origin)) != content_hash(_read(path))
+                            or json.loads(_read(origin.parent / "resume-base.json")) != json.loads(_read(path.parent / "resume-base.json"))
+                            or not writer_matches(origin, seen)):
+                        return False
+                    writer_origins[path] = writer_origins[origin]
+                    return True
+                writer_match = any(writer_matches(path) for path in returns)
+                evidence_source = ((source.replace(settings_context,review_settings_context,1)
+                    if settings_context else source + review_settings_context)
+                    + instruction + task + _read(previous_run / "task-root-intent.txt"))
+                evidence_source += "".join(_read(previous_run / f"{name}-before-alignment-candidate.json") for name in dependencies)
+                checked, quote_proofs = _restore_planning_review_quotes(checked, _stage_text(reviewed_candidate), evidence_source)
+                # 与新审核共用逐字门禁：无效附加引文不遮住已有有效依据，原报告不改写。
+                exact_evidence = [item for item in checked.evidence if item.candidate_excerpt in _stage_text(reviewed_candidate)
+                                  and item.source_excerpt in evidence_source]
+                grounded = bool(exact_evidence)
+                if (checked.verdict == "pass" and checked.confidence >= min_review_confidence
+                        and dependency_match and writer_match and grounded):
+                    atomic_write_text(candidate_path,_read(prior_candidate))
+                    checked = checked.model_copy(update={"evidence": exact_evidence})
+                    atomic_write_text(review_path,checked.model_dump_json(indent=2))
+                    if quote_proofs:
+                        trace.record(f"{stage}.review-quote-display", "completed",
+                            "续接时取回唯一连续原文，保留原审核与定位证明", public=False,
+                            metadata={"proofs": quote_proofs, "source_review_hash": content_hash(_read(prior_review))})
+                    prior_alignment = json.loads(_read(previous_run / "promise-alignment-proof.json") or "{}")
+                    contract_scope_changed = update_outline_promises and not prior_alignment.get("base", {}).get("update_outline_promises")
+                    # 新的明确合同同步只沿用原层通过结果；旧只读差异节点完整留在原run，不给它改权限。
+                    if not contract_scope_changed:
+                        for name in _alignment_artifact_names():
+                            if (previous_run / name).is_file():
+                                atomic_write_text(trace.run_dir / name,_read(previous_run / name))
+                    elif prior_alignment:
+                        trace.record("planning.contract-scope", "completed", "保留原只读补核记录；作者明确同步冲突大纲合同，另走窄差异节点",
+                            metadata={"source_run_id":previous_run.name,"prior_proof_hash":content_hash(_read(previous_run / "promise-alignment-proof.json"))},public=False)
+                    for path in returns:
+                        if path not in writer_origins:
+                            continue
+                        atomic_write_text(trace.run_dir / path.name,_read(path))
+                        origin = writer_origins[path]
+                        for marker in ("writer-base-", "writer-patch-"):
+                            sidecar = origin.with_name(origin.name.replace("writer-return-", marker))
+                            if sidecar.is_file():
+                                atomic_write_text(trace.run_dir / sidecar.name,_read(sidecar))
+                    trace.record(f"{stage}.review-reuse","completed",
+                        "保留同源已通过候选与原层审核；发布前另核承诺差异覆盖，不重复整层请求",
+                        metadata={"source_run_id":previous_run.name})
+                    return retained
         feedback = ""
         previous_candidate = ""
         resumed_candidate = None
@@ -1142,7 +1631,9 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                     previous_candidate = _stage_text(resumed_candidate)
                     trace.record(f"{stage}.resume", "completed",
                                  "复用上次候选作修订底稿" if creative_revision and stage == "chapter-window"
-                                 else "复用上次保存的候选，先重新审核；不重复生成整层")
+                                 else "复用上次保存的候选，先重新审核；不重复生成整层",
+                                 metadata={"source_run_id": previous_run.name,
+                                           "candidate_hash": content_hash(_read(prior_candidate))})
                 except ValueError:
                     resumed_candidate = None
         if (focus == "chapter-window" and stage == "chapter-window"
@@ -1196,7 +1687,30 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
             resumed_candidate = None
             trace.record(f"{stage}.resume-revise", "completed",
                          "本次提出新的剧情或节奏要求；先定点修订旧候选，再审核")
-        for attempt in range(3):
+        # 候选生成与独立审查分别成为工具节点；审核结果决定修订、停止或完成。
+        # 同一任务本层累计最多十次处理；旧来源链的实际Writer步骤带入，不因新run清零。
+        from .orchestration import run_tool_graph
+        legacy_attempts = 0
+        for prior in prior_runs:
+            try:
+                basis = json.loads(_read(prior / "resume-base.json"))
+                if not all(basis.get(key) == resume_basis.get(key) for key in ("snapshot_hash", "anchor", "end", "focus", "focus_chapters")):
+                    continue
+                for line in _read(prior / "events.jsonl").splitlines():
+                    event = json.loads(line)
+                    if re.fullmatch(re.escape(stage) + r"\.writer\.\d+", event.get("stage", "")) and event.get("status") == "completed":
+                        legacy_attempts += 1
+            except (ValueError, TypeError, AttributeError):
+                raise ValidationGateError("本层旧处理记录损坏，未将历史次数清零后重做规划。")
+        stage_budget = await engine._native_recovery_attempts(project, "planning." + stage, anchor,
+            legacy_attempts=legacy_attempts)
+        attempt = -1
+        candidate = review = None
+
+        async def write_candidate() -> str:
+            """优先保留同源候选，否则只生成当前规划层，再检查明确范围。"""
+            nonlocal attempt, candidate, previous_candidate, feedback, stage_budget
+            attempt += 1
             verify_canon()
             if attempt == 0 and resumed_candidate is not None:
                 candidate = resumed_candidate
@@ -1210,26 +1724,47 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 replan_note = ("\n【范围说明】这是用户授权的多章重排，可以重新分配目标窗口的行动、场景和转折；"
                                "不必保留旧规划的逐章流程。不得改已接受正文、大纲和卷细纲，也不得凭空送来关键证据。"
                                if replan_window else "")
+                # 明确单个正文栏的长度，避免长伏笔清单掩盖正文不足并触发整份格式重试。
                 chapter_body_note = ("\n【逐章交稿长度】每章 body 至少200个汉字，后面的章节也要写全；"
                                      "交代具体场景、人物目标、阻力、选择、可见后果及承接下一章的钩子。"
                                      "同时填写 time_location、goal、obstacle、decision、consequence、scenes、hook_question，"
                                      "这些结构字段与 body 一致，写具体动作因果，不填通用口号。不要用重复记纸凑字数。"
-                                     if stage == "chapter-window" else "")
+                                     if stage == "chapter-window" else
+                                     "\n【本层交稿长度】body 字段自身须有5000～25000个字符；"
+                                     "卷表、伏笔与其他结构字段不计入这个长度。充分交代本层剧情因果、人物选择、"
+                                     "谜题证据与收束，不重复堆字；只返回符合既有结构的完整候选。")
                 focused_note = ("\n【定点返回】只返回第 " + "、".join(str(number) for number in sorted(focus_chapters))
                                 + " 章的章节卡；其他章节由程序从生效版保留，不要复写。"
                                 if stage == "chapter-window" and active_source_run is not None
                                 and len(focus_chapters) < end - anchor else "")
                 current_node.update(phase="writer")
+                local_patch = candidate is not None and bool(feedback) and not replan_window and stage != "outline"
+                prompt = f"{source}\n\n【用户最新授权】\n{instruction}\n\n【本层任务】\n{task}{replan_note}{chapter_body_note}{focused_note}{revision_context}"
+                if local_patch:
+                    base_json = candidate.model_dump_json(indent=2)
+                    atomic_write_text(trace.run_dir / f"{stage}-writer-base-{attempt + 1}.json", base_json)
+                    prompt = (f"{source}\n\n【用户最新授权】\n{instruction}\n\n【本层任务】\n{task}"
+                        f"\n【当前候选JSON，补丁逐字定位的唯一底稿】\n{base_json}\n{feedback}"
+                        "\n只返回edits与reason，不重发完整候选。最多四处，每处target_excerpt须在上面JSON文本中唯一出现，"
+                        "replacement为对应JSON文本的最小替换；JSON内的引号与反斜杠须原样保留。"
+                        "只修有据问题与必要衔接，同步涉及的body、时间及承诺条件；不改卷号、章号、范围或承诺编号。")
+                stage_budget = await engine._native_recovery_attempts(project, "planning." + stage, anchor,
+                    legacy_attempts=legacy_attempts, reserve=True)
                 writer = await engine.provider.generate_json(
                     system_prompt=_WRITER_SYSTEM,
-                    user_prompt=f"{source}\n\n【用户最新授权】\n{instruction}\n\n【本层任务】\n{task}{replan_note}{chapter_body_note}{focused_note}{revision_context}",
-                    output_model=model_type, effort="high", thinking=False,
-                    max_tokens=engine.settings.max_output_tokens,
+                    user_prompt=prompt,
+                    output_model=AcceptedContinuityPatch if local_patch else model_type, effort="high", thinking=False,
+                    max_tokens=min(engine.settings.max_output_tokens, 8192) if local_patch else engine.settings.max_output_tokens,
                     timeout_seconds=engine.settings.planning_timeout_seconds, agent_role="writer",
                 )
-                candidate = writer.data
+                if local_patch:
+                    atomic_write_text(trace.run_dir / f"{stage}-writer-patch-{attempt + 1}.json", writer.data.model_dump_json(indent=2))
+                    candidate = _apply_planning_patch(candidate, writer.data)
+                else:
+                    candidate = writer.data
                 atomic_write_text(trace.run_dir / f"{stage}-writer-return-{attempt + 1}.json", candidate.model_dump_json(indent=2))
-                trace.record_model(f"{stage}.writer.{attempt + 1}", writer, "Writer 返回隔离规划候选；尚未发布")
+                trace.record_model(f"{stage}.writer.{attempt + 1}", writer,
+                    "Writer 返回局部规划补丁，候选已按原句派生；尚未发布" if local_patch else "Writer 返回隔离规划候选；尚未发布")
                 verify_canon()
                 if focus == "chapter-window" and stage == "chapter-window" and active_source_run is not None:
                     original = RollingPlanV2.model_validate_json(_read(active_source_run / "chapter-window-candidate.json"))
@@ -1248,17 +1783,24 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                                        or (volume_count is not None and len(candidate.volumes) != volume_count)):
                 feedback = f"本次用户明确的规模必须保持：{json.dumps(scope_constraints, ensure_ascii=False)}；请在当前候选上修正卷级范围，不改正史。"
                 trace.record("outline.scope", "needs_revision", "候选规模不符合用户确认范围，尚未进入审核或发布")
-                continue
+                if stage_budget["attempts"] >= stage_budget["limit"]:
+                    raise PlanningNeedsAttention(feedback, "从本层保存候选补齐具体问题；不重做上游。")
+                return "write_candidate"
             if stage == "chapter-window" and stage not in preserved_candidates and resumed_candidate is None:
                 if any(not all((item.goal, item.obstacle, item.decision, item.consequence, item.scenes))
                        for item in candidate.chapters):
                     feedback = "本次近期规划缺少具体目标、阻力、选择、后果或场景；请同次补齐结构字段，并与 body 一致。"
-                    if attempt == 2:
+                    if stage_budget["attempts"] >= stage_budget["limit"]:
                         raise PlanningNeedsAttention(feedback, "从当前近期规划候选补齐缺失细节，再审核；不重做上游。")
-                    continue
-            pattern_hint = _repeated_user_rejected_pattern(latest_instruction, candidate) if stage == "chapter-window" else ""
+                    return "write_candidate"
+            return "review_candidate"
+
+        async def review_candidate() -> str | None:
+            """由独立角色选择通过或定点修订；无依据指控不能触发 Writer。"""
+            nonlocal review, feedback
+            pattern_hint = _repeated_user_rejected_pattern(effective_instruction, candidate) if stage == "chapter-window" else ""
             if stage == "chapter-window" and replan_window:
-                pattern_issue = _repeated_user_rejected_pattern(latest_instruction, candidate)
+                pattern_issue = _repeated_user_rejected_pattern(effective_instruction, candidate)
                 if pattern_issue:
                     trace.record(f"{stage}.user-constraint.{attempt + 1}", "needs_review",
                                  pattern_issue, metadata={"source": "explicit_user_request"})
@@ -1291,12 +1833,16 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                                   "比较起点与终点的目标、选择、关系、风险和实际后果。词频只能提供线索，"
                                   "若有真实变化允许慢热和再次行动；若未覆盖明确要求，用问题章原句与用户原话定位，"
                                   "说明最小重组范围。结构字段与 body 必须相容。\n窄规则线索：" + (pattern_hint or "无，仍按语义审核"))
+            if engine.settings.prompt_cache_layout_version < 5:
+                # 新布局已在Provider末尾提醒；旧布局也补交付核对，不改冻结的系统合同。
+                review_prompt += ("\n【交付核对】判pass或revise至少给一条evidence，同时逐字引用候选和对照来源，"
+                    "保留原文换行，不拼接、删节或改写。必要来源确实不足时判insufficient_context，不能用空evidence报通过。")
             verify_canon()
             current_node.update(phase="review")
             reviewer = await engine.provider.generate_json(
                 system_prompt=_EDITOR_SYSTEM,
                 user_prompt=review_prompt,
-                output_model=PlanningReviewV2, effort="high", thinking=False,
+                output_model=PlanningReviewV2, effort="high", thinking=False, thinking_purpose="planning_conflict",
                 max_tokens=min(engine.settings.max_output_tokens, 8192),
                 timeout_seconds=engine.settings.planning_timeout_seconds, agent_role=review_role,
             )
@@ -1311,6 +1857,15 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 )
             candidate_text = _stage_text(candidate)
             review_source = source_for_review + "\n" + instruction + "\n" + task
+            def restore_quote_display(value: PlanningReviewV2) -> PlanningReviewV2:
+                """原始角色返回已独立留档，只恢复引用显示并记录与当前来源绑定的证明。"""
+                restored, proofs = _restore_planning_review_quotes(value, candidate_text, review_source)
+                if proofs:
+                    trace.record(f"{stage}.review-quote-display", "completed", "已取回仅差引号或分段显示的唯一连续原文，仍按逐字依据核验",
+                                 metadata={"proofs": proofs}, public=False)
+                return restored
+            review = restore_quote_display(review)
+            atomic_write_text(review_path, review.model_dump_json(indent=2))
             def grounded_item(item: Any) -> bool:
                 if item.candidate_excerpt not in candidate_text:
                     return False
@@ -1372,14 +1927,16 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                                      "若仍可通过，只给 1～3 条强证据，每条两个 excerpt 都必须是"
                                      "来源与候选中的一整段连续原文；revise 可引用候选内部互斥的两处原句，"
                                      "pass 仍须外部来源。不加事实 ID、引号、删节号，也不要拼接。"),
+                        # 仅引用格式未齐且原把握度达标时按普通核对；实质不确定仍走复杂复核，显式设置照常优先。
                         output_model=PlanningReviewV2, effort="high", thinking=False,
+                        thinking_purpose="routine" if review.confidence >= min_review_confidence else "planning_conflict",
                         max_tokens=min(engine.settings.max_output_tokens, 8192),
                         timeout_seconds=engine.settings.planning_timeout_seconds, agent_role=review_role,
                     )
-                    review = audit.data
-                    atomic_write_text(review_path, review.model_dump_json(indent=2))
                     trace.record_model(f"{stage}.editor-citation-repair.{attempt + 1}.{citation_attempt + 1}", audit,
-                                       f"仅重核引用：{review.verdict}")
+                                       f"仅重核引用：{audit.data.verdict}")
+                    review = restore_quote_display(audit.data)
+                    atomic_write_text(review_path, review.model_dump_json(indent=2))
                     verify_canon()
                     exact_evidence = [
                         item for item in review.evidence
@@ -1415,7 +1972,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                                  "若仍判 revise，指出排他性矛盾或缺失的必需因果链；"
                                  "若只是可能误读、少一句说明，改判 pass 并将建议留在 summary。"
                                  "不要让 Writer 为审核措辞问题重写。"),
-                    output_model=PlanningReviewV2, effort="high", thinking=False,
+                    output_model=PlanningReviewV2, effort="high", thinking=False, thinking_purpose="planning_conflict",
                     max_tokens=min(engine.settings.max_output_tokens, 8192),
                     timeout_seconds=engine.settings.planning_timeout_seconds, agent_role=review_role,
                 )
@@ -1423,6 +1980,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 atomic_write_text(trace.run_dir / f"{stage}-coexistence-return-{attempt + 1}.json", challenged.model_dump_json(indent=2))
                 trace.record_model(f"{stage}.editor-coexistence.{attempt + 1}", challenge,
                                    f"复核同真性：{challenged.verdict}")
+                challenged = restore_quote_display(challenged)
                 verify_canon()
                 challenged_evidence = [item for item in challenged.evidence
                                        if item.candidate_excerpt in candidate_text
@@ -1440,7 +1998,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                         review = challenged.model_copy(update={"evidence": revised_evidence})
                         atomic_write_text(review_path, review.model_dump_json(indent=2))
             if review.verdict == "pass" and review.confidence >= min_review_confidence and grounded:
-                return candidate
+                return None
             if not grounded or review.verdict == "pass":
                 raise PlanningNeedsAttention(
                     f"{stage} 的审核依据仍无法逐字定位或把握度不足；"
@@ -1460,16 +2018,534 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                         "只处理上面有原句依据的问题，并顺读前后章节确认因果；"
                         "未定位的附加建议不是硬要求。若重复动作跨越整个目标窗口，可重组这些章节，"
                         "不要只替换几句收尾；其他已成立的事实保持原样。")
-        if stage == "outline" and ((total_chapters is not None and candidate.volumes[-1].chapter_end != total_chapters)
-                                   or (volume_count is not None and len(candidate.volumes) != volume_count)):
-            raise ValidationGateError("两次定向补救后全书规模仍不符合用户确认范围，候选保留，未发布。")
-        leading_issue = review.evidence[0].finding if review.evidence else review.summary
-        raise PlanningNeedsAttention(
-            f"{stage} 两轮定向修订后仍未通过独立审核；当前具体问题：{leading_issue}"
-            f"。候选与审核记录已保留在 {trace.run_dir}，未覆盖生效规划。",
-            "先核对这条问题是关键因果矛盾还是未来规划可合理补足的细节；"
-            "误读只重核审核，真矛盾只修本层，不重跑已通过的大纲和细纲。",
-        )
+            if stage_budget["attempts"] >= stage_budget["limit"]:
+                if stage == "outline" and ((total_chapters is not None and candidate.volumes[-1].chapter_end != total_chapters)
+                                           or (volume_count is not None and len(candidate.volumes) != volume_count)):
+                    raise ValidationGateError("本层累计处理已达上限，全书规模仍不符合用户确认范围，候选保留，未发布。")
+                leading_issue = review.evidence[0].finding if review.evidence else review.summary
+                raise PlanningNeedsAttention(
+                    f"{stage} 累计{stage_budget['attempts']}次处理后仍未通过独立审核；当前具体问题：{leading_issue}"
+                    f"。候选与审核记录已保留在 {trace.run_dir}，未覆盖生效规划。",
+                    "先核对这条问题是关键因果矛盾还是未来规划可合理补足的细节；"
+                    "误读只重核审核，真矛盾只修本层，不重跑已通过的大纲和细纲。",
+                )
+            return "write_candidate"
+
+        await run_tool_graph(operations={"write_candidate": write_candidate, "review_candidate": review_candidate},
+            first="write_candidate", checkpoint_path=trace.run_dir / "planning-graph.sqlite", max_steps=2 * (COMPLETION_ATTEMPT_LIMIT + 1),
+            on_event=lambda name, status: trace.record(f"planning.graph.{stage}.{name}", status,
+                "规划工具节点开始" if status == "running" else "规划工具节点已返回；仍按原门禁判断结果"))
+        return candidate
+
+    async def align_promises(outline: BookOutlineV2, detail: VolumeDetailV2, window: RollingPlanV2) -> tuple[BookOutlineV2, VolumeDetailV2, RollingPlanV2]:
+        """发布前只统一冲突合同并附加一次差异审查；原层审查继续覆盖未改内容。"""
+        def digest(value: Any) -> str:
+            """用稳定JSON绑定范围、原候选、窄补丁与最终对象，不依赖文件更新时间。"""
+            return content_hash(json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(",",":")))
+        directory = trace.run_dir
+        proof_path = directory / "promise-alignment-proof.json"
+        candidate_path = directory / "promise-alignment-candidate.json"
+        review_path = directory / "promise-alignment-review.json"
+        outline_before = directory / "outline-before-alignment-candidate.json"
+        original_outline = BookOutlineV2.model_validate_json(_read(outline_before)) if outline_before.is_file() else outline
+        originals = {}
+        for stage, model, current in (("volume-detail",VolumeDetailV2,detail),("chapter-window",RollingPlanV2,window)):
+            before = directory / f"{stage}-before-alignment-candidate.json"
+            originals[stage] = model.model_validate_json(_read(before)) if before.is_file() else current
+        original_detail, original_window = originals["volume-detail"], originals["chapter-window"]
+        conflicts = _promise_definition_conflicts(original_outline,original_detail,original_window)
+        if not conflicts:
+            if proof_path.is_file() or candidate_path.is_file():
+                raise PlanningNeedsAttention("承诺补审产物不再对应原冲突，未采用旧覆盖证明。","核对原候选与补审身份，只处理本节点。")
+            return outline,detail,window
+        current_node.update(stage="promise-alignment",phase="source_check")
+        verify_canon()
+        # 已生效细纲与全书大纲不能因窗口对齐被顺带修改；本次新卷候选才允许联合统一定义。
+        lock_volume = active_detail is not None
+        original_hashes = {"outline":digest(original_outline.model_dump(mode="json")),
+            **{name:digest(value.model_dump(mode="json")) for name,value in originals.items()}}
+        review_hashes = {}
+        for stage in originals:
+            before_review = directory / f"{stage}-before-alignment-review.json"
+            current_review = directory / f"{stage}-review.json"
+            text = _read(before_review) if before_review.is_file() else _read(current_review)
+            review_hashes[stage] = content_hash(text)
+        base = {"source_basis":resume_basis,"source_context_hash":content_hash(stable_sources),
+            "root_intent_hash":content_hash(root_intent),"original_hashes":original_hashes,
+            "original_review_hashes":review_hashes,"lock_volume":lock_volume,"conflict_ids":sorted(conflicts)}
+        if update_outline_promises:
+            base["update_outline_promises"] = True
+            base["outline_promise_authorization_hash"] = content_hash(_planning_effective_instruction(requested_instruction))
+        base_hash = digest(base)
+        proof = json.loads(_read(proof_path)) if proof_path.is_file() else None
+        if proof is not None and proof.get("base") != base:
+            raise PlanningNeedsAttention("原承诺对齐的来源、范围或候选哈希已变化，未复用旧补审。","先核对受影响的承诺来源，不重生成未改章节卡。")
+        if proof is None:
+            if candidate_path.is_file() or review_path.is_file():
+                raise PlanningNeedsAttention("承诺补审缺少原候选绑定，未猜测已有返回的身份。","恢复本节点原绑定记录后继续。")
+            for stage,value in originals.items():
+                atomic_write_text(directory / f"{stage}-before-alignment-candidate.json",value.model_dump_json(indent=2))
+                old_review = _read(directory / f"{stage}-review.json")
+                if old_review:
+                    atomic_write_text(directory / f"{stage}-before-alignment-review.json",old_review)
+            if update_outline_promises:
+                atomic_write_text(outline_before,original_outline.model_dump_json(indent=2))
+            proof = {"status":"pending","base":base,"base_hash":base_hash}
+            atomic_write_text(proof_path,json.dumps(proof,ensure_ascii=False,indent=2))
+        # 原版和返回文件都留存；继续同一节点只读取已有Writer结果，不重新生成十五张章卡。
+        affected_beats = [{"chapter_no":chapter.chapter_no,"beat_index":index,**beat.model_dump(mode="json")}
+            for chapter in original_window.chapters for index,beat in enumerate(chapter.promise_beats)
+            if beat.thread_id in conflicts]
+        declared_ids = {plan.thread_id for owner in (original_outline,original_detail,original_window) for plan in owner.promises}
+        required_parent_ids = {parent for owner in (original_outline,original_detail,original_window)
+            for plan in owner.promises for parent in plan.parent_thread_ids if parent not in declared_ids}
+        if candidate_path.is_file():
+            patch = PromiseAlignmentPatch.model_validate_json(_read(candidate_path))
+        else:
+            if proof.get("writer_started"):
+                raise PlanningNeedsAttention("承诺Writer请求已有发送记录但未取得完整返回，未自动重复请求。","先核对本节点原模型回执与用量。")
+            current_node.update(phase="writer")
+            proof["writer_started"] = True
+            atomic_write_text(proof_path,json.dumps(proof,ensure_ascii=False,indent=2))
+            writer = await engine.provider.generate_json(system_prompt=_WRITER_SYSTEM +
+                "\n本次只做已有跨层承诺定义对齐，不返回大纲、卷细纲正文或章节卡。"
+                "完整返回给定冲突ID的统一PromisePlan；实际引用的缺失父定义按required_parent_ids同次补齐，不新增无关编号。"
+                "保留上下层有依据的实质信息，不能机械选上层或下层丢弃细化。"
+                "优先不改beat；确有必要时只改给定位置的expected_change，不改章号、索引、thread_id或action。"
+                "lock_outline为true时大纲合同锁定；为false表示作者只授权同步冲突伏笔定义，保留身份类型、大纲正文、卷章范围及未冲突定义。"
+                "lock_volume为true时卷细纲合同锁定，只统一下层副本。"
+                "parent_thread_ids只能引用本次完整规划实际声明的PromisePlan；历史伏笔索引不等于合同声明。"
+                "保留有依据的历史因果，不能因旧编号未声明便断言相关旧事不存在。",
+                user_prompt=stable_sources + "\n原任务：\n" + root_intent + "\n只读规划与冲突：\n" + json.dumps({
+                    "outline":original_outline.model_dump(mode="json"),"volume_detail":original_detail.model_dump(mode="json"),
+                    "window":original_window.model_dump(mode="json"),"conflicts":conflicts,
+                    "affected_beats":affected_beats,"lock_outline":not update_outline_promises,"lock_volume":lock_volume,
+                    "required_parent_ids":sorted(required_parent_ids),"current_instruction":instruction},ensure_ascii=False),
+                output_model=PromiseAlignmentPatch,effort="high",thinking=False,
+                max_tokens=engine.settings.max_output_tokens,timeout_seconds=engine.settings.planning_timeout_seconds,agent_role="writer")
+            trace.record_model("promise-alignment.writer",writer,"Writer仅返回冲突承诺与必要节拍说明")
+            patch = writer.data
+            atomic_write_text(candidate_path,patch.model_dump_json(indent=2))
+            verify_canon()
+        original_patch = patch
+        contract_repair_text = ""
+        try:
+            revised_outline,revised_detail,revised_window,paths = _apply_promise_alignment(
+                original_outline,original_detail,original_window,patch,lock_volume=lock_volume,update_outline=update_outline_promises)
+        except ValueError as exc:
+            missing = _alignment_missing_parents(original_outline,original_detail,original_window,patch,
+                lock_volume=lock_volume,update_outline=update_outline_promises)
+            fixed = {} if update_outline_promises else {plan.thread_id:plan for plan in original_outline.promises}
+            if lock_volume:
+                fixed.update({plan.thread_id:plan for plan in original_detail.promises})
+            locked_changes = {plan.thread_id:fixed[plan.thread_id].model_dump(mode="json")
+                for plan in patch.plans if plan.thread_id in fixed and plan != fixed[plan.thread_id]}
+            affected_ids = (set(missing) & set(conflicts)) | set(locked_changes)
+            required_parents = {identity for parents in missing.values() for identity in parents}
+            titles = "、".join(plan.title for plan in patch.plans if plan.thread_id in affected_ids) or "本次伏笔"
+            trace.record("promise-alignment.contract", "waiting_condition",
+                         "伏笔定义或前置关系尚未通过，原返回与次数保留", str(exc),
+                         metadata={"missing_parents":missing,"locked_changed_ids":sorted(locked_changes),
+                                   "original_patch_hash":digest(patch.model_dump(mode="json"))},public=False)
+            repairable_errors = {f"承诺 {identity} 引用了未声明的前置承诺" for identity in missing}
+            if locked_changes:
+                repairable_errors.add("承诺对齐不能修改全书大纲或已生效卷细纲的合同。")
+            if (not (affected_ids or required_parents) or not affected_ids <= set(conflicts)
+                    or str(exc) not in repairable_errors):
+                raise PlanningNeedsAttention("伏笔定义尚未通过完整关系核对，已保留原规划和返回。",
+                    "先补核这处定义关系，再继续原节点；不会重做已通过的章节计划。") from exc
+
+            # 此处只给原Writer一次合同补救；原返回不覆盖，未受影响的定义与全部节拍锁定。
+            from .runtime import active_runtime, active_generation_attempt_limit, active_generation_request_id
+            from .model_usage import UsageLedger
+            runtime = active_runtime.get()
+            if not scope or not runtime or runtime.task_id != scope.task_id:
+                raise PlanningNeedsAttention(f"“{titles}”依赖的另一条伏笔尚未定义。",
+                    "先恢复原任务身份，再由原Writer补核这处关系；保留候选，不重复生成章节。") from exc
+            original_patch_hash = digest(original_patch.model_dump(mode="json"))
+            binding = {"task_id":scope.task_id,"snapshot_hash":scope.snapshot_hash,"base_hash":base_hash,
+                "original_patch_hash":original_patch_hash,"missing_parents":missing,"role":"writer"}
+            # 新增锁定定义或父定义时单独绑定实际补核范围；原请求及发送账本继续保留。
+            if locked_changes or required_parents:
+                binding.update(locked_definitions=locked_changes,required_parent_ids=sorted(required_parents))
+            retained_repair = None
+            request_affected_ids = affected_ids
+            first_grant_key = "planning_contract_repair:" + digest(binding)
+            first_grant = project.db.get_metadata(first_grant_key)
+            # 原返回若已完整修好指定定义，只缺父定义，就保存这部分并单独绑定一次缺项请求。
+            # 不清空旧许可、不覆盖原返回，也不让未知/损坏返回触发额外模型调用。
+            if (required_parents and isinstance(first_grant,dict) and first_grant.get("binding") == binding
+                    and first_grant.get("status") == "returned" and first_grant.get("repair")):
+                first_return = PromiseAlignmentPatch.model_validate(first_grant["repair"])
+                first_path = directory / "promise-alignment-contract-repair.json"
+                if (digest(first_return.model_dump(mode="json")) == first_grant.get("repair_hash")
+                        and (not first_path.is_file() or PromiseAlignmentPatch.model_validate_json(_read(first_path)) == first_return)
+                        and {plan.thread_id for plan in first_return.plans} == affected_ids
+                        and all(plan.thread_id not in fixed or plan == fixed[plan.thread_id] for plan in first_return.plans)):
+                    # 复用原合并门禁检查重复、类型、越界及节拍；通过才开放仅缺项的后续机会。
+                    _merge_alignment_contract_repair(original_patch,first_return,affected_ids)
+                    retained_repair = first_return
+                    request_affected_ids = set()
+                    binding = {**binding,"retained_repair_hash":digest(first_return.model_dump(mode="json")),
+                               "prior_grant_key":first_grant_key}
+            grant_key = "planning_contract_repair:" + digest(binding)
+            repair_path = directory / ("promise-alignment-parent-definitions.json" if retained_repair is not None
+                                       else "promise-alignment-contract-repair.json")
+            verify_canon()
+            async with project_write_lock(project.root):
+                grant = project.db.get_metadata(grant_key)
+                if grant is None:
+                    if repair_path.is_file():
+                        raise PlanningNeedsAttention(f"“{titles}”的前置关系补核缺少原请求身份。",
+                            "核对已有返回的来源，不重新发送Writer。")
+                    baseline = UsageLedger().task_role_sent_count(scope.task_id,"writer")
+                    grant = {"binding":binding,"status":"reserved","sent_baseline":baseline,"request_id":grant_key}
+                    project.db.set_metadata(grant_key,grant)
+                elif not isinstance(grant,dict) or grant.get("binding") != binding:
+                    raise PlanningNeedsAttention(f"“{titles}”的前置关系补核身份已变化。",
+                        "核对原任务及候选来源后继续，不能用另次结果替代。")
+                elif not grant.get("repair"):
+                    raise PlanningNeedsAttention(f"“{titles}”的一次前置关系补核已请求，完整结果仍待核对。",
+                        "先核对原请求回执与用量；不会重复发送或重做章节。")
+            proof["contract_repair"] = {"grant_key":grant_key,"binding":binding}
+            atomic_write_text(proof_path,json.dumps(proof,ensure_ascii=False,indent=2))
+            if grant.get("repair"):
+                try:
+                    repair = PromiseAlignmentPatch.model_validate(grant["repair"])
+                    repair_changed = (digest(repair.model_dump(mode="json")) != grant.get("repair_hash")
+                        or repair_path.is_file() and PromiseAlignmentPatch.model_validate_json(_read(repair_path)) != repair)
+                except ValueError as saved_exc:
+                    raise PlanningNeedsAttention(f"“{titles}”的已存补核结构损坏。","核对原返回，不重新生成。") from saved_exc
+                if repair_changed:
+                    raise PlanningNeedsAttention(f"“{titles}”的补核候选与原返回身份不符。","保留两份记录，核对修改后再继续。")
+                atomic_write_text(repair_path,repair.model_dump_json(indent=2))
+            else:
+                # 全网路/格式重试合计一次；新增机会沿原任务发送账本，旧费用与次数不清零。
+                verify_canon()
+                old_limits = dict(runtime.role_attempt_limits)
+                runtime.role_attempt_limits["writer"] = int(grant["sent_baseline"]) + 1
+                cap_token = active_generation_attempt_limit.set(1)
+                request_token = active_generation_request_id.set(grant_key)
+                reserved_grant = dict(grant)
+                current_node.update(phase="contract_repair")
+                try:
+                    repaired = await engine.provider.generate_json(system_prompt=_WRITER_SYSTEM +
+                        "\n本次仅补核已有承诺对齐结果中的合同错误。只返回指定affected_ids及required_parent_ids的PromisePlan，"
+                        "beat_changes必须为空；其他承诺、所有原节拍、章节卡、卷细纲正文和大纲全部锁定。"
+                        "locked_definitions中的定义须完整逐字保留到下层；原缺失父定义只能按来源补齐到窗口，不能删除锁定的依赖。"
+                        "若有retained_repair，则这些定义已保存，不重复返回；只返回exact_return_ids指定的缺项。"
+                        "自行对照原来源、完整声明目录及坏返回修复依赖和必要定义；不得新增指定范围外的ID，不能将历史索引"
+                        "直接当作已声明合同，也不得因编号未声明便否定真实旧事。所有新父定义须以所给前史为据，不能再引入缺失父编号。",
+                        user_prompt=stable_sources + "\n原任务：\n" + root_intent + "\n只读原规划与坏返回：\n" + json.dumps({
+                            "outline":outline.model_dump(mode="json"),"volume_detail":original_detail.model_dump(mode="json"),
+                            "window":original_window.model_dump(mode="json"),"original_patch":original_patch.model_dump(mode="json"),
+                            "binding":binding,"contract_error":str(exc),"affected_ids":sorted(request_affected_ids),
+                            "required_parent_ids":sorted(required_parents),
+                            "exact_return_ids":sorted(request_affected_ids | required_parents),
+                            "retained_repair":retained_repair.model_dump(mode="json") if retained_repair is not None else None,
+                            "declared_ids":sorted({plan.thread_id for owner in (outline,original_detail,original_window) for plan in owner.promises})},ensure_ascii=False)
+                            + "\n【本次必须完整且仅返回的定义编号】\n" + json.dumps(sorted(request_affected_ids | required_parents))
+                            + "\nplans条数必须等于上述编号数；beat_changes为空。已保存的其他定义不要重复返回。",
+                        output_model=PromiseAlignmentPatch,effort="high",thinking=False,
+                        max_tokens=min(engine.settings.max_output_tokens,4096),timeout_seconds=engine.settings.planning_timeout_seconds,
+                        agent_role="writer")
+                    trace.record_model("promise-alignment.contract-repair",repaired,"原Writer仅补核锁定定义与缺失前置关系，原坏返回保留")
+                    repair = repaired.data
+                    atomic_write_text(repair_path,repair.model_dump_json(indent=2))
+                    verify_canon()
+                    grant = {**grant,"status":"returned","repair":repair.model_dump(mode="json"),
+                             "repair_hash":digest(repair.model_dump(mode="json"))}
+                    async with project_write_lock(project.root):
+                        if project.db.get_metadata(grant_key) != reserved_grant:
+                            raise PlanningNeedsAttention("这处伏笔补核的请求身份在返回期间变化。","保留返回并核对原请求，不采用迟到结果。")
+                        project.db.set_metadata(grant_key,grant)
+                finally:
+                    active_generation_request_id.reset(request_token)
+                    active_generation_attempt_limit.reset(cap_token)
+                    runtime.role_attempt_limits = old_limits
+            verify_canon()
+            if (retained_repair is None and required_parents
+                    and {plan.thread_id for plan in repair.plans} == affected_ids
+                    and all(plan.thread_id not in fixed or plan == fixed[plan.thread_id] for plan in repair.plans)):
+                # 已定位为仅漏父定义时，在同次对话继续一次缺项请求；下一次进入会带retained_repair，不能无限递归。
+                # 先沿原合并门禁确认七类有效定义没有重复、越界或类型变化，再复用刚保存的实际回包。
+                _merge_alignment_contract_repair(original_patch,repair,affected_ids)
+                trace.record("promise-alignment.contract-repair", "info", "已保存有效定义，自动续补缺少的父定义",
+                             metadata={"retained_repair_hash":digest(repair.model_dump(mode="json")),
+                                       "required_parent_ids":sorted(required_parents)},public=False)
+                return await align_promises(outline,detail,window)
+            try:
+                completion_return = repair
+                if retained_repair is not None:
+                    if ({plan.thread_id for plan in repair.plans} != required_parents
+                            or len(repair.plans) != len(required_parents) or repair.beat_changes):
+                        raise ValueError("缺失父定义补充只能完整返回指定父编号，不得重复已保存定义或改节拍。")
+                    repair = PromiseAlignmentPatch(plans=retained_repair.plans + repair.plans)
+                patch = _merge_alignment_contract_repair(original_patch,repair,affected_ids,required_parents=required_parents)
+                revised_outline,revised_detail,revised_window,paths = _apply_promise_alignment(
+                    original_outline,original_detail,original_window,patch,lock_volume=lock_volume,update_outline=update_outline_promises)
+            except ValueError as repair_exc:
+                trace.record("promise-alignment.contract-repair", "waiting_condition", "原Writer的前置关系补核仍未通过完整门禁",
+                             str(repair_exc),metadata={"grant_key":grant_key},public=False)
+                raise PlanningNeedsAttention(f"“{titles}”的前置关系补核仍未通过，原返回已保留。",
+                    "只核对这处伏笔的依据与关系；不会重发Writer或重做章节计划。") from repair_exc
+            contract_repair_text = ("\n原坏承诺补丁（未覆盖）：\n" + _stage_text(original_patch)
+                + "\n前置关系实际错误：\n" + str(exc)
+                + ("\n原Writer已保存的定义修复返回：\n" + _stage_text(retained_repair) if retained_repair is not None else "")
+                + "\n原Writer本次实际返回：\n" + _stage_text(completion_return))
+        patch_hash = digest(patch.model_dump(mode="json"))
+        result_hashes = {"volume-detail":digest(revised_detail.model_dump(mode="json")),
+                         "chapter-window":digest(revised_window.model_dump(mode="json"))}
+        if update_outline_promises:
+            result_hashes["outline"] = digest(revised_outline.model_dump(mode="json"))
+        result_hash = digest(result_hashes)
+        # 差异审核沿原角色资料权限替换设定上下文；允许引用的只读对照与逐字定位使用同一份文本。
+        review_sources = (stable_sources.replace(settings_context,review_settings_context,1)
+                          if settings_context else stable_sources + review_settings_context)
+        fixed_definitions = {} if update_outline_promises else {plan.thread_id:plan.model_dump(mode="json") for plan in original_outline.promises}
+        if lock_volume:
+            fixed_definitions.update({plan.thread_id:plan.model_dump(mode="json") for plan in original_detail.promises})
+        review_binding = {"base_hash":base_hash,"patch_hash":patch_hash,"result_hash":result_hash,
+            "reviewed_thread_ids":sorted(set(conflicts) | {plan.thread_id for plan in patch.plans}),"paths":paths}
+        # 明示来源身份，避免把本次候选误当生效合同，或把实际补齐的父定义误判成越界新增。
+        authority = {"source_authority_version":2,"lock_outline":not update_outline_promises,"lock_volume":lock_volume,
+            "outline_status":"作者本次只授权同步冲突伏笔定义；其余大纲与范围只读" if update_outline_promises else
+                "已生效，只读" if active_outline is not None else "本次上层已通过审核，下层对齐阶段只读",
+            "source_manifest_hash":active_start_hashes["planning/active-v2.json"],
+            "locked_definitions":fixed_definitions,
+            "locked_definition_sources":{identity:("volume-detail" if lock_volume and
+                any(plan.thread_id == identity for plan in original_detail.promises) else "outline") for identity in fixed_definitions},
+            "volume_detail_status":"已生效，只读" if lock_volume else "本次已通过本层审核、尚未发布的候选，可在授权内对齐",
+            "window_status":"本次未发布候选", "required_parent_ids":sorted(set(review_binding["reviewed_thread_ids"]) - set(conflicts))}
+        source_text = (review_sources + "\n原任务：\n" + root_intent
+            + "\n程序核验的来源身份与只读合同：\n" + json.dumps(authority,ensure_ascii=False,indent=2)
+            + "\n当前明确授权：\n" + instruction + "\n对齐前大纲：\n" + _stage_text(original_outline)
+            + "\n对齐前卷细纲（身份以上表为准）：\n" + _stage_text(original_detail)
+            + "\n对齐前窗口候选：\n" + _stage_text(original_window) + "\n原冲突定义：\n" + json.dumps(conflicts,ensure_ascii=False,indent=2)
+            + contract_repair_text)
+        patch_text = _stage_text(patch)
+        review_system = (_EDITOR_SYSTEM +
+            "\n返回PromiseAlignmentReviewV2；只审核跨层承诺对齐差异及受影响节拍，原层审核继续覆盖未改部分。"
+            "依据程序给定的lock_volume与locked_definitions区分生效只读合同和本次未发布候选，不把候选提升成生效合同。"
+            "lock_volume只约束卷细纲；大纲是否允许同步冲突定义由lock_outline及当前明确授权决定，其他大纲字段始终只读。"
+            "下层曾通过审核的同ID副本也不能覆盖只读上层合同；在下层恢复统一定义不属于修改上层。"
+            "合同可保留已发生的历史里程碑；仅章号早于当前锚点不等于重复执行，须看未来章节卡是否再次安排同一首次行动。"
+            "核对原上下层实质信息、因果与触发/完成条件；预计章节窗口不是硬截止。"
+            "实际补齐的父定义也须核对前史依据与真实依赖，原合同实际引用的缺失父定义可补齐，不是无关新增。"
+            "先前坏返回未采用，当前实际窄补丁才是审核对象；比较补核是否丢掉真实因果，不能只凭编号合法通过。"
+            "原样返回base_hash/patch_hash/result_hash及绑定的完整reviewed_thread_ids，不自行增删。"
+            "candidate_excerpt逐字取自当前实际窄补丁，source_excerpt取自给定来源或原定义。")
+        review_prompt = source_text + "\n当前实际窄补丁：\n" + patch_text + "\n绑定身份：\n" + json.dumps(review_binding)
+        if review_path.is_file():
+            assessment = PromiseAlignmentReviewV2.model_validate_json(_read(review_path))
+        else:
+            if proof.get("review_started"):
+                raise PlanningNeedsAttention("承诺差异审核已请求但未取得完整返回，未重发审核。","先核对原审核回执和用量，保留Writer结果。")
+            current_node.update(phase="review")
+            proof.update(review_started=True,patch_hash=patch_hash,result_hash=result_hash,paths=paths)
+            atomic_write_text(proof_path,json.dumps(proof,ensure_ascii=False,indent=2))
+            reviewed = await engine.provider.generate_json(system_prompt=review_system, user_prompt=review_prompt,
+                output_model=PromiseAlignmentReviewV2,effort="high",thinking=False,
+                max_tokens=min(engine.settings.max_output_tokens,8192),timeout_seconds=engine.settings.planning_timeout_seconds,agent_role=review_role)
+            trace.record_model("promise-alignment.review",reviewed,"原审核角色补核承诺差异，不重审未改章节卡")
+            assessment = reviewed.data
+            atomic_write_text(review_path,assessment.model_dump_json(indent=2))
+            verify_canon()
+        gaps = _alignment_review_gaps(assessment,review_binding,patch_text,source_text,min_review_confidence)
+        if gaps:
+            # 先让原审核角色核对身份、引文及来源层级；不因报告误读重发Writer，机会沿原节点留痕。
+            before_path = directory / "promise-alignment-review-before-recheck.json"
+            recheck_path = directory / "promise-alignment-review-recheck.json"
+            saved = proof.get("review_recheck")
+            if not before_path.is_file():
+                if saved is not None:
+                    raise PlanningNeedsAttention("原差异复核报告副本缺失，未补造来源。","恢复原报告后从本节点继续。")
+                atomic_write_text(before_path,assessment.model_dump_json(indent=2))
+            original_assessment = PromiseAlignmentReviewV2.model_validate_json(_read(before_path))
+            if saved is None and original_assessment != assessment:
+                raise PlanningNeedsAttention("差异复核副本与当前原报告不一致，未采用。","核对原报告与本次候选身份。")
+            recheck_binding = {**review_binding,"source_authority_version":2,"source_hash":content_hash(source_text),
+                "original_review_hash":digest(original_assessment.model_dump(mode="json"))}
+            recheck_key = "review_recheck"
+            review_feedback = original_assessment
+            if saved is not None and "source_authority_version" not in saved:
+                # 旧输入未声明大纲来源归属；核验并保留旧请求后，只为这次协议补正新增一个窄节点。
+                # 普通来源变化仍拒绝，不能让每次继续或改措辞领取新的审核次数。
+                legacy = PromiseAlignmentReviewV2.model_validate_json(_read(recheck_path)) if recheck_path.is_file() else None
+                if (legacy is None or proof.get("review_recheck_result_hash") != digest(legacy.model_dump(mode="json"))
+                        or any(saved.get(key) != value for key,value in {**review_binding,
+                            "original_review_hash":recheck_binding["original_review_hash"]}.items())):
+                    raise PlanningNeedsAttention("旧差异复核的原返回或对象身份未核清，未增加请求。","先恢复旧节点回执，不重做规划。")
+                recheck_key = "review_authority_recheck"
+                recheck_path = directory / "promise-alignment-review-authority-recheck.json"
+                review_feedback = legacy
+                recheck_binding["prior_recheck_hash"] = digest(legacy.model_dump(mode="json"))
+                saved = proof.get(recheck_key)
+            result_hash_key = recheck_key + "_result_hash"
+            if saved is not None and saved != recheck_binding:
+                raise PlanningNeedsAttention("原差异复核的来源或报告身份已变化，未重复请求。","核对原复核记录与当前候选。")
+            if recheck_path.is_file():
+                if saved is None:
+                    raise PlanningNeedsAttention("已有差异复核缺少原请求绑定，未采用。","恢复本节点的原来源记录。")
+                assessment = PromiseAlignmentReviewV2.model_validate_json(_read(recheck_path))
+                if proof.get(result_hash_key) != digest(assessment.model_dump(mode="json")):
+                    raise PlanningNeedsAttention("差异复核返回与原回执哈希不符，未采用。","核对原角色返回，不重新发送或强写通过。")
+            else:
+                if saved is not None:
+                    raise PlanningNeedsAttention("原差异复核已发起但返回未闭合，未自动重发。","先核对原请求回执及用量。")
+                proof[recheck_key] = recheck_binding
+                atomic_write_text(proof_path,json.dumps(proof,ensure_ascii=False,indent=2))
+                verify_canon()
+                checked = await engine.provider.generate_json(system_prompt=review_system,
+                    user_prompt=review_prompt + "\n此前报告，仅供逐项复核，不能当作事实来源：\n" + review_feedback.model_dump_json(indent=2)
+                        + "\n本次只重核上述报告的身份、原文及判断：\n" + "；".join(gaps)
+                        + "\n先核对所称只读限制是否适用、父定义是否有实际依赖，再判断实质信息是否丢失。"
+                        "有据问题保留并说明最小修法，误读或无法定位的指控撤回；不得为了通过省略真实问题。",
+                    output_model=PromiseAlignmentReviewV2,effort="high",thinking=False,
+                    max_tokens=min(engine.settings.max_output_tokens,8192),
+                    timeout_seconds=engine.settings.planning_timeout_seconds,agent_role=review_role)
+                assessment = checked.data
+                atomic_write_text(recheck_path,assessment.model_dump_json(indent=2))
+                proof[result_hash_key] = digest(assessment.model_dump(mode="json"))
+                atomic_write_text(proof_path,json.dumps(proof,ensure_ascii=False,indent=2))
+                trace.record_model("promise-alignment.review-recheck",checked,"原审核角色定点重核来源身份与实际差异，原报告保留")
+                verify_canon()
+            gaps = _alignment_review_gaps(assessment,review_binding,patch_text,source_text,min_review_confidence)
+            if not gaps:
+                atomic_write_text(review_path,assessment.model_dump_json(indent=2))
+        # 有据的语义意见交回原Writer，最多两次局部修订；不重写已通过章节卡，也不把来源复核当成修稿。
+        async def semantic_request(number: int, kind: str, model: Any, system: str, prompt: str,
+                binding: dict[str, Any], role: str) -> Any:
+            """同一补救请求只发送一次；保存完整返回与哈希，未知或迟到结果不能领取新次数。"""
+            from .runtime import active_runtime, active_generation_attempt_limit, active_generation_request_id
+            from .model_usage import UsageLedger
+            runtime = active_runtime.get()
+            if not scope or not runtime or runtime.task_id != scope.task_id:
+                raise PlanningNeedsAttention("伏笔局部修订缺少原任务身份。","先恢复原任务，不新建创作或重发请求。")
+            records = proof.setdefault("semantic_repairs", {})
+            key = f"{number}-{kind}"
+            path = directory / f"promise-alignment-semantic-{key}.json"
+            saved = records.get(key)
+            if saved is not None:
+                if saved.get("binding") != binding or not path.is_file():
+                    raise PlanningNeedsAttention("原伏笔局部修订的来源变化或返回未闭合。","保留原请求，核对回执后续接。")
+                result = model.model_validate_json(_read(path))
+                if saved.get("return_hash") != digest(result.model_dump(mode="json")):
+                    raise PlanningNeedsAttention("伏笔局部修订返回与保存回执不符。","核对原返回，不重复生成。")
+                return result
+            if path.is_file():
+                raise PlanningNeedsAttention("已有局部修订返回缺少原发送身份。","恢复原请求绑定，不另发模型。")
+            request_id = "planning_semantic_repair:" + digest({**binding,"kind":kind})
+            saved = {"binding":binding,"request_id":request_id,"status":"started",
+                "sent_baseline":UsageLedger().task_role_sent_count(scope.task_id,role)}
+            records[key] = saved
+            atomic_write_text(proof_path,json.dumps(proof,ensure_ascii=False,indent=2))
+            old_limits = dict(runtime.role_attempt_limits)
+            runtime.role_attempt_limits[role] = saved["sent_baseline"] + 1
+            cap_token = active_generation_attempt_limit.set(1)
+            request_token = active_generation_request_id.set(request_id)
+            current_node.update(phase=f"semantic_{kind}")
+            try:
+                verify_canon()
+                returned = await engine.provider.generate_json(system_prompt=system,user_prompt=prompt,
+                    output_model=model,effort="high",thinking=False,
+                    max_tokens=min(engine.settings.max_output_tokens,8192),
+                    timeout_seconds=engine.settings.planning_timeout_seconds,agent_role=role)
+                trace.record_model(f"promise-alignment.semantic-{number}.{kind}",returned,
+                    "原角色按有据意见定点修订伏笔定义" if kind == "writer" else "原审核角色核对局部修订及完整定义关系")
+                result = returned.data
+                atomic_write_text(path,result.model_dump_json(indent=2))
+                verify_canon()
+                saved.update(status="returned",return_hash=digest(result.model_dump(mode="json")))
+                atomic_write_text(proof_path,json.dumps(proof,ensure_ascii=False,indent=2))
+                return result
+            finally:
+                active_generation_request_id.reset(request_token)
+                active_generation_attempt_limit.reset(cap_token)
+                runtime.role_attempt_limits = old_limits
+
+        for number in range(1, COMPLETION_ATTEMPT_LIMIT + 1):
+            if not gaps:
+                break
+            # 只按能够逐字回源的意见改稿；附加坏引文留在原报告，不能盖住其余有据问题或授权改别处。
+            grounded_evidence = [item for item in assessment.review.evidence
+                if item.candidate_excerpt in patch_text and item.source_excerpt in source_text]
+            repair_assessment = assessment.model_copy(update={"review":assessment.review.model_copy(
+                update={"evidence":grounded_evidence})})
+            if (assessment.review.verdict != "revise" or not assessment.review.repair_instruction.strip()
+                    or _alignment_review_gaps(repair_assessment,review_binding,patch_text,source_text,
+                        min_review_confidence,require_pass=False)):
+                break
+            matches = [{plan.thread_id for plan in patch.plans if item.candidate_excerpt in _stage_text(plan)}
+                for item in grounded_evidence]
+            if not matches or any(not identities for identities in matches):
+                break
+            affected_ids = set().union(*matches)
+            if affected_ids & set(fixed_definitions):
+                break
+            binding = {**review_binding,"source_hash":content_hash(source_text),
+                "review_hash":digest(assessment.model_dump(mode="json")),"affected_ids":sorted(affected_ids),
+                "grounded_evidence_hash":digest([item.model_dump(mode="json") for item in grounded_evidence]),
+                "task_id":scope.task_id if scope else "","snapshot_hash":scope.snapshot_hash if scope else "","round":number}
+            repair = await semantic_request(number,"writer",PromiseAlignmentPatch,
+                _WRITER_SYSTEM + "\n本次只按有据差异审核修订指定affected_ids的PromisePlan，完整且仅返回这些定义；"
+                "beat_changes必须为空。保留各定义身份和类型，其余定义、父定义、所有节拍、章节卡、大纲和细纲正文锁定。"
+                "自行逐项核对所给原文与已通过章节安排，校正时间、因果和完成条件；不重复已发生事件、不提前揭示。"
+                "不能只改某一处句子而留下同定义内相矛盾的触发条件或完成条件。",
+                source_text + "\n当前实际补丁：\n" + patch_text + "\n本轮已定位原文的审核意见：\n" + repair_assessment.model_dump_json(indent=2)
+                + "\n仅修订以下定义：\n" + json.dumps(sorted(affected_ids),ensure_ascii=False),binding,"writer")
+            try:
+                patch = _merge_alignment_contract_repair(patch,repair,affected_ids)
+                revised_outline,revised_detail,revised_window,paths = _apply_promise_alignment(
+                    original_outline,original_detail,original_window,patch,
+                    lock_volume=lock_volume,update_outline=update_outline_promises)
+            except ValueError as exc:
+                raise PlanningNeedsAttention("伏笔局部修订超出原范围或未通过关系门禁，原返回保留。",
+                    "只处理这处修订，不重做已通过章节。") from exc
+            merged_path = directory / f"promise-alignment-semantic-{number}-candidate.json"
+            merged_text = patch.model_dump_json(indent=2)
+            if merged_path.is_file() and _read(merged_path) != merged_text:
+                raise PlanningNeedsAttention("局部修订派生候选与原返回不符。","核对原补丁，不覆盖已有产物。")
+            atomic_write_text(merged_path,merged_text)
+            patch_hash = digest(patch.model_dump(mode="json"))
+            result_hashes = {"volume-detail":digest(revised_detail.model_dump(mode="json")),
+                "chapter-window":digest(revised_window.model_dump(mode="json"))}
+            if update_outline_promises:
+                result_hashes["outline"] = digest(revised_outline.model_dump(mode="json"))
+            result_hash = digest(result_hashes)
+            review_binding = {**review_binding,"patch_hash":patch_hash,"result_hash":result_hash,"paths":paths}
+            patch_text = _stage_text(patch)
+            assessment = await semantic_request(number,"review",PromiseAlignmentReviewV2,review_system,
+                source_text + "\n当前实际窄补丁：\n" + patch_text + "\n绑定身份：\n" + json.dumps(review_binding)
+                + "\n上一轮意见与实际局部返回，仅作修订对照：\n" + assessment.model_dump_json(indent=2)
+                + "\n" + repair.model_dump_json(indent=2),
+                {**binding,"revised_binding":review_binding,"repair_hash":digest(repair.model_dump(mode="json"))},review_role)
+            gaps = _alignment_review_gaps(assessment,review_binding,patch_text,source_text,min_review_confidence)
+        if gaps:
+            titles = "、".join(plan.title for plan in patch.plans if plan.thread_id in conflicts)
+            raise PlanningNeedsAttention(f"{titles or '本次伏笔'}的一致性核对尚未完成：{'；'.join(gaps)}。原规划和本次修改均已保留。",
+                "可先查看待处理工作中的意见和来源，再安排负责角色补齐本处；已通过的章节安排无需重新生成。")
+        # 半写入或已通过候选的恢复仅允许原版与本次最终派生版；范围外手改不得被覆盖。
+        checked_objects = [("volume-detail",detail),("chapter-window",window)] + ([("outline",outline)] if update_outline_promises else [])
+        if any(digest(value.model_dump(mode="json")) not in {original_hashes[name],result_hashes[name]}
+               for name,value in checked_objects):
+            raise PlanningNeedsAttention("对齐期间候选发生额外修改，未覆盖当前候选。","对照修改的精确字段后从窄节点继续。")
+        verify_canon()
+        expected_proof = {**proof,"status":"passed","base_hash":base_hash,"patch_hash":patch_hash,
+            "result_hash":result_hash,"result_hashes":result_hashes,"paths":paths,"review_hash":digest(assessment.model_dump(mode="json"))}
+        if proof.get("status") == "passed" and any(proof.get(key) != expected_proof[key]
+                for key in ("base_hash","patch_hash","result_hash","result_hashes","paths","review_hash")):
+            raise PlanningNeedsAttention("已通过的承诺覆盖证明与当前产物不一致，未发布。","回查原补丁与补审，不自动重算旧证明冒充通过。")
+        atomic_write_text(proof_path,json.dumps(expected_proof,ensure_ascii=False,indent=2))
+        # 只在附加门禁通过后更新本次run的有效候选；原版及原review仍在before副本中。
+        atomic_write_text(directory / "volume-detail-candidate.json",revised_detail.model_dump_json(indent=2))
+        atomic_write_text(directory / "chapter-window-candidate.json",revised_window.model_dump_json(indent=2))
+        if update_outline_promises:
+            atomic_write_text(directory / "outline-candidate.json",revised_outline.model_dump_json(indent=2))
+        trace.record("promise-alignment.coverage","completed","承诺定义已统一并通过差异补审；原审核继续覆盖未改部分",
+            metadata={"base_hash":base_hash,"patch_hash":patch_hash,"result_hash":result_hash,"paths":paths,
+                "conflict_ids":sorted(conflicts),"review_role":review_role},public=False)
+        return revised_outline,revised_detail,revised_window
 
     superseded_files: list[dict[str, str]] = []
 
@@ -1482,7 +2558,7 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                             "下游细纲和近期规划本轮只做必要相容性审核，不自动重写。\n生效大纲："
                             + _stage_text(preserved_outline))
         if active_outline is not None:
-            outline = active_outline
+            outline = BookOutlineV2.model_validate_json(_read(trace.run_dir / "outline-candidate.json")) if approved_run_id else active_outline
             atomic_write_text(trace.run_dir / "outline-candidate.json", outline.model_dump_json(indent=2))
             trace.record("outline.reuse", "completed", "沿用已生效大纲；本轮不重新生成")
         else:
@@ -1519,6 +2595,9 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         expected = list(range(anchor + 1, end + 1))
         if plan.anchor_chapter != anchor or [item.chapter_no for item in plan.chapters] != expected:
             raise ValidationGateError("近期规划没有准确覆盖用户范围，候选未发布。")
+        outline,detail,plan = await align_promises(outline,detail,plan)
+        outline_text = _render_outline(outline)
+        detail_text = _render_detail(detail)
         plan_text = _render_window(plan)
         current_publication = load_active_planning(project, allow_document_edits=focus != "chapter-window")
         if current_publication is not None and all(
@@ -1543,13 +2622,15 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                     "run_id": trace.run_id, "anchor": anchor, "end": end,
                     "instruction": requested_instruction, "focus": focus,
                     "source_manifest_hash": active_start_hashes["planning/active-v2.json"],
-                    "artifact_hashes": {f"{stage}-{suffix}": content_hash(_read(
+                    "artifact_hashes": {**{f"{stage}-{suffix}": content_hash(_read(
                         trace.run_dir / f"{stage}-{suffix}"))
                         for stage in ("outline", "volume-detail", "chapter-window")
                         for suffix in (("candidate.json",) if ((focus == "chapter-window" and
                                                                (stage == "outline" or stage == "volume-detail" and active_detail is not None))
-                                                               or (focus == "volume-detail" and stage == "outline"))
+                                                               or (focus in {"volume-detail", "future-detail"} and stage == "outline"))
                                        else ("candidate.json", "review.json"))},
+                        **{name:content_hash(_read(trace.run_dir / name)) for name in _alignment_artifact_names()
+                           if (trace.run_dir / name).is_file()}},
                 })
             trace.finish(status="waiting_user", summary="三层候选审核通过，等待用户确认正式采用")
             return {"status": "waiting_user", "decision": "awaiting_confirmation",
@@ -1595,6 +2676,8 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                 "trace_id": trace.run_id,
                 "book_scale_updated": scale_matches == 1,
                 "legacy_plan_status": "replaced_in_database",
+                "promise_alignment_artifacts":{name:content_hash(_read(trace.run_dir / name))
+                    for name in _alignment_artifact_names() if (trace.run_dir / name).is_file()},
             }
             stamp = manifest["published_at"].replace(":", "-")
             # Stage the complete authorized write before the first mutation.
@@ -1651,7 +2734,9 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
                             **{str(path.relative_to(project.root)): content_hash(_read(path))
                                for path in trace.run_dir.glob("*-candidate.json")},
                             **{str(path.relative_to(project.root)): content_hash(_read(path))
-                               for path in trace.run_dir.glob("*-review.json")}},
+                               for path in trace.run_dir.glob("*-review.json")},
+                            **{str((trace.run_dir / name).relative_to(project.root)):content_hash(_read(trace.run_dir / name))
+                               for name in _alignment_artifact_names() if (trace.run_dir / name).is_file()}},
                 "accepted": [[row["chapter_no"], row["version"], row["content_hash"]] for row in accepted],
                 "settings_source_hash": settings_fingerprint, "preferences_hash": content_hash(frozen_preferences),
                 "bundle": v2_execution_bundle(project, manifest, outline, detail, plan).model_dump(mode="json"),
@@ -1684,8 +2769,8 @@ async def redesign_existing_story(engine: Any, root: str | Path, *, anchor: int,
         trace.finish(status="cancelled", summary="规划已停止，现有正史不变")
         raise
     except PlanningNeedsAttention as exc:
-        exc.next_action += (f" 当前断点：{current_node['stage']} / {current_node['phase']}；"
-                            f"来源与保留成果见 {trace.run_dir / 'planning-checkpoint.json'}。")
+        # 阶段代号和绝对路径留在检查点；作者沿界面查看待办即可续接。
+        exc.next_action += " 本阶段成果和来源已保留，可在待处理工作中查看缺口，从未完成的步骤继续。"
         checkpoint = {"status": "waiting_condition", **current_node,
             "reason": str(exc), "next_action": exc.next_action, "candidate_run_id": trace.run_id,
             "snapshot": scope.public_summary() if scope else None,

@@ -77,7 +77,7 @@ class ManualEditsService:
         jobs = [{**item, "display_name": source_display_name(self.project, item["relative_path"])}
                 for item in sorted(self.jobs().values(), key=lambda item: item["updated_at"], reverse=True)]
         return {"jobs": jobs, "issues": [item for item in jobs if item["status"] in
-                {"awaiting_confirmation", "needs_evidence", "failed", "revision_requested"}]}
+                {"awaiting_confirmation", "needs_evidence", "failed", "interrupted", "cancelled", "revision_requested"}]}
 
     def reconcile_setting_reviews(self):
         """A current, verified successor retires its old setting-review job."""
@@ -95,7 +95,7 @@ class ManualEditsService:
             jobs = self.jobs()
             candidates = [job for job in jobs.values() if job.get("kind") == "setting_record"
                 and job.get("applied") and type(job.get("record_revision")) is int
-                and job.get("status") in {"pending", "awaiting_confirmation", "needs_evidence", "failed", "revision_requested", "paused"}]
+                and job.get("status") in {"pending", "awaiting_confirmation", "needs_evidence", "failed", "interrupted", "cancelled", "revision_requested", "paused"}]
             if not candidates:
                 return
             service = StorySettingsService(self.project)
@@ -142,6 +142,13 @@ class ManualEditsService:
                     "applied": applied, "expected_visible_hash": current_hash if applied else previous_hash,
                     "record_revision": record_revision,
                     "attempts": 0, "summary": "手动内容已变化，等待同版本审查；未修改正史。", "issues": []}
+            from .runtime import active_runtime
+            runtime = active_runtime.get()
+            if runtime and runtime.role_attempt_limits:
+                # An auxiliary task cannot turn an explicit parent limit into a fresh allowance.
+                item.update(requires_explicit_review=True, source_task_id=runtime.task_id,
+                    source_run_id=runtime.run_id,
+                    summary="候选已保存；原任务有限定模型请求次数，明确续核后再启动独立审查。")
             artifact = self.project.db.save_agent_artifact(artifact_type="manual_edit_candidate",
                 run_id=item["job_id"], role="user", chapter_no=chapter_no,
                 data={"content": content, "relative_path": relative_path, "content_hash": current_hash},
@@ -158,7 +165,7 @@ class ManualEditsService:
             jobs = self.jobs()
             for job_id, job in jobs.items():
                 if job["status"] == "reviewing" and not _pid_alive(int(job.get("review_owner_pid") or 0)):
-                    jobs[job_id] = {**job, "status":"failed", "summary":"后台核对被中断，候选已保留，请查看断点后再决定续核。"}
+                    jobs[job_id] = {**job, "status":"interrupted", "summary":"后台核对被中断，候选和已用次数保留；请查看断点后再决定续核，没有自动重新请求模型。"}
             from .config import Settings
             if Settings.from_env(self.project.root).manual_edit_review_enabled:
                 for job_id, job in jobs.items():
@@ -300,31 +307,56 @@ class ManualEditsService:
         boundary = int(job.get("chapter_no") or self.project.db.latest_accepted_chapter_no() + 1)
         return InkFlowEngine._planning_source_fingerprint(self.project, boundary, boundary)
 
-    async def review(self, job_id, engine, *, resume=False):
-        from .config import Settings
+    def prepare_review_scope(self, job_id, settings, *, registered_now=False):
         from .task_settings import active_task_settings
         job = self.jobs().get(job_id)
         if not job:
             raise ValidationGateError("找不到这次手动编辑。")
-        if resume and job["status"] == "failed" and int(job.get("attempts", 0)) < 2:
-            async with project_write_lock(self.project.root):
-                jobs = self.jobs()
-                current = jobs.get(job_id)
-                if current and current["status"] == "failed" and current["current_hash"] == job["current_hash"]:
-                    jobs[job_id] = {**current, "status": "pending", "updated_at": utc_now()}
-                    self.project.db.set_metadata("manual_edit_jobs", jobs)
-                    job = jobs[job_id]
-        if job["status"] != "pending":
+        run_id = "manual-audit-" + job_id
+        with self.studio.db.connect() as connection:
+            link = connection.execute("SELECT task_id FROM task_run_settings WHERE run_id=?", (run_id,)).fetchone()
+        if job.get("task_id") and (link is None or link["task_id"] != job["task_id"]):
+            raise ValidationGateError("原核对任务的配置关联缺失或不一致；候选与次数保留，没有新建请求额度。")
+        original_scope = active_task_settings.get()
+        scope = self.studio.db.prepare_task_settings(run_id, novel_id=self.project.project_id,
+            settings=settings, workspace_root=self.project.root, registered_now=registered_now,
+            collaboration_mode=None if link is not None or not original_scope or original_scope.collaboration_pending
+                else original_scope.effective_collaboration_mode)
+        if job.get("snapshot_hash") and job["snapshot_hash"] != scope.snapshot_hash:
+            raise ValidationGateError("原核对配置版本与候选记录不一致，未换用当前设置重新请求。")
+        return scope
+
+    def _review_allowance(self, job, scope):
+        from .model_usage import UsageLedger
+        from .role_protocol import check_owners_for_mode
+        owners = check_owners_for_mode(scope.effective_collaboration_mode)
+        roles = set(owners.values()) if job["kind"] == "draft" else {
+            owners["memory"] if job["kind"] == "setting_record" else owners.get("general") or owners["logic_continuity"]}
+        ledger = UsageLedger()
+        sent = {role: ledger.task_role_sent_count(scope.task_id, role) for role in sorted(roles)}
+        if int(job.get("attempts", 0)) and (not job.get("model_attempt_limit") or job.get("model_usage_unknown")) and not sum(sent.values()):
+            with ledger._connect() as connection:
+                recorded = connection.execute("SELECT COUNT(*) FROM model_attempts WHERE task_id=?",
+                    (scope.task_id,)).fetchone()[0]
+            if not recorded:
+                raise ValidationGateError("旧核对有尝试记录，但请求账本未能对应原任务；先核对已发送回执，没有按零次重新分配额度。")
+        return scope.settings.model_attempt_limit, sent
+
+    async def review(self, job_id, engine, *, resume=False):
+        from .config import Settings
+        from .runtime import RunRuntime, active_runtime
+        from .role_protocol import AGENT_ROLES, roles_for_mode
+        from .task_settings import active_task_settings
+        job = self.jobs().get(job_id)
+        if not job:
+            raise ValidationGateError("找不到这次手动编辑。")
+        resuming = resume and job["status"] in {"failed", "interrupted", "cancelled"}
+        if job["status"] != "pending" and not resuming:
             return job
         if not Settings.from_env(self.project.root).manual_edit_review_enabled:
             return {**self.jobs().get(job_id, {}), "auto_review_disabled": True}
-        original_scope = active_task_settings.get()
-        run_id = "manual-audit-" + job_id
         try:
-            scope = self.studio.db.prepare_task_settings(run_id, novel_id=self.project.project_id,
-                settings=lambda: engine.settings, workspace_root=self.project.root,
-                collaboration_mode=None if job.get("task_id") or not original_scope or original_scope.collaboration_pending
-                    else original_scope.effective_collaboration_mode)
+            scope = self.prepare_review_scope(job_id, lambda: engine.settings)
         except Exception as exc:
             async with project_write_lock(self.project.root):
                 jobs = self.jobs()
@@ -333,17 +365,68 @@ class ManualEditsService:
                     self.project.db.set_metadata("manual_edit_jobs", jobs)
             raise
         token = active_task_settings.set(scope)
+        runtime_token = None
+        runtime = active_runtime.get()
+        previous_limits = dict(runtime.role_attempt_limits) if runtime is not None else {}
+        result = None
         try:
             from .studio import bind_active_collaboration
             scope = bind_active_collaboration(self.project, "manual_edits.review",
                 specialist="memory_keeper" if job["kind"] == "setting_record" else "reviewer") or scope
+            if runtime is None or runtime.task_id != scope.task_id:
+                if runtime is not None and runtime.role_attempt_limits:
+                    raise ValidationGateError("当前授权只补核原任务的指定角色；这项手动候选须从自己的核对断点继续，没有挪用或增加请求额度。")
+                runtime = RunRuntime(publish=runtime.publish if runtime is not None else lambda _: None,
+                    task_id=scope.task_id, run_id="manual-audit-" + job_id,
+                    request_priority=runtime.request_priority if runtime is not None else 1)
+                runtime_token = active_runtime.set(runtime)
+                previous_limits = {}
+            enabled_roles = roles_for_mode(scope.effective_collaboration_mode)
+            runtime.role_attempt_limits = {role: min(scope.settings.model_attempt_limit,
+                previous_limits.get(role, 0) if previous_limits else scope.settings.model_attempt_limit)
+                if role in enabled_roles else 0 for role in AGENT_ROLES}
+            if resuming:
+                async with project_write_lock(self.project.root):
+                    jobs = self.jobs()
+                    current = jobs.get(job_id)
+                    if current and current["status"] == job["status"] and current["current_hash"] == job["current_hash"]:
+                        jobs[job_id] = {**current, "status": "pending", "updated_at": utc_now()}
+                        self.project.db.set_metadata("manual_edit_jobs", jobs)
             if engine.settings.to_mapping() != scope.settings.to_mapping():
                 from .engine import InkFlowEngine
                 from .provider import create_provider
                 engine = InkFlowEngine(create_provider(scope.settings), scope.settings)
-            return await self._review(job_id, engine)
+            result = await self._review(job_id, engine)
         finally:
-            active_task_settings.reset(token)
+            try:
+                async with project_write_lock(self.project.root):
+                    jobs = self.jobs()
+                    current = jobs.get(job_id)
+                    if current and current.get("task_id") == scope.task_id:
+                        try:
+                            limit, sent = self._review_allowance(current, scope)
+                            jobs[job_id] = {**current, "model_attempt_limit": limit, "model_sent_attempts": sent,
+                                "model_usage_unknown": False, "model_usage_warning": ""}
+                        except Exception as exc:
+                            jobs[job_id] = {**current, "model_attempt_limit": scope.settings.model_attempt_limit,
+                                "model_sent_attempts": None, "model_usage_unknown": True, "model_usage_warning": str(exc)[:1600]}
+                        self.project.db.set_metadata("manual_edit_jobs", jobs)
+                        if isinstance(result, dict):
+                            result = jobs[job_id]
+            except Exception as exc:
+                if isinstance(result, dict):
+                    result = {**result, "model_sent_attempts": None, "model_usage_unknown": True,
+                        "model_usage_warning": "次数摘要暂未写回，请先核对原请求账本。"}
+                if runtime is not None:
+                    runtime.publish({"type": "usage.warning", "summary": "核对结果与原请求记录保留，界面的次数摘要暂未更新；请先核对账本，勿重发整项任务。",
+                        "metadata": {"error_type": type(exc).__name__}})
+            finally:
+                if runtime_token is not None:
+                    active_runtime.reset(runtime_token)
+                elif runtime is not None:
+                    runtime.role_attempt_limits = previous_limits
+                active_task_settings.reset(token)
+        return result
 
     async def _review(self, job_id, engine):
         from .role_protocol import check_owners_for_mode
@@ -361,13 +444,25 @@ class ManualEditsService:
             job = jobs[job_id]
             if job["status"] != "pending":
                 return job
-            if int(job.get("attempts", 0)) >= 2:
-                jobs[job_id] = {**job, "status": "needs_evidence", "summary": "同一候选的两次核对机会已用完，请修改具体内容或补充可定位来源后再处理。"}
+            scope = active_task_settings.get()
+            try:
+                limit, sent = self._review_allowance(job, scope)
+            except Exception as exc:
+                jobs[job_id] = {**job, "status": "failed", "model_attempt_limit": scope.settings.model_attempt_limit,
+                    "model_sent_attempts": None, "model_usage_unknown": True,
+                    "model_usage_warning": str(exc)[:1600], "summary": "核对请求次数暂不能确认：" + str(exc)[:1500]}
+                self.project.db.set_metadata("manual_edit_jobs", jobs)
+                raise
+            if job["kind"] != "draft" and all(count >= limit for count in sent.values()):
+                jobs[job_id] = {**job, "status": "needs_evidence", "model_attempt_limit": limit, "model_sent_attempts": sent,
+                    "model_usage_unknown": False, "model_usage_warning": "",
+                    "summary": f"这个候选已用完原档位允许的 {limit} 次模型请求；原稿、解释和已用次数保留，没有重新发起核对。"}
                 self.project.db.set_metadata("manual_edit_jobs", jobs)
                 return jobs[job_id]
-            scope = active_task_settings.get()
             job = {**job, "status": "reviewing", "review_owner_pid":os.getpid(), "attempts": int(job.get("attempts",0))+1,
-                "task_id": scope.task_id, "snapshot_hash": scope.snapshot_hash, "updated_at": utc_now()}
+                "task_id": scope.task_id, "snapshot_hash": scope.snapshot_hash,
+                "model_attempt_limit": limit, "model_sent_attempts": sent, "model_usage_unknown": False,
+                "model_usage_warning": "", "updated_at": utc_now()}
             jobs[job_id] = job
             self.project.db.set_metadata("manual_edit_jobs", jobs)
         try:
@@ -565,8 +660,10 @@ class ManualEditsService:
                 if current and current["status"]=="reviewing":
                     from .config import Settings
                     paused = isinstance(exc, asyncio.CancelledError) and not Settings.from_env(self.project.root).manual_edit_review_enabled
-                    jobs[job_id]={**current,"status":"paused" if paused else "failed",
-                        "summary":"后台核对已按设置暂停；候选及尝试记录保留。" if paused else str(exc)[:1600] or "后台核对被中断，候选已保留。",
+                    interrupted = isinstance(exc, asyncio.CancelledError)
+                    jobs[job_id]={**current,"status":"paused" if paused else "interrupted" if interrupted else "failed",
+                        "summary":"后台核对已按设置暂停；候选及尝试记录保留。" if paused else
+                            "后台核对已保留断点、原配置与已用次数；下次先核对已保存结果，再从未完成位置续接。" if interrupted else str(exc)[:1600],
                         "updated_at":utc_now()}
                     self.project.db.set_metadata("manual_edit_jobs",jobs)
             raise
@@ -605,11 +702,25 @@ class ManualEditsService:
                 self.note_engine_write(job["relative_path"],previous)
             status={"keep_pending":"awaiting_confirmation","request_revision":"revision_requested",
                     "confirm_exception":"awaiting_confirmation","discard_candidate":"discarded"}[decision]
-            if decision == "confirm_exception" and int(job.get("attempts",0)) < 2:
-                status = "pending"
+            if decision == "confirm_exception":
+                if job.get("task_id") or int(job.get("attempts", 0)):
+                    from .config import Settings
+                    try:
+                        scope = self.prepare_review_scope(job_id, lambda: Settings.from_env(self.project.root))
+                        limit, sent = self._review_allowance(job, scope)
+                        job = {**job, "model_attempt_limit": limit, "model_sent_attempts": sent,
+                            "model_usage_unknown": False, "model_usage_warning": ""}
+                        if job["kind"] == "draft" or any(count < limit for count in sent.values()):
+                            status = "pending"
+                    except Exception as exc:
+                        job = {**job, "model_sent_attempts": None, "model_usage_unknown": True,
+                            "model_usage_warning": str(exc)[:1600]}
+                else:
+                    status = "pending"
             job={**job,"status":status,"user_decision":decision,"user_reason":reason[:2000],
                  "updated_at":utc_now(),"canon_committed":False,
-                 "next_action":"解释已留存；修改候选或明确正史修订范围后，从受影响节点复核。"}
+                 "next_action":"解释已保存，请先核对原请求回执与配置，再从中断位置继续；未新增请求额度。" if job.get("model_usage_unknown") else
+                    "解释已留存；修改候选或明确正史修订范围后，从受影响节点复核。"}
             jobs[job_id]=job
             self.project.db.set_metadata("manual_edit_jobs",jobs)
             return job
@@ -641,7 +752,7 @@ class ManualEditsService:
         for job in self.jobs().values():
             setting_hard = job["kind"]=="setting_record" and any(issue.get("hard_conflict") for issue in job.get("issues",[]) if isinstance(issue,dict))
             relevant=job["kind"]=="setting_document" or setting_hard or (job["kind"]!="setting_record" and job.get("chapter_no") and int(job["chapter_no"])<=chapter_no)
-            if relevant and job["status"] in {"pending","reviewing","awaiting_confirmation","needs_evidence","failed","revision_requested"}:
+            if relevant and job["status"] in {"pending","reviewing","awaiting_confirmation","needs_evidence","failed","interrupted","cancelled","revision_requested"}:
                 from .utils import source_display_name
                 name = source_display_name(self.project, job["relative_path"])
                 raise ValidationGateError(f"{name}的改动还需要核对。请在“修改核对”查看具体疑点，处理后从当前步骤继续。")

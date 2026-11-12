@@ -14,7 +14,7 @@ import threading
 from typing import Any, Awaitable, Callable, Iterator
 from uuid import uuid4
 
-from .errors import ProjectBusyError, ProjectError
+from .errors import ProjectAccessError, ProjectBusyError, ProjectError
 
 
 _owned: ContextVar[dict[str, tuple[str, int]]] = ContextVar("inkflow_owned_project_locks", default={})
@@ -191,7 +191,7 @@ def _release(path: Path, lock_token: str) -> None:
 def _wait_error(path: Path, access_error: PermissionError | None) -> ProjectError:
     if access_error is not None:
         code = getattr(access_error, "winerror", None) or access_error.errno
-        return ProjectError(
+        return ProjectAccessError(
             f"等待项目锁时仍无法访问锁文件（系统错误 {code}，可能是临时共享占用或文件权限）：{path}。"
             "本次失败没有自动删除锁或放宽权限，也不会强行接管仍在运行的任务。"
             "请确认其他墨流窗口已完成操作后重试；若持续出现，请检查项目目录访问权限。"
@@ -273,7 +273,7 @@ async def _named_project_lock(root: str | Path, lock_name: str, *, timeout: floa
             access_error = exc
         if time.monotonic() >= deadline:
             if policy is None or access_error is not None or time.monotonic() >= final_deadline:
-                raise _wait_error(path, access_error)
+                raise _wait_error(path, access_error) from access_error
             wait_attempt += 1
             await policy[1](wait_attempt, retry_delay)
             await asyncio.sleep(min(retry_delay, max(0, final_deadline - time.monotonic())))
@@ -319,7 +319,7 @@ def project_write_lock_sync(root: str | Path, *, timeout: float = _WAIT_SECONDS)
         except PermissionError as exc:
             access_error = exc
         if time.monotonic() >= deadline:
-            raise _wait_error(path, access_error)
+            raise _wait_error(path, access_error) from access_error
         time.sleep(0.1)
     state = _owned.set({**ownership, project_key: (owner_id, 1)})
     try:

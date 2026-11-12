@@ -852,7 +852,7 @@ async function checkConnection(context: vscode.ExtensionContext): Promise<void> 
   checkingProvider = true;
   try {
     const provider = asRecord(await requestEngine(context, "provider.status", connectionParams()));
-    const choice = await vscode.window.showInformationMessage(`检查已保存生效配置：${String(provider.provider_kind)} · ${String(provider.model)}\n一次连接诊断，底层最多 3 次短请求，可能计费。只检查接收请求与格式回复，不表示小说写作或全部角色验证通过。`, { modal: true }, "发送连接检查");
+    const choice = await vscode.window.showInformationMessage(`检查已保存配置：${String(provider.provider_kind)} · ${String(provider.model)}\n发送一次短请求，可能计费。只检查模型身份与格式回复。`, { modal: true }, "发送连接检查");
     if (choice !== "发送连接检查") return;
     lastConnectionCheck = "连接检查正在进行。";
     const result = asRecord(await withProgress("正在检查模型接口；可能计费", (token) => requestEngine(context, "provider.test", { ...connectionParams(), ...(projectRoot() ? { project_root: projectRoot() } : {}) }, token)));
@@ -993,10 +993,9 @@ async function requestEngine(
         reject(cause instanceof vscode.CancellationError ? cause : new Error(errorMessage(cause)));
       } else { log(`收到结果 · ${Date.now() - started} ms`); resolve(result ?? null); }
     };
-    // Provider may make up to three 60-second short requests. Never wrap it in
-    // an automatic retry or an earlier UI timeout. Novel tasks remain cancellable.
+    // Model requests remain cancellable without a client time limit.
     const readOnly = new Set(["app.initialize", "provider.status", "project.status", "task.list", "task.status"]);
-    const timeout = method === "provider.test" ? 240_000 : readOnly.has(method) ? 30_000 : 0;
+    const timeout = readOnly.has(method) ? 30_000 : 0;
     if (timeout) timer = setTimeout(() => { finish(new Error(`本地引擎请求超时（${method}）。请查看输出与接口诊断，没有自动重发。`)); child.kill(); }, timeout);
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += decoder.write(chunk);

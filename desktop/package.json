@@ -1,6 +1,6 @@
 {
   "name": "inkflow-desktop",
-  "version": "0.7.5",
+  "version": "0.8.0",
   "private": true,
   "author": "InkFlow contributors",
   "description": "墨流（InkFlow）中文长篇小说桌面工作台",
@@ -13,7 +13,7 @@
     "build:web": "vite build",
     "build:electron": "tsc -p tsconfig.electron.json",
     "build": "npm run typecheck && npm run build:web && npm run build:electron",
-    "dist:win": "npm run build && electron-builder --win nsis"
+    "dist:win": "npm run build && electron-builder --win nsis --publish never"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
@@ -48,7 +48,7 @@
       "en-US"
     ],
     "directories": {
-      "output": "D:/墨流/release/0.7.5/desktop"
+      "output": "D:/墨流/release/0.8.0/desktop"
     },
     "files": [
       "dist/**/*",
@@ -61,16 +61,21 @@
         "to": "icon.ico"
       },
       {
-        "from": "D:/墨流/release/0.7.5/engine/inkflow-engine.exe",
+        "from": "D:/墨流/release/0.8.0/engine/inkflow-engine.exe",
         "to": "engine/inkflow-engine.exe"
       },
       {
-        "from": "../THIRD_PARTY_NOTICES.md",
-        "to": "THIRD_PARTY_NOTICES.md"
+        "from": "../third_party/NOTICES.txt",
+        "to": "THIRD_PARTY_NOTICES.txt"
       },
       {
         "from": "../third_party/edge-tts-LICENSE",
         "to": "edge-tts-LICENSE"
+      },
+      {
+        "from": "../third_party",
+        "to": "licenses",
+        "filter": ["graphify-LICENSE", "graphify-LICENSE-MIT", "graphify-NOTICE"]
       }
     ],
     "win": {

@@ -79,6 +79,16 @@ def check_owners_for_mode(mode: str) -> dict[str, AgentRole]:
     return dict(MODE_CHECK_OWNERS[new_task_mode(mode)])
 
 
+def assessment_criteria_for_role(mode: str, role: str) -> tuple[str, ...]:
+    checks = {check for check, owner in check_owners_for_mode(mode).items() if owner == role}
+    primary = ("continuity", "causality", "requirements", "motivation", "progression")
+    if "general" in checks:
+        return (*primary, "readability")
+    if "logic_continuity" in checks:
+        return primary
+    return ("readability",) if "expression" in checks else ()
+
+
 def migrate_role_settings(
     values: Mapping[str, Mapping[str, Any]],
     *,

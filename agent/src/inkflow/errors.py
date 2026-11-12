@@ -21,6 +21,10 @@ class ProjectBusyError(ProjectError):
     """项目写锁由另一项仍在执行的工作占用，可等待条件变化。"""
 
 
+class ProjectAccessError(ProjectError):
+    """本地项目文件暂不可访问；需要本地条件变化，模型补救不能解除文件占用或权限。"""
+
+
 class ProviderError(InkFlowError):
     """模型供应商调用失败。"""
 

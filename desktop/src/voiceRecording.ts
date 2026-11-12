@@ -1,3 +1,4 @@
+// Explain the failing input path without assuming another recognizer is installed.
 export function voiceInputFailure(cause: unknown): string {
   const name = cause instanceof Error ? cause.name : String(cause || "");
   const reasons: Record<string, string> = {
@@ -7,8 +8,8 @@ export function voiceInputFailure(cause: unknown): string {
     NotReadableError: "麦克风无法开始录音，可能被其他程序占用或设备连接异常。请关闭占用录音的程序后重试。",
     "not-allowed": "浏览器没有获得麦克风使用许可。请检查麦克风权限。",
     "audio-capture": "浏览器没有收到麦克风声音。请检查输入设备。",
-    network: "浏览器在线听写服务连接失败。可在语音设置中改用已安装的本地识别。",
-    "service-not-allowed": "当前浏览器环境无法使用在线听写服务。可在语音设置中改用本地识别。",
+    network: "浏览器在线听写服务连接失败。请检查网络，或打开语音设置查看本地识别是否就绪，再选择听写方式。",
+    "service-not-allowed": "当前窗口无法使用所选的在线听写服务。请打开语音设置，查看本地识别是否就绪后选择可用方式。",
     "no-speech": "暂时没有听到清晰说话声。请靠近麦克风，确认没有静音后再试。",
   };
   return reasons[name] || (cause instanceof Error ? cause.message : "语音输入没有完成，请查看麦克风和识别组件状态后重试。");

@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "display_name": "技能创建与适配",
+  "roles": [
+    "coordinator"
+  ],
+  "activation": "automatic",
+  "contracts": [
+    "skill.authoring"
+  ],
+  "when": "作者明确要求创建、完善或适配技能，且当前为Coordinator技能候选生成节点时使用。",
+  "not_when": "普通小说创作、仅查看或开关管理、未经授权覆盖文件、修改源码或增加Shell权限时不用。",
+  "inputs": [
+    "作者目标、作用库、现有能力与限制",
+    "外部技能原文件及来源许可（如有）"
+  ],
+  "outputs": [
+    "SkillDraft格式候选文件",
+    "校验结果、目录位置与启用前待核项目"
+  ],
+  "tasks": [
+    "区分Prompt Skill Tool",
+    "确定触发和角色",
+    "拆任务与交接",
+    "选择辅助文件",
+    "校验并保存未启用候选"
+  ],
+  "references": [
+    {
+      "path": "references/workflow-standard.md"
+    },
+    {
+      "path": "references/package-standard.md"
+    },
+    {
+      "path": "references/compatibility.md"
+    }
+  ],
+  "steps": [
+    {
+      "tool": "skill.scope",
+      "script": "scripts/scope.json"
+    },
+    {
+      "tool": "skill.resources",
+      "script": "scripts/resources.json"
+    },
+    {
+      "tool": "skill.output",
+      "script": "scripts/output.json"
+    },
+    {
+      "tool": "skills.validate"
+    }
+  ]
+}

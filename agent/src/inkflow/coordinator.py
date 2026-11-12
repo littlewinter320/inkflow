@@ -1,21 +1,25 @@
-"""Bounded workflow plans with one role contract and frozen task settings."""
+"""共享目标权限、参考流程与模型选择的工具计划；执行绑定原任务配置。"""
 from __future__ import annotations
 
 import re
+from graphlib import CycleError, TopologicalSorter
 from uuid import uuid4
 
 from .project import InkFlowProject
 from .role_protocol import CollaborationMode, check_owners_for_mode, new_task_mode, roles_for_mode
 from .schemas import BookBrief, DispatchPlan, DispatchStep, RoleCapability, TaskTicket, TerminalIntent
+from .errors import ValidationGateError
 
 
+# 各自然语言快捷入口共用正史动作词，否定仍优先，避免“转正史”被续接入口漏掉。
+ACCEPTANCE_PATTERN = re.compile(r"验收|接收|接受|入正史|进入正史|收进(?:正史|正文)?|收进去|定稿|(?:转|变)(?:为|成|入)?正史")
 NO_ACCEPTANCE_PATTERN = re.compile(
     r"(?:只|仅)(?:要|做|生成|给我看)?(?:草稿|审查|复审|初稿)|"
     r"(?:不要|暂不|暂时不|暂时别|先别|别|先不|不必|无需|不能|不可|不)"
     r"(?:再|先|自动|直接|立即|马上|现在|擅自|默认|替我|帮我)*"
-    r"(?:验收|接收|接受|入正史|进入正史|写入正史|写进正史|提交正史|收进正史|收进正文|收进去|定稿|收(?=[，,。！？；\s]|$))|"
+    r"(?:验收|接收|接受|入正史|进入正史|(?:转|变)(?:为|成|入)?正史|写入正史|写进正史|提交正史|收进正史|收进正文|收进去|定稿|收(?=[，,。！？；\s]|$))|"
     r"(?:不要|暂不|暂时不|暂时别|先别|别|先不)(?:修改正文|改稿|写正文)或(?:验收|接收|入正史)|"
-    r"草稿(?:即可|就好|先看)|"
+    r"草稿(?:即可|就好|先看)|(?:写好|写完)?(?:保存|存成|存为)草稿(?:后|就|即|便)*(?:停|结束)|"
     r"(?:我想|让我|我)先(?:看|看看|过目)(?:一下)?|先给我看"
 )
 
@@ -24,7 +28,7 @@ ROLE_CAPABILITIES: tuple[RoleCapability, ...] = (
     RoleCapability(
         role="coordinator",
         novel_production_agent=False,
-        can=["理解多样自然语言", "合并补充说明", "拆解任务", "识别进度和待处理事项并安排关联任务", "新增优化先询问用户", "选择与切换预定义工作流", "提出最小澄清", "汇总分歧", "通过 Novel Engine 请求白名单设置变更"],
+        can=["理解多样自然语言", "合并补充说明", "拆解任务", "识别进度和待处理事项并安排关联任务", "在当前授权内自主组合工具与依赖", "根据真实返回调整后续步骤", "提出最小澄清", "汇总分歧", "通过 Novel Engine 请求白名单设置变更"],
         cannot=["写正文", "审查正文", "提交正史", "直接写设置文件或数据库", "绕过引擎门禁", "自行扩权"],
     ),
     RoleCapability(
@@ -51,9 +55,10 @@ ROLE_CAPABILITIES: tuple[RoleCapability, ...] = (
 )
 
 
-_WORKFLOWS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
+_REFERENCE_WORKFLOWS: dict[str, tuple[tuple[str, str, str, str], ...]] = {
     "pending_work": (("engine", "work.pending", "", "待处理事项、关联任务与用户处理选择"),),
     "status": (("engine", "status.read", "", "项目状态"),),
+    "knowledge_query": (("engine", "knowledge.query", "", "沿知识关系与原文回答，并说明实际阅读范围"),),
     "help": (("engine", "help.read", "", "使用说明"),),
     "plan": (("writer", "plan.generate", "", "四级规划"),),
     "plan_preview": (("engine", "plan.preview", "", "规划预览"),),
@@ -129,11 +134,48 @@ _REVIEW_ACTIONS = frozenset({
     "batch_draft", "batch_draft_accept", "batch_repair", "batch_accept", "continue_run",
 })
 
+# 工具权限独立于参考流程的排列；模型选择组合，引擎仍执行各工具原有的版本和提交门禁。
+CHAPTER_TOOLS = {
+    "status.read": ("engine", "项目状态"),
+    "chapter.read": ("engine", "当前章节与审核状态"),
+    "source.search": ("engine", "有身份与版本的检索来源"),
+    "plan.preview": ("engine", "当前生效规划"),
+    "chapter.write": ("writer", "章节草稿"),
+    "chapter.revise": ("writer", "局部修订后的草稿"),
+    "chapter.review_mode": ("engine", "当前职责的审核与记忆候选"),
+    "chapter.accept": ("engine", "当前版本的正史提交回执"),
+}
+CHAPTER_TOOL_GOALS = frozenset({"write_draft", "write_review", "write_review_accept", "revise_draft",
+    "revise_review", "revise_review_accept", "review", "review_accept", "accept", "batch_draft",
+    "batch_draft_accept", "batch_repair", "batch_accept", "continue_run"})
+
+
+def authorized_chapter_tools(intent: TerminalIntent) -> list[str]:
+    """从原用户目标与禁止项确定工具权限，不把模型选择本身当作授权。"""
+    allowed = {"status.read", "chapter.read", "source.search", "plan.preview"}
+    if intent.action not in CHAPTER_TOOL_GOALS:
+        return []
+    if intent.action.startswith("write_") or intent.action in {"batch_draft", "batch_draft_accept", "continue_run"}:
+        allowed.add("chapter.write")
+    if (intent.action.startswith("revise_") or intent.action in {
+            "write_review", "write_review_accept", "batch_draft", "batch_draft_accept", "continue_run"}
+            or intent.action == "batch_repair" and not intent.batch_review_only):
+        allowed.add("chapter.revise")
+    if intent.action in _REVIEW_ACTIONS - {"accept", "batch_accept"}:
+        allowed.add("chapter.review_mode")
+    if intent.action.endswith("_accept") or intent.action in {"accept", "continue_run"}:
+        allowed.add("chapter.accept")
+    for forbidden in intent.forbidden_actions:
+        # 旧断点可保存动作别名或实际工具名，两者都不能因表示形式不同而失效。
+        allowed.discard({"write": "chapter.write", "revise": "chapter.revise",
+                        "review": "chapter.review_mode", "accept": "chapter.accept"}.get(forbidden, forbidden))
+    return sorted(allowed)
+
 
 def _mode_template(
     action: str, collaboration_mode: CollaborationMode = "everyday"
 ) -> tuple[tuple[str, str, str, str], ...]:
-    template = _WORKFLOWS[action]
+    template = _REFERENCE_WORKFLOWS[action]
     return tuple(
         (check_owners_for_mode(collaboration_mode).get("logic_continuity", "editor"), operation, dependency, output)
         if operation == "arc.audit"
@@ -152,7 +194,7 @@ class Coordinator:
     def normalize_intent(
         intent: TerminalIntent, user_text: str, *, previous_intent: TerminalIntent | None = None,
     ) -> TerminalIntent:
-        """Apply only clear user wording and links; uncertain edits stay scoped."""
+        """依据明确原话收束目标；只归一等价入口，模糊范围及未授权工具仍由门禁拒绝。"""
         text = user_text.strip()
         updates: dict[str, object] = {"user_message": text[:4_000]}
         action = intent.action
@@ -160,15 +202,16 @@ class Coordinator:
         review_after_revision = bool(re.search(
             r"(?:改完|改好|修订(?:完成)?后|修改(?:完成)?后|修好|完成后).{0,8}(?:再|重新)?(?:审查|审核|检查|复审)", text
         )) and not re.search(r"(?:先|首先)(?:帮我|直接|重新|仔细|由|让)?\s*(?:编辑|Editor|Reviewer|审查角色)?\s*(?:来)?(?:审查|审核|检查|复审|核对)", text)
-        if action in {"revise_draft", "revise_review", "revise_review_accept"} and review_after_revision:
-            updates["review_before_revision"] = False
-        elif action in {"revise_draft", "revise_review", "revise_review_accept"} and re.search(
+        # “有问题才修好，审核通过后…”仍是先核实；不能被后半句“修好…审核”误改为先写。
+        if action in {"revise_draft", "revise_review", "revise_review_accept"} and re.search(
             r"(?:有|发现|如果|若).{0,10}(?:问题|错误|不通过|没过).{0,12}(?:改|修)", text
         ) and re.search(r"审|检查|核对", text):
             action = "revise_review_accept" if action.endswith("_accept") else "revise_review"
             updates["review_before_revision"] = True
+        elif action in {"revise_draft", "revise_review", "revise_review_accept"} and review_after_revision:
+            updates["review_before_revision"] = False
         no_accept = NO_ACCEPTANCE_PATTERN.search(text)
-        no_review = re.search(r"(?:别|不要|先不|暂不|暂时不|暂时别|不必|无需).{0,8}(?:审查|审核|复审)", text)
+        no_review = re.search(r"(?:别|不要|不用|不|先不|暂不|暂时不|暂时别|不必|无需)(?:再|做|进行|追加|自动|重新|任何|额外|单独|一次|了|\s){0,8}(?:审查|审核|复审)", text)
         # Negation must govern the writing task itself. "别把丢失的原件写回来"
         # constrains story content; it does not mean "别写这一章".
         no_write = re.search(
@@ -265,6 +308,27 @@ class Coordinator:
                     updates["authorization"] = "none"
                     updates["authorization_source"] = "none"
                     updates["clarification_question"] = "要修改书籍设定、大纲还是剧情细纲？请指出具体字段或需要替换的原文。"
+        if (action in {"batch_draft_accept", "write_review_accept"}
+                and intent.end_chapter_no is not None and len(intent.quality_stages) <= 1
+                and re.search(r"(?:每章|逐章)[^。！？；\n]{0,24}(?:通过|合格|审好|审完|没问题|没有问题|无问题|(?:审[核查]|复核)(?:完成|完毕|好|完))[^。！？；\n]{0,16}(?:转为?正史|变为正史|收进正史|接收|接受)", text)
+                and not re.search(r"(?:一起|整批|统一)[^。！？；\n]{0,8}(?:转为?正史|变为正史|收进正史|接收|接受)", text)
+                and not re.search(r"(?:不要|别|不必|先不|暂不)[^。！？；\n]{0,4}(?:每章|逐章)", text)
+                and "accept" not in forbidden and "write" not in forbidden):
+            # “审好/没问题就转为正史”等表达沿逐章门禁执行；范围与单一档位不改变收一章再写一章的顺序。
+            action = "continue_run"
+            updates.update(narrative_scope="batch",
+                visible_reason="按本次目标逐章推进；每章通过必要审查和记忆交接后转正史，再处理下一章。")
+        if action == "scene_draft" and len(intent.tool_steps) == 1:
+            scene_step = intent.tool_steps[0]
+            # 独立场景沿现有固定Writer入口执行，不属于章节工具图。模型偶尔
+            # 把同一动作再填成scene_draft/scene.draft；只移除这个严格等价声明，
+            # 改章、接受、额外节点、依赖或其他角色仍保留并由原授权检查拒绝。
+            if (scene_step.operation in {"scene_draft", "scene.draft"}
+                    and scene_step.role == "writer" and scene_step.when == "always"
+                    and not scene_step.depends_on and scene_step.chapter_no in {None, intent.chapter_no}):
+                updates["tool_steps"] = []
+                if not intent.operation_instruction.strip() and scene_step.instruction.strip():
+                    updates["operation_instruction"] = scene_step.instruction
         updates["action"] = action
         updates["forbidden_actions"] = list(dict.fromkeys(forbidden))
         return intent.model_copy(update=updates)
@@ -274,12 +338,19 @@ class Coordinator:
         collaboration_mode: CollaborationMode = "everyday",
         task_snapshot_hash: str | None = None,
     ) -> tuple[TaskTicket, DispatchPlan]:
+        """把模型目标编译为绑定原权限的计划，执行者由已登记工具确定。"""
         if intent.user_message:
             intent = self.normalize_intent(intent, intent.user_message)
         collaboration_mode = new_task_mode(collaboration_mode)
         roles_for_mode(collaboration_mode)
         if not task_snapshot_hash:
             raise ValueError("工作流计划必须绑定已冻结的任务配置快照")
+        # 方法技能继续供责任角色阅读；流程技能只产出原有DispatchStep，再走相同授权校验。
+        from .skill_workflows import compile_workflow_steps, bind_workflow_plan
+        from .task_settings import active_task_settings
+        skill_steps, workflow_skill = compile_workflow_steps(intent)
+        if skill_steps is not None:
+            intent = intent.model_copy(update={"tool_steps": skill_steps})
         template = _mode_template(intent.action, collaboration_mode)
         steps: list[DispatchStep] = []
         for index, (role, operation, dependency, output) in enumerate(template, 1):
@@ -299,7 +370,7 @@ class Coordinator:
             elif operation == "chapter.accept":
                 gate = "仅当前版本满足本次模式的全部必需审查、记忆候选及用户接受授权后提交；force=false"
             elif operation in {"chapter.write", "batch.draft_loop", "chapter.gated_loop"}:
-                gate = "缺卡先在已授权范围内由 Writer 补必要近期计划；不改旧卡或正史，依据缺失不猜写"
+                gate = "沿有效前文及作者要求写作；缺少小纲时在当前任务内准备临时目标，正式规划独立保存"
             steps.append(
                 DispatchStep(
                     step_id=f"step-{index}",
@@ -310,6 +381,22 @@ class Coordinator:
                     gate=gate,
                 )
             )
+        # 批次接受绑定来源晋升，逐章续写绑定每章通过即提交；不能拆成失去这些保证的普通工具。
+        # 模型仍决定目标与授权范围，其他任务保留自由选工具，事务本身走现有引擎门禁。
+        chapter_sequence = intent.action in {"batch_accept", "continue_run"} or (
+            intent.action in {"batch_draft", "batch_draft_accept", "batch_repair"}
+            and intent.end_chapter_no != intent.chapter_no)
+        selected_tools = bool(intent.tool_steps) and not chapter_sequence
+        if selected_tools:
+            if intent.action not in CHAPTER_TOOL_GOALS:
+                raise ValueError("本次目标没有章节工具的执行授权。")
+            steps = [item.model_copy(update={"chapter_no": item.chapter_no or intent.chapter_no,
+                # 审核工具的执行者是引擎，模型常误填实际审核角色；仅纠正这一明确的职责层次混淆。
+                "role": "engine" if item.operation == "chapter.review_mode"
+                    and item.role in {"editor", "reviewer", "memory_keeper"} else item.role,
+                "required_output": CHAPTER_TOOLS.get(item.operation, ("", "未知工具"))[1],
+                "gate": "执行前核用户范围和当前版本；结果继续经过原工具的证据与提交门禁"})
+                for item in intent.tool_steps]
         chapter = self.project.db.get_chapter(intent.chapter_no) if intent.chapter_no else None
         chapter_count = max(1, (intent.end_chapter_no or intent.chapter_no or 1) - (intent.chapter_no or 1) + 1)
         estimated_calls = self._model_call_budget(intent, chapter_count)
@@ -347,6 +434,7 @@ class Coordinator:
                 "失败时先在授权范围内复用成果、缩小范围或切换可用路径，再决定是否需要用户介入",
                 "已授权正文范围内的必要补卡由引擎衔接 Writer，不额外逐章调用 Coordinator 或扩大章节范围",
             ],
+            authorized_operations=authorized_chapter_tools(intent),
             input_sources=self._input_sources(intent),
             deliverables=[item.required_output for item in steps],
             max_model_calls=estimated_calls,
@@ -377,9 +465,10 @@ class Coordinator:
             ),
             return_to_base=collaboration_mode != "everyday",
             workflow=intent.action,
+            selection_source="agent" if selected_tools else "reference",
             steps=steps,
             parallel=(
-                collaboration_mode in {"review_boost", "full_specialist"}
+                not selected_tools and collaboration_mode in {"review_boost", "full_specialist"}
                 and any(item.operation in {"chapter.review_mode", "batch.draft_loop", "batch.repair_loop", "chapter.gated_loop"} for item in steps)
             ),
             stop_conditions=[
@@ -391,6 +480,9 @@ class Coordinator:
             ],
         )
         self.validate(plan, ticket)
+        if workflow_skill is not None:
+            bind_workflow_plan(active_task_settings.get(), workflow_skill, plan.steps, intent=intent,
+                skipped=workflow_skill.get("_compiled_skipped", []), rounds=workflow_skill.get("_compiled_rounds", {}))
         return ticket, plan
 
     @staticmethod
@@ -398,9 +490,9 @@ class Coordinator:
         allowed_roles = roles_for_mode(plan.collaboration_mode)
         if not plan.task_snapshot_hash:
             raise ValueError("工作流计划缺少任务配置快照")
-        template = _WORKFLOWS.get(plan.workflow)
+        template = _REFERENCE_WORKFLOWS.get(plan.workflow)
         if template is None:
-            raise ValueError("Coordinator 只能选择预定义工作流")
+            raise ValueError("任务目标未登记，无法确定对应工具权限。")
         allowed = _mode_template(plan.workflow, plan.collaboration_mode)
         actual = [(item.role, item.operation, item.depends_on, item.required_output) for item in plan.steps]
         expected = [(role, operation, [dependency] if dependency else [], output)
@@ -410,8 +502,32 @@ class Coordinator:
             and any(operation in {"chapter.review_mode", "batch.draft_loop", "batch.repair_loop", "chapter.gated_loop"}
                     for _, operation, _, _ in allowed)
         )
-        if actual != expected or plan.parallel != expected_parallel:
-            raise ValueError("Coordinator 调度计划超出固定能力边界")
+        if plan.selection_source == "agent":
+            if ticket is None or plan.workflow not in CHAPTER_TOOL_GOALS or not plan.steps or plan.parallel:
+                raise ValueError("工具计划缺少原目标、范围或任务凭据。")
+            identities = {step.step_id for step in plan.steps}
+            if len(identities) != len(plan.steps) or any(not identity.strip() for identity in identities):
+                raise ValueError("工具步骤必须具有唯一身份。")
+            lower, upper = ticket.chapter_no, ticket.end_chapter_no or ticket.chapter_no
+            if not lower or not upper or lower > upper:
+                raise ValueError("工具计划必须绑定明确的原章节范围。")
+            for step in plan.steps:
+                capability = CHAPTER_TOOLS.get(step.operation)
+                if (capability is None or step.operation not in ticket.authorized_operations
+                        or step.role != capability[0] or set(step.depends_on) - identities):
+                    raise ValidationGateError("协调计划中的工具、执行角色或前置步骤不符合本次授权，尚未执行。请按原任务核对派工后继续。")
+                if step.operation not in {"status.read", "plan.preview"}:
+                    start = 1 if step.operation in {"chapter.read", "source.search"} else lower
+                    if not start or not upper or not step.chapter_no or not start <= step.chapter_no <= upper:
+                        raise ValidationGateError(
+                            f"这一步指定第{step.chapter_no or '未指定'}章，超出本次允许的第{start}—{upper}章；"
+                            "尚未执行，请核对任务总范围与分步章节。")
+            try:
+                TopologicalSorter({step.step_id: step.depends_on for step in plan.steps}).prepare()
+            except CycleError as exc:
+                raise ValueError("工具计划的依赖形成循环。") from exc
+        elif actual != expected or plan.parallel != expected_parallel:
+            raise ValueError("参考流程记录与实际执行入口不一致。")
         if any(
             item.role not in allowed_roles for item in plan.steps if item.role != "engine"
         ):
@@ -432,6 +548,39 @@ class Coordinator:
                     or ticket.max_model_calls < len(set(plan.check_owners.values()))
                     or ticket.max_tokens < ticket.max_model_calls):
                 raise ValueError("计划与任务快照或调用预算不一致")
+
+    @staticmethod
+    def workflow_reference(action: str, collaboration_mode: CollaborationMode = "everyday") -> dict:
+        """从实际登记流程给出当前目标的默认顺序与变更边界，不另建一套可执行流程。"""
+        steps = _mode_template(action, collaboration_mode)
+        return {
+            "workflow": action,
+            "reference_only": True,
+            "entry": "原目标、范围、配置和权限已确定；先核必要来源和当前版本，缺口转补读。",
+            "default_steps": [{"id": f"step-{index}", "role": role, "operation": operation,
+                "depends_on": [dependency] if dependency else [], "output": output}
+                for index, (role, operation, dependency, output) in enumerate(steps, 1)],
+            "completion": "以当前产物、有效审查和原目标所需提交回执为准；模型自述不算完成。",
+            "routine_steps": (
+                ["读取当前话题与必要前文", "直接回答或修改指定表达", "保存对话；无生产请求则结束"]
+                if action in {"chat", "discuss", "ideate"} else
+                ["定位指定大纲/细纲/近期计划及版本", "复用有效上层，只生成或修改目标部分", "保存候选和差异，按原授权处理后续"]
+                if action in {"plan", "outline", "plan_next_arc", "redesign_story", "plan_brief"} else
+                ["定位集合、记录与当前版本", "按来源修改指定字段或生成候选", "保存差异、来源和记录身份；仅修改记录时结束"]
+                if action in {"story_settings_manage", "story_setting_edit"} else
+                ["定位现有产物和目标范围", "复用有效结果，处理本次指定的生成或修改", "保存版本、差异和回执，按原目标结束或续接"]),
+            "small_artifacts": "钩子与伏笔先定位本章目标和已有线索，只更新指定内容及推进记录；记忆先定位来源和事实身份，只更新受影响条目。明确不审核的修改保存为未审核版本，不追加模型审查，不自动成为正史。",
+            "adaptation": {
+                "source_gap": "退回产生缺口的最近前置步骤，调整取材、规划或交付内容，保存完善后的结果，再续受影响步骤；不机械重跑全链。",
+                "review_gap": "引文缺失或疑似误读直接请作者抉择，展示原文依据和争议；选择前保留正文及报告，不追加自动补核。",
+                "confirmed_error": "按授权局部修改并保存差异记录；明确不审核时到保存结束，后续接受正史另核权限和当前版本条件。",
+                "version_changed": "重核受影响依赖；旧结果保留，不覆盖用户新版本。",
+                "response_unknown": "先核保存返回、发送账本和提交状态；不自动重发未知付费请求。",
+                "local_file_failure": "等待或恢复本地访问条件，不靠增加模型调用解除占用。",
+            },
+            "reordering": "有真实返回支持时可跳过有效完成项、补前置或重排剩余依赖；"
+                "说明变化原因，只选本轮白名单工具，循环及批次提交仍由原引擎管理，不扩大权限或重置次数。",
+        }
 
     @staticmethod
     def capabilities(protocol_version: int | None = None) -> list[dict]:
@@ -464,4 +613,4 @@ class Coordinator:
             return min(100, 1 + chapter_count * (4 + 4 * max(0, intent.max_revision_rounds)))
         if intent.action == "batch_accept":
             return min(100, chapter_count)
-        return max(8, sum(item[0] in {"writer", "reviewer"} for item in _WORKFLOWS[intent.action]) * 6)
+        return max(8, sum(item[0] in {"writer", "reviewer"} for item in _REFERENCE_WORKFLOWS[intent.action]) * 6)

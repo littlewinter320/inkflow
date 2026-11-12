@@ -122,6 +122,23 @@ def memory_overview(database):
     return {"facts": facts, "events": events, "notice": "过期证据待核对，不等于事实错误；仅显示已记录的直接引用。"}
 
 
+def memory_index(database):
+    """将现有同版事实和事件投影为浏览数据，省去原文全文与历史审计对象。"""
+    from .narrative_memory import event_history
+
+    facts = database.current_facts(include_evidence=False)
+    boundary = database.latest_accepted_chapter_no() + 1
+    history = event_history(database.narrative_history_rows(boundary))
+    return {
+        "facts": [{key: fact[key] for key in ("fact_id", "subject", "predicate", "value",
+                   "source_chapter", "epistemic_kind")} for fact in facts],
+        "events": [{key: event[key] for key in ("source_id", "chapter_no", "summary", "participants",
+                    "location", "narrative_mode", "event_time")} for event in history["events"]],
+        "coverage": history["coverage"],
+        "missing_chapters": sorted({item["chapter_no"] for item in history["gaps"]}),
+    }
+
+
 def affected_fact_ids(facts, before, after):
     old, new = before.splitlines(), after.splitlines()
     changed = []

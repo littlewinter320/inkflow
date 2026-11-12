@@ -1,0 +1,16 @@
+/* 决定提醒常驻但不闪烁；主色跟随主题，正文保持深浅模式可读。 */
+.setting-decisions-live { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+:root[data-theme] .project-heading .setting-decision-entry { display: inline-flex; align-items: center; gap: 7px; padding: 7px 10px; border-color: color-mix(in srgb, var(--theme-warm) 55%, var(--line)); background: color-mix(in srgb, var(--theme-warm) 14%, var(--panel)); color: var(--text); font-size: 12px; }
+.setting-decision-entry > span { color: var(--theme-ink); }
+.setting-decisions-dialog { width: min(720px, calc(100vw - 36px)); max-height: calc(100vh - 48px); overflow: auto; padding: 26px; border: 1px solid var(--line); border-radius: 20px; background: var(--panel); color: var(--text); box-shadow: var(--shadow); }
+.setting-decisions-dialog::backdrop { background: #0006; }
+.setting-decisions-dialog > header { display: flex; align-items: flex-start; gap: 18px; justify-content: space-between; }
+.setting-decisions-dialog h2 { margin: 4px 0 14px; font-size: clamp(20px, 3vw, 27px); }
+.setting-decisions-dialog p { line-height: 1.8; overflow-wrap: anywhere; }
+.setting-decision-card { margin: 16px 0; padding: 18px; border: 1px solid color-mix(in srgb, var(--theme-warm) 38%, var(--line)); border-radius: 12px; background: linear-gradient(110deg, color-mix(in srgb, var(--theme-warm) 10%, var(--panel)), var(--panel) 72%); }
+.setting-decision-card > small { color: var(--muted); }
+.setting-decision-card h3 { margin: 7px 0; }
+.setting-decision-card > details { margin-block: 12px; color: var(--muted); font-size: 12px; }
+.setting-decision-card > details > summary { cursor: pointer; }
+.setting-decision-card > button { border-color: var(--accent-dim); color: var(--text); }
+@media (max-width: 600px) { .setting-decisions-dialog { padding: 18px; } :root[data-theme] .project-heading .setting-decision-entry { font-size: 11px; padding: 5px 7px; } }

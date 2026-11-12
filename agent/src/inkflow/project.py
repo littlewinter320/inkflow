@@ -56,7 +56,27 @@ class InkFlowProject:
             StorySettingsService(self).ensure_defaults()
             self.db.set_metadata("base_story_settings_initialized", True)
 
+    @staticmethod
+    def _pending_work_chapter_range(item: dict[str, Any]) -> tuple[int, int] | None:
+        """核对保存范围；仅原话与目标两个明确单章限定一致时，纠正旧路由的展示与证据定位。"""
+        intent = item.get("intent") or {}
+        first, last = intent.get("chapter_no"), intent.get("end_chapter_no") or intent.get("chapter_no")
+        chapter_actions = {"write", "write_draft", "write_review", "review", "accept", "review_accept", "write_review_accept",
+                           "revise", "revise_draft", "revise_review", "revise_review_accept", "batch_draft", "batch_accept", "batch_draft_accept"}
+        # 兼容旧数据把“只完成第55章”错存为第1章或整批范围的情况。
+        # 必须原话与所存目标都明确同一单章；规划/设定任务不按此规则推断。
+        # 这里只修正显示和完成证据的查找范围，不改可执行intent，也不扩大授权。
+        targets = [set(int(value) for value in re.findall(
+            r"(?<!不)(?:只|仅)(?:完成|处理|审查|审核|写作|写)\s*(?:第\s*)?(\d+)\s*章", str(intent.get(field) or "")))
+            for field in ("user_message", "requested_outcome")]
+        if intent.get("action") in chapter_actions and len(targets[0]) == 1 and targets[0] == targets[1]:
+            number = next(iter(targets[0]))
+            if number > 0:
+                return number, number
+        return (first, last) if type(first) is int and type(last) is int and 1 <= first <= last else None
+
     def pending_work(self, *, chapter_no: int | None = None, include_rejected: bool = False) -> list[dict[str, Any]]:
+        """按当前进度投影可处理待办，保留原intent及尚未完成的附属收尾。"""
         from .manual_edits import ManualEditsService
         ManualEditsService(self).reconcile_setting_reviews()
         with self.db.connect() as connection:
@@ -68,12 +88,12 @@ class InkFlowProject:
         jobs = self.db.get_metadata("manual_edit_jobs", {})
         if isinstance(jobs, dict):
             for job in jobs.values():
-                if job.get("status") in {"pending", "reviewing", "awaiting_confirmation", "needs_evidence", "failed", "revision_requested", "paused"}:
+                if job.get("status") in {"pending", "reviewing", "awaiting_confirmation", "needs_evidence", "failed", "interrupted", "cancelled", "revision_requested", "paused"}:
                     native.append({"id": "manual-" + str(job["job_id"]), "kind": "manual_edit",
                         "status": job["status"], "chapter_no": job.get("chapter_no"),
                         "reason": job.get("summary") or "手动修改候选仍需核对",
                         "next_action": "按候选原快照与来源续核；需要创作选择时先询问，不直接覆盖已接受正文。",
-                        "source": {**{key: job.get(key) for key in ("job_id", "relative_path", "current_hash", "attempts")},
+                        "source": {**{key: job.get(key) for key in ("job_id", "relative_path", "current_hash", "attempts", "task_id", "model_sent_attempts", "model_attempt_limit", "model_usage_unknown")},
                             "display_name": source_display_name(self, str(job.get("relative_path") or ""))}})
         with self.db.connect() as connection:
             revisions = connection.execute("SELECT key,value_json FROM metadata WHERE key LIKE 'pending_plan_revision:%'").fetchall()
@@ -99,16 +119,29 @@ class InkFlowProject:
         for item in native:
             decision = saved.get(item["id"], {})
             items.append({**decision, **item, **({"status": decision["status"]} if decision.get("status") in {"deferred", "rejected"} else {})})
-        workflows = {item["source"]["task_id"]: item for item in items if item["kind"] == "workflow" and item.get("source", {}).get("task_id")}
+        workflows = {item["source"]["task_id"]: item for item in items if item["kind"] == "workflow"
+                     and item.get("source", {}).get("task_id") and item.get("status") not in {"completed", "superseded", "rejected"}}
         for item in items:
             parent = workflows.get(item.get("source", {}).get("task_id"))
             if parent and parent["id"] != item["id"]:
                 item["parent_id"] = parent["id"]
             if item["kind"] == "workflow":
                 intent = item.get("intent", {})
+                item.pop("scope_needs_confirmation", None)
+                span = self._pending_work_chapter_range(item)
+                original_span = (intent.get("chapter_no"), intent.get("end_chapter_no") or intent.get("chapter_no"))
+                # 旧路由与明确目标冲突时仍留审计，并阻止据此继续执行。
+                # 后续真实产物可证明它已过时；修改标题不能变成执行另一章的许可。
+                if span is not None and span != original_span:
+                    item["original_chapter_no"] = item.get("chapter_no")
+                    item["chapter_no"] = span[0]
+                    item["scope_needs_confirmation"] = True
+                    item["next_action"] = "原保存范围与用户明确的单章目标不一致；按原话显示目标章，保留旧路由，核对前不执行旧任务。"
+                item.pop("remaining_chapter_no", None)
+                item.pop("completed_through", None)
                 if intent.get("action") in {"accept", "review_accept", "write_review_accept", "revise_review_accept", "continue_run", "batch_accept", "batch_draft_accept"}:
-                    first, last = intent.get("chapter_no"), intent.get("end_chapter_no") or intent.get("chapter_no")
-                    if isinstance(first, int) and isinstance(last, int) and 1 <= first <= last:
+                    if span is not None:
+                        first, last = span
                         remaining = [number for number in range(first, last + 1)
                             if not (chapter := self.db.get_chapter(number)) or chapter["status"] != "accepted"]
                         if remaining and remaining[0] != first:
@@ -125,7 +158,9 @@ class InkFlowProject:
             if item["kind"] in {"accepted_projection", "planning_publication"}:
                 handling = "local"
             elif item["kind"] == "manual_edit":
-                handling = "manual" if item["status"] in {"pending", "failed", "deferred"} and int(item["source"].get("attempts") or 0) < 2 else "decision"
+                sent, limit = item["source"].get("model_sent_attempts"), item["source"].get("model_attempt_limit")
+                exhausted = isinstance(sent, dict) and type(limit) is int and any(type(value) is int and value >= limit for value in sent.values())
+                handling = "manual" if item["status"] in {"pending", "failed", "interrupted", "cancelled", "deferred"} and not exhausted and not item["source"].get("model_usage_unknown") else "decision"
             elif item["kind"] in {"review_gate", "review_evidence", "chapter_gate"} and item.get("chapter_no"):
                 number = int(item["chapter_no"])
                 chapter = self.db.get_chapter(number)
@@ -138,6 +173,15 @@ class InkFlowProject:
                     if owner:
                         item["parent_id"] = owner["id"]
                 elif chapter and (review := self.db.latest_review_record(number)):
+                    # 同版审查缺口是创作任务的断点，不另算一份工作；范围重叠不唯一时保持独立。
+                    source = item.get("source", {})
+                    if not item.get("parent_id") and source.get("content_hash") == chapter["content_hash"] and source.get("version") == chapter["version"]:
+                        owners = [work for work in workflows.values()
+                            if work.get("intent", {}).get("action") in {"write_review", "write_review_accept", "review", "review_accept",
+                                "revise_review", "revise_review_accept", "batch_draft", "batch_draft_accept", "batch_repair", "continue_run"}
+                            and (span := self._pending_work_chapter_range(work)) and span[0] <= number <= span[1]]
+                        if len(owners) == 1:
+                            item["parent_id"] = owners[0]["id"]
                     report = review["report"]
                     if (review["chapter_version"] == chapter["version"] and report.source_hash == chapter["content_hash"]
                             and report.verdict == "unknown" and report.evidence_recovery.get("attempted")):
@@ -145,7 +189,7 @@ class InkFlowProject:
                         item["next_action"] = "同版已做有界补读；先修复报告列出的具体来源或输出条件，不从诊断卡重复整章审查。"
             if item["status"] == "running" or (item["kind"] == "manual_edit" and item["status"] == "reviewing"):
                 handling = "running"
-            if int(item.get("processing_attempts", 0)) >= 2:
+            elif item.get("scope_needs_confirmation"):
                 handling = "blocked"
             if item["kind"] in {"workflow", "accept_finalization"} and not (item.get("run_id") and item.get("source", {}).get("task_id")):
                 handling = "blocked"
@@ -153,7 +197,7 @@ class InkFlowProject:
             if task_id and handling == "resume" and item["kind"] != "accept_finalization":
                 with self.db.connect() as connection:
                     records = connection.execute("SELECT value_json FROM metadata WHERE key LIKE ?", (f"coordinator_recovery:{task_id}:%",)).fetchall()
-                if any(len(record.get("attempts", [])) >= 2 or record.get("status") == "waiting_user"
+                if any(len(record.get("attempts", [])) >= record.get("attempt_limit", 3)
                        for row in records if isinstance(record := json.loads(row["value_json"]), dict)):
                     handling = "blocked"
             item["handling"] = "deferred" if item["status"] == "deferred" else handling
@@ -168,6 +212,74 @@ class InkFlowProject:
         return [item for item in items if item["status"] not in {"completed", "superseded"}
                 and (include_rejected or item["status"] != "rejected")
                 and (chapter_no is None or item.get("chapter_no") in {None, chapter_no})]
+
+    def _setting_attachment_maintenance(self, item: dict[str, Any]) -> dict[str, Any] | None:
+        """只读证明正文已完成且仅剩设定参考附件；分类不签收附件，也不改变原任务状态。"""
+        if (item.get("kind") != "accept_finalization"
+                or item.get("status") in {"running", "waiting_user", "awaiting_confirmation", "rejected"}
+                or item.get("requires_user_decision")):
+            return None
+        source = item.get("source") or {}
+        number, task_id = item.get("chapter_no"), source.get("task_id")
+        if (type(number) is not int or not isinstance(task_id, str) or not task_id
+                or self.db.canonical_content_migration_required()):
+            return None
+        chapter = self.db.get_chapter(number)
+        receipt = self.db.get_metadata(f"workflow_accept:{task_id}:{number}", {})
+        if not isinstance(receipt, dict):
+            return None
+        progress = receipt.get("post_commit") or {}
+        deferred = receipt.get("deferred_setting_candidates") or []
+        # 已明确要求作者取舍的差异仍在当前列表。旧回执没有逐项候选信息时，
+        # 只能证明附件尚未完成，不能据空列表声称它已经被新设定解决。
+        if (not isinstance(progress, dict) or progress.get("settings") != "pending"
+                or progress.get("checkpoint") != "completed"
+                or any(value != "completed" for key, value in progress.items() if key != "settings")
+                or not isinstance(deferred, list)
+                or any(not isinstance(candidate, dict) or candidate.get("status") in {"needs_user", "waiting_user", "awaiting_confirmation"}
+                    or candidate.get("requires_user_decision") for candidate in deferred)):
+            return None
+        # 必须同时核原任务提交回执、当前已接受版本与原待办来源，不能因后面
+        # 已写到第几章就隐藏旧问题；不同版本、丢失投影或正文被手改均留当前。
+        if (not chapter or chapter["status"] != "accepted" or receipt.get("chapter_no") != number
+                or source.get("chapter_no") != number or type(receipt.get("review_id")) is not int
+                or source.get("version") != chapter["version"]
+                or source.get("content_hash") != chapter["content_hash"]
+                or receipt.get("version") != chapter["version"]
+                or receipt.get("content_hash") != chapter["content_hash"]
+                or receipt.get("path") != chapter["path"]
+                or source.get("review_id") != receipt.get("review_id")):
+            return None
+        try:
+            body = self.db.canonical_chapter_content(number)
+            path = self.resolve_user_path(chapter["path"])
+            if (not body or content_hash(body) != chapter["content_hash"] or not path.is_file()
+                    or content_hash(path.read_text(encoding="utf-8")) != chapter["content_hash"]):
+                return None
+        except (OSError, UnicodeError, ProjectError):
+            return None
+        return {"task_id": task_id, "chapter_no": number, "version": chapter["version"],
+            "content_hash": chapter["content_hash"], "review_id": receipt.get("review_id"),
+            "post_commit": dict(progress), "projection_status": "synced"}
+
+    def pending_work_snapshot(self) -> dict[str, list[dict[str, Any]]]:
+        """为界面分出当前事项、后台附件与拒绝历史；内部待办和恢复身份保持原样。"""
+        current, maintenance, rejected = [], [], []
+        for original in self.pending_work(include_rejected=True):
+            item = dict(original)
+            if item.get("status") == "rejected":
+                rejected.append({**item, "display_scope": "history"})
+                continue
+            proof = self._setting_attachment_maintenance(item)
+            if proof is None:
+                current.append({**item, "display_scope": "current"})
+                continue
+            # 后台维护仍可按原任务继续，原失败、费用及来源没有核销。
+            # 顶部当前待办只接收current；正文完成不再显示为旧章仍未写完。
+            maintenance.append({**item, "display_scope": "maintenance", "acceptance_proof": proof,
+                "display_reason": f"第 {proof['chapter_no']} 章正文与检查点已完成，仅设定参考附件待补核。",
+                "next_action": "从原接受任务补齐设定参考，核对当前记录与原候选来源；保留已接受正文和记忆，不重写旧章。"})
+        return {"pending_work": current, "maintenance_work": maintenance, "rejected_work": rejected}
 
     def decide_pending_work(self, identity: str, *, decision: str, reason: str = "",
                             expected_updated_at: str | None = None) -> dict[str, Any]:
@@ -218,12 +330,28 @@ class InkFlowProject:
                                           ensure_ascii=False, sort_keys=True))[:24]
         key = f"pending_work:{identity}"
         with project_write_lock_sync(self.root):
+            if kind == "workflow" and source.get("task_id"):
+                with self.db.connect() as connection:
+                    rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
+                matches = [value for row in rows if (value := json.loads(row["value_json"])).get("kind") == kind
+                           and value.get("source", {}).get("task_id") == source["task_id"]
+                           and value["source"].get("conversation") == source.get("conversation")]
+                if matches:
+                    # Related task links describe provenance, not a second workflow identity.
+                    previous_work = max(matches, key=lambda value: (value.get("status") == "running", value.get("updated_at", "")))
+                    identity = previous_work["id"]
+                    key = f"pending_work:{identity}"
             previous = self.db.get_metadata(key, {})
+            if kind == "workflow" and previous.get("status") in {"completed", "superseded", "rejected"}:
+                return previous
             item = {**previous, "id": identity, "kind": kind, "reason": reason,
                     "next_action": next_action, "source": source, "chapter_no": chapter_no,
                     "status": previous.get("status", status) if previous.get("status") not in {"completed", "superseded"} else status,
                     "created_at": previous.get("created_at", utc_now()),
                     "updated_at": utc_now()}
+            if kind == "workflow" and previous.get("source") and previous["source"] != source:
+                item["source_history"] = [*previous.get("source_history", []),
+                    {"source": previous["source"], "at": previous.get("updated_at")}]
             if intent is not None:
                 item["intent"] = intent
             if run_id:
@@ -245,16 +373,39 @@ class InkFlowProject:
 
     def reconcile_pending_work(self, *, current_pass: Callable[[int], dict[str, Any] | None] | None = None,
                                current_source: dict[str, Any] | None = None) -> None:
-        """Close only issues whose concrete source/output now proves resolution."""
+        """只核销有来源证明的事项，分别保留已接受正文与未完成附件同步的状态。
+
+        旧任务的路由错误和失败记录不删除。当前章节进度、其他任务的回执
+        都不能独自证明所有旧要求已经完成，须逐项核对版本和任务绑定产物。
+        """
         validated: dict[int, dict[str, Any] | None] = {}
+        with project_write_lock_sync(self.root):
+            with self.db.connect() as connection:
+                rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
+            workflows: dict[tuple[str, str | None], list[dict[str, Any]]] = {}
+            for row in rows:
+                item = json.loads(row["value_json"])
+                source = item.get("source", {})
+                if item.get("kind") == "workflow" and source.get("task_id") and item.get("status") not in {"completed", "superseded", "rejected"}:
+                    workflows.setdefault((source["task_id"], source.get("conversation")), []).append(item)
+            for duplicates in workflows.values():
+                owner = max(duplicates, key=lambda value: (value.get("status") == "running", value.get("updated_at", "")))
+                for item in duplicates:
+                    if item["id"] != owner["id"]:
+                        self.update_pending_work(item["id"], status="superseded", resolution={
+                            "workflow_id": owner["id"], "reason": "同一任务的重复待办由当前记录接管；原失败与次数保留，不代表审核通过。"})
         with self.db.connect() as connection:
             rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
         self._reconcile_workflow_outputs([json.loads(row["value_json"]) for row in rows], current_pass=current_pass)
-        self._reconcile_completed_discussions()
+        self._reconcile_completed_discussions(current_pass=current_pass)
         with self.db.connect() as connection:
             rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
+        active_tasks = {item.get("source", {}).get("task_id") for row in rows
+                        if (item := json.loads(row["value_json"])).get("kind") == "workflow"
+                        and item.get("status") not in {"completed", "superseded", "rejected"}}
         finished_tasks = {item["source"].get("task_id"): item for row in rows
                           if (item := json.loads(row["value_json"])).get("kind") == "workflow" and item.get("status") in {"completed", "superseded"} and item.get("source", {}).get("task_id")}
+        finished_tasks = {task: item for task, item in finished_tasks.items() if task not in active_tasks}
         for item in self.pending_work():
             if item["kind"] == "workflow" and item.get("intent", {}).get("pending_work_id"):
                 target_id = item["intent"]["pending_work_id"]
@@ -305,12 +456,58 @@ class InkFlowProject:
                 self.update_pending_work(item["id"], status="superseded", resolution="提出建议时的来源已变化；旧建议保留历史，不再反复安排。")
                 continue
             if item["kind"] == "context_source":
-                number = item.get("source", {}).get("chapter_no")
+                source = item.get("source", {})
+                number = source.get("chapter_no")
                 chapter = self.db.get_chapter(int(number)) if number else None
+                if source.get("attachment_kind") == "promise_threads":
+                    # 正文入库不证明后台附件完成；与后台调度共用原任务及全部来源的回执核验。
+                    from .story_promises import thread_attachment_index_valid
+                    index = self.db.get_metadata("promise_thread_index:" + item["id"], {})
+                    if isinstance(index, dict) and index.get("work_id") == item["id"] and thread_attachment_index_valid(self, index):
+                        self.update_pending_work(item["id"], status="completed", resolution={
+                            "version": chapter["version"], "content_hash": chapter["content_hash"],
+                            "reason": "原任务同版伏笔派生索引及实际来源已核验，附件工作完成。"})
+                    continue
                 if chapter and chapter["status"] == "accepted":
                     text_path = self.resolve_user_path(chapter["path"])
                     if text_path.is_file() and content_hash(text_path.read_text(encoding="utf-8")) == chapter["content_hash"]:
                         self.update_pending_work(item["id"], status="completed", resolution={"version": chapter["version"], "content_hash": chapter["content_hash"]})
+                continue
+            if item["kind"] == "accept_finalization" and item.get("chapter_no"):
+                number, source = int(item["chapter_no"]), item.get("source", {})
+                chapter = self.db.get_chapter(number)
+                task_id = source.get("task_id")
+                receipt = self.db.get_metadata(f"workflow_accept:{task_id}:{number}", {}) if task_id else {}
+                if (chapter and chapter["status"] == "accepted" and type(source.get("version")) is int
+                        and chapter["version"] > source["version"] and receipt.get("version") == source["version"]
+                        and receipt.get("content_hash") == source.get("content_hash")):
+                    # 新正史已经生效时，旧版交接只能留档，不能再次提交记忆或覆盖新设定。
+                    body = self.db.canonical_chapter_content(number)
+                    path = self.resolve_user_path(chapter["path"])
+                    try:
+                        current_saved = (body and content_hash(body) == chapter["content_hash"] and path.is_file()
+                                         and content_hash(path.read_text(encoding="utf-8")) == chapter["content_hash"])
+                    except (OSError, UnicodeError):
+                        current_saved = False
+                    if current_saved:
+                        self.update_pending_work(item["id"], status="superseded", resolution={
+                            "version": chapter["version"], "content_hash": chapter["content_hash"],
+                            "reason": "本章已有核验一致的新正史，旧版附件和原取舍留档。"})
+                    continue
+                # 其他任务同步成功不能替本任务的设定候选签收。只认原task的
+                # 精确回执、当前正史版本/hash及settings/checkpoint两个收尾状态；
+                # 任何一项仍pending都继续保留，不以正文已入正史冒充附件完成。
+                if (chapter and chapter["status"] == "accepted"
+                        and source.get("version") == chapter["version"]
+                        and source.get("content_hash") == chapter["content_hash"]
+                        and receipt.get("version") == chapter["version"]
+                        and receipt.get("content_hash") == chapter["content_hash"]
+                        and receipt.get("path") == chapter["path"]
+                        and all(receipt.get("post_commit", {}).get(step) == "completed" for step in ("settings", "checkpoint"))
+                        and self.completed_acceptance_receipt(number) is not None):
+                    self.update_pending_work(item["id"], status="completed", resolution={
+                        "task_id": task_id, "version": chapter["version"], "content_hash": chapter["content_hash"],
+                        "post_commit": receipt["post_commit"], "reason": "原任务同版本提交回执已证明附属收尾完成。"})
                 continue
             if item["kind"] == "planning_dependency" and self.db.get_current_plan_bundle() is not None:
                 self.update_pending_work(item["id"], status="completed", resolution="当前规划记录已恢复，原缺失依赖已解除。")
@@ -365,11 +562,12 @@ class InkFlowProject:
                     self.update_pending_work(item["id"], status="completed",
                         resolution={"run_id": active[0]["trace_id"], "revision_no": active[0].get("revision_no", 1)})
 
-    def _reconcile_completed_discussions(self) -> None:
-        """Retire old handoffs only against complete, current acceptance receipts."""
+    def _reconcile_completed_discussions(self, *, current_pass=None) -> None:
+        """Retire resolved review risks separately from unfinished acceptance work."""
         from datetime import datetime
         active = self.db.list_collaboration_messages(active_only=True, limit=500)
         receipts: dict[int, dict[str, Any] | None] = {}
+        passes = {}
         def accepted(number: int, created: str, version: int | None = None, *, repeated_accept: bool = False) -> bool:
             chapter = self.db.get_chapter(number)
             if not chapter or (version is not None and chapter["version"] != version):
@@ -387,6 +585,20 @@ class InkFlowProject:
             if item.get("message_type") not in {"risk", "task_assignment"}:
                 continue
             number, created = item.get("chapter_no"), item["created_at"]
+            if number and item["message_type"] == "risk" and current_pass is not None:
+                chapter = self.db.get_chapter(int(number))
+                review = self.db.latest_review_record(int(number))
+                if chapter and review and (item.get("chapter_version") is None or item["chapter_version"] <= chapter["version"]):
+                    try:
+                        if number not in passes:
+                            passes[number] = current_pass(int(number))
+                        passed = passes[number]
+                        if (passed and passed.get("source_hash") == chapter["content_hash"]
+                                and datetime.fromisoformat(review["created_at"]) >= datetime.fromisoformat(created)):
+                            completed.add(item["message_id"])
+                            continue
+                    except (ProjectError, ValidationGateError, ValueError, OSError, TypeError, KeyError):
+                        pass
             if number and accepted(int(number), created, item.get("chapter_version")):
                 completed.add(item["message_id"])
                 continue
@@ -449,39 +661,117 @@ class InkFlowProject:
         return None
 
     def _reconcile_workflow_outputs(self, items: list[dict[str, Any]], *, current_pass: Callable[[int], dict[str, Any] | None] | None = None) -> None:
-        """Reconcile concrete later outputs, without replaying old requests or accepting prose."""
+        """依据较新的正式接受稿归档旧正文断点，不重放请求，也不代替审核或接受。
+
+        接受时间必须晚于旧待办，避免把后来新提的审查/改稿要求误判完成。
+        正文已接受时仍检查原任务的收尾回执。未完成的附属项保持等待，不重放正文。
+        """
         if self.db.canonical_content_migration_required():
             return
         from datetime import datetime
         def later(value: str | None, created: str | None) -> bool:
+            """旧数据缺日期或日期格式异常时保留待核，不猜测先后关系。"""
             try:
                 return bool(value and created and datetime.fromisoformat(value) >= datetime.fromisoformat(created))
             except (ValueError, TypeError):
                 return False
         active = None
         active_checked = False
+        task_runs = None
         validated: dict[int, dict[str, Any] | None] = {}
         accept_actions = {"accept", "review_accept", "write_review_accept", "revise_review_accept",
                           "continue_run", "batch_accept", "batch_draft_accept"}
+        # write仅兼容历史动作名；当前写草稿动作是write_draft。
+        # revise_draft/revise_review不在此列，不能仅凭旧章已接受核销新的改稿要求。
+        prose_stages = {"write", "write_draft", "write_review", "batch_draft", "review"}
         for item in items:
-            if item.get("kind") != "workflow" or item.get("status") in {"completed", "superseded", "rejected", "running"}:
+            if item.get("kind") != "workflow" or item.get("status") in {"superseded", "rejected", "running"}:
+                continue
+            # 旧版可能凭正文回执误报完成，只有留有收尾线索的已结束任务需要重新核对。
+            if item.get("status") == "completed" and not (isinstance(item.get("resolution"), dict)
+                    and item["resolution"].get("pending_finalization_ids")):
                 continue
             intent = item.get("intent") or {}
             action = intent.get("action")
-            first, last = intent.get("chapter_no"), intent.get("end_chapter_no") or intent.get("chapter_no")
-            if not isinstance(first, int) or not isinstance(last, int) or not 1 <= first <= last:
+            task_id = item.get("source", {}).get("task_id")
+            if task_id and (self.internal / "studio.db").is_file():
+                if task_runs is None:
+                    from .studio import StudioDatabase
+                    task_runs = StudioDatabase(self.internal / "studio.db")
+                latest_run = task_runs.latest_task_run_for_settings(task_id)
+                if (latest_run and latest_run.get("method") == "conversation.send"
+                        and latest_run.get("settings_snapshot", {}).get("status") == "captured"
+                        and latest_run["settings_snapshot"].get("novel_id") == self.project_id
+                        and latest_run.get("run_id") != item.get("run_id")
+                        and latest_run.get("status") in {"failed", "interrupted", "cancelled", "waiting_user", "waiting_condition"}
+                        and later(latest_run.get("started_at"), item.get("updated_at"))):
+                    item = self.update_pending_work(item["id"], run_id=latest_run["run_id"],
+                        status="interrupted" if latest_run["status"] == "cancelled" else latest_run["status"],
+                        resolution=latest_run.get("error_message") or latest_run.get("summary") or "请查看本次实际运行结果。",
+                        previous_run_id=item.get("run_id"))
+            if action == "story_settings_manage":
+                change = intent.get("setting_change", {})
+                expected = change.get("expected_revision")
+                if (change.get("operation") == "record_supplement" and type(expected) is int and expected > 0
+                        and change.get("collection_id") and change.get("record_id")):
+                    from .story_settings import StorySettingsService
+                    service = StorySettingsService(self)
+                    record = next((value for value in service.records(change["collection_id"])
+                                   if value["record_id"] == change["record_id"]), None)
+                    collection = next((value for value in service.list_collections()
+                                       if value["collection_id"] == change["collection_id"]), None)
+                    live = service._context_record(record, collection, None, {}) if record and collection else None
+                    if (live and live.get("status") == "verified_reference"
+                            and live.get("revision", 0) > expected and not live.get("classification_issues")
+                            and any(event.get("action") == "record_supplement" and event.get("revision", 0) > expected
+                                    and later(event.get("at"), item.get("created_at")) for event in record.get("history", []))):
+                        self.update_pending_work(item["id"], status="superseded", resolution={
+                            "record_id": record["record_id"], "revision": record["revision"],
+                            "reason": "同一设定已由后续补充并核对的新修订接管；旧失败留档，不重复按旧修订号写入，也不代表其他设定检查完成。"})
+                        key = item.get("source", {}).get("conversation")
+                        pending = self.db.get_metadata(key) if isinstance(key, str) and key else None
+                        if isinstance(pending, dict) and pending.get("task_id") == item.get("source", {}).get("task_id"):
+                            self.db.set_metadata(key, {**pending, "status": "superseded"})
+                continue
+            span = self._pending_work_chapter_range(item)
+            if span is None:
+                continue
+            first, last = span
+            # 按总字数运行的目标不能靠“起始章已接受”算完成，须另核终点证据。
+            if action == "continue_run" and intent.get("target_characters") and not intent.get("end_chapter_no"):
                 continue
             status, resolution = None, None
-            if action in accept_actions or action == "review":
+            if action in accept_actions or action in prose_stages:
                 chapters = [self.db.get_chapter(number) for number in range(first, last + 1)]
                 if (all(chapter and chapter["status"] == "accepted" and (later(chapter.get("accepted_at"), item.get("created_at"))
                             or action in {"accept", "batch_accept"} and self.completed_acceptance_receipt(chapter["chapter_no"])) for chapter in chapters)
-                        and (action == "review" or not any(work.get("kind") == "accept_finalization" and work.get("chapter_no") in range(first, last + 1)
-                                    and work.get("status") not in {"completed", "superseded"} for work in items))
                         and all((body := self.db.canonical_chapter_content(chapter["chapter_no"]))
                                 and content_hash(body) == chapter["content_hash"] for chapter in chapters)):
-                    status = "superseded" if action == "review" else "completed"
-                    resolution = {"reason": "后续正式验收已完成目标范围，旧请求不再重复执行。",
+                    original_span = (intent.get("chapter_no"), intent.get("end_chapter_no") or intent.get("chapter_no"))
+                    receipts = {chapter["chapter_no"]: self.db.get_metadata(f"workflow_accept:{task_id}:{chapter['chapter_no']}", {})
+                                for chapter in chapters} if task_id else {}
+                    own_commits = bool(receipts) and all(
+                        (receipt := receipts[chapter["chapter_no"]]).get("version") == chapter["version"]
+                        and receipt.get("content_hash") == chapter["content_hash"]
+                        and receipt.get("path") == chapter["path"] for chapter in chapters)
+                    unfinished = {number for number, receipt in receipts.items() if any(
+                        receipt.get("post_commit", {}).get(step) != "completed" for step in ("settings", "checkpoint"))}
+                    pending_tails = [work["id"] for work in items if work.get("kind") == "accept_finalization"
+                                     and work.get("chapter_no") in unfinished
+                                     and work.get("status") not in {"completed", "superseded", "rejected"}
+                                     and work.get("source", {}).get("task_id") == task_id
+                                     and all(work["source"].get(key) == receipts[work["chapter_no"]].get(key)
+                                             for key in ("version", "content_hash"))]
+                    # 正文完成与任务完成分别从原回执核验，其他任务的稿只能接管旧断点。
+                    if action in accept_actions and span == original_span and own_commits:
+                        status = "waiting_condition" if unfinished else "completed"
+                        reason = "正文已入正史，仍有本地收尾待处理。" if unfinished else "目标范围已入正史，收尾已完成。"
+                    else:
+                        status, reason = "superseded", "目标范围已由其他正式验收稿接管，旧正文断点留档。"
+                    resolution = {"reason": reason,
+                        "chapter_range": [first, last], "original_chapter_range": list(original_span),
+                        "scope_basis": "用户原话与所存目标明确一致的单章范围" if span != original_span else "原结构化章节范围",
+                        "pending_finalization_ids": pending_tails,
                         "chapters": [{key: chapter[key] for key in ("chapter_no", "version", "content_hash")} for chapter in chapters]}
                 elif action == "review" and current_pass is not None:
                     reports = []
@@ -515,7 +805,7 @@ class InkFlowProject:
                         status = "superseded"
                         resolution = {"reason": "后续正式规划已覆盖这一范围，旧失败任务留档，继续使用当前生效版。",
                                       "run_id": active[0]["trace_id"], "revision_no": active[0].get("revision_no")}
-            if status:
+            if status and (item.get("status") != status or item.get("resolution") != resolution):
                 self.update_pending_work(item["id"], status=status, resolution=resolution)
                 key = item.get("source", {}).get("conversation")
                 pending = self.db.get_metadata(key) if isinstance(key, str) and key else None

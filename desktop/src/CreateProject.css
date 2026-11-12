@@ -1,0 +1,95 @@
+/* 新建窗口自成一屏：步骤与操作固定，长方案只在中部滚动，不截断故事内容。 */
+:root[data-theme] .modal.create-project-modal {
+  display: flex; flex-direction: column; width: min(1080px, calc(100vw - 40px));
+  height: min(880px, calc(100dvh - 48px)); max-height: calc(100dvh - 48px); padding: 0; overflow: hidden;
+  border-radius: 22px; border: 1px solid var(--glass-edge, var(--line));
+  background: radial-gradient(ellipse at 0 0, color-mix(in srgb, var(--theme-secondary, var(--accent)) 12%, transparent), transparent 45%), var(--glass-fill, var(--panel));
+  box-shadow: inset 0 1px 0 var(--glass-glint, #ffffff50), var(--glass-shadow, var(--shadow));
+  backdrop-filter: blur(22px) saturate(130%); color: var(--text);
+}
+.create-project-modal::before { display: none; }
+.create-project-modal:focus { outline: none; }
+.create-project-header { position: relative; flex: 0 0 auto; padding: 25px 30px 20px; border-bottom: 1px solid var(--line-soft); }
+.create-project-header > div { padding-right: 35px; }
+.create-project-header .eyebrow { margin: 0 0 7px; color: var(--theme-ink, var(--accent)); font-size: 11px; }
+.create-project-modal .create-project-header h2 { font-family: inherit; font-size: 26px; font-weight: 650; }
+.create-project-header p:not(.eyebrow) { margin: 9px 0 0; color: var(--muted); font-size: 13px; line-height: 1.65; }
+.create-project-close { position: absolute; top: 23px; right: 25px; width: 32px; height: 32px; display: grid; place-items: center; padding: 0; font-size: 23px; line-height: 1; }
+.create-project-steps { display: flex; gap: 14px 24px; margin: 23px 0 0; padding: 0; list-style: none; }
+.create-project-steps li { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--faint); font-size: 12px; }
+.create-project-steps li > span { display: grid; place-items: center; width: 25px; height: 25px; flex-shrink: 0; border: 1px solid var(--line); border-radius: 50%; font-variant-numeric: tabular-nums; }
+.create-project-steps li.current { color: var(--text); font-weight: 650; }
+.create-project-steps li.current > span { border-color: var(--accent-dim); color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 6%, transparent); }
+.create-project-steps li.complete { color: var(--theme-ink, var(--accent)); }
+.create-project-flow { display: flex; flex: 1; flex-direction: column; min-height: 0; margin: 0; }
+.create-project-scroll { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 28px 30px 32px; scrollbar-gutter: stable; }
+.create-project-scroll section { min-width: 0; }
+.create-project-scroll h3 { margin: 8px 0 12px; font-size: 21px; font-weight: 650; line-height: 1.5; }
+.create-project-scroll p { color: var(--muted); font-size: 13px; line-height: 1.85; overflow-wrap: anywhere; }
+.create-project-kicker { color: var(--theme-ink, var(--accent)); font-size: 11px; letter-spacing: .03em; }
+.create-project-modal label { display: flex; flex-direction: column; gap: 7px; color: var(--text); font-size: 13px; line-height: 1.65; }
+.create-project-modal label > small { color: var(--muted); font-size: 11px; font-weight: 400; }
+:root[data-theme] .create-project-modal :is(input, textarea) { min-width: 0; background: color-mix(in srgb, var(--panel) 64%, transparent); color: var(--text); border-color: var(--line); }
+.create-project-modal textarea { min-height: 84px; max-height: 340px; line-height: 1.8; resize: vertical; }
+.create-project-modal :is(button, input, textarea):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.create-project-modal button { white-space: normal; line-height: 1.5; }
+.create-project-location { padding-block: 14px 26px; max-width: 800px; }
+.create-project-location > label { margin-top: 28px; }
+.create-project-path { display: flex; gap: 9px; }
+.create-project-path input { flex: 1; }
+.create-project-path button { flex: 0 0 auto; }
+.create-project-modal .create-project-note { margin: 12px 0 0; color: var(--muted); font-size: 12px; line-height: 1.75; }
+.create-project-modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 20px 0 25px; }
+.create-project-modes > button { min-width: 0; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; padding: 16px 18px; border: 1px solid var(--line); border-radius: 13px; text-align: left; }
+.create-project-modes > button strong { color: var(--text); font-size: 14px; }
+.create-project-modes > button span { color: var(--muted); font-size: 12px; }
+:root[data-theme] .create-project-modes > button[aria-pressed="true"] { border-color: var(--accent-dim); background: linear-gradient(115deg, var(--accent-soft), color-mix(in srgb, var(--panel) 65%, transparent)); box-shadow: inset 3px 0 var(--accent), inset 0 1px 0 var(--glass-glint, #ffffff30); }
+.create-project-idea-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 13px; }
+.create-project-ideas { display: grid; gap: 16px; margin-top: 26px; }
+.create-project-idea { min-width: 0; padding: 21px 23px; border: 1px solid var(--line); border-radius: 15px; background: color-mix(in srgb, var(--panel) 68%, transparent); }
+.create-project-idea.selected { border-color: var(--accent-dim); box-shadow: inset 3px 0 var(--accent), inset 0 1px 0 var(--glass-glint, #ffffff30); }
+.create-project-idea > header { display: flex; justify-content: space-between; gap: 10px; color: var(--theme-ink, var(--accent)); font-size: 11px; }
+.create-project-idea h4 { margin: 11px 0 13px; color: var(--text); font-size: 20px; line-height: 1.55; overflow-wrap: anywhere; }
+.create-project-idea p, .create-project-idea dd, .create-project-idea li { white-space: pre-wrap; overflow-wrap: anywhere; }
+.create-project-modal dl { margin: 16px 0; }
+.create-project-modal dl > div { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 10px; padding-block: 9px; border-bottom: 1px solid var(--line-soft); }
+.create-project-modal dt { color: var(--muted); font-size: 12px; line-height: 1.85; }
+.create-project-modal dd { margin: 0; color: var(--text); font-size: 13px; line-height: 1.85; white-space: pre-wrap; overflow-wrap: anywhere; }
+.create-project-rules > strong { color: var(--muted); font-size: 12px; }
+.create-project-rules ul, .create-project-reasoning ul { padding-left: 20px; color: var(--muted); font-size: 13px; line-height: 1.85; }
+.create-project-idea .create-project-choice-note { color: var(--theme-ink, var(--accent)); }
+.create-project-idea > button { margin-top: 5px; }
+.create-project-reasoning { margin-top: 17px; padding: 14px 17px; border: 1px solid var(--line-soft); border-radius: 11px; color: var(--muted); }
+.create-project-reasoning summary { cursor: pointer; font-size: 12px; }
+.create-project-edit { margin-top: 30px; padding-top: 24px; border-top: 1px solid var(--line); scroll-margin-top: 20px; }
+.create-project-edit fieldset { display: grid; gap: 17px; min-width: 0; margin: 20px 0 0; padding: 0; border: 0; }
+.create-project-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px; }
+.create-project-fields.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.create-project-confirm { padding-bottom: 10px; }
+.create-project-confirm dl { margin-top: 23px; padding: 8px 18px; border: 1px solid var(--glass-edge, var(--line)); border-radius: 13px; background: color-mix(in srgb, var(--panel) 64%, transparent); }
+.create-project-confirm dl > div:last-child { border-bottom: 0; }
+.create-project-footer { flex: 0 0 auto; padding: 16px 30px 20px; border-top: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 72%, transparent); box-shadow: inset 0 1px 0 var(--glass-glint, #ffffff30); }
+.create-project-feedback { max-height: min(180px, 20dvh); overflow: auto; margin-bottom: 13px; }
+.create-project-feedback p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
+.create-project-feedback p.form-error { color: var(--red); margin-bottom: 6px; }
+.create-project-feedback small { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.create-project-footer-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 9px; }
+.create-project-footer-actions > button:first-child { margin-right: auto; }
+.create-project-sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+@media (max-width: 660px) {
+  .create-project-backdrop { padding: 10px; }
+  :root[data-theme] .modal.create-project-modal { width: 100%; height: calc(100dvh - 20px); max-height: calc(100dvh - 20px); border-radius: 16px; }
+  .create-project-header { padding: 20px 18px 15px; }
+  .create-project-close { right: 17px; top: 17px; }
+  .create-project-modal .create-project-header h2 { font-size: 23px; }
+  .create-project-steps { gap: 9px; justify-content: space-between; margin-top: 17px; }
+  .create-project-steps li { gap: 5px; font-size: 10px; }
+  .create-project-steps li > span { width: 21px; height: 21px; }
+  .create-project-scroll { padding: 22px 18px 26px; }
+  .create-project-modes, .create-project-fields, .create-project-fields.three { grid-template-columns: minmax(0, 1fr); }
+  .create-project-idea { padding: 17px; }
+  .create-project-modal dl > div { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  .create-project-footer { padding: 13px 18px 16px; }
+}
+@media (prefers-reduced-motion: reduce) { .create-project-modal, .create-project-modal *, .create-project-modal *::before, .create-project-modal *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
+@media (forced-colors: active) { :root[data-theme] .modal.create-project-modal { background: Canvas; color: CanvasText; border-color: CanvasText; backdrop-filter: none; box-shadow: none; } .create-project-modal :is(button, input, textarea, .create-project-idea) { border: 1px solid CanvasText; } }

@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "display_name": "最小完整工作",
+  "roles": [
+    "coordinator",
+    "writer",
+    "editor",
+    "reviewer",
+    "memory_keeper"
+  ],
+  "activation": "manual",
+  "contracts": [
+    "*"
+  ],
+  "when": "作者主动点名@ponytail，或明确要求使用最小完整工作方法时使用；不新增独立请求。",
+  "not_when": "不能用来缩短明确篇幅、删独立信息、跳过必要审核和记忆、关闭门禁或少交作者要求。",
+  "inputs": [
+    "当前目标、范围、已有产物、保留项"
+  ],
+  "outputs": [
+    "在原范围内的完整产物与简短说明"
+  ],
+  "tasks": [
+    "辨清必须完成的目标",
+    "复用已有有效成果",
+    "删掉无必要重复步骤",
+    "交完整结果与限制"
+  ],
+  "references": [],
+  "steps": []
+}

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "kind": "hybrid",
+  "workflow": {
+    "path": "scripts/workflow.json"
+  },
+  "display_name": "小说正文写作",
+  "roles": [
+    "writer"
+  ],
+  "activation": "automatic",
+  "contracts": [
+    "writer.draft",
+    "writer.scene"
+  ],
+  "when": "Writer已获起草授权，实际进入完整章节或独立场景生成时使用。",
+  "not_when": "只审稿、只给建议、定点改稿、制作规划或正式接受时不用；不会主动扩章。",
+  "inputs": [
+    "当前任务目标、篇幅与保留项",
+    "完整必要前文、设定和当前执行卡"
+  ],
+  "outputs": [
+    "DraftOutput或场景步骤的当前输出结构",
+    "版本对应的公开说明和候选附件"
+  ],
+  "tasks": [
+    "读懂本次目标与前史",
+    "组织场景与视角",
+    "完成正文",
+    "交接钩子与候选附件"
+  ],
+  "references": [
+    {
+      "path": "references/handoff.md"
+    }
+  ],
+  "steps": [
+    {
+      "tool": "skill.scope",
+      "script": "scripts/scope.json"
+    },
+    {
+      "tool": "skill.resources",
+      "script": "scripts/resources.json"
+    },
+    {
+      "tool": "skill.output",
+      "script": "scripts/output.json"
+    }
+  ]
+}

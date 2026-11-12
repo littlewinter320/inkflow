@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "display_name": "中文自然表达",
+  "roles": [
+    "writer",
+    "editor"
+  ],
+  "activation": "automatic",
+  "contracts": [
+    "writer.draft",
+    "writer.scene",
+    "writer.revise",
+    "writer.local_revision",
+    "writer.selection",
+    "writer.length_*",
+    "check.expression",
+    "check.general"
+  ],
+  "when": "当前角色正在创作中文正文、进行已授权修订，或实际承担表达审核时使用；不另发润色请求。",
+  "not_when": "纯逻辑、纯记忆、代码与数据字段、以AI检测分数为目标或按词语标点配额改稿时不用。",
+  "inputs": [
+    "当前段落、作者要求、样稿风格和允许范围"
+  ],
+  "outputs": [
+    "当前任务结构里的自然正文或有原句的表达建议"
+  ],
+  "tasks": [
+    "确认文体和保留信息",
+    "定位具体空泛或重复",
+    "按人物声音定点修表达",
+    "核对信息与确定程度"
+  ],
+  "references": [
+    {
+      "path": "references/craft-standard.md"
+    },
+    {
+      "path": "references/expression-standard.md"
+    }
+  ],
+  "steps": []
+}

@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { documentLabel, readableSourceText } from "./readableNames";
+import { chapterNavigationVolumes, type ChapterVolume } from "./chapterNavigation";
 
 type Request = <T>(method: string, params?: Record<string, unknown>) => Promise<T>;
 
@@ -12,7 +13,8 @@ type DashboardLike = {
     open_threads?: number;
   };
   accepted_characters: number;
-  chapter_outline?: { state: string; revision_no?: number; volumes: Array<{ volume_no: number; title: string; chapter_start: number; chapter_end: number }>; cards: Array<Record<string, unknown>> };
+  chapter_progress?: { accepted_through?: number; awaiting_review: number };
+  chapter_outline?: { state: string; revision_no?: number; volumes: ChapterVolume[]; cards: Array<Record<string, unknown>> };
   planning_impact?: { changed_sources: string[]; affected: string[]; accepted_chapters_preserved: number; next_step: string };
   pending_planning_publication?: { run_id: string; anchor: number; end: number } | null;
   quality_hold?: { chapter_no: number; source_hash: string; stage?: "legacy_review" | "repair_confirmation"; reason: string; detail?: string; first_evidence: string; second_evidence: string } | null;
@@ -81,6 +83,7 @@ type ProjectTreeItemLike = {
   relative_path: string;
   chapter_no?: number;
   status?: string;
+  is_current?: boolean;
 };
 
 type TrashItem = {
@@ -91,13 +94,17 @@ type TrashItem = {
   restore_blocked: boolean;
 };
 
+// 展示本书进度与已有工作入口，所有创作仍由统一聊天服务执行。
 export function ProjectCenter({
   dashboard,
   workspace,
   tree,
   request,
+  backgroundTasks,
+  outlineComplete,
   onPrompt,
   onSend,
+  actionDisabled,
   onOpen,
   onRefresh,
   onNotice,
@@ -107,8 +114,11 @@ export function ProjectCenter({
   workspace: Record<string, unknown> | null;
   tree: { items?: ProjectTreeItemLike[]; groups?: Array<{ id: string; items: ProjectTreeItemLike[] }> } | null;
   request: Request;
+  backgroundTasks: ReactNode;
+  outlineComplete: boolean;
   onPrompt: (prompt: string) => void;
   onSend: (prompt: string) => void;
+  actionDisabled: boolean;
   onOpen: (item: ProjectTreeItemLike) => void;
   onRefresh: () => Promise<unknown>;
   onNotice: (message: string) => void;
@@ -351,7 +361,7 @@ export function ProjectCenter({
   const currentWorkspace = workspace as ChapterWorkspaceLike | null;
   const documentItems = tree?.items || [];
   const hasRecentPlan = documentItems.some((item) => item.relative_path === "RECENT_PLAN.md");
-  const suggestions = projectSuggestions(dashboard, documentItems.map(item => item.relative_path));
+  const suggestions = projectSuggestions(dashboard, documentItems.map(item => item.relative_path), outlineComplete);
   const legacyPlan = dashboard?.current_plan || null;
   const currentPlan = hasRecentPlan ? null : legacyPlan;
   const volume = (currentPlan?.volume || {}) as Record<string, unknown>;
@@ -360,6 +370,14 @@ export function ProjectCenter({
   const legacyArc = (legacyPlan?.arc || {}) as Record<string, unknown>;
   const legacyCardCount = Array.isArray(legacyArc.chapter_cards) ? legacyArc.chapter_cards.length : 0;
   const chapterFiles = (tree?.groups || []).find((group) => group.id === "chapters")?.items || [];
+  const nextDraft = chapterFiles.filter(item => item.status === "draft" && item.chapter_no)
+    .sort((a, b) => a.chapter_no! - b.chapter_no!)[0];
+  const lastAccepted = chapterFiles.filter(item => item.status === "accepted" && item.chapter_no)
+    .sort((a, b) => b.chapter_no! - a.chapter_no!)[0];
+  const currentFile = nextDraft || lastAccepted;
+  const currentMatches = currentFile && currentWorkspace?.chapter_no === currentFile.chapter_no;
+  const plannedRange = plannedWritingRange(dashboard);
+  const activeTasks = tasks.filter(task => !task.historical && task.status === "running");
   const foundation = [
     { path: "BOOK.md", label: "设定", note: "世界与人物" },
     { path: "OUTLINE.md", label: "大纲", note: "全书主线" },
@@ -379,10 +397,12 @@ export function ProjectCenter({
   return (
     <div className="scroll-panel project-center">
       <header className="section-heading project-heading-block">
-        <p className="eyebrow">你的写作桌</p>
-        <h2>故事，继续生长。</h2>
-        <p>从一章开始，慢慢写成一本书。</p>
-        <div className="project-heading-actions"><button disabled={working} onClick={() => { void Promise.all([load(), onRefresh()]).catch((cause) => onError(errorMessage(cause))); }}>刷新</button><button disabled={working} onClick={() => void loadTrash()}>回收站</button></div>
+        <div><p className="eyebrow">项目</p><h2>写作概览</h2></div>
+        <div className="project-heading-actions">
+          {backgroundTasks}
+          <button disabled={working} onClick={() => { void Promise.all([load(), onRefresh()]).catch((cause) => onError(errorMessage(cause))); }}>刷新</button>
+          <button disabled={working} onClick={() => void loadTrash()}>回收站</button>
+        </div>
       </header>
 
       {trashItems !== null && <section className="project-section trash-section" aria-label="项目回收站"><div className="project-section-title"><div><h3>项目回收站</h3><p>普通删除会保留在项目回收区；正史正文不能从这里绕过验收流程删除。</p></div><button disabled={working} onClick={() => setTrashItems(null)}>收起</button></div>{trashItems.length === 0 ? <p className="empty-mini">暂无可恢复文件。</p> : trashItems.map((item) => <article className="trash-item" key={item.trash_id}><div><strong>{documentLabel(item.relative_path)}</strong><small>{item.deleted_at}</small>{item.restore_blocked && <small>原位置已有同名文件，需先处理冲突</small>}</div><button disabled={working || item.restore_blocked} onClick={() => void restoreTrashItem(item)}>恢复文件</button></article>)}</section>}
@@ -406,25 +426,27 @@ export function ProjectCenter({
         </section>
       )}
 
-      {currentWorkspace && <section className="project-section" aria-label="当前章节状态"><div className="project-section-title"><div><h3>当前章节</h3><p>第 {String(currentWorkspace.chapter_no || "—")} 章 · v{String(currentWorkspace.record?.version || "—")} · {currentWorkspace.record?.status === "accepted" ? "已进入正史" : currentWorkspace.can_accept ? "当前版本可验收" : currentWorkspace.review?.matches_current_version ? `Editor 审查：${String(currentWorkspace.review?.report?.verdict || "待审查")}` : "等待当前版本审查"}</p></div><span>{currentWorkspace.can_accept ? "可验收" : "进行中"}</span></div></section>}
-
-      <section className="project-metrics" aria-label={"\u9879\u76ee\u7edf\u8ba1"}>
-        <Metric label={"\u5df2\u63a5\u53d7\u6b63\u6587"} value={`${(dashboard?.accepted_characters || 0).toLocaleString()} \u5b57`} />
-        <Metric label={"\u8349\u7a3f\u7ae0\u8282"} value={String(chapterStatus.draft || 0)} />
-        <Metric label={"\u6b63\u53f2\u7ae0\u8282"} value={String(chapterStatus.accepted || 0)} />
-        <Metric label={"\u5f00\u653e\u7ebf\u7d22"} value={String(dashboard?.status.open_threads || 0)} />
+      <section className="project-writing-focus" aria-label="当前写作">
+        <p className="eyebrow">{nextDraft ? "接着看草稿" : outlineComplete ? "全书规划已写完" : lastAccepted ? "最近完成" : "从这里开始"}</p>
+        <h3>{currentFile ? `第 ${currentFile.chapter_no} 章` : "把故事的方向想清楚"}</h3>
+        <p className="project-focus-status">{currentFile
+          ? currentFile.status === "accepted" ? "已进入正史" : currentMatches && currentWorkspace?.can_accept ? "当前版本已通过审查，可以验收" : "草稿已保存，打开查看正文与审查状态"
+          : suggestions[0]?.reason || "先聊想法，再开始写作。"}</p>
+        <div className="project-focus-actions">
+          {currentFile
+            ? <button className="primary" onClick={() => onOpen(currentFile)}>打开第 {currentFile.chapter_no} 章{nextDraft ? "草稿" : "正文"}</button>
+            : <button className="primary" onClick={() => onPrompt(nextFoundation ? foundationPrompt : suggestions[0].prompt)}>聊聊{nextFoundation?.label || "接下来的安排"}</button>}
+          {currentFile && suggestions[0] && <button onClick={() => onPrompt(suggestions[0].prompt)}>{suggestions[0].title}…</button>}
+          {plannedRange && <button disabled={working || actionDisabled} title="按当前设置连续写作、审查并收稿；需要你决定时保留断点。"
+            onClick={() => onSend(`按当前生效规划写完第${plannedRange.start}～${plannedRange.end}章，正常审查与必要修订，通过后按当前接收方式收稿。保留已接受正文，只处理这些章节，遇到需要我决定的问题时保留断点。`)}>
+            一键写完第 {plannedRange.start}～{plannedRange.end} 章
+          </button>}
+        </div>
+        <p className="project-focus-totals"><span>正史 <strong>{chapterStatus.accepted || 0}</strong> 章</span><span>{(dashboard?.accepted_characters || 0).toLocaleString()} 字</span>{!!chapterStatus.draft && <span>草稿 {chapterStatus.draft} 章</span>}</p>
       </section>
 
-      <details className="project-disclosure"><summary>查看故事状态与线索</summary><ProjectSnapshot
-        planned={legacyCardCount}
-        draft={numberValue(chapterStatus.draft)}
-        accepted={numberValue(chapterStatus.accepted)}
-        activeFacts={numberValue(dashboard?.status.active_facts)}
-        openThreads={numberValue(dashboard?.status.open_threads)}
-      /></details>
-
       <section className="project-section plan-overview">
-        <div className="project-section-title"><div><h3>故事依据</h3><p>先定方向，再安排近期章节；任何一层都能单独修改。</p></div>{nextFoundation && <button onClick={() => onPrompt(foundationPrompt)}>继续：{nextFoundation.label}</button>}</div>
+        <div className="project-section-title"><div><h3>本书资料</h3></div>{nextFoundation && <button onClick={() => onPrompt(foundationPrompt)}>补充{nextFoundation.label}…</button>}</div>
         {dashboard?.pending_planning_publication && <div className="planning-impact"><strong>新规划已审核通过，等待你确认</strong><p>安排第 {dashboard.pending_planning_publication.anchor + 1}～{dashboard.pending_planning_publication.end} 章；采用后才更新正式版。当前规划继续生效。</p><button onClick={() => onPrompt(`确认采用候选 ${dashboard.pending_planning_publication?.run_id} 的三层规划，正式发布新版。`)}>把确认指令放入对话框</button></div>}
         <div className="foundation-flow" aria-label="故事资料层级">{foundation.map((item) => {
           const documentItem = documentItems.find((doc) => doc.relative_path === item.path);
@@ -442,10 +464,13 @@ export function ProjectCenter({
         </>}
       </section>
 
-      <ChapterNavigator key={dashboard?.root} cards={dashboard?.chapter_outline?.state === "active" ? dashboard.chapter_outline.cards : chapterCards} files={chapterFiles} volume={volume} outline={dashboard?.chapter_outline} acceptedTotal={numberValue(chapterStatus.accepted)} onOpen={onOpen} onPrompt={onPrompt} hasRecentPlan={hasRecentPlan} />
+      <details className="project-panel">
+        <summary><strong>全书章节</strong><span>按篇查看正文、草稿和章节安排</span></summary>
+        <ChapterNavigator key={dashboard?.root} cards={dashboard?.chapter_outline?.state === "active" ? dashboard.chapter_outline.cards : chapterCards} files={chapterFiles} volume={volume} outline={dashboard?.chapter_outline} acceptedTotal={numberValue(chapterStatus.accepted)} onOpen={onOpen} onPrompt={onPrompt} hasRecentPlan={hasRecentPlan} />
+      </details>
 
-      <section className="project-section">
-        <div className="project-section-title"><div><h3>接下来可以做什么</h3><p>建议来自当前确定性状态，不会自动执行。</p></div></div>
+      <details className="project-panel">
+        <summary><strong>创作建议</strong><span>选择后放入对话框，由你发送</span></summary>
         <div className="suggestion-grid">
           {suggestions.map((item) => (
             <button key={item.prompt} className="suggestion-card" onClick={() => onPrompt(item.prompt)}>
@@ -455,13 +480,10 @@ export function ProjectCenter({
             </button>
           ))}
         </div>
-      </section>
+      </details>
 
-      <section className="project-section">
-        <div className="project-section-title">
-          <div><h3>任务记录</h3><p>先看结果和下一步；完整原因可展开。只对可安全重做的操作提供重试。</p></div>
-          <span>{tasks.length}</span>
-        </div>
+      <details id="project-task-records" className="project-panel" open={activeTasks.length > 0 || undefined}>
+        <summary><strong>任务记录</strong><span>{activeTasks.length ? `${activeTasks.length} 项正在运行` : "查看工作结果、断点和运行详情"}</span></summary>
         {tasks.length === 0 && <p className="empty-mini">还没有需要恢复的任务。</p>}
         <div className="task-list">
           {visibleTasks.map((task) => (
@@ -496,11 +518,12 @@ export function ProjectCenter({
         </div>
         {tasks.length > visibleTasks.length && <button className="task-history-toggle" onClick={() => setShowAllTasks(true)}>查看其余 {tasks.length - visibleTasks.length} 条历史记录</button>}
         {showAllTasks && tasks.length > 5 && <button className="task-history-toggle" onClick={() => setShowAllTasks(false)}>收起历史记录</button>}
-      </section>
+      </details>
 
-      <section className="project-section" id="project-checkpoints">
+      <details className="project-panel" id="project-checkpoints" open={!!pendingRecovery || !!preview || undefined}>
+        <summary><strong>回退与恢复</strong><span>{pendingRecovery ? "上一次回退尚未完成，需要处理" : "保存当前状态，或预览回到之前的版本"}</span></summary>
         <div className="project-section-title">
-          <div><h3>检查点与分支式回退</h3><p>先预览影响，再确认恢复；不会用删文件代替正史回退。</p></div>
+          <p>先预览影响，再确认回退。</p>
           <button disabled={working} onClick={() => void createCheckpoint()}>＋ 创建检查点</button>
         </div>
         {pendingRecovery && (
@@ -545,13 +568,16 @@ export function ProjectCenter({
             </article>
           ))}
         </div>
-      </section>
+      </details>
+      <details className="project-panel"><summary><strong>故事状态</strong><span>{dashboard?.status.open_threads || 0} 条开放线索 · 查看资料统计</span></summary><ProjectSnapshot
+        planned={legacyCardCount}
+        draft={numberValue(chapterStatus.draft)}
+        accepted={numberValue(chapterStatus.accepted)}
+        activeFacts={numberValue(dashboard?.status.active_facts)}
+        openThreads={numberValue(dashboard?.status.open_threads)}
+      /></details>
     </div>
   );
-}
-
-function Metric({ label, value }: { label: string; value: string }) {
-  return <article><span>{label}</span><strong>{value}</strong></article>;
 }
 
 function ProjectSnapshot({
@@ -608,6 +634,7 @@ function ProjectSnapshot({
   );
 }
 
+/** 显示各篇的规划与实际正文进度，连续续章计入所在篇的已写章节。 */
 function ChapterNavigator({
   cards,
   files,
@@ -654,7 +681,8 @@ function ChapterNavigator({
     ? [...new Set([...cardsByChapter.keys(), ...accepted, ...drafts.keys(), ...canon.keys()])]
       .filter((chapterNo) => Number.isInteger(chapterNo) && chapterNo > 0).sort((a, b) => a - b)
     : Array.from({ length: target }, (_, index) => start + index);
-  const volumes = outline?.state === "active" ? outline.volumes : [];
+  const plannedVolumes = outline?.state === "active" ? outline.volumes : [];
+  const volumes = chapterNavigationVolumes(plannedVolumes, files);
   const covered = (number: number) => volumes.some(item => number >= item.chapter_start && number <= item.chapter_end);
   const ungrouped = knownNumbers.filter(number => !covered(number));
   const groups = volumes.map(item => ({ key: `volume-${item.volume_no}`, title: `第 ${item.volume_no} 篇 · ${item.title.replace(/^第[一二三四五六七八九十百零〇两\d]+[卷篇部]\s*[·：:、-]?\s*/, "")}`,
@@ -667,12 +695,12 @@ function ChapterNavigator({
     if (!group) { group = { key, title: `第 ${first}～${first + 9} 章`, numbers: [], planned: false }; groups.push(group); }
     group.numbers.push(number);
   }
-  const total = groups.reduce((sum, group) => sum + group.numbers.length, 0);
+  const plannedTotal = plannedVolumes.reduce((sum, item) => sum + item.chapter_end - item.chapter_start + 1, 0);
   const current = Math.max(0, ...accepted);
   return (
     <section className="project-section chapter-navigator">
       <div className="project-section-title">
-        <div><h3>全书进度</h3><p>已完成 {Math.max(acceptedTotal, accepted.size)} 章{volumes.length ? ` · 全书规划 ${total} 章` : ""}{current ? ` · 最近完成第 ${current} 章` : ""}</p></div>
+        <div><h3>全书进度</h3><p>已完成 {Math.max(acceptedTotal, accepted.size)} 章{plannedVolumes.length ? ` · 全书规划 ${plannedTotal} 章` : ""}{current ? ` · 最近完成第 ${current} 章` : ""}</p></div>
         {!!expanded.length && <button className="text-button" onClick={() => setExpanded([])}>全部收起</button>}
       </div>
       {outline?.state === "needs_attention" && <p className="chapter-plan-note">规划有改动尚未核对，暂按已有章节分组；正文进度照常显示。</p>}
@@ -720,7 +748,24 @@ function numberValue(value: unknown): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed) : 0;
 }
 
-function projectSuggestions(dashboard: DashboardLike | null, documents: string[]) {
+// 只展示紧接连续正史、位于同一篇且有完整生效章节卡的范围；草稿与候选先走原断点。
+function plannedWritingRange(dashboard: DashboardLike | null): { start: number; end: number } | null {
+  const outline = dashboard?.chapter_outline;
+  const accepted = dashboard?.chapter_progress?.accepted_through;
+  if (outline?.state !== "active" || accepted === undefined || !Number.isInteger(accepted) || accepted < 0
+      || dashboard?.chapter_progress?.awaiting_review || dashboard?.quality_hold || dashboard?.pending_planning_publication) return null;
+  const start = accepted + 1;
+  const volume = outline.volumes.find(item => item.chapter_start <= start && start <= item.chapter_end);
+  if (!volume) return null;
+  const chapters = outline.cards.map(card => Number(card.chapter_no))
+    .filter(number => Number.isInteger(number) && number >= start && number <= volume.chapter_end).sort((a, b) => a - b);
+  if (!chapters.length || chapters.some((number, index) => number !== start + index)) return null;
+  return { start, end: chapters[chapters.length - 1] };
+}
+
+// 全书规划写完后将默认建议转为回看；作者仍可主动安排新内容。
+function projectSuggestions(dashboard: DashboardLike | null, documents: string[], outlineComplete: boolean) {
+  if (outlineComplete) return [{ title: "回看结尾", reason: "查看主线收束和仍有余味的线索。", prompt: "回看已经收进正史的结尾，看看主线和伏笔收得怎么样，先给我阅读意见。" }];
   const status = dashboard?.status.chapters || {};
   if (documents.includes("OUTLINE.md") && !documents.includes("STORY_DETAIL.md")) {
     return [{ title: "展开剧情细纲", reason: "大纲之后建议先理清因果；仍可按你的意愿直接写。", prompt: "大纲有了，接着帮我展开剧情细纲，写清楚人物为什么这样做、事情怎么发展和收尾，先不分章节。" }];

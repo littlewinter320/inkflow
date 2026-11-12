@@ -1,0 +1,31 @@
+/* 报告独立样式仅使用现有主题变量，避免覆盖编辑器、待答和其他分身正在维护的全局主题。 */
+.review-report { display: grid; gap: 16px; min-width: 0; margin-block: 18px; color: var(--text); }
+.review-report h3, .review-report p { margin: 0; }
+.review-report p { line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
+.review-report-overview, .review-report-section { min-width: 0; padding: 20px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
+.review-report header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.review-report header small, .review-report-score small { color: var(--muted); line-height: 1.7; }
+.review-report-state { flex-shrink: 0; border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px; font-size: 13px; }
+.review-report-state.passed { color: color-mix(in srgb, var(--accent-dim) 35%, var(--text)); background: var(--accent-soft); }
+.review-report-state.pending { color: color-mix(in srgb, var(--amber) 40%, var(--text)); background: color-mix(in srgb, var(--amber) 8%, var(--panel)); }
+.review-report-score { display: grid; gap: 5px; margin-top: 16px; padding: 14px 16px; border-radius: 10px; background: var(--panel-2); }
+.review-report-score strong { font-size: 18px; }
+.review-report .review-report-next { display: flex; align-items: baseline; gap: 12px; margin-top: 14px; }
+.review-report-next b { flex-shrink: 0; color: color-mix(in srgb, var(--accent-dim) 35%, var(--text)); font-size: 13px; }
+.review-report .review-report-notice { margin-top: 12px; color: color-mix(in srgb, var(--amber) 40%, var(--text)); }
+.review-report-item { margin-top: 10px; padding: 14px; border: 1px solid var(--line-soft); border-radius: 9px; background: var(--panel-2); }
+.review-report-item > p, .review-report-item > .review-report-quote { margin-top: 10px; }
+.review-report summary { cursor: pointer; line-height: 1.7; font-weight: 600; }
+.review-report summary > span { float: right; margin-left: 12px; color: var(--muted); font-size: 12px; font-weight: 400; }
+.review-report-checks { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 290px), 1fr)); gap: 10px; }
+.review-report-checks > .review-report-item { margin-top: 0; }
+.review-report-quote small { display: block; color: var(--muted); }
+.review-report blockquote { margin: 7px 0 0; padding: 10px 14px; border-left: 3px solid var(--accent-dim); background: var(--panel); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.9; }
+.review-report-full[open] > summary { margin-bottom: 14px; }
+.review-report-diagnostics { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 14px; color: var(--muted); }
+.review-report-diagnostics pre { max-height: 520px; overflow: auto; padding: 14px; border-radius: 8px; background: var(--panel-2); color: var(--text); font-size: 12px; line-height: 1.7; }
+.review-report-readable > section { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line-soft); }
+.review-report-readable h4 { margin: 0 0 10px; font-size: 15px; }
+.review-report-readable ul { margin: 10px 0; padding-left: 22px; line-height: 1.8; }
+.review-report-readable .review-report-quote { margin-block: 10px; }
+@media (max-width: 700px) { .review-report-overview, .review-report-section { padding: 14px; } .review-report .review-report-next { display: block; } .review-report-next b { margin-right: 10px; } }

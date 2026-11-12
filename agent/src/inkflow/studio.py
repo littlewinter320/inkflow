@@ -722,6 +722,8 @@ class StudioDatabase:
         novel_id: str,
         settings: Settings | Callable[[], Settings] | None = None,
         resume_run_id: str | None = None,
+        resume_batch_id: str | None = None,
+        interaction_run_id: str | None = None,
         workspace_root: str | Path | None = None,
         capture_source: str = "task_start",
         registered_now: bool = False,
@@ -737,7 +739,28 @@ class StudioDatabase:
             raise TaskSettingsError("任务运行编号不能为空。")
         if not isinstance(novel_id, str) or not novel_id.strip():
             raise TaskSettingsError("任务配置必须绑定当前小说身份。")
+        if resume_run_id and interaction_run_id:
+            raise TaskSettingsError("补充对话不能同时作为恢复任务启动。")
+        source_run_id = interaction_run_id or resume_run_id
         root = Path(workspace_root).resolve() if workspace_root is not None else self.path.resolve().parent.parent
+        batch_reference = None
+        if resume_batch_id is not None:
+            # 新补核运行关联原生产配置；原对话的路由配置及原运行记录保持独立。
+            if (not resume_run_id or interaction_run_id or not isinstance(resume_batch_id, str)
+                    or not re.fullmatch(r"batch-[A-Za-z0-9_-]{1,120}", resume_batch_id)):
+                raise TaskSettingsError("批次补核缺少有效的原运行与批次身份。")
+            path = (root / ".inkflow" / "batches" / f"{resume_batch_id}.json").resolve()
+            if not path.is_relative_to((root / ".inkflow").resolve()):
+                raise TaskSettingsError("批次配置来源越界，未恢复。")
+            try:
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                if saved["batch_id"] != resume_batch_id or saved["last_run_id"] != resume_run_id:
+                    raise ValueError("批次原运行不符")
+                batch_reference = saved["task_settings"]
+                if not isinstance(batch_reference, dict) or batch_reference.get("novel_id") != novel_id:
+                    raise ValueError("批次小说身份不符")
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                raise TaskSettingsError("原批次配置或运行绑定不可核对，未使用当前设置替换。") from exc
 
         def requested_mode_matches(scope: TaskSettingsScope) -> TaskSettingsScope:
             if collaboration_mode is not None and not scope.matches_collaboration_request(collaboration_mode):
@@ -754,10 +777,24 @@ class StudioDatabase:
                        WHERE link.run_id=?""", (run,),
                 ).fetchone()
 
+            def original_settings() -> sqlite3.Row | None:
+                """普通续接沿原运行；批次补核只接受逐字段匹配的既有生产快照。"""
+                if batch_reference is None:
+                    return linked(source_run_id)
+                row = connection.execute("SELECT * FROM task_settings_snapshots WHERE task_id=?",
+                    (batch_reference.get("task_id"),)).fetchone()
+                snapshot = self._task_settings_record(row, novel_id) if row else None
+                if snapshot is None:
+                    raise TaskSettingsError("批次原配置快照缺失，未创建替代快照。")
+                frozen = restore_task_settings(snapshot, novel_id=novel_id, workspace_root=root)
+                if adapt_task_reference(batch_reference) != frozen.public_summary():
+                    raise TaskSettingsError("批次引用与原生产配置不一致，未恢复。")
+                return row
+
             current = linked(run_id)
             if current is not None:
-                if resume_run_id:
-                    previous = linked(resume_run_id)
+                if source_run_id:
+                    previous = original_settings()
                     if previous is None or previous["task_id"] != current["task_id"]:
                         raise TaskSettingsError("此运行已经绑定其他任务配置，不能重新指定恢复来源。")
                 snapshot = self._task_settings_record(current, novel_id)
@@ -766,17 +803,28 @@ class StudioDatabase:
 
             source = "task_start"
             previous = None
-            if resume_run_id is not None:
-                if not isinstance(resume_run_id, str) or not resume_run_id.strip() or resume_run_id == run_id:
+            if source_run_id is not None:
+                if not isinstance(source_run_id, str) or not source_run_id.strip() or source_run_id == run_id:
                     raise TaskSettingsError("恢复任务必须使用有效的原运行编号和新的运行编号。")
                 original = connection.execute(
-                    "SELECT status FROM task_runs WHERE run_id=?", (resume_run_id,),
+                    "SELECT status,params_json FROM task_runs WHERE run_id=?", (source_run_id,),
                 ).fetchone()
                 if original is None:
                     raise TaskSettingsError("找不到要恢复的原运行，不能创建替代配置。")
-                if original["status"] not in {"failed", "cancelled", "interrupted", "waiting_condition", "waiting_user"}:
+                if interaction_run_id:
+                    current_run = connection.execute("SELECT method,params_json FROM task_runs WHERE run_id=?", (run_id,)).fetchone()
+                    params = json.loads(current_run["params_json"]) if current_run else {}
+                    parent_params = json.loads(original["params_json"])
+                    if (not registered_now or not current_run or current_run["method"] != "conversation.send"
+                            or params.get("running_run_id") != interaction_run_id
+                            or (params.get("conversation_id") or "main") != (parent_params.get("conversation_id") or "main")):
+                        raise TaskSettingsError("补充消息与原对话身份不一致，未重新启动任务。")
+                elif original["status"] not in {"failed", "cancelled", "interrupted", "waiting_condition", "waiting_user"}:
                     raise TaskSettingsError("原运行尚未停止或已完成，不能作为恢复任务重新启动。")
-                previous = linked(resume_run_id)
+                previous = original_settings()
+                # An interaction borrows the exact snapshot, even if its parent just finished; it never resumes production.
+                if interaction_run_id and previous is None:
+                    raise TaskSettingsError("原任务缺少配置快照，未用当前设置代替。")
                 if previous is None:
                     source = "legacy_recovery"
             else:
@@ -901,15 +949,20 @@ class StudioDatabase:
             return cursor.rowcount == 1
 
     def latest_task_run_for_settings(self, task_id: str) -> dict[str, Any] | None:
-        """Find the latest run linked to an immutable task-settings snapshot."""
+        """Find the latest production run; side replies must not become recovery targets."""
         with self.connect() as connection:
-            row = connection.execute(
-                """SELECT r.run_id FROM task_runs r
+            rows = connection.execute(
+                """SELECT r.run_id,r.params_json FROM task_runs r
                    JOIN task_run_settings link ON link.run_id=r.run_id
-                   WHERE link.task_id=? ORDER BY r.started_at DESC LIMIT 1""",
+                   WHERE link.task_id=? ORDER BY r.started_at DESC""",
                 (task_id,),
-            ).fetchone()
-        return self.get_task(str(row["run_id"])) if row else None
+            ).fetchall()
+        for row in rows:
+            params = json.loads(row["params_json"])
+            # 后台附件共用原任务账本，但不能成为正文继续入口或替换父任务的恢复目标。
+            if not params.get("running_run_id") and not params.get("_background") and params.get("work_id") is None:
+                return self.get_task(str(row["run_id"]))
+        return None
 
     def claim_batch_resume(self, batch_id: str, run_id: str) -> bool:
         """Allow one active run to resume a batch; terminal attempts may be superseded."""
@@ -960,12 +1013,37 @@ class StudioDatabase:
             connection.commit()
         return self.get_task(run_id)
 
-    def record_task_progress(self, run_id: str, event_type: str, summary: str) -> None:
+    def record_task_progress(self, run_id: str, event_type: str, summary: str, *, event: dict[str, Any] | None = None) -> None:
         """Keep only a short, public, durable activity trail for current work."""
         text = re.sub(r"\s+", " ", summary).strip()[:200]
         if not text:
             return
         with self.connect(timeout=0.2) as connection:
+            public = _public_process_event(event or {"type": event_type, "summary": text}, run_id)
+            if public is None:
+                return
+            if public is not None:
+                key = "run_public_process:" + run_id
+                row = connection.execute("SELECT value_json FROM studio_metadata WHERE key=?", (key,)).fetchone()
+                try:
+                    trail = json.loads(row["value_json"]) if row else []
+                    if not isinstance(trail, list):
+                        trail = []
+                except (TypeError, json.JSONDecodeError):
+                    trail = []
+                if public["type"] == "model.stream.progress":
+                    # Heartbeats update one entry per request/phase, even when
+                    # other roles interleave. No private reasoning is stored.
+                    identity = lambda item: (item.get("type"), item.get("role"), item.get("model"),
+                        tuple((item.get("metadata") or {}).get(name) for name in ("request_id", "attempt_id", "attempt", "phase")))
+                    trail = [item for item in trail if isinstance(item, dict) and identity(item) != identity(public)]
+                if not trail or any(trail[-1].get(name) != public.get(name) for name in ("type", "summary", "role", "stage")):
+                    trail.append(public)
+                else:
+                    trail[-1] = public
+                connection.execute("""INSERT INTO studio_metadata(key,value_json,updated_at) VALUES(?,?,?)
+                    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at""",
+                    (key, json_dumps(trail[-200:], indent=None), utc_now()))
             row = connection.execute(
                 "SELECT progress_json FROM task_presentation WHERE run_id=?", (run_id,),
             ).fetchone()
@@ -977,6 +1055,7 @@ class StudioDatabase:
             except (TypeError, json.JSONDecodeError):
                 steps = []
             if steps and steps[-1]["summary"] == text:
+                connection.commit()
                 return
             steps = [*steps, {"type": event_type[:80], "summary": text, "at": utc_now()}][-5:]
             connection.execute(
@@ -987,6 +1066,30 @@ class StudioDatabase:
                 (run_id, json_dumps(steps, indent=None), utc_now()),
             )
             connection.commit()
+
+    def task_public_process(self, run_id: str, *, conversation: str) -> dict[str, Any] | None:
+        task = self.get_task(run_id)
+        if (task["method"] not in {"conversation.send", "workflow.run", "document.revise_selection"}
+                or str(task["params"].get("conversation_id") or "main") != conversation):
+            return None
+        with self.connect() as connection:
+            row = connection.execute("SELECT value_json FROM studio_metadata WHERE key=?",
+                ("run_public_process:" + run_id,)).fetchone()
+        try:
+            events = json.loads(row["value_json"]) if row else []
+        except (TypeError, json.JSONDecodeError):
+            events = []
+        if not isinstance(events, list):
+            return None
+        steps = [value for event in events if isinstance(event, dict)
+                 and (value := _public_process_event(event, run_id)) is not None]
+        if not steps:
+            steps = [value for item in task.get("progress", [])
+                if (value := _public_process_event({"type": item["type"], "summary": item["summary"],
+                    "timestamp": item["at"]}, run_id)) is not None]
+        return {"runId": run_id, "startedAt": task["started_at"],
+                "finishedAt": None if task["status"] == "running" else task["updated_at"],
+                "status": task["status"], "steps": steps}
 
     def reconcile_interrupted_tasks(self, owner_id: str) -> int:
         """把已经退出的本地引擎遗留任务标记为中断。
@@ -1083,7 +1186,8 @@ class StudioDatabase:
             raise ProjectError(f"任务不存在：{run_id}")
         return self._task_row(row)
 
-    def list_tasks(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_tasks(self, limit: int = 50, *, method: str | None = None) -> list[dict[str, Any]]:
+        """读取任务回执，可按操作筛选独立后台工作。"""
         safe_limit = max(1, min(int(limit), 200))
         with self.connect() as connection:
             rows = connection.execute(
@@ -1092,8 +1196,9 @@ class StudioDatabase:
                    FROM task_runs r LEFT JOIN task_run_settings link ON link.run_id=r.run_id
                    LEFT JOIN task_settings_snapshots s ON s.task_id=link.task_id
                    LEFT JOIN task_presentation presentation ON presentation.run_id=r.run_id
-                   WHERE r.status<>'dismissed' ORDER BY r.updated_at DESC LIMIT ?""",
-                (safe_limit,),
+                   WHERE r.status<>'dismissed' AND (? IS NULL OR r.method=?)
+                   ORDER BY r.updated_at DESC LIMIT ?""",
+                (method, method, safe_limit),
             ).fetchall()
         return [self._task_row(row) for row in rows]
 
@@ -1195,6 +1300,44 @@ class StudioDatabase:
         }
 
 
+def _public_process_event(event: dict[str, Any], run_id: str) -> dict[str, Any] | None:
+    kind = str(event.get("type") or "")
+    stage = str(event.get("stage") or "")
+    if (event.get("run_id") not in (None, "", run_id)
+            or isinstance(event.get("metadata"), dict) and event["metadata"].get("internal") is True
+            or re.search(r"provider[_ .-]?reasoning|reasoning_content|thinking_content|raw_thought|chain[_ .-]?of[_ .-]?thought|\.(?:delta|token)$", kind + " " + stage, re.I)
+            or kind == "usage.updated" or not isinstance(event.get("summary"), str)):
+        return None
+    result = {key: str(event[key])[:500 if key == "summary" else 180]
+              for key in ("type", "stage", "status", "role", "model", "summary", "timestamp")
+              if isinstance(event.get(key), str)}
+    result.update(run_id=run_id, timestamp=result.get("timestamp") or utc_now())
+    if kind in {"controller.routed", "workflow.planned"}:
+        # Persist only the displayed plan, never the user's full ticket or private writing instructions.
+        ticket = event.get("task_ticket")
+        if isinstance(ticket, dict):
+            result["task_ticket"] = {key: value for key in ("chapter_no", "end_chapter_no")
+                                     if type(value := ticket.get(key)) is int and value > 0}
+        plan = event.get("dispatch_plan")
+        if isinstance(plan, dict) and isinstance(plan.get("steps"), list):
+            result["dispatch_plan"] = {"steps": [{key: step[key][:500] for key in ("role", "operation", "gate")
+                if isinstance(step.get(key), str)} for step in plan["steps"] if isinstance(step, dict)]}
+    metadata = event.get("metadata")
+    if isinstance(metadata, dict):
+        result["metadata"] = {key: value for key in
+            ("chapter_no", "batch_id", "request_id", "attempt_id", "attempt", "phase", "elapsed_ms", "idle_ms",
+             "event_count", "received_bytes", "content_chars", "reasoning_chars", "headers_ms",
+             "first_event_ms", "last_event_ms", "finish_reason", "tail_interrupted", "error_type",
+             "draft_effective_characters")
+            if isinstance((value := metadata.get(key)), (str, int, float, bool)) and len(str(value)) <= 180}
+        # 仅保留实测篇幅，重开对话也能说明交付缺口，不附带正文或推定合格结论。
+        if kind == "model.output.invalid" and isinstance(metadata.get("validation_errors"), list):
+            result["metadata"]["validation_errors"] = [
+                {key: item[key][:180] for key in ("location", "type") if isinstance(item.get(key), str)}
+                for item in metadata["validation_errors"][:8] if isinstance(item, dict)]
+    return result
+
+
 def _owner_process_alive(owner_id: str) -> bool | None:
     """尽力判断同一台电脑上的引擎进程是否仍在运行，不增加运行依赖。"""
 
@@ -1286,12 +1429,21 @@ class StudioService:
         except (ProjectError, ValidationGateError, OSError, ValueError):
             # Never show obsolete ranges as a current plan when source verification fails.
             chapter_outline["state"] = "needs_attention"
+        threads = self.project.db.open_threads()
+        from .story_promises import thread_catalog
+        catalog = thread_catalog(self.project, plan, include_plans=chapter_outline["state"] != "needs_attention")
+        status = {**self.project.db.project_status(), "open_threads": len(threads)}
+        status["chapters"] = {state: sum(chapter["status"] == state for chapter in chapters)
+                              for state in {chapter["status"] for chapter in chapters}}
         return {
             "project_id": self.project.project_id,
             "root": str(self.project.root),
             "recovery_warnings": self.project.recovery_warnings,
             "brief": brief.model_dump(mode="json"),
-            "status": self.project.db.project_status(),
+            "status": status,
+            "chapter_catalog": [{"id": chapter["path"], "relative_path": chapter["path"], "kind": "chapter",
+                "label": f"第 {chapter['chapter_no']} 章", "is_current": True,
+                **{key: chapter[key] for key in ("chapter_no", "status", "title", "version")}} for chapter in chapters],
             "current_plan": (
                 {
                     "volume": plan.current_volume.model_dump(mode="json"),
@@ -1301,7 +1453,8 @@ class StudioService:
                 else None
             ),
             "facts": self.project.db.current_facts(),
-            "threads": self.project.db.open_threads(),
+            "threads": threads,
+            "thread_catalog": catalog,
             "bible_entries": self.db.list_bible_entries(),
             "accepted_characters": total_characters,
             "chapter_outline": chapter_outline,
@@ -1351,7 +1504,9 @@ class StudioService:
                     path,
                     label=label,
                     kind="chapter",
-                    extra={"chapter_no": chapter_no, "status": (record or {}).get("status", "file")},
+                    extra={"chapter_no": chapter_no, "status": (record or {}).get("status", "file"),
+                           "title": (record or {}).get("title"), "version": (record or {}).get("version"),
+                           "is_current": bool(record and path == self.project.root / record["path"])},
                 )
             )
 

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { LocalWavRecorder, voiceInputFailure } from "./voiceRecording";
+import { voiceJobLabel } from "./BackgroundTasks";
 
 type Request = <T,>(method: string, params?: Record<string, unknown>) => Promise<T>;
 
@@ -23,9 +23,9 @@ export type VoiceSettings = {
   voice_output_device: string;
   voice_compute_device: "auto" | "cpu" | "cuda";
   voice_input_engine: "off" | "local" | "browser";
-  voice_dialogue_engine: "off" | "edge" | "moss";
-  voice_text_engine: "off" | "edge" | "moss";
-  voice_novel_engine: "off" | "edge" | "moss";
+  voice_dialogue_engine: "off" | "edge";
+  voice_text_engine: "off" | "edge";
+  voice_novel_engine: "off" | "edge";
   voice_light_asr_model: string;
   voice_light_tts_model: string;
   voice_sample_rate: number;
@@ -47,6 +47,8 @@ export type VoiceStatus = {
   edge?: {
     installed: boolean;
     connection_ready?: boolean;
+    service_status?: "unchecked" | "available" | "failed";
+    update_check_failed?: boolean;
     needs_update?: boolean;
     compatibility_message?: string;
     version?: string;
@@ -65,32 +67,15 @@ export type VoiceStatus = {
     downloaded_mb?: number;
     retryable?: boolean;
   };
-  moss?: {
-    package_installed: boolean;
-    dependencies_ready: boolean;
-    tts_ready: boolean;
-    models_ready: boolean;
-    model_root: string;
-    model_size_mb: number;
-    storage_size_mb?: number;
-    has_local_files?: boolean;
-    estimated_download_mb: number;
-    estimated_dependency_download_mb: number;
-    estimated_model_download_mb: number;
-    installing?: boolean;
-    python_available?: boolean;
-    last_error?: string;
-    install_status?: string;
-    install_stage?: string;
-    install_progress?: number;
-    install_summary?: string;
-    downloaded_mb?: number;
-    retryable?: boolean;
-    source?: string;
-  };
   asr?: {
     package_installed: boolean;
     asr_ready: boolean;
+    version?: string;
+    latest_version?: string;
+    update_available?: boolean;
+    update_check_failed?: boolean;
+    initialization_error?: string;
+    model_release?: string;
     model_root: string;
     model_size_mb: number;
     storage_size_mb?: number;
@@ -130,7 +115,7 @@ type VoiceSegment = {
   audio_path: string;
 };
 
-type VoiceJob = {
+export type VoiceJob = {
   job_id: string;
   engine?: "edge" | "moss";
   reused_existing?: boolean;
@@ -141,11 +126,27 @@ type VoiceJob = {
   completed_segments: number;
   total_segments: number;
   characters: number;
-  output_dir: string;
+  output_dir?: string;
   playlist_path?: string;
   error?: string;
   segments: VoiceSegment[];
+  created_at?: string;
+  deleted_at?: string;
+  audio_delete_available?: boolean;
+  audio_delete_block_reason?: string;
 };
+
+// 首段产出或任务结束时补读文件详情，普通进度轮询只同步元数据。
+export function voiceJobNeedsDetails(job: VoiceJob, update: Partial<VoiceJob>): boolean {
+  return (update.completed_segments || 0) > 0 && !job.segments.some(segment => segment.audio_path)
+    || update.status !== job.status && ["completed", "failed", "cancelled", "paused", "deleted"].includes(update.status || "");
+}
+
+// 同名转换仍有独立身份，用创建和删除时间区分；缺失时间保持未知，不补造先后。
+function voiceJobTime(value?: string): string {
+  const time = value ? new Date(value) : null;
+  return time && Number.isFinite(time.getTime()) ? time.toLocaleString("zh-CN", { hour12: false }) : "时间未记录";
+}
 
 type VoiceRoleMap = {
   narrator_profile_id: string;
@@ -153,11 +154,7 @@ type VoiceRoleMap = {
   updated_at: string;
 };
 
-type VoiceCloneReadingScript = {
-  reading_text: string;
-  coverage_summary: string[];
-};
-
+// Manage conversion and recording history without holding a writing task's project lock.
 export function VoiceCenter({
   projectRoot,
   source,
@@ -167,6 +164,7 @@ export function VoiceCenter({
   onNotice,
   onError,
   onPlay,
+  recordingBusy = false,
 }: {
   projectRoot: string;
   source: VoiceSource | null;
@@ -176,6 +174,7 @@ export function VoiceCenter({
   onNotice: (message: string) => void;
   onError: (message: string) => void;
   onPlay: (audioPath: string) => Promise<void>;
+  recordingBusy?: boolean;
 }) {
   const [profiles, setProfiles] = useState<VoiceProfile[]>([]);
   const [jobs, setJobs] = useState<VoiceJob[]>([]);
@@ -184,7 +183,14 @@ export function VoiceCenter({
   const [sourceText, setSourceText] = useState(source?.text || "");
   const [sourceType, setSourceType] = useState<VoiceSource["type"]>(source?.type || "text");
   const [working, setWorking] = useState(false);
-  const [showClone, setShowClone] = useState(false);
+  const [historyLimit, setHistoryLimit] = useState(10);
+  const [deletedLimit, setDeletedLimit] = useState(10);
+  const [deletingJobIds, setDeletingJobIds] = useState<string[]>([]);
+  const deletingJobIdsRef = useRef(new Set<string>());
+  // 删除回执保留但折叠展示，不能把原分段数重新画成未完成的转换进度。
+  const deletedJobs = jobs.filter(job => job.status === "deleted");
+  const historical = jobs.filter(job => ["completed", "cancelled"].includes(job.status));
+  const visibleJobs = [...jobs.filter(job => !["completed", "cancelled", "deleted"].includes(job.status)), ...historical.slice(0, historyLimit)];
 
   const load = useCallback(async () => {
     if (!projectRoot) return;
@@ -202,7 +208,28 @@ export function VoiceCenter({
     }
   }, [onError, projectRoot, request]);
 
-  useEffect(() => { void load(); }, [load, refreshKey]);
+  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    let disposed = false;
+    // Progress events update metadata, not the profiles, role map or full segment text.
+    const timer = window.setTimeout(() => {
+      void request<{ jobs: Partial<VoiceJob>[] }>("voice.background").then(async result => {
+        if (disposed) return;
+        if (result.jobs.some(job => !jobs.some(current => current.job_id === job.job_id))) { void load(); return; }
+        const missing = result.jobs.filter(update => {
+          const previous = jobs.find(job => job.job_id === update.job_id);
+          return previous && voiceJobNeedsDetails(previous, update);
+        });
+        const details = await Promise.allSettled(missing.map(job => request<VoiceJob>("voice.job.status", { job_id: job.job_id })));
+        if (disposed) return;
+        const completed = details.flatMap(value => value.status === "fulfilled" ? [value.value] : []);
+        setJobs(current => current.map(job => completed.find(detail => detail.job_id === job.job_id) || { ...job, ...result.jobs.find(update => update.job_id === job.job_id) }));
+      }).catch(cause => { if (!disposed) onError(cause instanceof Error ? cause.message : String(cause)); });
+    }, 600);
+    return () => { disposed = true; window.clearTimeout(timer); };
+    // A revision coalesces incoming progress; local job changes do not request another refresh.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey, projectRoot, request]);
   useEffect(() => { if (source) { setSourceText(source.text); setSourceType(source.type); } }, [source]);
 
   const roleNames = useMemo(
@@ -263,12 +290,35 @@ export function VoiceCenter({
     }
   };
 
+  // 同一条任务从确认开始就防止连点重入；这里只请求删除明确的副本，目录边界仍由后台复核。
+  const deleteAudio = async (job: VoiceJob) => {
+    if (deletingJobIdsRef.current.has(job.job_id)) return;
+    if (job.audio_delete_available === false) return onError(job.audio_delete_block_reason || "当前不能删除这项音频，请先核对任务状态和保存位置。");
+    deletingJobIdsRef.current.add(job.job_id);
+    setDeletingJobIds(current => [...current, job.job_id]);
+    try {
+      if (!await window.inkflow.confirm(`删除“${job.source_name}”的转换音频和转换用文字副本？小说原文不受影响。会保留一条删除记录；已导出的副本不会删除。`)) return;
+      const updated = await request<VoiceJob>("voice.job.delete", { job_id: job.job_id, confirmation: "delete_voice_job" });
+      setJobs(current => current.map(item => item.job_id === updated.job_id ? updated : item));
+      onNotice("本任务的音频副本已删除，删除记录已保留。");
+    } catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
+    finally {
+      deletingJobIdsRef.current.delete(job.job_id);
+      setDeletingJobIds(current => current.filter(id => id !== job.job_id));
+    }
+  };
+
   if (!projectRoot) return <section className="empty"><h2>听读中心</h2><p>先打开一本小说，再选择正文、草稿或文字开始转换。</p></section>;
+
+  const onlineProfiles = profiles.filter((profile) => profile.kind === "builtin");
+  const voiceOptions = (selected: string) => <>
+    {!onlineProfiles.some((profile) => profile.profile_id === selected) && <option value={selected} disabled>请选择微软预设声音</option>}
+    {onlineProfiles.map((profile) => <option value={profile.profile_id} key={profile.profile_id}>{profile.name}</option>)}
+  </>;
 
   return <section className="voice-center">
     <header className="panel-heading voice-heading">
-      <div><p className="eyebrow">语音听读</p><h2>听读中心</h2><p>按语音设置选择在线或本地组件；这里的转换任务在后台继续运行。</p></div>
-      <button onClick={() => setShowClone(true)}>＋ 克隆我的声音</button>
+      <div><p className="eyebrow">语音听读</p><h2>听读中心</h2><p>使用微软在线语音转换正文、草稿和文本。</p></div>
     </header>
 
     <div className="voice-grid">
@@ -280,10 +330,10 @@ export function VoiceCenter({
 
       <article className="voice-card">
         <div className="voice-card-title"><strong>2. 分配声音</strong><span>{roleNames.length} 个角色</span></div>
-        <label className="voice-role-row"><span>旁白</span><select value={roles.narrator_profile_id} onChange={(event) => setRoles({ ...roles, narrator_profile_id: event.target.value })}>{profiles.map((profile) => <option value={profile.profile_id} key={profile.profile_id}>{profile.name}</option>)}</select></label>
+        <label className="voice-role-row"><span>旁白</span><select value={roles.narrator_profile_id} onChange={(event) => setRoles({ ...roles, narrator_profile_id: event.target.value })}>{voiceOptions(roles.narrator_profile_id)}</select></label>
         <div className="voice-role-list">
           {roleNames.length === 0 && <p className="muted">分析正文后，这里会列出可能的说话角色。无法判断时会使用旁白声音。</p>}
-          {roleNames.map((name) => <label className="voice-role-row" key={name}><span>{name}</span><select value={roles.characters[name] || roles.narrator_profile_id} onChange={(event) => setRoles({ ...roles, characters: { ...roles.characters, [name]: event.target.value } })}>{profiles.map((profile) => <option value={profile.profile_id} key={profile.profile_id}>{profile.name}</option>)}</select></label>)}
+          {roleNames.map((name) => <label className="voice-role-row" key={name}><span>{name}</span><select value={roles.characters[name] || roles.narrator_profile_id} onChange={(event) => setRoles({ ...roles, characters: { ...roles.characters, [name]: event.target.value } })}>{voiceOptions(roles.characters[name] || roles.narrator_profile_id)}</select></label>)}
         </div>
         <button onClick={() => void saveRoles()}>保存角色分配</button>
       </article>
@@ -291,126 +341,85 @@ export function VoiceCenter({
 
     <section className="voice-section">
       <div className="voice-card-title"><strong>声音库</strong><span>{profiles.length} 个</span></div>
-      <div className="voice-profile-grid">{profiles.map((profile) => <article className="voice-profile" key={profile.profile_id}><span>{profile.gender === "male" ? "男声" : profile.gender === "female" ? "女声" : "自定义"}</span><strong>{profile.name}</strong><p>{profile.description}</p></article>)}</div>
+      <div className="voice-profile-grid">{profiles.map((profile) => <article className="voice-profile" key={profile.profile_id}><span>{profile.gender === "male" ? "男声" : profile.gender === "female" ? "女声" : "自定义"}</span><strong>{profile.name}</strong><p>{profile.kind === "clone" ? "历史声音档案" : profile.description}</p></article>)}</div>
     </section>
 
     <section className="voice-section">
-      <div className="voice-card-title"><strong>后台任务</strong><button onClick={() => void load()}>刷新</button></div>
+      <div className="voice-card-title"><strong>转换记录与音频</strong><button onClick={() => void load()}>刷新</button></div>
+      <p className="muted">切换页面不影响转换。首页“后台任务”可查看进度；暂停与失败任务会保留已完成片段。</p>
       <div className="voice-job-list">
-        {jobs.length === 0 && <p className="muted">还没有转换任务。</p>}
-        {jobs.map((job) => {
+        {visibleJobs.length === 0 && <p className="muted">{deletedJobs.length ? "当前没有待转换任务或保留的听读音频，删除记录在下方查看。" : "还没有转换任务。"}</p>}
+        {visibleJobs.map((job) => {
           const playable = job.segments.find((segment) => segment.audio_path);
-          return <article className="voice-job" key={job.job_id}><div><strong>{job.source_name}</strong><span>{job.engine === "edge" ? "Edge 在线" : job.engine === "moss" ? "本地 MOSS" : "旧任务"} · {job.status} · {job.completed_segments}/{job.total_segments}</span></div><div className="voice-progress"><i style={{ width: `${job.progress}%` }} /></div>{job.error && <p className="error-copy">{job.error}</p>}<div className="voice-actions">{playable && <button onClick={() => void onPlay(playable.audio_path)}>试听已完成片段</button>}{job.playlist_path && job.completed_segments > 0 && <button onClick={() => void window.inkflow.openPath(job.playlist_path!)}>连续播放</button>}<button onClick={() => void window.inkflow.openPath(job.output_dir)}>查看已保存音频</button>{["queued", "running"].includes(job.status) && <button onClick={() => void jobAction(job, "pause")}>暂停</button>}{["paused", "interrupted", "failed"].includes(job.status) && <button onClick={() => void jobAction(job, "resume")}>继续</button>}{!["completed", "cancelled"].includes(job.status) && <button className="danger" onClick={() => void jobAction(job, "cancel")}>取消</button>}</div></article>;
+          const deletableState = ["completed", "cancelled", "failed", "interrupted", "paused"].includes(job.status);
+          const deleting = deletingJobIds.includes(job.job_id);
+          return <article className={`voice-job status-${job.status}`} key={job.job_id}>
+            <div><strong>{job.source_name}</strong><span>{job.engine === "edge" ? "Edge 在线" : job.engine === "moss" ? "本地 MOSS" : "旧任务"} · {voiceJobLabel(job.status)} · {job.completed_segments}/{job.total_segments} 段</span></div>
+            <p className="muted">创建于 {voiceJobTime(job.created_at)}</p>
+            <div className="voice-progress"><i style={{ width: `${Math.max(0, Math.min(100, job.progress))}%` }} /></div>
+            {job.error && <p className="error-copy">{job.error}</p>}
+            <div className="voice-actions">
+              {playable && <button onClick={() => void onPlay(playable.audio_path)}>试听已完成片段</button>}
+              {job.playlist_path && job.completed_segments > 0 && <button onClick={() => void window.inkflow.openPath(job.playlist_path!)}>连续播放</button>}
+              {job.output_dir && job.status !== "deleted" && <button onClick={() => void window.inkflow.openPath(job.output_dir!)}>查看已保存音频</button>}
+              {["queued", "running"].includes(job.status) && <button onClick={() => void jobAction(job, "pause")}>暂停</button>}
+              {job.engine === "edge" && ["paused", "interrupted", "failed"].includes(job.status) && <button onClick={() => void jobAction(job, "resume")}>继续</button>}
+              {!["completed", "cancelled", "deleted"].includes(job.status) && <button onClick={() => void jobAction(job, "cancel")}>取消任务</button>}
+              {deletableState && <button className="danger" disabled={deleting || job.audio_delete_available === false} title={job.audio_delete_block_reason} onClick={() => void deleteAudio(job)}>{deleting ? "正在处理…" : "删除音频"}</button>}
+            </div>
+            {deletableState && job.audio_delete_available === false && job.audio_delete_block_reason && <p className="muted">{job.audio_delete_block_reason}</p>}
+          </article>;
         })}
+        {historical.length > historyLimit && <button onClick={() => setHistoryLimit(value => value + 10)}>显示更多历史记录 · 还有 {historical.length - historyLimit} 条</button>}
       </div>
+      {deletedJobs.length > 0 && <details className="voice-section"><summary>已删除音频记录 · {deletedJobs.length} 条</summary>
+        <p className="muted">这里只保留删除记录，不会继续转换。同名记录用创建时间区分。</p>
+        <div className="voice-job-list">{deletedJobs.slice(0, deletedLimit).map(job => <article className="voice-job status-deleted" key={job.job_id}>
+          <div><strong>{job.source_name}</strong><span>{voiceJobLabel(job.status)} · 原 {job.total_segments} 段</span></div>
+          <p className="muted">创建于 {voiceJobTime(job.created_at)} · 删除于 {voiceJobTime(job.deleted_at)}</p>
+        </article>)}</div>
+        {deletedJobs.length > deletedLimit && <button onClick={() => setDeletedLimit(value => value + 10)}>显示更多删除记录 · 还有 {deletedJobs.length - deletedLimit} 条</button>}
+      </details>}
     </section>
 
-    {showClone && <VoiceCloneDialog projectRoot={projectRoot} request={request} onClose={() => setShowClone(false)} onCreated={() => { setShowClone(false); void load(); }} onNotice={onNotice} onError={onError} />}
+    <VoiceRecordingLibrary revision={refreshKey} busy={recordingBusy} onPlay={onPlay} onNotice={onNotice} onError={onError} />
   </section>;
 }
 
-function VoiceCloneDialog({ projectRoot, request, onClose, onCreated, onNotice, onError }: { projectRoot: string; request: Request; onClose: () => void; onCreated: () => void; onNotice: (message: string) => void; onError: (message: string) => void }) {
-  const [audioPath, setAudioPath] = useState("");
-  const [name, setName] = useState("我的声音");
-  const [gender, setGender] = useState("other");
-  const [referenceText, setReferenceText] = useState("");
-  const [instruction, setInstruction] = useState("自然普通话，保留原声线。");
-  const [speed, setSpeed] = useState(1);
-  const [volume, setVolume] = useState(1);
-  const [consent, setConsent] = useState(false);
-  const [recording, setRecording] = useState(false);
-  const [working, setWorking] = useState(false);
-  const [scriptWorking, setScriptWorking] = useState(false);
-  const [scriptInfo, setScriptInfo] = useState<VoiceCloneReadingScript | null>(null);
-  const recorderRef = useRef<LocalWavRecorder | null>(null);
-  useEffect(() => () => { if (recorderRef.current) void recorderRef.current.stop(); }, []);
-
-  const finishRecording = useCallback(async () => {
-    const recorder = recorderRef.current;
-    if (!recorder) return;
-    recorderRef.current = null;
-    setRecording(false);
-    try {
-      const bytes = await recorder.stop();
-      if (!bytes.length) throw new Error("录音内容为空，请重新录制。");
-      setAudioPath(await window.inkflow.saveVoiceRecording(bytes, "wav"));
-    } catch (cause) {
-      onError(cause instanceof Error ? cause.message : String(cause));
-    }
+// Keep microphone recordings and transcripts local, with recoverable, explicitly confirmed deletion.
+function VoiceRecordingLibrary({ revision, busy, onPlay, onNotice, onError }: { revision: number; busy: boolean; onPlay: (path: string) => Promise<void>; onNotice: (value: string) => void; onError: (value: string) => void }) {
+  const [records, setRecords] = useState<VoiceRecordingEntry[]>([]);
+  const [directory, setDirectory] = useState("");
+  const [removing, setRemoving] = useState("");
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
+  const refresh = useCallback(async () => {
+    try { const value = await window.inkflow.listVoiceRecordings(); setRecords(value.recordings); setDirectory(value.directory); }
+    catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
   }, [onError]);
-
-  useEffect(() => {
-    if (!recording) return;
-    const timer = window.setTimeout(() => {
-      void finishRecording();
-      onNotice("已达到两分钟，录音已自动停止。请核对文字是否与实际录音一致。");
-    }, 120_000);
-    return () => window.clearTimeout(timer);
-  }, [recording, finishRecording, onNotice]);
-
-  const choose = async () => {
-    const selected = await window.inkflow.chooseAudio("选择用于克隆的普通话参考语音");
-    if (selected) setAudioPath(selected);
+  useEffect(() => { const timer = window.setTimeout(() => void refresh(), 500); return () => window.clearTimeout(timer); }, [revision, refresh]);
+  // The native bridge validates ownership again; a filename from the renderer is not authority.
+  const remove = async (entry: VoiceRecordingEntry) => {
+    if (busy || !await window.inkflow.confirm(`将这段录音及其转写记录移入系统回收站？\n${new Date(entry.createdAt).toLocaleString()}`)) return;
+    setRemoving(entry.path);
+    try { await window.inkflow.deleteVoiceRecording(entry.path); await refresh(); onNotice("录音和转写记录已移入回收站，需要时可从系统回收站恢复。"); }
+    catch (cause) { onError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setRemoving(""); }
   };
-
-  const toggleRecording = async () => {
-    if (recording) {
-      await finishRecording();
-      return;
-    }
-    try {
-      const settings = await request<VoiceSettings>("voice.settings.get");
-      recorderRef.current = await LocalWavRecorder.start(settings.voice_input_device, 120);
-      setAudioPath("");
-      setRecording(true);
-    } catch (cause) {
-      onError(voiceInputFailure(cause));
-    }
-  };
-
-  const create = async () => {
-    if (!audioPath) return onError("请先上传或录制一段清晰普通话。");
-    setWorking(true);
-    try {
-      await request("voice.profile.clone", { audio_path: audioPath, name, gender, reference_text: referenceText, instruction, speed, volume, consent_confirmed: consent });
-      onNotice("自定义声音已保存在本机。参考音频不会上传，也不会写入小说项目。 ");
-      onCreated();
-    } catch (cause) {
-      onError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setWorking(false);
-    }
-  };
-
-  const generateReadingScript = async () => {
-    setScriptWorking(true);
-    try {
-      const script = await request<VoiceCloneReadingScript>("voice.clone_script.generate", { project_root: projectRoot });
-      setReferenceText(script.reading_text);
-      setAudioPath("");
-      setScriptInfo(script);
-      onNotice("Writer 已生成朗读稿。请照读后录音；文字可以在下方按实际录音调整。");
-    } catch (cause) {
-      onError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setScriptWorking(false);
-    }
-  };
-
-  return <div className="modal-backdrop"><section className="modal voice-clone-dialog" role="dialog" aria-modal="true">
-    <button className="modal-close" onClick={onClose}>×</button>
-    <p className="eyebrow">只保存在本机</p><h2>克隆我的声音</h2>
-    <p className="modal-subtitle">先准备朗读文字，再单独录音。两个步骤各自检查自己的限制。</p>
-    <section className="voice-clone-script"><strong>一、Writer 朗读稿</strong><p>只负责生成自然普通话材料，限制为 180～400 字；不会控制或判断录音时长。</p><div className="voice-actions"><button type="button" disabled={scriptWorking || recording || working} onClick={() => void generateReadingScript()}>{scriptWorking ? "Writer 正在生成…" : "让 Writer 生成朗读稿"}</button><small>点击将调用当前 Writer 模型，可能产生少量费用。</small></div></section>
-    {scriptInfo && <p className="form-hint">发音覆盖：{scriptInfo.coverage_summary.join("；")}。</p>}
-    <label>照读文字 / 录音原文 <small>{referenceText.length}/400 字</small><textarea maxLength={400} value={referenceText} disabled={recording || scriptWorking} onChange={(event) => { setReferenceText(event.target.value); setScriptInfo(null); }} placeholder="可以让 Writer 先生成朗读稿，也可以填写已有录音的准确原文；留空时使用本地识别。" /></label>
-    <section className="voice-clone-recording"><strong>二、参考录音</strong><p>只负责采集声音，限制为 3～120 秒；达到 120 秒自动停止。请在安静环境用平常声音朗读，并确保录音与上方文字一致。</p><div className="clone-source"><button disabled={recording || working} onClick={() => void choose()}>上传语音</button><button disabled={working || scriptWorking} className={recording ? "recording" : ""} onClick={() => void toggleRecording()}>{recording ? "■ 停止录音" : "● 照稿录音"}</button><span>{audioPath || "尚未选择录音"}</span></div></section>
-    <p className="form-hint">重写朗读稿后需要重新录音。声音克隆需在语音设置中选用本地 MOSS；Edge 在线朗读只使用预设声音。</p>
-    <label>声音名称<input value={name} onChange={(event) => setName(event.target.value)} /></label>
-    <label>声音类型<select value={gender} onChange={(event) => setGender(event.target.value)}><option value="female">女声</option><option value="male">男声</option><option value="other">其他 / 不指定</option></select></label>
-    <label>朗读要求<input value={instruction} onChange={(event) => setInstruction(event.target.value)} /></label>
-    <div className="clone-sliders"><label>语速 <output>{speed.toFixed(2)}</output><input type="range" min="0.75" max="1.35" step="0.05" value={speed} onChange={(event) => setSpeed(Number(event.target.value))} /></label><label>音量 <output>{volume.toFixed(2)}</output><input type="range" min="0.25" max="1.5" step="0.05" value={volume} onChange={(event) => setVolume(Number(event.target.value))} /></label></div>
-    <label className="consent-row"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} /><span>我拥有这段声音的使用权，并已获得克隆与本地使用所需的同意。</span></label>
-    <div className="dialog-actions"><button onClick={onClose}>取消</button><button className="primary" disabled={working || recording || scriptWorking || !audioPath || !consent} onClick={() => void create()}>{working ? "正在创建…" : "创建本地声音"}</button></div>
-  </section></div>;
+  const filtered = records.filter(entry => `${entry.name} ${entry.transcript} ${new Date(entry.createdAt).toLocaleDateString()}`.toLowerCase().includes(search.toLowerCase()));
+  return <section className="voice-section voice-recording-library">
+    <div className="voice-card-title"><strong>录音与转写记录</strong><span>{records.length} 条 · {(records.reduce((sum, entry) => sum + entry.bytes, 0) / 1024 / 1024).toFixed(1)} MB</span><button onClick={() => void refresh()}>刷新</button></div>
+    <p className="muted">本机录音单独保存在语音目录中，不写入小说正史。在线浏览器听写没有本地录音文件。</p>
+    <input aria-label="搜索录音记录" placeholder="搜索转写内容或日期" value={search} onChange={event => { setSearch(event.target.value); setPage(1); }} />
+    {!filtered.length && <p className="muted">{search ? "没有匹配的录音。" : "完成本地录音后，这里会保留音频；识别成功后同时保存转写。"}</p>}
+    {filtered.slice(0, page * 15).map(entry => <article className="voice-recording-row" key={entry.path}>
+      <div><strong>{new Date(entry.createdAt).toLocaleString()}</strong><small>{(entry.bytes / 1024 / 1024).toFixed(2)} MB</small></div>
+      {entry.transcript ? <details><summary>{entry.transcript.slice(0, 75)}{entry.transcript.length > 75 ? "…" : ""}</summary><p>{entry.transcript}</p><button onClick={() => { void navigator.clipboard.writeText(entry.transcript).then(() => onNotice("转写已复制。"), cause => onError(String(cause))); }}>复制文字</button></details> : <p className="muted">录音已保存，暂无转写文字。</p>}
+      <div className="voice-actions"><button onClick={() => void onPlay(entry.path)}>播放录音</button><button onClick={() => void window.inkflow.showItem(entry.path)}>查看文件</button><button className="danger" disabled={busy || Boolean(removing)} onClick={() => void remove(entry)}>{removing === entry.path ? "正在移入回收站…" : "删除录音"}</button></div>
+    </article>)}
+    {filtered.length > page * 15 && <button onClick={() => setPage(value => value + 1)}>显示更多记录</button>}
+    {directory && records.length > 0 && <button className="text-button" onClick={() => void window.inkflow.openPath(directory)}>打开录音保存位置</button>}
+  </section>;
 }
+
+// Create a local voice profile with an explicit recording and consent choice.

@@ -1,9 +1,10 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, Notification, screen, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, Notification, screen, shell } from "electron";
 import { AppUpdater, NsisUpdater, autoUpdater } from "electron-updater";
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import * as asyncFs from "node:fs/promises";
 import readline from "node:readline";
 
 const isDevelopment = !app.isPackaged || Boolean(process.env.VITE_DEV_SERVER_URL
@@ -51,8 +52,33 @@ type UpdateState = {
   source: "none" | "embedded" | "github" | "environment";
 };
 
-function redactEngineDiagnostics(value: string): string {
-  return value
+function redactEngineDiagnostics(value: unknown): string {
+  // 引擎的校验诊断是{type,loc,msg}数组，其他错误也可能只返回文本；不能只用TS断言当运行时校验。
+  // 只读取明确的诊断字段，不序列化整个对象，避免把input、上下文、书稿或密钥附带写进日志。
+  const diagnosticText = (item: unknown, depth = 0): string => {
+    if (typeof item === "string") return item;
+    if (typeof item === "number" && Number.isFinite(item)) return String(item);
+    if (typeof item === "boolean") return item ? "true" : "false";
+    if (item == null) return "";
+    if (depth >= 3) return "（更深层诊断请查看任务记录）";
+    if (Array.isArray(item)) {
+      const parts = item.slice(0, 20).map(entry => diagnosticText(entry, depth + 1)).filter(Boolean);
+      if (item.length > 20) parts.push(`另有 ${item.length - 20} 项诊断，请查看任务记录。`);
+      return parts.join("\n");
+    }
+    if (typeof item === "object") {
+      const detail = item as Record<string, unknown>;
+      const message = typeof detail.msg === "string" ? detail.msg : typeof detail.message === "string" ? detail.message : "";
+      const kind = typeof detail.type === "string" ? detail.type : "";
+      const location = Array.isArray(detail.loc) ? detail.loc
+        .filter(part => typeof part === "string" || (typeof part === "number" && Number.isFinite(part)))
+        .join(".") : typeof detail.loc === "string" ? detail.loc : "";
+      return [location, kind, message].filter(Boolean).join("：") || "（诊断格式暂不能展开，请查看任务记录）";
+    }
+    return "（诊断格式暂不能展开，请查看任务记录）";
+  };
+  // 先提取允许的文本，再脱敏和限长；数组、Error和未知对象都不能绕过密钥隐藏。
+  return diagnosticText(value)
     .replace(/(bearer\s+|api[_ -]?key\s*[:=]\s*)[^\s,;]+/gi, "$1[已隐藏]")
     .replace(/sk-[A-Za-z0-9_-]{8,}/g, "[已隐藏密钥]")
     .slice(-1_200);
@@ -102,6 +128,122 @@ function saveRecentProjects(items: RecentProject[]): RecentProject[] {
 
 function sameProjectRoot(left: string, right: string): boolean {
   return path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase();
+}
+
+function workspaceViewsFile(): string {
+  return path.join(app.getPath("userData"), "workspace-views.json");
+}
+
+function workspaceViews(): Array<Record<string, unknown>> {
+  try {
+    const saved: unknown = JSON.parse(readFileSync(workspaceViewsFile(), "utf8"));
+    if (!Array.isArray(saved) || saved.some(item => !item || typeof item.projectRoot !== "string" || !path.isAbsolute(item.projectRoot))) {
+      throw new Error("上次界面记录格式异常，原文件已保留，未重置或覆盖。");
+    }
+    return saved;
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw cause;
+  }
+}
+
+let lastWorkspaceView = "";
+const deletedConversationViews = new Set<string>();
+/** 仅在本进程阻止已授权删除的旧页卸载写回；重开后的目录身份由共享服务核对。 */
+const conversationViewKey = (root: string, identity: string) => `${path.resolve(root).toLowerCase()}\n${identity}`;
+/** 所有界面记录共用原子写入，删除和普通保存不维护第二份草稿文件。 */
+function writeWorkspaceViews(views: Array<Record<string, unknown>>): void {
+  const file = workspaceViewsFile();
+  mkdirSync(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  try { writeFileSync(temporary, JSON.stringify(views), "utf8"); renameSync(temporary, file); }
+  finally { if (existsSync(temporary)) unlinkSync(temporary); }
+}
+function saveWorkspaceView(value: unknown): void {
+  if (!value || typeof value !== "object") return;
+  const view = value as Record<string, unknown>;
+  if (typeof view.projectRoot !== "string" || !path.isAbsolute(view.projectRoot)) return;
+  const serialized = JSON.stringify(view);
+  if (serialized === lastWorkspaceView) return;
+  // 旧记录没有conversationId时归入原聊天；各聊天的输入、队列和未保存正文候选独立保留。
+  const identity = typeof view.conversationId === "string" ? view.conversationId : "main";
+  if (!/^[A-Za-z0-9_-]{1,80}$/.test(identity)) throw new Error("聊天界面身份无效，原记录未覆盖。");
+  if (deletedConversationViews.has(conversationViewKey(view.projectRoot, identity))) return;
+  const views = [{ ...view, conversationId: identity }, ...workspaceViews().filter(item =>
+    !sameProjectRoot(String(item.projectRoot), view.projectRoot as string) || (item.conversationId || "main") !== identity)];
+  writeWorkspaceViews(views);
+  lastWorkspaceView = serialized;
+}
+
+type Appearance = {
+  theme: "dark" | "light" | "system";
+  accent: "lime" | "jade" | "blue" | "violet" | "amber" | "rose";
+  density: "comfortable" | "compact";
+  graphNodeLimit?: number | null;
+  prefillEnabled?: boolean;
+  prefillDelayMs?: number;
+  prefillLength?: "short" | "medium" | "long";
+  suggestedPromptsEnabled?: boolean;
+  suggestionShortcutEnabled?: boolean;
+  suggestionShortcut?: string;
+};
+
+// 只接受界面偏好白名单。旧记录缺少的字段保留为缺失，以便从旧工作台记录恢复。
+function checkedAppearance(value: unknown): Appearance | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const saved = value as Record<string, unknown>;
+  if (typeof saved.theme !== "string" || !["dark", "light", "system"].includes(saved.theme)
+    || typeof saved.accent !== "string" || !["lime", "jade", "blue", "violet", "amber", "rose"].includes(saved.accent)
+    || typeof saved.density !== "string" || !["comfortable", "compact"].includes(saved.density)) return null;
+  const limit = saved.graphNodeLimit;
+  const preferences: Appearance = { theme: saved.theme as Appearance["theme"], accent: saved.accent as Appearance["accent"], density: saved.density as Appearance["density"],
+    ...(limit === null || (typeof limit === "number" && Number.isSafeInteger(limit) && limit > 0) ? { graphNodeLimit: limit } : {}) };
+  for (const key of ["prefillEnabled", "suggestedPromptsEnabled", "suggestionShortcutEnabled"] as const) {
+    if (typeof saved[key] === "boolean") preferences[key] = saved[key];
+  }
+  if (typeof saved.prefillDelayMs === "number" && Number.isInteger(saved.prefillDelayMs)
+    && saved.prefillDelayMs >= 300 && saved.prefillDelayMs <= 3000) preferences.prefillDelayMs = saved.prefillDelayMs;
+  if (saved.prefillLength === "short" || saved.prefillLength === "medium" || saved.prefillLength === "long") preferences.prefillLength = saved.prefillLength;
+  if (typeof saved.suggestionShortcut === "string" && saved.suggestionShortcut.length <= 80) preferences.suggestionShortcut = saved.suggestionShortcut;
+  return preferences;
+}
+
+// 外观跟随桌面应用保存，避免开发端口改变后首页读不到原来的白色主题。
+function appearanceFile(): string {
+  return path.join(app.getPath("userData"), "appearance.json");
+}
+
+// 旧版原生文件只存了部分字段，升级时借用最近一次工作台快照补齐。
+function readAppearance(): Appearance | null {
+  let saved: Appearance | null = null;
+  try {
+    saved = checkedAppearance(JSON.parse(readFileSync(appearanceFile(), "utf8")));
+    if (!saved) throw new Error("外观记录格式异常");
+    if (saved.graphNodeLimit !== undefined && saved.prefillEnabled !== undefined && saved.prefillDelayMs !== undefined
+      && saved.prefillLength !== undefined && saved.suggestedPromptsEnabled !== undefined
+      && saved.suggestionShortcutEnabled !== undefined && saved.suggestionShortcut !== undefined) return saved;
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code !== "ENOENT") logLifecycle("appearance.read.failed");
+  }
+  try {
+    const legacy = checkedAppearance(workspaceViews()[0]?.uiPreferences);
+    return saved && legacy ? { ...legacy, ...saved } : saved || legacy;
+  } catch { logLifecycle("appearance.legacy.read.failed"); return saved; }
+}
+
+// 先写完整临时文件再替换；保存失败保留旧设置。
+function saveAppearance(value: unknown): void {
+  const saved = checkedAppearance(value);
+  if (!saved) throw new Error("外观设置无效，请重新选择主题、配色和显示密度。");
+  const file = appearanceFile();
+  mkdirSync(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, JSON.stringify(saved), "utf8");
+    renameSync(temporary, file);
+  } finally { if (existsSync(temporary)) unlinkSync(temporary); }
+  // 原生菜单/下拉弹层也要跟随应用主题，不能只改网页CSS后仍沿用系统黑色主题。
+  nativeTheme.themeSource = saved.theme;
 }
 
 function rememberRecentProject(rootValue: string, titleValue: string): RecentProject[] {
@@ -207,6 +349,7 @@ class UpdateManager {
 class EngineBridge {
   private process: ChildProcessWithoutNullStreams | null = null;
   private pending = new Map<string, Pending>();
+  private backgroundRuns = new Map<string, Pick<Pending, "child" | "conversationId" | "settled" | "markSettled">>();
   private compatibilityCheck: Promise<void> | null = null;
   private shuttingDown = false;
   private shutdownPromise: Promise<void> | null = null;
@@ -229,7 +372,7 @@ class EngineBridge {
     this.process = child;
     child.stdin.on("error", (cause) => this.failChild(child, new Error(`墨流本地引擎通信中断：${cause.message}`)));
     const lines = readline.createInterface({ input: child.stdout });
-    lines.on("line", (line) => this.receive(line));
+    lines.on("line", (line) => this.receive(line, child));
     let stderrTail = "";
     child.stderr.on("data", (chunk: Buffer) => {
       stderrTail = redactEngineDiagnostics(`${stderrTail}${chunk.toString("utf8")}`);
@@ -325,6 +468,7 @@ class EngineBridge {
 
   stop(): void {
     const child = this.process;
+    this.finishBackgroundRuns(child || undefined);
     if (!child) return;
     if (child.killed || child.exitCode !== null || child.signalCode !== null) {
       this.process = null;
@@ -357,6 +501,15 @@ class EngineBridge {
       return;
     }
 
+    // Seal background dispatch before taking the final active-work snapshot.
+    const sealed = await this.waitForCompletion(this.requestOnChild(child, "run.cancel", {
+      run_id: "", source: "app_exit", reason: "桌面退出；保留原配置、已用次数和未完成断点。",
+    }), 5_000);
+    if (!sealed) {
+      logLifecycle("engine.shutdown.seal-timeout");
+      this.stop();
+      return;
+    }
     const pending = [...this.pending.values()].filter((item) => item.child === child);
     const existingCancelRunIds = new Set(
       pending.filter((item) => item.method === "run.cancel" && item.runId).map((item) => item.runId),
@@ -372,7 +525,8 @@ class EngineBridge {
       entries.push(item);
       runRequests.set(item.runId, entries);
     }
-    const runIds = [...runRequests.keys()];
+    const background = [...this.backgroundRuns.entries()].filter(([, item]) => item.child === child);
+    const runIds = [...new Set([...runRequests.keys(), ...background.map(([runId]) => runId)])];
     const requestsToCancel = runIds.filter((runId) => !existingCancelRunIds.has(runId));
     const existingCancelRequests = pending.filter((item) => item.method === "run.cancel");
     const waitForRequests = [
@@ -395,13 +549,16 @@ class EngineBridge {
     const cancelResults: Array<{ run_id: string; cancelled?: boolean; error?: string }> = [];
     const cancelAcknowledgements = Promise.all(requestsToCancel.map(async (runId) => {
       try {
-        const result = await this.requestOnChild(child, "run.cancel", { run_id: runId }) as { cancelled?: unknown } | null;
+        const result = await this.requestOnChild(child, "run.cancel", {
+          run_id: runId, source: "app_exit", reason: "桌面退出；保留原配置、已用次数和未完成断点。",
+        }) as { cancelled?: unknown } | null;
         cancelResults.push({ run_id: runId, cancelled: result?.cancelled === true });
       } catch (cause) {
         cancelResults.push({ run_id: runId, error: cause instanceof Error ? cause.message : String(cause) });
       }
     }));
-    const requestsSettled = Promise.all(waitForRequests.map((item) => item.settled));
+    const requestsSettled = Promise.all([...waitForRequests.map((item) => item.settled),
+      ...background.map(([, item]) => item.settled)]);
     const completed = await this.waitForCompletion(Promise.all([cancelAcknowledgements, requestsSettled]), 5_000);
     if (!completed) {
       logLifecycle("engine.shutdown.cancel-timeout", {
@@ -437,7 +594,7 @@ class EngineBridge {
   }
 
   private isCancellableWork(item: Pending): boolean {
-    if (["conversation.send", "document.revise_selection", "task.retry"].includes(item.method)) return true;
+    if (["conversation.send", "document.revise_selection", "task.retry", "manual_edits.review"].includes(item.method)) return true;
     if (item.method !== "workflow.run") return false;
     return !["checkpoint_list", "rollback_preview"].includes(item.action);
   }
@@ -475,15 +632,19 @@ class EngineBridge {
   }
 
   pendingWorkCount(conversationId?: string): number {
-    const reads = new Set(["project.open", "project.status", "project.tree", "collaboration.overview", "collaboration.list",
-      "context.status", "context.details", "task.status", "task.list", "document.read", "document.read_reference", "document.version.read", "document.search",
-      "settings.get", "computer.actions.list", "voice.status", "voice.settings.get", "voice.job.list", "voice.job.status", "voice.profile.list", "voice.roles.get", "project.trash.list", "project.canon_migration.status",
-      "story_settings.list", "story_settings.records", "story_settings.templates", "manual_edits.status", "memory.audit"]);
+    // Passive preloading and status requests cannot turn an idle window into a running task.
+    const reads = new Set(["project.preload", "project.open", "project.status", "project.tree", "collaboration.overview", "collaboration.list", "batch.progress",
+      "context.status", "context.details", "usage.overview", "task.status", "task.list", "document.read", "document.read_reference", "document.version.read", "document.search",
+      "settings.get", "computer.actions.list", "voice.status", "voice.background", "voice.settings.get", "voice.job.list", "voice.job.status", "voice.profile.list", "voice.roles.get", "project.trash.list", "project.canon_migration.status", "conversation.history", "conversation.list", "memory.index",
+      "story_settings.list", "story_settings.maintenance", "story_settings.records", "story_settings.templates", "manual_edits.scan", "manual_edits.status", "memory.audit",
+      "knowledge.index", "knowledge.page", "knowledge.source", "knowledge.search", "knowledge.graph", "knowledge.status"]);
     // Unknown requests still protect exit; only known status and read requests are passive.
-    return [...this.pending.values()].filter(item => (!conversationId || item.conversationId === conversationId)
+    const work = [...this.pending.values()].filter(item => (!conversationId || item.conversationId === conversationId)
       && !reads.has(item.method) && item.method !== "run.cancel"
       && !(item.method === "preferences.manage" && ["list", "usage", "history"].includes(item.action))
-      && !(item.method === "workflow.run" && ["checkpoint_list", "rollback_preview"].includes(item.action))).length;
+      && !(item.method === "workflow.run" && ["checkpoint_list", "rollback_preview"].includes(item.action)));
+    return work.length + [...this.backgroundRuns].filter(([runId, item]) =>
+      (!conversationId || item.conversationId === conversationId) && !work.some(request => request.runId === runId)).length;
   }
 
   pendingMethods(): string[] {
@@ -493,6 +654,7 @@ class EngineBridge {
   }
 
   private failChild(child: ChildProcessWithoutNullStreams, error: Error): void {
+    this.finishBackgroundRuns(child);
     for (const [id, item] of this.pending.entries()) {
       if (item.child !== child) continue;
       item.reject(error);
@@ -506,17 +668,49 @@ class EngineBridge {
     this.send("engine:status", { level: "error", message: error.message });
   }
 
-  private receive(line: string): void {
+  private finishBackgroundRuns(child?: ChildProcessWithoutNullStreams): void {
+    for (const [runId, item] of this.backgroundRuns) {
+      if (child && item.child !== child) continue;
+      item.markSettled();
+      this.backgroundRuns.delete(runId);
+    }
+  }
+
+  private receive(line: string, child: ChildProcessWithoutNullStreams): void {
     let value: Record<string, unknown>;
     try {
       value = JSON.parse(line) as Record<string, unknown>;
     } catch {
       return;
     }
+    // 损坏的JSON-RPC行不能触发主进程异常；只接受对象封包，原请求继续等有效回执。
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
     if (value.method === "event") {
+      if (child !== this.process) return;
+      const event = value.params as { type?: string; summary?: string; run_id?: string; conversation_id?: string; _background?: boolean } | undefined;
+      if (event?._background === true && event.run_id) {
+        if (event.type === "run.started" && !this.backgroundRuns.has(event.run_id)) {
+          let markSettled: () => void = () => {};
+          const settled = new Promise<void>(done => { markSettled = done; });
+          this.backgroundRuns.set(event.run_id, { child, conversationId: event.conversation_id || "main", settled, markSettled });
+        } else if (/^run\.(completed|failed|cancelled|interrupted|waiting_user|waiting_condition)$/.test(event.type || "")) {
+          this.backgroundRuns.get(event.run_id)?.markSettled();
+          this.backgroundRuns.delete(event.run_id);
+        }
+      }
       this.send("engine:event", value.params);
-      const event = value.params as { type?: string; summary?: string } | undefined;
-      if (/^voice\.(moss|qwen|asr)\.(ready|models_failed|install\.failed)$/.test(event?.type || "") && Notification.isSupported()) {
+      // 素材内容和原文只在应用内展示，系统通知仅提示回到设置查看。
+      if (event?.run_id?.startsWith("preference-material-") &&
+          /^run\.(waiting_user|waiting_condition|failed|interrupted)$/.test(event.type || "") && Notification.isSupported()) {
+        try {
+          new Notification({
+            title: event.type === "run.waiting_user" ? "写作素材有结果待查看" : "写作素材分析未完成",
+            body: "打开墨流的「作者习惯与记忆」查看结果、原因或待答问题。",
+            icon: applicationIconPath(),
+          }).show();
+        } catch { /* 系统通知不可用时，应用内仍保留任务回执。 */ }
+      }
+      if (/^voice\.(edge|asr)\.(ready|models_failed|install\.failed)$/.test(event?.type || "") && Notification.isSupported()) {
         try {
           new Notification({
             title: event?.type?.endsWith("ready") ? "语音组件安装完成" : "语音组件安装未完成",
@@ -531,22 +725,31 @@ class EngineBridge {
     }
     const id = String(value.id ?? "");
     const pending = this.pending.get(id);
-    if (!pending) return;
+    if (!pending || pending.child !== child) return;
     this.pending.delete(id);
     pending.markSettled();
     if (value.error) {
-      const error = value.error as {
-        title?: string;
-        message?: string;
-        code?: string;
-        impact?: string;
-        actions?: Array<{ label?: string }>;
-      };
+      const error = typeof value.error === "object" && !Array.isArray(value.error)
+        ? value.error as Record<string, unknown> : {};
+      const title = typeof error.title === "string" ? redactEngineDiagnostics(error.title) : "";
+      const message = redactEngineDiagnostics(error.message ?? (
+        typeof value.error === "string" || Array.isArray(value.error) ? value.error : ""));
+      const code = typeof error.code === "string" || (typeof error.code === "number" && Number.isFinite(error.code))
+        ? redactEngineDiagnostics(error.code) : "unknown";
+      const impact = typeof error.impact === "string" ? redactEngineDiagnostics(error.impact) : "";
+      const details = redactEngineDiagnostics(error.details);
+      const actions = Array.isArray(error.actions) ? error.actions.flatMap(item => {
+        if (!item || typeof item !== "object" || typeof item.label !== "string") return [];
+        return [redactEngineDiagnostics(item.label)];
+      }).filter(Boolean) : [];
+      // 非文本details先规范化再记录；此处不再可能因.replace/.map失败让已移出pending的Promise悬空。
+      logLifecycle("engine.request.failed", { method: pending.method, code, ...(details ? { details } : {}) });
       const lines = [
-        error.title && error.title !== error.message ? error.title : "",
-        error.message || error.code || "墨流引擎请求失败。",
-        error.impact || "",
-        error.actions?.length ? `下一步：${error.actions.map((item) => item.label).filter(Boolean).join("；")}` : "",
+        title && title !== message ? title : "",
+        message || (code !== "unknown" ? code : "墨流引擎请求失败。"),
+        details ? `具体原因：${details}` : "",
+        impact,
+        actions.length ? `下一步：${actions.join("；")}` : "",
       ].filter(Boolean);
       pending.reject(new Error(lines.join("\n")));
     } else {
@@ -582,11 +785,28 @@ class EngineBridge {
 }
 
 let mainWindow: BrowserWindow | null = null;
-type WorkspacePanelId = "navigation" | "assistant" | "inspector";
+type WorkspacePanelId = "navigation" | "assistant" | "inspector" | "workbench";
 const conversationWindows = new Map<number, { projectRoot: string; conversationId: string; panel?: WorkspacePanelId; ownerId?: number; relativePath?: string; shared?: boolean; returnHidden?: boolean }>();
+const conversationSwitches = new Set<number>();
 const workspaceStates = new Map<number, Record<string, unknown>>();
 let bridge: EngineBridge | null = null;
 let voiceDataDirectory = "";
+
+// Keep recording management inside the same directory used by microphone capture.
+function voiceInputDirectory(): string {
+  return voiceDataDirectory ? path.join(voiceDataDirectory, "cache", "voice-input") : process.platform === "win32" && existsSync("D:/") ? "D:/墨流/cache/voice-input" : path.join(app.getPath("userData"), "voice-input");
+}
+
+// Only app-owned recording names in the current storage root can be changed or recycled.
+async function managedVoiceRecording(target: string): Promise<string> {
+  if (typeof target !== "string") throw new Error("录音路径无效。");
+  const resolved = path.resolve(target);
+  const folder = await asyncFs.realpath(voiceInputDirectory());
+  if (await asyncFs.realpath(path.dirname(resolved)) !== folder || !/^recording-[a-f0-9-]{36}\.(wav|webm|ogg|mp3|m4a)$/.test(path.basename(resolved))) throw new Error("只能管理墨流当前录音目录中的录音。");
+  const info = await asyncFs.lstat(resolved);
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error("录音文件指向外部位置，未操作。");
+  return resolved;
+}
 let updates: UpdateManager | null = null;
 let confirmationPending = false;
 let closeConfirmationPending = false;
@@ -615,25 +835,8 @@ function projectArgument(argv = process.argv): string | null {
   return index >= 0 && argv[index + 1] ? path.resolve(argv[index + 1]) : null;
 }
 
-type ConversationWindow = { conversationId: string; projectRoot: string; openedAt: string };
-function recentConversationWindows(projectRoot?: string): ConversationWindow[] {
-  try {
-    const value: unknown = JSON.parse(readFileSync(path.join(app.getPath("userData"), "conversation-windows.json"), "utf8"));
-    if (!Array.isArray(value)) return [];
-    return value.filter((item): item is ConversationWindow => item && /^chat-[0-9a-f-]{36}$/.test(item.conversationId)
-      && typeof item.projectRoot === "string" && typeof item.openedAt === "string"
-      && (!projectRoot || sameProjectRoot(item.projectRoot, projectRoot))).slice(0, 40);
-  } catch { return []; }
-}
-function rememberConversationWindow(projectRoot: string, conversationId: string): void {
-  const file = path.join(app.getPath("userData"), "conversation-windows.json");
-  mkdirSync(path.dirname(file), { recursive: true });
-  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(temporary, JSON.stringify([{ conversationId, projectRoot, openedAt: new Date().toISOString() }, ...recentConversationWindows().filter(item => item.conversationId !== conversationId || !sameProjectRoot(item.projectRoot, projectRoot))].slice(0, 40)), "utf8");
-  renameSync(temporary, file);
-}
-
-function loadWorkspace(window: BrowserWindow, conversationId?: string, panel?: WorkspacePanelId): void {
+/** 等待真实页面载入；失败保留可恢复入口，聊天切换可据此回滚窗口绑定。 */
+function loadWorkspace(window: BrowserWindow, conversationId?: string, panel?: WorkspacePanelId): Promise<boolean> {
   const developmentUrl = process.env.VITE_DEV_SERVER_URL;
   const query: Record<string, string> = { ...(conversationId ? { conversation_id: conversationId } : {}), ...(panel ? { workspace_panel: panel } : {}) };
   const url = developmentUrl ? new URL(developmentUrl) : null;
@@ -641,56 +844,35 @@ function loadWorkspace(window: BrowserWindow, conversationId?: string, panel?: W
   const loading = developmentUrl
     ? window.loadURL(url!.toString())
     : window.loadFile(path.join(__dirname, "..", "dist", "index.html"), { query });
-  void loading.then(() => {
-    if (window.isDestroyed()) return;
+  return loading.then(() => {
+    if (window.isDestroyed()) return false;
     if (window.isMinimized()) window.restore();
     window.show();
     window.focus();
     logLifecycle("window.loaded", { windowId: window.id });
+    return true;
   }).catch((cause) => {
-    logLifecycle("window.load-failed", { windowId: window.id, reason: redactEngineDiagnostics(String(cause)) });
-    if (window.isDestroyed()) return;
+    logLifecycle("window.load-failed", { windowId: window.id, reason: redactEngineDiagnostics(cause) });
+    if (window.isDestroyed()) return false;
     window.show();
     void dialog.showMessageBox(window, {
       type: "error", title: "墨流界面加载失败", message: "窗口已经打开，但工作台未能载入。",
-      detail: `${redactEngineDiagnostics(String(cause))}\n启动记录保存在 ${path.join(app.getPath("userData"), "logs")}。`,
+      detail: `${redactEngineDiagnostics(cause)}\n启动记录保存在 ${path.join(app.getPath("userData"), "logs")}。`,
       buttons: ["重新载入", "查看启动日志"], defaultId: 0, cancelId: 1,
     }).then(({ response }) => {
-      if (response === 0 && !window.isDestroyed()) loadWorkspace(window, conversationId, panel);
+      if (response === 0 && !window.isDestroyed()) void loadWorkspace(window, conversationWindows.get(window.id)?.conversationId || (window === mainWindow ? undefined : conversationId), panel);
       else void shell.openPath(path.join(app.getPath("userData"), "logs"));
     }).catch(() => undefined);
+    return false;
   });
 }
-function createConversationWindow(projectRoot: string, requestedId?: string): { conversationId: string } {
-  if (!mainWindow || mainWindow.isDestroyed()) throw new Error("主工作区已关闭，请重新打开墨流。");
-  if (requestedId && !recentConversationWindows(projectRoot).some(item => item.conversationId === requestedId)) throw new Error("这份对话不在当前小说的窗口记录中。");
-  const conversationId = requestedId || `chat-${randomUUID()}`;
-  const existing = [...conversationWindows.entries()].find(([, item]) => item.conversationId === conversationId);
-  const open = existing ? BrowserWindow.fromId(existing[0]) : null;
-  if (open && !open.isDestroyed()) {
-    if (existing && conversationWindows.get(existing[0])?.projectRoot !== projectRoot) open.webContents.send("app:open-project", projectRoot);
-    if (open.isMinimized()) open.restore(); open.focus(); return { conversationId };
-  }
-  rememberConversationWindow(projectRoot, conversationId);
-  const window = new BrowserWindow({
-    width: 620, height: 820, minWidth: 320, minHeight: 300,
-    title: "墨流 · 独立对话", icon: applicationIconPath(), backgroundColor: "#11110f", show: true, autoHideMenuBar: true,
-    webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true },
-  });
-  conversationWindows.set(window.id, { projectRoot, conversationId, panel: "assistant" });
-  let closeConfirmed = false; let asking = false;
-  window.on("close", event => {
-    if (closeConfirmed || !bridge?.pendingWorkCount(conversationId)) return;
-    event.preventDefault();
-    if (asking) return;
-    asking = true;
-    void dialog.showMessageBox(window, { type: "question", title: "这份对话还有请求未返回", message: "关闭窗口后，当前任务仍会在后台继续，已保存的记录保留。", detail: "重新打开对话历史可核对结果；关闭主工作区会按全应用退出流程处理所有任务。", buttons: ["继续查看", "关闭这份窗口"], defaultId: 0, cancelId: 0, noLink: true }).then(result => { if (result.response === 1 && !window.isDestroyed()) { closeConfirmed = true; window.close(); } }).finally(() => { asking = false; });
-  });
-  window.once("closed", () => conversationWindows.delete(window.id));
-  loadWorkspace(window, conversationId, "assistant");
-  return { conversationId };
+/** 保存门禁阻止导航时也结束等待；正常切换和删除后的重载共用此结果。 */
+async function loadConversation(window: BrowserWindow, identity: string): Promise<boolean> {
+  let blocked = () => {};
+  const prevented = new Promise<boolean>(resolve => { blocked = () => resolve(false); window.webContents.once("will-prevent-unload", blocked); });
+  try { return await Promise.race([loadWorkspace(window, identity), prevented]); }
+  finally { window.webContents.removeListener("will-prevent-unload", blocked); }
 }
-
 function createWorkspacePanel(owner: BrowserWindow, projectRoot: string, panel: WorkspacePanelId, relativePath?: string, requested?: Electron.Rectangle): void {
   const existing = [...conversationWindows].find(([, item]) => item.ownerId === owner.id && item.panel === panel && sameProjectRoot(item.projectRoot, projectRoot));
   const opened = existing ? BrowserWindow.fromId(existing[0]) : null;
@@ -702,7 +884,7 @@ function createWorkspacePanel(owner: BrowserWindow, projectRoot: string, panel: 
   const bounds = owner.getBounds();
   const window = new BrowserWindow({
     x: Math.max(display.x, Math.min(display.x + display.width - width, requested?.x ?? bounds.x + 48)), y: Math.max(display.y, Math.min(display.y + display.height - height, requested?.y ?? bounds.y + 48)),
-    width, height, minWidth: Math.min(minimumWidth, display.width), minHeight: Math.min(240, display.height), title: `墨流 · ${{ navigation: "小说结构", assistant: "墨宝对话", inspector: "批注与版本" }[panel]}`,
+    width, height, minWidth: Math.min(minimumWidth, display.width), minHeight: Math.min(240, display.height), title: `墨流 · ${{ navigation: "小说结构", assistant: "墨宝对话", inspector: "批注与版本", workbench: "工程工作台" }[panel]}`,
     icon: applicationIconPath(), backgroundColor: "#11110f", show: true, autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
@@ -867,10 +1049,11 @@ function createWindow(): void {
     unresponsivePromptShown = false;
   });
   affectedWindow.on("close", (event) => {
+    // 关闭主窗口会终止共享后台；这里统计所有窗口的实际工作，不把被动读取当成任务。
     const pending = bridge?.pendingWorkCount() || 0;
     const allPending = bridge?.pendingCount() || 0;
     logLifecycle("window.close-requested", { pending: allPending, active_pending: pending, pending_methods: bridge?.pendingMethods() || [] });
-    if (closeAuthorized || allPending === 0) return;
+    if (closeAuthorized || !bridge) return;
     event.preventDefault();
     if (closeConfirmationPending) return;
     closeConfirmationPending = true;
@@ -879,19 +1062,23 @@ function createWindow(): void {
       closeConfirmationPending = false;
       return;
     }
-    const confirmation = pending === 0 ? Promise.resolve({ response: 1 }) : dialog.showMessageBox(closingWindow, {
-      type: "warning",
-      title: "墨流还有工作尚未结束",
-      message: `还有 ${pending} 项工作尚未结束。退出会停止这些工作。`,
-      detail: "请先在任务记录核对正在进行的生成、安装或写入。返回墨流会继续当前任务，不会重新发送请求。",
-      buttons: ["返回墨流，继续运行", "停止并退出"],
-      defaultId: 0,
-      cancelId: 0,
-      noLink: true,
-    });
-    void confirmation.then(async ({ response }) => {
-      if (response !== 1 || closingWindow.isDestroyed()) return;
+    void (async () => {
       const stoppingBridge = bridge;
+      // 必须先取得退出决定，再取消任务；关闭提示或按 Esc 都等同于继续工作。
+      if ((stoppingBridge?.pendingWorkCount() || 0) > 0) {
+        const decision = await dialog.showMessageBox(closingWindow, {
+          type: "warning",
+          title: "退出墨流？",
+          message: "墨流还有任务正在运行，确定要退出吗？",
+          detail: "退出会中断当前工作。已保存的内容会保留，尚未完成的输出可能无法找回；已经发送的模型请求仍可能产生费用。",
+          buttons: ["继续工作", "退出软件"],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true,
+        });
+        if (decision.response !== 1 || closingWindow.isDestroyed()) return;
+      }
+      // 用户确认后沿用原取消与限时收尾，不重置预算，也不把未完成任务标成成功。
       try {
         await stoppingBridge?.shutdownForExit();
       } catch (cause) {
@@ -904,8 +1091,8 @@ function createWindow(): void {
       if (closingWindow.isDestroyed()) return;
       closeAuthorized = true;
       closingWindow.close();
-    }).catch((cause) => {
-      logLifecycle("window.close-confirmation-failed", { reason: cause instanceof Error ? cause.message : String(cause) });
+    })().catch((cause) => {
+      logLifecycle("window.close-save-failed", { reason: cause instanceof Error ? cause.message : String(cause) });
     }).finally(() => {
       closeConfirmationPending = false;
     });
@@ -932,6 +1119,8 @@ function createWindow(): void {
     const source = BrowserWindow.fromWebContents(event.sender);
     if (!source || (source !== mainWindow && !conversationWindows.has(source.id))) throw new Error("这个窗口没有本地引擎访问权限。");
     const conversationId = conversationWindows.get(source.id)?.conversationId || "main";
+    // 旧页面卸载期间的迟到调用不能被悄悄改绑到刚切换的新聊天。
+    if (params.conversation_id !== undefined && params.conversation_id !== conversationId) throw new Error("聊天已切换，这项旧界面请求没有发送。请在当前聊天继续。");
     const result = await bridge?.request(method, { ...params, conversation_id: conversationId });
     if (method === "voice.settings.get" || method === "voice.settings.configure" || method === "voice.storage.move") {
       const settings = (method === "voice.storage.move" ? (result as { settings?: unknown })?.settings : result) as { voice_data_dir?: string } | undefined;
@@ -940,20 +1129,80 @@ function createWindow(): void {
     const context = conversationWindows.get(source.id);
     if (context && method === "project.open" && typeof params.project_root === "string" && context.projectRoot !== params.project_root) {
       context.projectRoot = params.project_root;
-      try { if (!context.shared) rememberConversationWindow(context.projectRoot, context.conversationId); }
-      catch { logLifecycle("conversation-windows.write.failed"); }
     }
     return result;
   });
-  ipcMain.handle("app:conversation-window", (event, projectRoot: string, conversationId?: string) => {
+  ipcMain.handle("conversation:switch", async (event, rootValue: string, identity?: string) => {
     const source = BrowserWindow.fromWebContents(event.sender);
-    if (!source || (source !== mainWindow && !conversationWindows.has(source.id))) throw new Error("无法从这个窗口创建对话。");
-    return createConversationWindow(projectRoot ? resolveInkFlowProject(projectRoot) : "", conversationId);
+    if (!source || source !== mainWindow || !bridge) throw new Error("请回到主窗口切换聊天。");
+    if (conversationSwitches.has(source.id)) throw new Error("正在切换聊天，请等待本次界面加载。");
+    conversationSwitches.add(source.id);
+    try {
+      const root = resolveInkFlowProject(rootValue);
+      const current = conversationWindows.get(source.id)?.conversationId || "main";
+      const previousState = workspaceStates.get(source.id);
+      const previous = conversationWindows.get(source.id) || { projectRoot: String(previousState?.projectRoot || root), conversationId: current };
+      if (identity !== undefined && !/^[A-Za-z0-9_-]{1,80}$/.test(identity)) throw new Error("要打开的聊天身份无效。");
+      // 目录由共享服务确认；不能用调用方传来的任意身份冒充已保存聊天。
+      const catalog = await bridge.request("conversation.list", { project_root: root, conversation_id: current }) as { items: Array<{ id: string }> };
+      if (identity !== undefined && !catalog.items.some(item => item.id === identity)) throw new Error("这份聊天不在当前小说中，已有聊天未改变。");
+      const next = identity || (await bridge.request("conversation.create", { project_root: root, conversation_id: current }) as { id: string }).id;
+      // 原请求继续持有原聊天、快照和预算；切换只重建界面，不取消任务或转移迟到事件。
+      // 拆出的面板属于原聊天，返回后重建；不把其迟到状态同步给新聊天。
+      for (const [id, context] of conversationWindows) if (context.ownerId === source.id) BrowserWindow.fromId(id)?.close();
+      workspaceStates.delete(source.id);
+      conversationWindows.set(source.id, { projectRoot: root, conversationId: next });
+      try {
+        // 保存门禁阻止卸载时也须结束等待，不能只依赖页面完成/网络失败事件。
+        if (!await loadConversation(source, next)) throw new Error("新聊天界面没有成功载入，原聊天和任务已保留。可重新载入原聊天后继续。");
+      } catch (cause) {
+        // 导航被旧页保存门禁阻止或加载失败时，身份必须跟随可恢复的原聊天，不能锁死旧页面。
+        if (!source.isDestroyed()) { conversationWindows.set(source.id, previous); if (previousState) workspaceStates.set(source.id, previousState); }
+        throw cause;
+      }
+    } finally { conversationSwitches.delete(source.id); }
   });
-  ipcMain.handle("app:conversation-windows", (_event, projectRoot: string) => recentConversationWindows(projectRoot));
+  ipcMain.handle("conversation:delete", async (event, rootValue: string, identity: string) => {
+    const source = BrowserWindow.fromWebContents(event.sender);
+    if (!source || source !== mainWindow || !bridge) throw new Error("请回到主窗口删除本书聊天。");
+    if (conversationSwitches.has(source.id)) throw new Error("正在调整聊天，请等待本次操作完成。");
+    if (typeof identity !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(identity)) throw new Error("要删除的聊天身份无效。");
+    const root = resolveInkFlowProject(rootValue), current = conversationWindows.get(source.id)?.conversationId || "main";
+    const displayedRoot = conversationWindows.get(source.id)?.projectRoot || workspaceStates.get(source.id)?.projectRoot;
+    if (typeof displayedRoot !== "string" || !sameProjectRoot(displayedRoot, root)) throw new Error("小说已切换，请重新选择要删除的聊天。");
+    if (bridge.pendingWorkCount(identity)) throw new Error("这份聊天还有请求正在处理，请先停止并等待收尾。");
+    if (identity === current && [...conversationWindows].some(([id, context]) => context.ownerId === source.id && !BrowserWindow.fromId(id)?.isDestroyed())) throw new Error("请先把本聊天的独立面板返回主界面，再删除聊天。");
+    conversationSwitches.add(source.id);
+    const key = conversationViewKey(root, identity);
+    let originalViews: Array<Record<string, unknown>> | undefined, deleted = false;
+    try {
+      originalViews = workspaceViews();
+      const targetView = originalViews.find(item => sameProjectRoot(String(item.projectRoot), root) && (item.conversationId || "main") === identity);
+      if (targetView?.editorDraft) throw new Error("这份聊天还保留未保存的正文，请先打开它保存或处理正文候选，再删除聊天。");
+      deletedConversationViews.add(key); lastWorkspaceView = "";
+      writeWorkspaceViews(originalViews.filter(item => !sameProjectRoot(String(item.projectRoot), root) || (item.conversationId || "main") !== identity));
+      await bridge.request("conversation.delete", { project_root: root, conversation_id: current, target_conversation_id: identity });
+      deleted = true;
+      if (identity !== current) return { deleted: true, reloaded: false };
+      // 物理删除成功后不能回滚到已删身份；加载失败也保留新的有效聊天，给出手动重载入口。
+      const catalog = await bridge.request("conversation.list", { project_root: root, conversation_id: current }) as { items: Array<{ id: string }> };
+      const next = catalog.items[0]?.id || (await bridge.request("conversation.create", { project_root: root, conversation_id: current }) as { id: string }).id;
+      workspaceStates.delete(source.id);
+      conversationWindows.set(source.id, { projectRoot: root, conversationId: next });
+      if (!await loadConversation(source, next)) throw new Error("新聊天界面未载入，请重新加载窗口。");
+      return { deleted: true, reloaded: true };
+    } catch (cause) {
+      if (!deleted) {
+        deletedConversationViews.delete(key); lastWorkspaceView = "";
+        if (originalViews) writeWorkspaceViews([...workspaceViews().filter(item => !sameProjectRoot(String(item.projectRoot), root) || (item.conversationId || "main") !== identity),
+          ...originalViews.filter(item => sameProjectRoot(String(item.projectRoot), root) && (item.conversationId || "main") === identity)]);
+      }
+      throw new Error(`${deleted ? "聊天已经删除，请重新打开本书或加载窗口。" : ""}${cause instanceof Error ? cause.message : String(cause)}`);
+    } finally { conversationSwitches.delete(source.id); }
+  });
   ipcMain.handle("workspace:open", (event, projectRoot: string, panel: WorkspacePanelId, relativePath?: string, value?: unknown) => {
     const source = BrowserWindow.fromWebContents(event.sender);
-    if (!source || (source !== mainWindow && !conversationWindows.has(source.id)) || !["navigation", "assistant", "inspector"].includes(panel) || typeof projectRoot !== "string" || !projectRoot) throw new Error("请先打开小说，再移动这个面板。");
+    if (!source || (source !== mainWindow && !conversationWindows.has(source.id)) || !["navigation", "assistant", "inspector", "workbench"].includes(panel) || typeof projectRoot !== "string" || !projectRoot) throw new Error("请先打开小说，再移动这个面板。");
     if (conversationWindows.get(source.id)?.shared) throw new Error("请先回到主工作台，再打开独立面板。");
     let requested: Electron.Rectangle | undefined;
     if (value !== undefined) {
@@ -967,7 +1216,7 @@ function createWindow(): void {
   ipcMain.handle("workspace:return", (event, panel?: WorkspacePanelId, hide = false) => {
     const source = BrowserWindow.fromWebContents(event.sender);
     if (panel && source && (source === mainWindow || conversationWindows.has(source.id))) {
-      if (!["navigation", "assistant", "inspector"].includes(panel)) throw new Error("这个面板不能返回工作台。");
+      if (!["navigation", "assistant", "inspector", "workbench"].includes(panel)) throw new Error("这个面板不能返回工作台。");
       const opened = [...conversationWindows].find(([, item]) => item.ownerId === source.id && item.panel === panel);
       if (opened) opened[1].returnHidden = hide === true;
       const window = opened ? BrowserWindow.fromId(opened[0]) : null;
@@ -986,22 +1235,61 @@ function createWindow(): void {
     if (!source || (source !== mainWindow && !conversationWindows.has(source.id)) || conversationWindows.get(source.id)?.shared || !value || typeof value !== "object") return;
     const state = value as Record<string, unknown>;
     if (typeof state.projectRoot !== "string" || !state.projectRoot || !Array.isArray(state.messages) || state.messages.length > 200) return;
-    workspaceStates.set(source.id, state);
+    if (((state.view as Record<string, unknown> | undefined)?.conversationId || "main") !== (conversationWindows.get(source.id)?.conversationId || "main")) return;
+    saveWorkspaceView(state.view);
+    // 待答的未提交输入只属于主窗口本机草稿，不随共享阅读面板广播。
+    const sharedState = { ...state, view: { ...(state.view as Record<string, unknown>), questionDrafts: undefined } };
+    workspaceStates.set(source.id, sharedState);
     for (const [id, context] of conversationWindows) {
       if (context.ownerId !== source.id || !context.shared) continue;
       const window = BrowserWindow.fromId(id);
       if (!window || window.isDestroyed()) continue;
       if (!sameProjectRoot(context.projectRoot, state.projectRoot)) window.close();
-      else window.webContents.send("workspace:event", { type: "state", state });
+      else window.webContents.send("workspace:event", { type: "state", state: sharedState });
     }
+  });
+  ipcMain.handle("workspace:view", (event, root: string) => {
+    const source = BrowserWindow.fromWebContents(event.sender);
+    if (!source || (source !== mainWindow && !conversationWindows.has(source.id))) throw new Error("界面记录读取窗口不匹配。");
+    const identity = conversationWindows.get(source.id)?.conversationId || "main";
+    return workspaceViews().find(item => typeof root === "string" && sameProjectRoot(String(item.projectRoot), root) && (item.conversationId || "main") === identity) || null;
+  });
+  ipcMain.on("workspace:view:save", (event, value: unknown) => {
+    const source = BrowserWindow.fromWebContents(event.sender);
+    try {
+      if (!source || source !== mainWindow || conversationWindows.get(source.id)?.shared) throw new Error("状态保存窗口不匹配。");
+      // 卸载前保存仍归属于发出它的旧页面，不能因主进程已切换身份而覆盖新聊天。
+      const identity = new URL(source.webContents.getURL()).searchParams.get("conversation_id") || "main";
+      if (((value as Record<string, unknown> | null)?.conversationId || "main") !== identity) throw new Error("界面记录与聊天不对应。");
+      saveWorkspaceView(value);
+      event.returnValue = { saved: true };
+    } catch { event.returnValue = { saved: false }; }
+  });
+  // 同步读取仅用于首屏外观；限制为本应用窗口，不能扩展为通用文件访问。
+  ipcMain.on("appearance:read", event => {
+    const source = BrowserWindow.fromWebContents(event.sender);
+    event.returnValue = source && (source === mainWindow || conversationWindows.has(source.id)) ? readAppearance() : null;
+    if (event.returnValue) nativeTheme.themeSource = event.returnValue.theme;
+  });
+  // 和工作台快照一样同步确认落盘，退出时无需等待未完成的 IPC。
+  ipcMain.on("appearance:save", (event, value: unknown) => {
+    event.returnValue = { saved: false };
+    const source = BrowserWindow.fromWebContents(event.sender);
+    if (!source || (source !== mainWindow && !conversationWindows.has(source.id))) return;
+    try {
+      saveAppearance(value);
+      event.returnValue = { saved: true };
+    } catch { logLifecycle("appearance.save.failed"); }
   });
   ipcMain.handle("workspace:command", (event, command: string, value: string, relativePath?: string) => {
     const source = BrowserWindow.fromWebContents(event.sender), context = source ? conversationWindows.get(source.id) : null;
-    const allowed = context?.panel === "assistant" ? ["chat"] : context?.panel === "navigation" ? ["document"] : ["compare", "annotation"];
+    const allowed = context?.panel === "assistant" ? ["chat", "document", "navigate", "conversation-layout"] : context?.panel === "navigation" ? ["document", "navigate"] : ["compare", "annotation"];
     if (!context?.shared || !context.ownerId || !allowed.includes(command) || typeof value !== "string" || value.length > 100_000) throw new Error("这个面板不能执行这项操作，请回到主工作台处理。");
+    if (command === "navigate" && !/^(?:pending_work(?::[1-9]\d{0,5})?|library:(?:draft|accepted|threads))$/.test(value)) throw new Error("这个导航目标不可用，请回到主工作台查看。");
+    if (command === "conversation-layout" && (!Number.isFinite(Number(value)) || Number(value) < .15 || Number(value) > .75)) throw new Error("对话布局比例无效，请重新调整。");
     const owner = BrowserWindow.fromId(context.ownerId);
     if (!owner || owner.isDestroyed()) throw new Error("主工作台已关闭，请重新打开小说。");
-    if (["document", "compare"].includes(command)) { if (owner.isMinimized()) owner.restore(); owner.focus(); }
+    if (["document", "compare", "navigate"].includes(command)) { if (owner.isMinimized()) owner.restore(); owner.focus(); }
     owner.webContents.send("workspace:event", { type: "command", command, value, relativePath, projectRoot: context.projectRoot });
   });
   ipcMain.handle("dialog:confirm", async (event, message: string) => {
@@ -1073,6 +1361,15 @@ function createWindow(): void {
     });
     return result.canceled ? null : result.filePaths[0];
   });
+  // 原生选取文件，后台只接收路径，避免把大文件内容编码后经 IPC 转发。
+  ipcMain.handle("dialog:choose-preference-materials", async () => {
+    const result = await dialog.showOpenDialog(mainWindow!, {
+      title: "选择写作素材",
+      properties: ["openFile", "multiSelections"],
+      filters: [{ name: "写作素材", extensions: ["txt", "md", "markdown", "docx", "pdf", "epub", "html", "htm"] }],
+    });
+    return result.canceled ? [] : result.filePaths;
+  });
   ipcMain.handle("dialog:choose-audio", async (_event, title: string) => {
     const result = await dialog.showOpenDialog(mainWindow!, {
       title,
@@ -1081,15 +1378,50 @@ function createWindow(): void {
     });
     return result.canceled ? null : result.filePaths[0];
   });
-  ipcMain.handle("voice:save-recording", (_event, bytes: Uint8Array, extension = "webm", snapshotId?: string) => {
+  ipcMain.handle("voice:save-recording", async (_event, bytes: Uint8Array, extension = "webm", snapshotId?: string) => {
     if (!bytes?.byteLength || bytes.byteLength > 50 * 1024 * 1024) throw new Error("录音为空或过长，请分段录制。");
     if (snapshotId !== undefined && !/^[a-f0-9-]{36}$/.test(snapshotId)) throw new Error("本次录音的身份无效，请重新开始录音。");
     const safeExtension = ["wav", "webm", "ogg", "mp3", "m4a"].includes(extension) ? extension : "webm";
-    const folder = voiceDataDirectory ? path.join(voiceDataDirectory, "cache", "voice-input") : process.platform === "win32" && existsSync("D:/") ? "D:/墨流/cache/voice-input" : path.join(app.getPath("userData"), "voice-input");
-    mkdirSync(folder, { recursive: true });
+    const folder = voiceInputDirectory();
+    await asyncFs.mkdir(folder, { recursive: true });
     const target = path.join(folder, `${snapshotId ? "snapshot" : "recording"}-${snapshotId || randomUUID()}.${safeExtension}`);
-    writeFileSync(target, Buffer.from(bytes));
+    // Atomic publication keeps a decoder from reading a half-written WAV.
+    const temporary = `${target}.${randomUUID()}.partial`;
+    try { await asyncFs.writeFile(temporary, Buffer.from(bytes)); await asyncFs.rename(temporary, target); }
+    finally { await asyncFs.rm(temporary, { force: true }).catch(() => undefined); }
     return target;
+  });
+  ipcMain.handle("voice:recording-list", async () => {
+    const folder = voiceInputDirectory();
+    const entries = await asyncFs.readdir(folder, { withFileTypes: true }).catch((cause: NodeJS.ErrnoException) => {
+      if (cause.code === "ENOENT") return [];
+      throw cause;
+    });
+    const records = await Promise.all(entries.filter(entry => entry.isFile() && /^recording-[a-f0-9-]{36}\.(wav|webm|ogg|mp3|m4a)$/.test(entry.name)).map(async entry => {
+      const audioPath = path.join(folder, entry.name);
+      const info = await asyncFs.stat(audioPath);
+      let transcript = "";
+      try {
+        const sidecar = await asyncFs.lstat(`${audioPath}.json`);
+        if (sidecar.isFile() && !sidecar.isSymbolicLink() && sidecar.size <= 512_000) transcript = String(JSON.parse(await asyncFs.readFile(`${audioPath}.json`, "utf8")).transcript || "");
+      }
+      catch { /* Older recordings remain playable without a transcript sidecar. */ }
+      return { path: audioPath, name: entry.name, bytes: info.size, createdAt: info.birthtime.toISOString(), transcript };
+    }));
+    return { directory: folder, recordings: records.sort((a, b) => b.createdAt.localeCompare(a.createdAt)) };
+  });
+  ipcMain.handle("voice:recording-transcript", async (_event, target: string, transcript: string) => {
+    const audioPath = await managedVoiceRecording(target);
+    if (typeof transcript !== "string" || transcript.length > 100_000) throw new Error("转写文字过长，未保存记录。");
+    const sidecar = `${audioPath}.json`, temporary = `${sidecar}.${randomUUID()}.partial`;
+    try { await asyncFs.writeFile(temporary, JSON.stringify({ transcript, updatedAt: new Date().toISOString() }), "utf8"); await asyncFs.rename(temporary, sidecar); }
+    finally { await asyncFs.rm(temporary, { force: true }).catch(() => undefined); }
+  });
+  ipcMain.handle("voice:recording-delete", async (_event, target: string) => {
+    const audioPath = await managedVoiceRecording(target);
+    await shell.trashItem(audioPath);
+    if (existsSync(`${audioPath}.json`)) await shell.trashItem(`${audioPath}.json`);
+    return { deleted: true, recoverable: true };
   });
   ipcMain.handle("voice:audio-url", async (_event, target: string) => {
     const resolved = path.resolve(target);
@@ -1121,7 +1453,7 @@ function createWindow(): void {
     };
     const mime = mimeByExtension[path.extname(resolved).toLowerCase()];
     if (!mime) throw new Error("这个音频格式暂不支持播放。");
-    return `data:${mime};base64,${readFileSync(resolved).toString("base64")}`;
+    return `data:${mime};base64,${(await asyncFs.readFile(resolved)).toString("base64")}`;
   });
   ipcMain.handle("shell:open-path", (_event, target: string) => shell.openPath(target));
   ipcMain.handle("shell:show-item", (_event, target: string) => shell.showItemInFolder(target));
@@ -1129,7 +1461,8 @@ function createWindow(): void {
     const source = BrowserWindow.fromWebContents(event.sender);
     const context = source ? conversationWindows.get(source.id) : undefined;
     const nativePanels = source ? [...conversationWindows.values()].filter(item => item.ownerId === source.id && item.shared && item.panel).map(item => item.panel!) : [];
-    return { projectRoot: context ? context.projectRoot || null : projectArgument(), conversationId: context?.conversationId || "main", panel: context?.panel, relativePath: context?.relativePath, shared: context?.shared, sharedState: context?.shared && context.ownerId ? workspaceStates.get(context.ownerId) : undefined, nativePanels };
+    // Normal launches stay on Home; explicit file opens and detached panels retain their target.
+    return { projectRoot: context ? context.projectRoot || null : projectArgument() || null, conversationId: context?.conversationId || "main", panel: context?.panel, relativePath: context?.relativePath, shared: context?.shared, sharedState: context?.shared && context.ownerId ? workspaceStates.get(context.ownerId) : undefined, nativePanels };
   });
   ipcMain.handle("app:update-status", () => updates?.status());
   ipcMain.handle("app:update-check", () => updates?.check());
@@ -1174,8 +1507,8 @@ if (!singleInstance) {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
   }).catch((cause) => {
-    logLifecycle("app.startup-failed", { reason: redactEngineDiagnostics(String(cause)) });
-    dialog.showErrorBox("墨流启动失败", `未能创建工作台：${redactEngineDiagnostics(String(cause))}\n请查看 ${path.join(app.getPath("userData"), "logs")} 中的启动记录。`);
+    logLifecycle("app.startup-failed", { reason: redactEngineDiagnostics(cause) });
+    dialog.showErrorBox("墨流启动失败", `未能创建工作台：${redactEngineDiagnostics(cause)}\n请查看 ${path.join(app.getPath("userData"), "logs")} 中的启动记录。`);
     app.quit();
   });
 }

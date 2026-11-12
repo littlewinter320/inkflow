@@ -10,14 +10,7 @@ media/feature-selection.png
 media/feature-process.png
 !media/inkflow.svg
 !media/mobao.png
-!media/walkthrough-connect.md
-!media/walkthrough-api.md
-!media/walkthrough-draft.md
-!media/walkthrough-open.md
-!media/walkthrough-plan.md
+!media/guides/**
 !media/mascot/**
-!README.md
-!CHANGELOG.md
-!SUPPORT.md
 !LICENSE
 scripts/**

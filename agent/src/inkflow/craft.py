@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .humanizer import HUMANIZER_ZH_CONTRACT
+from .humanizer import HUMANIZER_ZH_CONTRACT, HUMANIZER_CORE_CONTRACT
 
 
 # Shared, static expression guidance. Source observations live in the author-style
@@ -63,6 +63,7 @@ AUTHOR_VOICE_CONTRACT = (
 
 
 AUTHOR_VOICE_CONTRACT += "\n" + HUMANIZER_ZH_CONTRACT
+AUTHOR_VOICE_CONTRACT += "\n\n" + HUMANIZER_CORE_CONTRACT
 
 
 @dataclass(frozen=True)

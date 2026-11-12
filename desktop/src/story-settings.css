@@ -22,7 +22,50 @@
 .manual-edit-monitor blockquote { margin: 0; padding: 8px 12px; border-left: 2px solid var(--accent); color: var(--muted); }
 .manual-edit-issues { border: 1px solid var(--accent); border-radius: 8px; padding: 8px 12px; margin: 0 12px 8px; }
 .manual-edit-issues > summary { cursor: pointer; font-size: 13px; }
-.manual-monitor-modal { width: min(900px, 92vw); }
+/* 只让核对内容滚动：标题和关闭按钮留在视口内，不改变其他 Modal 的布局。 */
+.modal.manual-monitor-modal {
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  width: min(960px, 100%);
+  max-width: 100%;
+  min-width: 0;
+  min-height: 0;
+  max-height: calc(100vh - 50px);
+  max-height: calc(100dvh - 50px);
+  overflow: hidden;
+  padding: 24px;
+}
+.manual-monitor-modal > :is(.eyebrow, h2, .modal-subtitle) {
+  flex: 0 0 auto;
+  min-width: 0;
+  padding-right: 36px;
+  overflow-wrap: anywhere;
+}
+.manual-monitor-modal > .modal-subtitle { margin-bottom: 16px; }
+.manual-monitor-modal > .manual-edit-monitor {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  /* 双侧预留同样的滚动槽，避免右侧滚动条挤歪卡片；外层留白保护圆角。 */
+  scrollbar-gutter: stable both-edges;
+  padding: 2px 8px 12px;
+}
+.manual-monitor-modal .thread-card {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+.manual-monitor-modal .thread-card :is(header, div, details, label) { min-width: 0; max-width: 100%; }
+.manual-monitor-modal .thread-card header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 12px; }
+.manual-monitor-modal :is(p, blockquote, summary) { overflow-wrap: anywhere; }
+.manual-monitor-modal blockquote { white-space: pre-wrap; }
+.manual-monitor-modal .settings-inline-actions { flex-wrap: wrap; }
 @media (max-width: 900px) { .setting-manager-columns { grid-template-columns: 1fr; } .setting-collection-list { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 12px; } .setting-field-row { grid-template-columns: 1fr 1fr; } }
 .setting-role-permissions { border: 1px solid var(--line); border-radius: 8px; display: flex; flex-wrap: wrap; gap: 12px; padding: 10px; margin: 8px 0; }
 .setting-role-permissions label { display: flex; align-items: center; gap: 6px; font-size: 12px; }
@@ -40,25 +83,78 @@
 .setting-category-branch > summary { display: flex; gap: 8px; align-items: center; cursor: pointer; padding: 7px 0; }
 .setting-category-branch > summary small { margin-left: auto; color: var(--muted); }
 .setting-category-branch .setting-category-branch { border-left: 1px solid var(--line-soft); margin-left: 5px; }
-.setting-record-index { font-size: 12px; color: var(--muted); margin-top: 8px; }
-.setting-record-index > p { white-space: pre-wrap; line-height: 1.65; }
-.setting-record-index > button { display: block; text-align: left; width: 100%; margin-top: 6px; font-size: 12px; }
+.setting-editor-heading h3 { margin: 0; }
+.setting-module-options { min-width: 0; padding: 12px; border: 1px solid var(--line-soft); border-radius: 10px; }
+.setting-module-options > summary { cursor: pointer; font-weight: 600; }
+.setting-module-options[open] > summary { margin-bottom: 12px; }
+.setting-module-options > label, .setting-module-options > details, .setting-module-options > .settings-inline-actions { margin-top: 12px; }
+.setting-candidate-sources blockquote { margin: 8px 0; padding-left: 10px; border-left: 2px solid var(--line); }
 
-.book-settings-browser { height: 100%; overflow-y: auto; padding: clamp(16px, 3vw, 32px); }
-.book-settings-browser > header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 20px; }
-.book-settings-browser h2, .book-settings-browser h3 { margin: 0 0 8px; }
-.book-settings-browser > header p { color: var(--muted); margin: 0; }
-.book-settings-browser > header button { margin: 4px; }
-.book-setting-section { border-bottom: 1px solid color-mix(in srgb, var(--muted) 16%, transparent); padding: 16px 0; }
-.book-setting-section summary { display: flex; flex-wrap: wrap; gap: 8px; cursor: pointer; font-weight: 600; }
-.book-setting-section summary::before { content: "›"; color: var(--muted); }
-.book-setting-section[open] > summary::before, .book-setting-collection[open] > summary::before, .book-setting-record[open] > summary::before { content: "⌄"; }
-.book-setting-section summary small { color: var(--muted); font-weight: 400; margin-left: auto; }
-.book-setting-collection, .book-setting-record { margin: 14px 0 0 12px; padding: 12px; background: color-mix(in srgb, var(--muted) 4%, transparent); border-radius: 10px; }
-.book-settings-browser dl > div { display: grid; grid-template-columns: minmax(85px, .2fr) minmax(0, 1fr); gap: 16px; padding: 8px 0; }
-.book-settings-browser dt { color: var(--muted); }
-.book-settings-browser dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
-.book-setting-rules p { line-height: 1.8; overflow-wrap: anywhere; }
-.book-setting-evidence { margin-top: 12px; }
-.book-setting-evidence blockquote { margin: 12px 0; padding-left: 12px; border-left: 2px solid var(--accent); }
-@media(max-width: 600px) { .book-settings-browser dl > div { grid-template-columns: 1fr; gap: 4px; } }
+/* 目录和内容在宽工作台独立滚动，窄面板改为上下排列。 */
+.book-settings-browser { display: flex; flex-direction: column; gap: 14px; height: 100%; min-height: 0; padding: clamp(12px, 2vw, 24px); container-type: inline-size; }
+.book-settings-browser > header, .book-setting-view > header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; align-items: center; }
+.book-settings-browser :is(h2, h3, h4) { margin: 0; }
+.book-settings-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.book-settings-layout { display: grid; grid-template-columns: clamp(144px, 24%, 230px) minmax(0, 1fr); gap: 14px; flex: 1; min-height: 0; }
+.book-settings-index, .book-settings-detail { min-width: 0; min-height: 0; overflow: auto; }
+.book-settings-index { padding: 10px; border: 1px solid var(--line-soft); border-radius: 12px; background: color-mix(in srgb, var(--panel-2) 62%, var(--panel)); }
+.book-settings-index input { width: 100%; min-width: 0; margin-bottom: 10px; }
+.book-settings-index section { margin-top: 14px; }
+.book-settings-index section h3 { padding: 0 8px 5px; color: var(--muted); font-size: 12px; }
+.book-settings-index button { display: flex; justify-content: space-between; gap: 8px; width: 100%; padding: 8px; border: 1px solid transparent; border-radius: 8px; background: transparent; text-align: left; white-space: normal; }
+.book-settings-index button[aria-current="page"] { border-color: var(--line); background: var(--accent-soft); color: var(--text); font-weight: 600; }
+.book-settings-index button small, .book-setting-view > header small, .book-setting-view > header > span { color: var(--muted); }
+.book-settings-detail { padding: 0 4px 10px 0; }
+.book-setting-view > header { margin-bottom: 12px; padding: 10px 0; border-bottom: 1px solid var(--line-soft); }
+.book-setting-view dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 155px), 1fr)); gap: 8px; margin: 0; }
+.book-setting-view dl > div, .book-setting-rules { min-width: 0; padding: 12px; border: 1px solid var(--line-soft); border-radius: 10px; background: var(--panel); }
+.book-setting-view .book-setting-wide { grid-column: 1 / -1; }
+.book-setting-view dt { color: var(--muted); font-size: 12px; }
+.book-setting-view dd { margin: 3px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; }
+.book-setting-rules { margin-top: 14px; }
+.book-setting-rules ol { margin: 8px 0 0; padding-inline-start: 22px; line-height: 1.7; overflow-wrap: anywhere; }
+.book-setting-record { margin: 8px 0; padding: 12px; border-radius: 10px; }
+.book-setting-record > summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; cursor: pointer; font-weight: 600; }
+.book-setting-record > summary::before { content: "›"; color: var(--muted); }
+.book-setting-record[open] > summary::before { content: "⌄"; }
+.book-setting-record > summary > small { margin-left: auto; color: var(--muted); font-weight: 400; }
+.book-setting-record[open] > .story-settings-manager { margin-top: 12px; }
+.book-memory-filters { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.book-memory-filters input { flex: 1 1 190px; min-width: 0; }
+.book-memory-filters select { flex: 1 1 130px; min-width: 0; }
+.book-memory-gap { padding: 8px 10px; border-left: 2px solid var(--theme-warm); color: var(--muted); line-height: 1.6; }
+.book-memory-list { display: grid; gap: 8px; }
+.book-memory-list article { padding: 10px 12px; border: 1px solid var(--line-soft); border-radius: 9px; background: var(--panel); }
+.book-memory-list article header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 10px; }
+.book-memory-list article small, .book-memory-connections small { color: var(--muted); }
+.book-memory-list article p { margin: 5px 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+.book-memory-connections { display: grid; justify-items: center; margin: 12px 0; padding: 14px 10px; border: 1px solid var(--line-soft); border-radius: 12px; background: var(--panel-2); }
+.book-memory-connections > strong { padding: 6px 14px; border: 1px solid var(--accent); border-radius: 8px; background: var(--accent-soft); }
+.book-memory-connections > div { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; padding-top: 14px; position: relative; }
+.book-memory-connections > div::before { content: ""; position: absolute; inset: 0 auto auto 50%; width: 1px; height: 14px; background: var(--line); }
+.book-memory-connections button { display: grid; min-width: 0; text-align: center; overflow-wrap: anywhere; border-top-color: var(--accent); }
+@container (max-width: 560px) {
+  .book-settings-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, auto) minmax(0, 1fr); }
+  .book-settings-index { max-height: 180px; }
+}
+
+/* 待决定项有文字和暖色双重提示，已经核对的参考用冷绿区分，避免只靠颜色辨识。 */
+.book-setting-record { border: 1px solid color-mix(in srgb, var(--theme-cool) 18%, var(--line-soft)); background: linear-gradient(110deg, color-mix(in srgb, var(--theme-cool) 6%, var(--panel)), var(--panel) 72%); }
+.book-setting-record:is([data-status="needs_user"], [data-status="conflict"]) { border-color: color-mix(in srgb, var(--theme-warm) 65%, var(--line)); background: linear-gradient(110deg, color-mix(in srgb, var(--theme-warm) 12%, var(--panel)), var(--panel) 70%); }
+.book-setting-record:is([data-status="needs_user"], [data-status="conflict"]) > summary > small { color: color-mix(in srgb, var(--theme-warm) 38%, var(--text)); font-weight: 600; }
+.book-setting-record:is([data-status="verified_reference"], [data-status="accepted"]) > summary > small { color: color-mix(in srgb, var(--theme-green) 40%, var(--text)); }
+.setting-choice-guide { margin: 14px 0; padding: 14px 16px; border-left: 3px solid var(--theme-warm); background: color-mix(in srgb, var(--theme-warm) 7%, var(--panel)); border-radius: 0 10px 10px 0; }
+.setting-choice-guide p { margin: 8px 0 12px; color: var(--muted); line-height: 1.8; }
+:root[data-theme] .setting-choice-guide button { border-color: color-mix(in srgb, var(--theme-warm) 42%, var(--line)); color: var(--text); background: color-mix(in srgb, var(--theme-warm) 13%, var(--panel)); }
+
+.setting-difference { margin-block: 12px; padding: 10px 14px; border: 1px solid var(--line-soft); border-radius: 10px; background: var(--panel); overflow-wrap: anywhere; }
+.setting-difference p { margin: 7px 0; white-space: pre-wrap; line-height: 1.8; }
+.setting-difference p > span { color: var(--muted); }
+.setting-difference > div { padding-block: 8px; border-top: 1px solid var(--line-soft); }
+
+.setting-candidate-card { padding: 16px; border: 1px solid color-mix(in srgb, var(--theme-warm) 48%, var(--line)); border-radius: 12px; background: color-mix(in srgb, var(--theme-warm) 6%, var(--panel)); }
+.setting-candidate-card > header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 8px; }
+.setting-candidate-card > header small { color: var(--muted); }
+.setting-candidate-card p, .setting-candidate-card blockquote { line-height: 1.8; overflow-wrap: anywhere; }
+.setting-candidate-card .settings-inline-actions { flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.setting-candidate-card > details > summary { cursor: pointer; color: var(--muted); }

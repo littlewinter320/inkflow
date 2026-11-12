@@ -80,11 +80,16 @@ try {
     catch [Threading.AbandonedMutexException] { $startupLockHeld = $true }
     if (-not $startupLockHeld) { return }
 
-$inkflowRunning = Get-CimInstance Win32_Process -Filter "Name='electron.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.ExecutablePath -eq $inkflowElectron -and $_.CommandLine -notmatch '(?:^|\s)--type=' } |
+# 同时识别旧入口与已更名的开发运行时；只接受本项目的精确路径，排除渲染子进程。
+$inkflowRunning = Get-CimInstance Win32_Process -Filter "Name='electron.exe' OR Name='墨流 InkFlow.exe'" -ErrorAction SilentlyContinue |
+    Where-Object {
+        ([string]::Equals([string]$_.ExecutablePath, $inkflowElectron, [StringComparison]::OrdinalIgnoreCase) -or
+         [string]::Equals([string]$_.ExecutablePath, $inkflowBrandedElectron, [StringComparison]::OrdinalIgnoreCase)) -and
+        $_.CommandLine -notmatch '(?:^|\s)--type='
+    } |
     Select-Object -First 1
 if ($inkflowRunning) {
-    Start-Process -FilePath $inkflowElectron -ArgumentList @("`"$desktopRoot`"") -WorkingDirectory $desktopRoot -WindowStyle Hidden
+    Start-Process -FilePath $inkflowRunning.ExecutablePath -ArgumentList @("`"$desktopRoot`"") -WorkingDirectory $desktopRoot -WindowStyle Hidden
     Write-Output '墨流已在运行，已请求显示现有窗口。'
     return
 }
@@ -98,7 +103,8 @@ $launchId = [Guid]::NewGuid().ToString('N')
 $stdout = Join-Path $runLogRoot "desktop-$launchId.stdout.log"
 $stderr = Join-Path $runLogRoot "desktop-$launchId.stderr.log"
 
-function Show-InkFlowStartupFailure([string]$Message) {
+# 普通提示只说现象与下一步；作者主动选择后才打开本次日志，不把技术输出直接塞进弹窗。
+function Show-InkFlowStartupFailure([string]$Message, [string]$LogPath) {
     try {
         if (-not ('InkFlowStartupNotice' -as [type])) {
             Add-Type -TypeDefinition @'
@@ -110,22 +116,17 @@ public static class InkFlowStartupNotice {
 }
 '@ -ErrorAction Stop | Out-Null
         }
-        [InkFlowStartupNotice]::Show([IntPtr]::Zero, $Message, '墨流启动提示', 0x10) | Out-Null
+        if ($LogPath -and (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
+            $choice = [InkFlowStartupNotice]::Show([IntPtr]::Zero,
+                "$Message`n`n是否打开本次启动记录查看原因？", '墨流启动提示', 0x114)
+            if ($choice -eq 6) {
+                Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\notepad.exe') -ArgumentList @("`"$LogPath`"") -ErrorAction Stop
+            }
+        } else {
+            [InkFlowStartupNotice]::Show([IntPtr]::Zero, $Message, '墨流启动提示', 0x10) | Out-Null
+        }
     } catch {
         try { Add-Content -LiteralPath $stderr -Value "Unable to show startup notice: $($_.Exception.Message)" -Encoding UTF8 } catch { }
-    }
-}
-
-function Get-RecentStartupLogText([string]$Path) {
-    try {
-        $lines = @(Get-Content -LiteralPath $Path -Tail 8 -ErrorAction Stop | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        $escapePattern = [regex]::Escape([string][char]27) + '\[[0-?]*[ -/]*[@-~]'
-        $text = ($lines -join "`n") -replace $escapePattern, ''
-        $text = $text -replace '(?i)(bearer\s+|api[_ -]?key\s*[:=]\s*)[^\s,;]+', '$1[已隐藏]'
-        if ($text.Length -gt 700) { $text = $text.Substring($text.Length - 700) }
-        return $text
-    } catch {
-        return ''
     }
 }
 
@@ -148,7 +149,23 @@ function Get-DescendantProcessIds([int]$RootProcessId, [object[]]$Processes) {
 }
 
 try {
-    $node = (Get-Command node.exe -ErrorAction Stop).Source
+    $inkflowNodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
+    $inkflowNodeRecord = 'D:\墨流\dev-launcher\node-path.txt'
+    $inkflowNodeCandidates = @(
+        $(if ($inkflowNodeCommand) { $inkflowNodeCommand.Source }),
+        $(if (Test-Path -LiteralPath $inkflowNodeRecord) { (Get-Content -LiteralPath $inkflowNodeRecord -Raw).Trim() }),
+        (Join-Path $env:ProgramFiles 'nodejs\node.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\nodejs\node.exe'),
+        (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe')
+    )
+    $inkflowNodeCandidates | Where-Object { $_ } | ForEach-Object {
+        Add-Content -LiteralPath $stderr -Value ("Node candidate: {0}; exists={1}" -f $_, (Test-Path -LiteralPath $_ -PathType Leaf)) -Encoding UTF8
+    }
+    $node = $inkflowNodeCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+    if (-not $node) { throw '本机未找到可用的 Node.js 运行时；请安装 Node.js 或在 node-path.txt 指定现有 node.exe 的完整路径。未自动下载或启动旧版。' }
+    $inkflowNodeVersion = & $node --version 2>&1
+    if ($LASTEXITCODE -ne 0 -or [string]$inkflowNodeVersion -notmatch '^v\d+\.\d+\.\d+') { throw '已找到的 Node.js 运行时无法正常启动；未改用其他墨流版本。' }
+    [IO.File]::WriteAllText($inkflowNodeRecord, $node, [Text.UTF8Encoding]::new($false))
     $nodeRoot = Split-Path -Parent $node
     $devScript = Join-Path $desktopRoot 'scripts\dev.mjs'
     $desktopBin = Join-Path $desktopRoot 'node_modules\.bin'
@@ -165,7 +182,7 @@ try {
 } catch {
     $reason = $_.Exception.Message
     try { Add-Content -LiteralPath $stderr -Value $reason -Encoding UTF8 } catch { }
-    Show-InkFlowStartupFailure "墨流开发版没有启动。`n原因：$reason`n`n本次启动日志：`n$stdout`n$stderr"
+    Show-InkFlowStartupFailure -Message '墨流暂时无法启动，本地启动准备没有完成。请查看本次记录，确认需要处理的组件或启动条件，再重新打开。' -LogPath $stderr
     return
 }
 
@@ -179,7 +196,8 @@ while ((Get-Date) -lt $deadline) {
     $process.Refresh()
     if ($process.HasExited) {
         $process.WaitForExit()
-        $failure = "启动进程提前退出，代码 $($process.ExitCode)。"
+        Add-Content -LiteralPath $stderr -Value "Startup exited before window confirmation; exit_code=$($process.ExitCode)" -Encoding UTF8 -ErrorAction SilentlyContinue
+        $failure = '工作台在窗口打开前就结束了。请先查看任务栏是否已有墨流窗口；没有的话，再启动一次。'
         break
     }
 
@@ -210,17 +228,15 @@ if (-not $ready) {
     $process.Refresh()
     if (-not $failure) {
         if ($process.HasExited) {
-            $failure = "启动进程提前退出，代码 $($process.ExitCode)。"
+            Add-Content -LiteralPath $stderr -Value "Startup exited before window confirmation; exit_code=$($process.ExitCode)" -Encoding UTF8 -ErrorAction SilentlyContinue
+            $failure = '工作台在窗口打开前就结束了。请先查看任务栏是否已有墨流窗口；没有的话，再启动一次。'
         } else {
-            $failure = "等待 $startupTimeoutSeconds 秒后仍未确认墨流主窗口就绪；进程可能仍在初始化，本脚本不会重启或强制结束它。"
+            $failure = '墨流暂时还没有显示主窗口，可能仍在初始化。请先等片刻并查看任务栏，不要连续点击启动；仍打不开时查看本次记录。'
         }
     }
-    $logTail = Get-RecentStartupLogText $stdout
-    if (-not $logTail) { $logTail = Get-RecentStartupLogText $stderr }
-    $message = "墨流开发版启动未确认。`n$failure`n"
-    if ($logTail) { $message += "`n最近日志：`n$logTail`n" }
-    $message += "`n本次启动日志：`n$stdout`n$stderr"
-    Show-InkFlowStartupFailure $message
+    $stdoutFile = Get-Item -LiteralPath $stdout -ErrorAction SilentlyContinue
+    $detailLog = if ($stdoutFile -and $stdoutFile.Length -gt 0) { $stdout } else { $stderr }
+    Show-InkFlowStartupFailure -Message $failure -LogPath $detailLog
     return
 }
 

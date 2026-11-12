@@ -16,6 +16,7 @@ const groups: Record<string, string> = {
   selected: "本次选用", omitted: "本次未选用", discarded: "没有取回的资料", questions: "需要你选择的问题",
   scene_summaries: "本章场景", unresolved_conflicts: "尚未消解的冲突", decision_summary: "处理依据",
   change_summary: "修改说明", strengths: "做得合适的部分", public_reasoning_summary: "公开判断依据",
+  trigger_conditions: "何时推进", completion_criteria: "怎样算回应", milestones: "推进过程",
 };
 const prose: Record<string, string> = {
   reply: "", summary: "", chapter_summary: "本章内容", description: "", text: "", message: "",
@@ -23,6 +24,8 @@ const prose: Record<string, string> = {
   evidence: "正文依据", quote: "引用原文", source_quote: "对照来源", chapter_quote: "本章原文", setting_quote: "设定原文",
   resolution: "处理结果", remaining_question: "尚需确定", requested_response: "本步需要", answer: "回应",
   task: "本次任务", before: "修改前", after: "修改后", inserted_text: "补充的内容", replacement: "替换内容",
+  question: "留给读者的问题", purpose: "叙事作用", causal_basis: "剧情依据", open_reason: "保留悬念的原因",
+  expected_change: "本章带来的变化",
 };
 
 export function readableValue(value: unknown): string {
@@ -35,6 +38,7 @@ export function readableValue(value: unknown): string {
     .map(([key, item]) => `${labels[key] || (/[^\x00-\x7f]/.test(key) ? key : "内容")}：${readableValue(item)}`).join("；");
 }
 
+/** 从真实记录整理公开说明；缺失信息不补造，内部身份仍保存在原记录中。 */
 export function readableRecord(value: unknown): string {
   const lines: string[] = [], seen = new Set<unknown>();
   const add = (text: string) => { const clean = readableSourceText(text).trim(); if (clean && !lines.includes(clean)) lines.push(clean); };
@@ -56,6 +60,13 @@ export function readableRecord(value: unknown): string {
       const label = [heading, title, chapter, actor, state].filter(Boolean).join(" · ");
       if (label) add(label);
     }
+    // 规划阅读保留伏笔的类型、跨度、条件和动作；编号仍可在原文模式核对。
+    const kind = ({ plot: "剧情线索", promise: "故事承诺", foreshadow: "伏笔", relationship: "人物关系", mystery: "谜团", hook: "章节钩子" } as Record<string, string>)[String(record.kind || "")];
+    const horizon = ({ short: "近期", arc: "本篇", volume: "本卷", book: "全书", open: "开放留白" } as Record<string, string>)[String(record.horizon || "")];
+    const action = ({ plant: "埋下线索", advance: "推进线索", payoff: "回应线索", delay: "延后回应" } as Record<string, string>)[String(record.action || "")];
+    if (kind || horizon || action) add([kind, horizon, action].filter(Boolean).join(" · "));
+    if (typeof record.window_start === "number" && typeof record.window_end === "number") add(`预计回应：第${record.window_start}～${record.window_end}章（仍须满足剧情条件）`);
+    if (Array.isArray(record.parent_thread_ids) && record.parent_thread_ids.length) add(`关联线索：${record.parent_thread_ids.length}条，具体对应可在原文核对。`);
     for (const [key, label] of Object.entries(prose)) if (typeof record[key] === "string" && record[key]) {
       add(`${label ? label + "：" : ""}${String(record[key])}`);
     }

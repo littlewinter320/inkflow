@@ -1,0 +1,68 @@
+/* 110ms反馈、220ms显现、160ms退出；退出保留时长与MotionPresence一致。 */
+:root { --motion-feedback: 110ms; --motion-reveal: 220ms; --motion-exit: 160ms; --motion-ease: cubic-bezier(.2, .8, .2, 1); }
+:is(button, a[href], input, textarea, select, summary, [role="button"], [role="tab"]) {
+  transition-property: color, background-color, border-color, box-shadow, opacity, translate, scale, filter;
+  transition-duration: var(--motion-feedback);
+  transition-timing-function: var(--motion-ease);
+}
+@media (hover: hover) {
+  :is(button, a[href], summary, [role="button"]):hover:not(:disabled):not([aria-disabled="true"]) { translate: 0 -1px; }
+}
+:is(button, summary, [role="button"]):active:not(:disabled):not([aria-disabled="true"]) { scale: .975; translate: 0 0; }
+:is(button, a[href], input, textarea, select, summary, [role="button"], [role="tab"]):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+/* 拖动、分隔条与按真实占比绘制的区段不能因悬停缩放改变命中位置。 */
+:is(.workspace-title-handle, .context-composition > button):is(:hover, :active), .workspace-interacting :is(button, summary) { translate: none; scale: none; }
+.workspace-interacting *, .conversation-split[data-resizing="true"] * { transition: none !important; }
+.context-composition > button:is(:hover, :focus-visible) { filter: brightness(1.14); }
+:is(.process-triangle, .tree-label > span:first-child) { transition: rotate var(--motion-feedback), transform var(--motion-feedback); }
+
+/* 原生popover由浏览器保留顶层到退出结束，不使用延迟再次打开或重复派发点击。 */
+[popover].workspace-menu-content { opacity: 0; translate: 0 -7px; scale: .97; transform-origin: top right;
+  transition: opacity var(--motion-exit) var(--motion-ease), translate var(--motion-reveal) var(--motion-ease), scale var(--motion-reveal) var(--motion-ease), display var(--motion-exit) allow-discrete, overlay var(--motion-exit) allow-discrete; }
+[popover].workspace-menu-content:popover-open { opacity: 1; translate: 0 0; scale: 1; }
+@starting-style { [popover].workspace-menu-content:popover-open { opacity: 0; translate: 0 -7px; scale: .97; } }
+
+/* 自定义弹窗与原生dialog共享出入层次；包裹层不改变原有grid/flex布局。 */
+.motion-presence { display: contents; }
+.motion-presence[data-motion-exiting="true"] { pointer-events: none; }
+:is(.modal-backdrop, dialog[open]) { opacity: 1; transition: opacity var(--motion-exit) var(--motion-ease); }
+:is(.modal-backdrop > .modal, dialog[open]) { translate: 0 0; scale: 1; transition: opacity var(--motion-exit) var(--motion-ease), translate var(--motion-reveal) var(--motion-ease), scale var(--motion-reveal) var(--motion-ease); }
+.motion-presence[data-motion-exiting="true"] > :is(.modal-backdrop, dialog) { opacity: 0; }
+.motion-presence[data-motion-exiting="true"] > .modal-backdrop > .modal,
+.motion-presence[data-motion-exiting="true"] > dialog { translate: 0 9px; scale: .985; }
+dialog::backdrop { opacity: 1; transition: opacity var(--motion-exit); }
+.motion-presence[data-motion-exiting="true"] > dialog::backdrop { opacity: 0; }
+@starting-style {
+  :is(.modal-backdrop, dialog[open]), dialog[open]::backdrop { opacity: 0; }
+  :is(.modal-backdrop > .modal, dialog[open]) { translate: 0 12px; scale: .975; }
+}
+
+/* details保留原生语义；不支持尺寸插值的宿主仍可立即展开并读到全部内容。 */
+@supports selector(details::details-content) {
+  details::details-content { opacity: 0; transition: opacity var(--motion-reveal), content-visibility var(--motion-reveal) allow-discrete; }
+  details[open]::details-content { opacity: 1; }
+  @supports (interpolate-size: allow-keywords) {
+    details::details-content { interpolate-size: allow-keywords; block-size: 0; overflow: clip; transition: block-size var(--motion-reveal) var(--motion-ease), opacity var(--motion-reveal), content-visibility var(--motion-reveal) allow-discrete; }
+    details[open]::details-content { block-size: auto; }
+  }
+}
+
+/* 面板保留关闭前的矩形；只过渡显隐，指针拖动期间不插值left/width。 */
+.workspace-grid.workspace-free > .workspace-panel { opacity: 1; transition: opacity var(--motion-exit) var(--motion-ease), display var(--motion-exit) allow-discrete; }
+.workspace-grid.workspace-free > .workspace-panel[hidden] { opacity: 0; }
+@starting-style { .workspace-grid.workspace-free > .workspace-panel:not([hidden]) { opacity: 0; } }
+.question-backdrop { transition: opacity var(--motion-exit), display var(--motion-exit) allow-discrete; }
+.question-backdrop[hidden] { opacity: 0; }
+
+/* 新出现的反馈和资料轻微浮现，流式正文和每秒计时不设置重复入场动画。 */
+:is(.context-segment-tooltip, .context-material-prose, .context-material-list, .prompt-optimization-preview, .voice-live-transcript, .pending-question-notice, .form-error, .toast, .notice) { animation: studio-feedback-in var(--motion-reveal) var(--motion-ease) both; }
+.motion-presence > :is(.tree-items, .chapter-tree-groups, .context-material-prose, .context-material-list, .context-segment-tooltip, .prompt-optimization-preview, .voice-live-transcript, .conversation-rename) { opacity: 1; transition: opacity var(--motion-exit), translate var(--motion-exit); }
+.motion-presence[data-motion-exiting="true"] > :is(.tree-items, .chapter-tree-groups, .context-material-prose, .context-material-list, .context-segment-tooltip, .prompt-optimization-preview, .voice-live-transcript, .conversation-rename) { opacity: 0; translate: 0 5px; animation: none; }
+@starting-style { .motion-presence > :is(.tree-items, .chapter-tree-groups, .conversation-rename) { opacity: 0; translate: 0 5px; } }
+@keyframes studio-feedback-in { from { opacity: 0; translate: 0 6px; } to { opacity: 1; translate: 0 0; } }
+:root:has(.modal-backdrop:not([hidden]), dialog[open]) .welcome-shell::after { animation-play-state: paused; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  :is(button, a[href], summary, [role="button"]):is(:hover, :active) { translate: none !important; scale: none !important; }
+  details::details-content { transition: none !important; }
+}

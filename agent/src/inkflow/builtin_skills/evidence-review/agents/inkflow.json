@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "kind": "hybrid",
+  "workflow": {
+    "path": "scripts/workflow.json"
+  },
+  "display_name": "有据审核",
+  "roles": [
+    "editor",
+    "reviewer"
+  ],
+  "activation": "automatic",
+  "contracts": [
+    "review.*"
+  ],
+  "when": "Editor或Reviewer实际承担当前版正文审核、表达审核、连续性或已定位证据核验时使用。",
+  "not_when": "未分派的职责、纯记忆提取、闲聊或已有同版有效核验时不用；只审查不改正文。",
+  "inputs": [
+    "当前同版完整正文或定向问题",
+    "明确检查项、必要来源和作者要求"
+  ],
+  "outputs": [
+    "当前审核Schema的结论、定位引文与来源关系",
+    "可执行的最小改动建议或补源缺口"
+  ],
+  "tasks": [
+    "确认本次检查归属",
+    "顺读当前原文",
+    "寻找可共存解释",
+    "定位证据与问题",
+    "提出最小修订或补源"
+  ],
+  "references": [
+    {
+      "path": "references/evidence-standard.md",
+      "contracts": [
+        "review.editor",
+        "review.reviewer",
+        "review.arc"
+      ]
+    },
+    {
+      "path": "references/targeted-evidence.md",
+      "contracts": [
+        "review.claim",
+        "review.dispute",
+        "review.same_chapter",
+        "review.correction"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "tool": "skill.scope",
+      "script": "scripts/scope.json"
+    },
+    {
+      "tool": "skill.resources",
+      "script": "scripts/resources.json"
+    },
+    {
+      "tool": "skill.output",
+      "script": "scripts/output.json"
+    }
+  ]
+}

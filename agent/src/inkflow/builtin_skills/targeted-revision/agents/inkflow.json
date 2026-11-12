@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "kind": "hybrid",
+  "workflow": {
+    "path": "scripts/workflow.json"
+  },
+  "display_name": "定点改稿",
+  "roles": [
+    "writer"
+  ],
+  "activation": "automatic",
+  "contracts": [
+    "writer.revise",
+    "writer.local_revision",
+    "writer.selection",
+    "writer.length_*"
+  ],
+  "when": "Writer进入已授权的选区、局部、篇幅或章级修订节点；有当前版原文与可定位问题时使用。",
+  "not_when": "只审稿、只看方案、原句不唯一、来源已换版或未获已接受稿专门修订权限时不用。",
+  "inputs": [
+    "同版原稿、定位引句、作者要求或有效审核",
+    "本次保留项和允许替换范围"
+  ],
+  "outputs": [
+    "当前Schema要求的局部替换、补足计划或完整修订稿",
+    "新版对应说明与未解决问题"
+  ],
+  "tasks": [
+    "锁定原版本与允许范围",
+    "判断意见依据",
+    "选择最小有效修法",
+    "处理长度或选区分支",
+    "交新版与回归说明"
+  ],
+  "references": [
+    {
+      "path": "references/operations.md"
+    }
+  ],
+  "steps": [
+    {
+      "tool": "skill.scope",
+      "script": "scripts/scope.json"
+    },
+    {
+      "tool": "skill.resources",
+      "script": "scripts/resources.json"
+    },
+    {
+      "tool": "skill.output",
+      "script": "scripts/output.json"
+    }
+  ]
+}

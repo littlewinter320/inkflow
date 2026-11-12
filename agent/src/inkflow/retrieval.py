@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from math import isfinite
 
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 import json
 import math
@@ -11,7 +11,8 @@ import re
 from typing import Any
 
 from .project import InkFlowProject
-from .utils import content_hash
+from .retrieval_lifecycle import ambiguity_groups, consolidate_candidates, preserve_alternatives
+from .utils import content_hash, estimate_tokens
 
 
 _MODEL_CACHE: dict[str, Any] = {}
@@ -68,6 +69,7 @@ class HybridRetriever:
         self.source_gaps: list[dict[str, Any]] = []
         self._embedding_cache_hits = 0
         self._embedding_cache_misses = 0
+        self._knowledge_snapshot: dict[str, Any] = {}
 
     def retrieve(
         self,
@@ -77,8 +79,16 @@ class HybridRetriever:
         chapter_no: int,
         chapter_version: int | None = None,
         top_k: int | None = None,
+        quality_preset: str | None = None,
+        context_token_budget: int | None = None,
+        foreshadow_query: str = "",
     ) -> list[dict[str, Any]]:
+        """按权限与相关性召回；新任务按可用窗口选材，旧快照保留原数量策略。"""
+        if context_token_budget is not None and (type(context_token_budget) is not int or context_token_budget < 1):
+            raise ValueError("检索资料预算必须是正整数。")
+        self._knowledge_query = query
         candidates = self._candidates(role=role, chapter_no=chapter_no, chapter_version=chapter_version)
+        corpus_candidate_count = len(candidates)
         from .preferences import applicable_preferences
         preferences = applicable_preferences(self._preference_items(), query,
             {"chapter_no": chapter_no, "genre": self.project.db.get_brief().genre})
@@ -86,13 +96,25 @@ class HybridRetriever:
         candidates = [item for item in candidates if item.get("source_type") != "user_preference"
                        or item["source_id"] in allowed_preferences]
         candidates, overlaps, conflicts = self._merge_candidates(candidates)
+        candidates, duplicates = consolidate_candidates(candidates)
+        ambiguities = ambiguity_groups(candidates)
+        fingerprints = {item["source_id"]: item["source_fingerprint"] for item in candidates}
+        maintenance = self.project.db.maintain_retrieval_cache(
+            {item["source_id"]: content_hash(item["title"] + "\n" + item["body"]) for item in candidates},
+            revision=content_hash(json.dumps(fingerprints, sort_keys=True)))
         exact, lexical, branches = self._local_branches(query, candidates)
         self._embedding_cache_hits = 0
         self._embedding_cache_misses = 0
         if not candidates:
-            self.last_diagnostics = {"query": query, "candidate_count": 0, "selected": [], "discarded": [],
+            self.last_diagnostics = {"query": query, "query_hash": content_hash(query), "candidate_count": 0, "selected": [], "discarded": [],
                                      "source_gaps": self.source_gaps, "branches": branches,
-                                     "overlaps": overlaps, "source_conflicts": conflicts}
+                                     "overlaps": overlaps, "source_conflicts": conflicts,
+                                     "duplicates": duplicates, "ambiguities": ambiguities, "maintenance": maintenance}
+            if quality_preset is not None:
+                self.last_diagnostics.update(corpus_candidate_count=corpus_candidate_count, relevant_candidate_count=0,
+                    retrieved_count=0, coverage_policy={"policy_version": 2, "quality_preset": quality_preset,
+                        "relevant_candidate_count": 0, "target_count": 0, "target_fraction": 0,
+                        "denominator": "matched_source_valid_candidates"})
             return []
         factors = self._adaptive_factors(query, candidates, chapter_no)
         limit = top_k if top_k is not None else self._adaptive_top_k(query, len(candidates), factors)
@@ -105,7 +127,11 @@ class HybridRetriever:
             except (ImportError, OSError, RuntimeError, ValueError) as exc:
                 optional_failures.append({"channel": "semantic", "error_type": type(exc).__name__,
                     "reason": str(exc), "fallback": "exact_and_bm25"})
-        rankings = (("精确", exact), ("BM25", lexical), ("语义", semantic))
+        # 关系与全文属于主召回；向量只补充相似表达，不能挤掉同权威的主召回证据。
+        graph_ids = self._knowledge_related_ids(query)
+        graph = [(item["source_id"], 1.0) for item in candidates if item["source_id"] in graph_ids]
+        primary_ids = {identity for identity, _ in exact + lexical + graph}
+        rankings = (("关系", graph), ("精确", exact), ("BM25", lexical), ("语义辅助", semantic))
         scores: dict[str, float] = {}
         reasons: dict[str, list[str]] = {}
         for label, ranking in rankings:
@@ -113,7 +139,7 @@ class HybridRetriever:
                 if not isfinite(raw_score) or raw_score <= 0:
                     continue
                 # RRF fuses rank positions; BM25 and cosine raw scores have different scales.
-                scores[source_id] = scores.get(source_id, 0.0) + 1.0 / (50 + rank)
+                scores[source_id] = scores.get(source_id, 0.0) + (0.2 if label == "语义辅助" else 1.0) / (50 + rank)
                 reasons.setdefault(source_id, []).append(label)
         for candidate in candidates:
             source_id = candidate["source_id"]
@@ -122,21 +148,117 @@ class HybridRetriever:
             # Unscoped historical citations cannot establish relevance or source quality for this request.
             if candidate["authority_rank"] <= 3:
                 scores[source_id] += 0.01
+        if foreshadow_query.strip():
+            # 当前卡的推进/兑现目标单独召回，避免被长正文查询稀释；不扩大数量或越过来源核验。
+            canon = [item for item in candidates if item["source_type"] in {
+                "canon_thread", "canon_fact", "chapter_summary", "canon_source"}]
+            focus_exact = self._exact_ranking(foreshadow_query, canon)
+            focus_lexical = self._bm25_ranking(foreshadow_query, canon)
+            for ranking in (focus_exact, focus_lexical):
+                for rank, (source_id, raw_score) in enumerate(ranking, 1):
+                    if not isfinite(raw_score) or raw_score <= 0:
+                        continue
+                    scores[source_id] = scores.get(source_id, 0.0) + 2.0 / (50 + rank)
+                    if "本章伏笔目标：双倍排序权重" not in reasons.setdefault(source_id, []):
+                        reasons[source_id].append("本章伏笔目标：双倍排序权重")
+        try:
+            feedback = self.project.db.retrieval_feedback_scores(query=query, role=role, chapter_no=chapter_no,
+                                                               fingerprints=fingerprints)
+        except (ValueError, TypeError) as exc:
+            feedback = {}
+            optional_failures.append({"channel": "feedback", "error_type": type(exc).__name__,
+                "reason": "反馈绑定记录无法核验，未采用其排序影响。", "fallback": "unadjusted_rrf"})
+        for source_id, adjustment in feedback.items():
+            if source_id in scores:
+                scores[source_id] += adjustment
         by_id = {item["source_id"]: item for item in candidates}
         ranked_ids = sorted(
             scores,
-            key=lambda source_id: (by_id[source_id]["authority_rank"], -scores[source_id], source_id),
+            key=lambda source_id: (by_id[source_id]["authority_rank"], source_id not in primary_ids, -scores[source_id], source_id),
         )
+        verified_sources: dict[int, dict[str, Any]] = {}
+        candidate_source_reads = []
+        invalid_source_ids = set()
+
+        def verified_source(hit: dict[str, Any]) -> dict[str, Any]:
+            """新策略先本地核验匹配来源，按章复用已读正文，不靠候选数猜有效比例。"""
+            if (type(hit.get("chapter_no")) is not int or hit["chapter_no"] < 1
+                    or type(hit.get("version")) is not int or hit["version"] < 1 or not hit.get("source_hash")):
+                raise ValueError("正史候选缺少可靠章节、版本或来源哈希，不能计作有效证据。")
+            number = int(hit["chapter_no"])
+            if number not in verified_sources:
+                verified_sources[number] = self._accepted_source(number, before_chapter=chapter_no)
+            source = verified_sources[number]
+            if ((hit.get("version") is not None and source["version"] != hit["version"])
+                    or (hit.get("source_hash") and source["content_hash"] != hit["source_hash"])):
+                raise ValueError("命中后正文来源版本或哈希已变化。")
+            if hit["source_type"] == "canon_fact" and (not str(hit.get("evidence") or "").strip()
+                    or hit["evidence"] not in source["content"]):
+                raise ValueError("事实主证据未在当前已接受原文定位。")
+            return source
+
+        coverage = {}
+        if quality_preset is not None and top_k is None:
+            # 分母排除已经证实失效的相关来源；未取回的原文核验也只是本地工作，并非模型已读。
+            for source_id in ranked_ids:
+                item = by_id[source_id]
+                if item["source_type"] not in {"chapter_summary", "canon_fact", "canon_thread", "canon_source"}:
+                    continue
+                try:
+                    verified_source(item)
+                except (ValueError, OSError, UnicodeError) as exc:
+                    invalid_source_ids.add(source_id)
+                    self.source_gaps.append({"kind": item["source_type"], "chapter_no": item["chapter_no"],
+                        "version": item.get("version"), "source_hash": item.get("source_hash"),
+                        "state": "source_unavailable", "owner": "memory_owner", "reason": str(exc)})
+                    candidate_source_reads.append({"source_id": source_id, "state": "failed", "reason": str(exc)})
+            ranked_ids = [identity for identity in ranked_ids if identity not in invalid_source_ids]
+            # 比例针对有匹配信号的有效候选；零匹配资料不因凑比例被强行装入。
+            relevant_count = len(ranked_ids)
+            base = self._adaptive_top_k(query, relevant_count, factors)
+            economy_ratio = min(0.5, 0.3 + max(0, base - 20) / 100)
+            economy_target = math.ceil(relevant_count * economy_ratio)
+            balanced_target = min(relevant_count, economy_target * 2)
+            limit = economy_target if quality_preset == "economy" else balanced_target
+            if quality_preset == "quality":
+                limit = max(balanced_target, math.ceil(relevant_count * 0.5))
+            limit = min(limit, relevant_count)
+            if context_token_budget is not None:
+                # 不再按书库大小填充上下文；复杂任务可以多取，但不会随全书条目无界增长。
+                tier_limit = {"economy": 12, "balanced": 20, "quality": 28}.get(quality_preset, 20)
+                limit = min(relevant_count, max(4, min(tier_limit, base)),
+                            max(1, context_token_budget // 1800))
+            coverage = {"policy_version": 2, "quality_preset": quality_preset,
+                "relevant_candidate_count": relevant_count, "target_count": limit,
+                "target_fraction": limit / relevant_count if relevant_count else 0,
+                "denominator": "matched_source_valid_candidates", "economy_target_count": economy_target,
+                "source_validation_failed_count": len(invalid_source_ids),
+                "meaning": "先按适用范围、去重、匹配信号及本地正文来源核验计目标；本地核验不等于已向模型装入。"}
+            if context_token_budget is not None:
+                coverage.update(policy_version=3, context_token_budget=context_token_budget,
+                    meaning="按任务相关性及角色窗口选择背景资料，不以全书比例或填满容量为目标；未选来源仍可定点回查。")
         selected = ranked_ids[:limit]
         initial_ids = set(selected)
-        selected = self._relation_expand(selected, candidates, limit=limit)
+        # 新策略扩展与比例使用同一已匹配、已核源池，不能把分母外的零分资料补进分子。
+        relevant_ids = set(ranked_ids)
+        relation_candidates = [item for item in candidates if item["source_id"] in relevant_ids] if coverage else candidates
+        selected = self._relation_expand(selected, relation_candidates, limit=limit)
+        comparison_groups = [{**group, "source_ids": [identity for identity in group["source_ids"]
+            if identity in relevant_ids]} for group in ambiguities] if coverage else ambiguities
+        selected = preserve_alternatives(selected, comparison_groups, limit=limit)
         relation_ids = set(selected) - initial_ids
         hits = []
         for source_id in selected:
             item = dict(by_id[source_id])
+            item["semantic_only"] = source_id not in primary_ids
             item["score"] = round(scores.get(source_id, 0.0), 6)
             item["retrieval_reasons"] = (["关系扩展：在最终数量预算内替换低相关项"]
                 if source_id in relation_ids else reasons.get(source_id, ["关系扩展"]))
+            if source_id in feedback and feedback[source_id]:
+                item["retrieval_reasons"].append("同查询、同角色、同来源版本的有界反馈排序")
+            if any(source_id in group["source_ids"] for group in ambiguities):
+                item["retrieval_status"] = "needs_comparison"
+                item["retrieval_reasons"].append("存在不同内容、认识类型或时点，须结合原文对照")
             hits.append(item)
         if self.reranker_model and len(hits) > 1:
             try:
@@ -145,28 +267,43 @@ class HybridRetriever:
                 optional_failures.append({"channel": "reranker", "error_type": type(exc).__name__,
                     "reason": str(exc), "fallback": "rrf"})
         # Backfill rejected derived summaries with already ranked, unselected sources.
-        backfill = [source_id for source_id in ranked_ids if source_id not in selected][:6] if limit else []
+        # 扩大召回后可能有多条旧来源失效；按原排序补足，实际读取在达到目标时即停止。
+        backfill = [source_id for source_id in ranked_ids if source_id not in selected] if limit else []
+        if not coverage:
+            backfill = backfill[:6]
         hits.extend({**by_id[source_id], "score": round(scores[source_id], 6),
             "retrieval_reasons": reasons[source_id], "backfilled": True} for source_id in backfill)
         result = hits
-        source_reads = []
+        source_reads = candidate_source_reads
         validated = []
         for hit in result:
             if len(validated) >= limit:
                 break
-            if hit["source_type"] != "chapter_summary":
+            if hit["source_type"] not in {"chapter_summary", "canon_fact", "canon_thread", "canon_source"}:
                 validated.append(hit)
                 continue
             try:
-                source = self._accepted_source(int(hit["chapter_no"]), before_chapter=chapter_no)
-                if source["version"] != hit["version"] or source["content_hash"] != hit["source_hash"]:
-                    raise ValueError("摘要命中后正文来源版本已变化。")
+                source = verified_source(hit) if coverage else self._accepted_source(int(hit["chapter_no"]), before_chapter=chapter_no)
+                if ((hit.get("version") is not None and source["version"] != hit["version"])
+                        or (hit.get("source_hash") and source["content_hash"] != hit["source_hash"])):
+                    raise ValueError("命中后正文来源版本或哈希已变化。")
+                if hit["source_type"] == "canon_fact" and (not str(hit.get("evidence") or "").strip()
+                        or hit["evidence"] not in source["content"]):
+                    raise ValueError("事实主证据未在当前已接受原文定位。")
+                if hit["source_type"] != "chapter_summary":
+                    validated.append(hit)
+                    source_reads.append({"source_id": hit["source_id"], "chapter_no": hit["chapter_no"],
+                        "version": source["version"], "source_hash": source["content_hash"],
+                        "state": "source_validated", "via": hit["source_type"]})
+                    continue
                 text = source["content"]
-                spans = [{"source_id": str(offset), "title": hit["title"], "body": text[offset:offset + 5000]}
-                         for offset in range(0, len(text), 1000)]
+                excerpt_size = (max(800, min(2400, context_token_budget // max(1, limit)))
+                                if context_token_budget is not None else 5000)
+                spans = [{"source_id": str(offset), "title": hit["title"], "body": text[offset:offset + excerpt_size]}
+                         for offset in range(0, len(text), min(1000, excerpt_size // 2))]
                 ranked_spans = self._bm25_ranking(query, spans)
                 offset = int(ranked_spans[0][0]) if ranked_spans else 0
-                excerpt, offset, end = _paragraph_excerpt(text, offset)
+                excerpt, offset, end = _paragraph_excerpt(text, offset, max_chars=excerpt_size)
                 hit = {**hit, "summary_body": hit["body"], "body": excerpt,
                     "summary_content_hash": hit.get("content_hash"), "content_hash": content_hash(excerpt),
                     "identity": "accepted_source_excerpt", "body_kind": "accepted_prose",
@@ -177,7 +314,7 @@ class HybridRetriever:
                 source_reads.append({**hit["resolved_source"], "state": "read", "via": "chapter_summary"})
                 validated.append(hit)
             except (ValueError, OSError, UnicodeError) as exc:
-                self.source_gaps.append({"kind": "chapter_summary", "chapter_no": hit["chapter_no"],
+                self.source_gaps.append({"kind": hit["source_type"], "chapter_no": hit["chapter_no"],
                     "version": hit.get("version"), "source_hash": hit.get("source_hash"),
                     "state": "source_unavailable", "owner": "memory_owner", "reason": str(exc)})
                 source_reads.append({"source_id": hit["source_id"], "state": "failed", "reason": str(exc)})
@@ -188,20 +325,32 @@ class HybridRetriever:
             "branches": branches, "overlaps": overlaps, "source_conflicts": conflicts,
             "source_reads": source_reads,
             "optional_failures": optional_failures,
+            "query_hash": content_hash(query), "duplicates": duplicates,
+            "ambiguities": [{**group, "selected_source_ids": [identity for identity in group["source_ids"] if identity in selected_ids],
+                "omitted_count": sum(identity not in selected_ids for identity in group["source_ids"])} for group in ambiguities][:16],
+            "ambiguity_group_count": len(ambiguities), "maintenance": maintenance,
+            "feedback_adjustments": {identity: value for identity, value in feedback.items() if identity in selected_ids},
             "backfilled_source_ids": [item["source_id"] for item in result if item.get("backfilled")],
             "relation_expansion": {"included": sorted(relation_ids), "replaced": sorted(initial_ids - set(selected)),
                                    "budget": limit},
             "query": query,
             "candidate_count": len(candidates),
+            **({"coverage_policy": {**coverage,
+                "retrieved_fraction": len(result) / coverage["relevant_candidate_count"] if coverage["relevant_candidate_count"] else 0},
+                "corpus_candidate_count": corpus_candidate_count,
+                "relevant_candidate_count": coverage["relevant_candidate_count"]} if coverage else {}),
             "initial_top_k": limit,
             "retrieved_count": len(result),
             "not_retrieved_count": len(candidates) - len(result),
             "adaptive_factors": factors,
-            "selected": [{"source_id": item["source_id"], "score": item["score"], "reasons": item["retrieval_reasons"]} for item in result],
+            "selected": [{"source_id": item["source_id"], "score": item["score"], "reasons": item["retrieval_reasons"],
+                "source_fingerprint": item["source_fingerprint"]} for item in result],
             "discarded": [
                 {"source_id": item["source_id"], "title": item.get("title", "相关资料"),
                  "source_type": item["source_type"], "chapter_no": item.get("chapter_no"),
-                 "reason": "本次相关性排序和资料容量下未选中" if item["source_id"] in scores else "没有匹配本次查找内容"}
+                 "reason": "来源章节、版本、哈希或正文证据核验未通过，未作为有效证据取回。"
+                    if item["source_id"] in invalid_source_ids else
+                    "本次相关性排序和资料容量下未选中" if item["source_id"] in scores else "没有匹配本次查找内容"}
                 for item in candidates if item["source_id"] not in selected_ids
             ][:80],
             "discarded_display_limit": 80,
@@ -209,6 +358,227 @@ class HybridRetriever:
         if self.embedding_model:
             self.last_diagnostics["embedding_cache_hits"] = self._embedding_cache_hits
             self.last_diagnostics["embedding_cache_misses"] = self._embedding_cache_misses
+        return result
+
+    def narrative_context(self, query: str, *, chapter_no: int, token_limit: int,
+                          seed_chapters: list[int] | None = None, source_limit: int = 6,
+                          provisional_chapters: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Compare versioned parent scenes locally, with explicit history and budget gaps."""
+        from .narrative_memory import event_history, event_patch_gaps, scene_span
+        # shortcut: scan and validate local history on demand; cache by source versions if large-book latency warrants it.
+        rows = self.project.db.narrative_history_rows(chapter_no)
+        history = event_history(rows)
+        events = history["events"]
+        temporary_gaps, temporary_sources = [], []
+        batch_ids = {str(item.get("batch_id") or "") for item in provisional_chapters or []}
+        temporary_counts = Counter(int(item["chapter_no"]) for item in provisional_chapters or [])
+        for item in sorted(provisional_chapters or [], key=lambda value: int(value["chapter_no"])):
+            number = int(item["chapter_no"])
+            if number >= chapter_no:
+                continue
+            batch_id = str(item.get("batch_id") or "")
+            current = self.project.db.get_chapter(number)
+            if current and current["status"] == "accepted":
+                continue
+            try:
+                if len(batch_ids) != 1 or not batch_id:
+                    raise ValueError("临时对照必须明确绑定同一个原批次")
+                if temporary_counts[number] != 1:
+                    raise ValueError("临时对照章节重复，未猜测采用哪份输入")
+                staged = self.project.db.get_provisional_memory_patch(batch_id, number)
+                text = str(item.get("content") or "")
+                if (not staged or staged["status"] != "active" or not current or current["status"] != "draft"
+                        or current["version"] != staged["chapter_version"] or current["content_hash"] != staged["content_hash"]
+                        or content_hash(text) != staged["content_hash"]):
+                    raise ValueError("临时事件的当前草稿或原批次暂存版本已变化")
+                path = (self.project.root / current["path"]).resolve()
+                if not path.is_relative_to(self.project.root.resolve()) or content_hash(path.read_text(encoding="utf-8")) != staged["content_hash"]:
+                    raise ValueError("临时事件的草稿文件来源已变化或越出项目")
+                patch = staged["patch"]
+                if patch.chapter_no != number:
+                    raise ValueError("临时事件的章节身份不一致")
+                gaps = event_patch_gaps(patch, text, prior_events=history["events"], sources=history["sources"],
+                                       source_bindings=history["source_bindings"])
+                if gaps:
+                    raise ValueError("；".join(gaps))
+                temporary_sources.append({"chapter_no": number, "version": current["version"],
+                    "content_hash": staged["content_hash"], "text": text, "batch_id": batch_id})
+                if not patch.narrative_events:
+                    temporary_gaps.append({"chapter_no": number, "reason": "同批次草稿尚无事件索引，仅提供已核原文"})
+                for event in patch.narrative_events:
+                    value = event.model_dump(mode="json")
+                    start, end = scene_span(text, value)
+                    events.append({**value, "chapter_no": number, "source_version": current["version"],
+                        "source_hash": staged["content_hash"], "start": start, "end": end,
+                        "source_id": f"batch-event:{batch_id}:{number:05d}:{event.event_id}",
+                        "source_status": "provisional", "batch_id": batch_id, "index_origin": "reviewed_batch_memory"})
+            except (ValueError, OSError, UnicodeError) as exc:
+                temporary_gaps.append({"chapter_no": number, "reason": str(exc)})
+        by_chapter: dict[int, list[dict[str, Any]]] = {}
+        for event in events:
+            by_chapter.setdefault(event["chapter_no"], []).append(event)
+        candidates, unavailable = [], []
+        for row in rows:
+            number = int(row["chapter_no"])
+            text = history["sources"].get(number)
+            if text is None:
+                try:
+                    source = self._accepted_source(number, before_chapter=chapter_no)
+                    if source["version"] != row["version"] or source["content_hash"] != row["content_hash"]:
+                        raise ValueError("对照来源版本已变化")
+                    text = source["content"]
+                except (ValueError, OSError, UnicodeError) as exc:
+                    unavailable.append({"chapter_no": number, "reason": str(exc)})
+                    continue
+            chapter_events = by_chapter.get(number, [])
+            spans = {(item["start"], item["end"]) for item in chapter_events} or {(0, len(text))}
+            for start, end in sorted(spans):
+                related = [item for item in chapter_events if item["start"] == start and item["end"] == end]
+                candidates.append({"source_id": f"chapter:{number:05d}:scene:{start}:{end}",
+                    "chapter_source_id": f"chapter:{number:05d}", "source_status": "accepted",
+                    "chapter_no": number, "version": int(row["version"]), "source_hash": row["content_hash"],
+                    "start": start, "end": end, "body": text[start:end],
+                    "title": " ".join(item["summary"] + " " + " ".join(item["participants"]) for item in related),
+                    "scope": "indexed_scene" if related else "whole_chapter_fallback",
+                    "event_ids": [item["event_id"] for item in related]})
+        for source in temporary_sources:
+            number, text, batch_id = source["chapter_no"], source["text"], source["batch_id"]
+            chapter_events = by_chapter.get(number, [])
+            for start, end in sorted({(item["start"], item["end"]) for item in chapter_events} or {(0, len(text))}):
+                related = [item for item in chapter_events if item["start"] == start and item["end"] == end]
+                candidates.append({"source_id": f"batch:{batch_id}:chapter:{number:05d}:scene:{start}:{end}",
+                    "chapter_source_id": f"batch:{batch_id}:chapter:{number:05d}", "source_status": "provisional",
+                    "chapter_no": number, "version": source["version"], "source_hash": source["content_hash"],
+                    "start": start, "end": end, "body": text[start:end], "batch_id": batch_id,
+                    "title": " ".join(item["summary"] for item in related),
+                    "scope": "indexed_scene" if related else "whole_chapter_fallback",
+                    "event_ids": [item["event_id"] for item in related]})
+        # Keep the full query; bounded extra views stop one prominent action from monopolizing recall.
+        queries = list(dict.fromkeys([query, *[part.strip() for part in re.split(r"[\n。；]", query)
+                                               if len(part.strip()) >= 4][:4]]))
+        scores: dict[str, float] = {}
+        for view in queries:
+            for rank, (identity, _) in enumerate(self._bm25_ranking(view, candidates), 1):
+                scores[identity] = scores.get(identity, 0.0) + 1 / (50 + rank)
+        seeds = set(seed_chapters or [])
+        for item in candidates:
+            if item["chapter_no"] in seeds:
+                scores[item["source_id"]] = scores.get(item["source_id"], 0.0) + 1 / 100
+        ranked = sorted((item for item in candidates if item["source_id"] in scores),
+            key=lambda item: (-scores[item["source_id"]], item["chapter_no"], item["start"]))
+        event_map = {(item["chapter_no"], item["event_id"]): item for item in events}
+        neighbors: dict[tuple, set[tuple]] = {}
+        for key, event in event_map.items():
+            for link in event["relations"]:
+                target = (link["target_chapter"], link["target_event_id"])
+                if target in event_map:
+                    neighbors.setdefault(key, set()).add(target)
+                    neighbors.setdefault(target, set()).add(key)
+        roots = {(item["chapter_no"], event_id) for item in ranked[:6] for event_id in item["event_ids"]}
+        connected, frontier = set(roots), deque(sorted(roots))
+        chain_order = []
+        while frontier:
+            key = frontier.popleft()
+            chain_order.append(key)
+            for target in sorted(neighbors.get(key, ())):
+                if target not in connected:
+                    connected.add(target)
+                    frontier.append(target)
+        # Read linked prerequisites even when their wording does not match the current query.
+        for item in candidates:
+            keys = {(item["chapter_no"], identity) for identity in item["event_ids"]}
+            if keys & connected and item["source_id"] not in scores:
+                ranked.append(item)
+        first_roots = {item["source_id"] for item in ranked[:2]}
+        ranked.sort(key=lambda item: (0 if item["source_id"] in first_roots else 1 if
+            {(item["chapter_no"], identity) for identity in item["event_ids"]} & (connected - roots) else 2,
+            -scores.get(item["source_id"], 0), item["chapter_no"], item["start"]))
+        result: dict[str, Any] = {"sources": [], "timeline": [], "continuity_sources": [], "expression_sources": [], "coverage": {
+            **history["coverage"], "readable_chapters": len(rows) - len(unavailable),
+            "candidate_scenes": len(candidates), "matched_scenes": len(ranked),
+            "history_gaps": history["gaps"][:32], "history_gap_count": len(history["gaps"]),
+            "provisional_chapters": len(temporary_sources), "provisional_gaps": temporary_gaps[:16],
+            "provisional_gap_count": len(temporary_gaps),
+            "unavailable_sources": unavailable[:16], "unavailable_source_count": len(unavailable),
+            "omitted_sources": [], "timeline_events_omitted": 0,
+            "meaning": "全量本地候选扫描不等于全书事件已提取或模型已读完。结果按相关性与预算选择；保留未知，不证明没有矛盾。"}}
+        result["coverage"]["indexed_chapters_all_present"] = result["coverage"].pop("complete")
+        result["coverage"]["timeline_order"] = "source_order_only_not_story_time"
+        selected_chapters = set()
+        omitted = []
+        # Reserve different chapters first; never discard a conflicting scene by semantic deduplication.
+        ordered = []
+        for item in ranked:
+            if item["chapter_no"] not in selected_chapters:
+                ordered.append(item)
+                selected_chapters.add(item["chapter_no"])
+        first_ids = {item["source_id"] for item in ordered}
+        ordered.extend(item for item in ranked if item["source_id"] not in first_ids)
+        for item in ordered:
+            if len(result["sources"]) >= source_limit:
+                omitted.append({"source_id": item["source_id"], "reason": "本轮共享补读来源上限"})
+                continue
+            source = {**item, "use": "continuity_and_expression",
+                      "authority": "同批次已审核临时原文；未接受，不是正史" if item["source_status"] == "provisional"
+                          else "已接受同版原文；相似不等于矛盾，也不要求改写"}
+            trial = {**result, "sources": [*result["sources"], source]}
+            if estimate_tokens(json.dumps(trial, ensure_ascii=False)) > max(0, token_limit * 3 // 4):
+                omitted.append({"source_id": item["source_id"], "reason": "完整场景或整章超过剩余对照预算，未截断冒充全文"})
+                continue
+            result["sources"].append(source)
+        chosen_events = [(item["chapter_no"], identity) for item in result["sources"] for identity in item["event_ids"]]
+        remaining_events = [(item["chapter_no"], item["event_id"]) for item in reversed(events)
+                            if item["chapter_no"] in seeds or any(name.casefold() in query.casefold() for name in item["participants"])]
+        event_order = list(dict.fromkeys([*chosen_events, *chain_order, *remaining_events]))
+        timeline_tokens = estimate_tokens(json.dumps(result, ensure_ascii=False))
+        for key in event_order:
+            event = event_map[key]
+            event_tokens = estimate_tokens(json.dumps(event, ensure_ascii=False)) + 1
+            if timeline_tokens + event_tokens > max(0, token_limit - 512):
+                result["coverage"]["timeline_events_omitted"] += 1
+                continue
+            result["timeline"].append(event)
+            timeline_tokens += event_tokens
+        result["timeline"].sort(key=lambda item: (item["chapter_no"], item["start"], item["event_id"]))
+        # 保留原截取范围，仅稳定诊断清单顺序，避免同一未读集合扰动恢复身份及缓存。
+        result["coverage"]["omitted_sources"] = sorted(omitted[:16], key=lambda item: (item["source_id"], item["reason"]))
+        result["coverage"]["omitted_source_count"] = len(omitted)
+        result["coverage"]["selected_scenes"] = len(result["sources"])
+        result["coverage"]["selected_timeline_events"] = len(result["timeline"])
+        unread = [item["source_id"] for item in result["timeline"] if not any(
+            source["chapter_no"] == item["chapter_no"] and source["start"] <= item["start"]
+            and source["end"] >= item["end"] for source in result["sources"])]
+        result["coverage"]["timeline_sources_not_in_comparison"] = unread[:16]
+        result["coverage"]["timeline_sources_not_in_comparison_count"] = len(unread)
+        result["continuity_sources"] = [item["source_id"] for item in result["sources"]]
+        represented = set()
+        for item in result["sources"]:
+            if item["chapter_no"] not in represented:
+                result["expression_sources"].append(item["source_id"])
+                represented.add(item["chapter_no"])
+        # Metadata also shares the cap; retain counts if detailed gap lists are too large.
+        for field in ("history_gaps", "unavailable_sources", "provisional_gaps", "omitted_sources", "timeline_sources_not_in_comparison"):
+            if estimate_tokens(json.dumps(result, ensure_ascii=False)) > max(0, token_limit):
+                result["coverage"][field] = []
+        while estimate_tokens(json.dumps(result, ensure_ascii=False)) > max(0, token_limit) and result["timeline"]:
+            result["timeline"].pop()
+            result["coverage"]["timeline_events_omitted"] += 1
+        while estimate_tokens(json.dumps(result, ensure_ascii=False)) > max(0, token_limit) and result["sources"]:
+            result["sources"].pop()
+            result["coverage"]["omitted_source_count"] += 1
+            result["continuity_sources"] = [item["source_id"] for item in result["sources"]]
+            result["expression_sources"] = [identity for identity in result["expression_sources"] if identity in result["continuity_sources"]]
+        result["coverage"]["selected_scenes"] = len(result["sources"])
+        result["coverage"]["selected_timeline_events"] = len(result["timeline"])
+        unread = [item["source_id"] for item in result["timeline"] if not any(
+            source["chapter_no"] == item["chapter_no"] and source["start"] <= item["start"]
+            and source["end"] >= item["end"] for source in result["sources"])]
+        result["coverage"]["timeline_sources_not_in_comparison_count"] = len(unread)
+        if result["coverage"]["timeline_sources_not_in_comparison"]:
+            result["coverage"]["timeline_sources_not_in_comparison"] = unread[:16]
+        if estimate_tokens(json.dumps(result, ensure_ascii=False)) > max(0, token_limit):
+            return {"sources": [], "timeline": [], "continuity_sources": [], "expression_sources": [],
+                "coverage": {"reason": "本轮容量不足以装入事件对照及覆盖说明，未执行完整对照"}}
         return result
 
     def _accepted_source(self, chapter_no: int, *, before_chapter: int) -> dict[str, Any]:
@@ -329,6 +699,9 @@ class HybridRetriever:
                 "title": f"{fact['subject']} / {fact['predicate']}",
                 "body": json.dumps(fact["value"], ensure_ascii=False) + "\n" + str(fact.get("evidence") or ""),
                 "chapter_no": int(fact["source_chapter"]), "version": fact.get("source_version"),
+                "source_hash": fact.get("source_hash"), "evidence": fact.get("evidence", ""),
+                "subject": fact["subject"], "predicate": fact["predicate"], "value": fact["value"],
+                "valid_from_chapter": fact.get("valid_from_chapter"), "valid_to_chapter": fact.get("valid_to_chapter"),
                 "epistemic_kind": fact.get("epistemic_kind", "objective"),
                 "event_time": fact.get("event_time"), "narrative_time": fact.get("narrative_time"),
                 "authority_rank": 2, "authority": "已验收正史", "entities": [str(fact["subject"])],
@@ -361,6 +734,7 @@ class HybridRetriever:
                 "source_id": str(thread["thread_id"]), "source_type": "canon_thread",
                 "title": str(thread["title"]), "body": str(thread["description"]),
                 "chapter_no": int(thread.get("last_advanced_chapter") or thread.get("planted_chapter") or 0), "version": thread.get("source_version"),
+                "source_hash": thread.get("source_hash"),
                 "authority_rank": 2, "authority": "已验收正史", "entities": _entities(str(thread["title"]) + str(thread["description"])),
             })
         for chapter in self.project.db.accepted_chapters():
@@ -393,6 +767,7 @@ class HybridRetriever:
                 except (OSError, ValueError) as exc:
                     gap["source_problem"] = str(exc)
                 self.source_gaps.append(gap)
+                body = ""
             if body:
                 items.append({
                     "source_id": f"chapter-summary:{number:05d}", "source_type": "chapter_summary",
@@ -451,6 +826,35 @@ class HybridRetriever:
                 "title": title, "body": body, "chapter_no": None, "version": None,
                 "source_hash": reference["source_hash"], "source_path": reference["source_path"],
                 "authority_rank": 8, "authority": "reference_only", "entities": _entities(title + body)})
+        from .knowledge import KnowledgeService, STATES
+        self._knowledge_snapshot = KnowledgeService(self.project).snapshot(actor=role, before_chapter=chapter_no)
+        for source in KnowledgeService(self.project).reference_hits(getattr(self, "_knowledge_query", "") or "\0"):
+            items.append({"source_id": source["id"], "source_type": "expression_reference", "title": source["title"],
+                "body": source["body"], "chapter_no": None, "version": None, "source_hash": source["hash"],
+                "authority_rank": 8, "authority": "外部参考原文，不属于小说正史", "entities": _entities(source["title"])})
+        existing_ids = {item["source_id"] for item in items}
+        # 全文成为可检索候选；摘要仍可先读，但不能因摘要省略而找不到原文。
+        for source in self._knowledge_snapshot["sources"]:
+            if source["state"] == "canon":
+                identity = f"chapter:{source['chapter']:05d}"
+                if identity not in existing_ids:
+                    items.append({"source_id": identity, "source_type": "canon_source", "title": source["title"],
+                        "body": source["body"], "chapter_no": source["chapter"], "version": source["version"], "source_hash": source["hash"],
+                        "authority_rank": 2, "authority": "已接受正文全文", "entities": _entities(source["title"] + source["body"])})
+        for node in self._knowledge_snapshot["nodes"]:
+            sections = [section for section in node["sections"] if section["state"] != "conflict"]
+            if not sections:
+                continue
+            body = "\n\n".join(f"{section['title']}（{STATES.get(section['state'], section['state'])}"
+                f"{'，历史状态' if section.get('current') is False else ''}，来源 {section['source_id']}）\n"
+                f"{section['body']}\n原文：{section['quote']}" for section in sections)
+            if node["note"]:
+                body = "作者档案补充（未改写已确认事实）：\n" + node["note"] + "\n\n" + body
+            items.append({"source_id": "knowledge:" + node["id"], "source_type": "knowledge_page",
+                "title": node["name"], "body": body, "chapter_no": None, "version": node["revision"],
+                "source_hash": content_hash(body), "authority_rank": 5,
+                "authority": "分层知识档案：含历史、规划与有据归纳，不能代替原文或提高来源效力",
+                "entities": [node["name"], *node["aliases"]]})
         for item in items:
             item["content_hash"] = content_hash(str(item["body"]))
             item["memory_layer"], item["category"], item["identity"] = self._memory_identity(item["source_type"])
@@ -466,6 +870,7 @@ class HybridRetriever:
             "chapter_summary": ("canon", "sources", "derived_summary"),
             "story_reference": ("reference_design", "story_settings", "reference_only"),
             "expression_reference": ("reference_design", "expression", "reference_only"),
+            "knowledge_page": ("reference_design", "knowledge", "source_bound_knowledge"),
             "user_preference": ("author_preferences", "preferences", "preference"),
             "work_decision": ("task_temporary", "task", "collaboration")}.get(
                 source_type, ("task_temporary", "task", "unclassified"))
@@ -494,7 +899,7 @@ class HybridRetriever:
         return merged, overlaps, conflicts
 
     def _local_branches(self, query: str, candidates: list[dict[str, Any]]) -> tuple[list[tuple[str, float]], list[tuple[str, float]], list[dict[str, Any]]]:
-        categories = ("facts", "threads", "story_settings", "expression", "preferences", "sources", "task")
+        categories = ("facts", "threads", "story_settings", "knowledge", "expression", "preferences", "sources", "task")
         groups = {category: tuple(item for item in candidates if category in item["retrieval_uses"])
                   for category in categories}
         def rank(category: str) -> tuple[str, list[tuple[str, float]], list[tuple[str, float]], str]:
@@ -521,6 +926,20 @@ class HybridRetriever:
                 "candidate_count": len(groups[category]), "matched_source_ids": list(dict.fromkeys(key for key, _ in first + second)),
                 "reason": error or ("本地分类匹配完成。" if first or second else "无适用匹配，停止此分支。")})
         return sorted(exact, key=lambda item: (-item[1], item[0])), sorted(lexical, key=lambda item: (-item[1], item[0])), diagnostics
+
+    def _knowledge_related_ids(self, query: str) -> set[str]:
+        """沿明确对象的一跳有据关系补资料，不将连接数当事实权重。"""
+        nodes = self._knowledge_snapshot.get("nodes", [])
+        matched = {node["id"] for node in nodes if any(name and name in query for name in [node["name"], *node["aliases"]])}
+        expanded = set(matched)
+        for edge in self._knowledge_snapshot.get("edges", []):
+            if edge["state"] != "conflict" and (edge["source"] in matched or edge["target"] in matched):
+                expanded.update((edge["source"], edge["target"]))
+        result = {"knowledge:" + identity for identity in expanded}
+        for node in nodes:
+            if node["id"] in expanded:
+                result.update(f"chapter:{int(source.split(':')[1]):05d}" for source in node["sources"] if source.startswith("chapter:"))
+        return result
 
     @staticmethod
     def _exact_ranking(query: str, candidates: list[dict[str, Any]]) -> list[tuple[str, float]]:
@@ -605,7 +1024,7 @@ class HybridRetriever:
             raise ValueError("重排模型没有返回与候选对应的有效分数，继续采用排名融合结果。")
         for item, score in zip(hits, scores, strict=True):
             item["reranker_score"] = float(score)
-        return sorted(hits, key=lambda item: (item["authority_rank"], -item["reranker_score"], -item["score"]))
+        return sorted(hits, key=lambda item: (item["authority_rank"], item.get("semantic_only", False), -item["reranker_score"], -item["score"]))
 
     @staticmethod
     def _relation_expand(selected: list[str], candidates: list[dict[str, Any]], *, limit: int) -> list[str]:
@@ -656,12 +1075,12 @@ def _cached_cross_encoder(model_name: str):
     return _MODEL_CACHE[key]
 
 
-def _paragraph_excerpt(text: str, offset: int) -> tuple[str, int, int]:
+def _paragraph_excerpt(text: str, offset: int, *, max_chars: int = 5000) -> tuple[str, int, int]:
     """Keep nearby paragraph boundaries while retaining exact source offsets."""
     offset = max(0, min(len(text), offset))
     boundary = text.rfind("\n", max(0, offset - 300), offset)
     start = boundary + 1 if boundary >= 0 else offset
-    end = min(len(text), start + 5000)
+    end = min(len(text), start + max_chars)
     if end < len(text):
         boundary = text.rfind("\n", max(start + 1, end - 300), end)
         if boundary > start:

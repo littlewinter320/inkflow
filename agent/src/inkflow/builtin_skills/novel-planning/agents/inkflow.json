@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "kind": "hybrid",
+  "workflow": {
+    "path": "scripts/workflow.json"
+  },
+  "display_name": "小说分层规划",
+  "roles": [
+    "writer",
+    "editor",
+    "reviewer"
+  ],
+  "activation": "automatic",
+  "contracts": [
+    "writer.plan",
+    "writer.outline",
+    "planning.*"
+  ],
+  "when": "制作、修订或审查指定规划层级时使用；单层目标保留原层级和章段。",
+  "not_when": "只讨论或解释术语、写正文、已完成同版发布、未经授权重构全书时不用。",
+  "inputs": [
+    "当前原话与层级范围",
+    "已接受前史和有效上层规划",
+    "已有候选及审查意见"
+  ],
+  "outputs": [
+    "当前Schema的规划或规划审核候选",
+    "公开的变化、保留项、缺口和下一步"
+  ],
+  "tasks": [
+    "确认层级和授权范围",
+    "衔接已接受事实",
+    "组织事件与人物因果",
+    "对齐承诺定义",
+    "交付规划候选与必要审核"
+  ],
+  "references": [
+    {
+      "path": "references/levels.md"
+    },
+    {
+      "path": "references/promises.md"
+    }
+  ],
+  "steps": [
+    {
+      "tool": "skill.scope",
+      "script": "scripts/scope.json"
+    },
+    {
+      "tool": "skill.resources",
+      "script": "scripts/resources.json"
+    },
+    {
+      "tool": "skill.output",
+      "script": "scripts/output.json"
+    }
+  ]
+}

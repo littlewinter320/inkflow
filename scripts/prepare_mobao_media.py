@@ -1,7 +1,7 @@
 """Prepare Mobao videos and animation sheets, preserving original sources on D:.
 
 Developer-only: installed rembg/ONNX/OpenCV; no new application dependency.
-Model must already exist in --model-cache. See MOBAO_MEDIA_2026-10-11.md.
+Model must already exist in the --model-cache directory on D:.
 """
 from __future__ import annotations
 import argparse

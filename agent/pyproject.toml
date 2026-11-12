@@ -4,29 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inkflow-novel-agent"
-version = "0.7.5"
+version = "0.8.0"
 description = "墨流（InkFlow）——面向长篇中文小说的协作创作引擎"
-readme = "README.md"
+readme = {text = "墨流共享创作引擎，提供 CLI、MCP 与桌面/扩展后台入口。完整使用说明见项目根目录 README.md。", content-type = "text/markdown"}
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "InkFlow contributors"}]
 dependencies = [
   "beautifulsoup4>=4.12,<5",
-  "edge-tts>=7.2.8,<8",
+  "edge-tts>=7.3.1,<8",
+  "graphifyy==0.9.107",
   "httpx>=0.27,<1",
+  "jsonpatch>=1.37,<2",
   "keyring>=25,<27",
+  "langchain==1.4.7",
+  "langgraph==1.2.17",
+  "langgraph-checkpoint-sqlite==3.1.2",
+  "langsmith==0.14.12",
   "mcp>=1.20,<2",
   "pydantic>=2.9,<3",
+  "pypdf>=7.0.1,<8",
+  "PyYAML>=6,<7",
 ]
 
 [project.optional-dependencies]
 build = ["pyinstaller>=6.15,<7"]
-mossvoice = [
-  "moss-tts-nano @ git+https://github.com/OpenMOSS/MOSS-TTS-Nano.git",
-  "huggingface_hub>=0.23,<1",
-  "onnxruntime-gpu>=1.20,<2",
-  "soundfile>=0.12,<1",
-]
 review = [
   "torch>=2.2,<3",
   "transformers>=4.44,<6",
@@ -40,3 +42,6 @@ inkflow-app-server = "inkflow.app_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+inkflow = ["builtin_skills/**/*", "prompt_catalog.json"]

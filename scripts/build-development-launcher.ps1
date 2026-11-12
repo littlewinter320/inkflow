@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $inkflowLauncherDirectory = 'D:\墨流\dev-launcher'
 $inkflowLauncherExecutable = Join-Path $inkflowLauncherDirectory '墨流 InkFlow.exe'
 $inkflowLauncherSource = Join-Path $PSScriptRoot 'InkFlowLauncher.cs'

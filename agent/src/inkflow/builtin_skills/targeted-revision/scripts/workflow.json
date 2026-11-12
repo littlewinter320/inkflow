@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "executor": "chapter_tools",
+  "actions": [
+    "revise_draft",
+    "revise_review",
+    "revise_review_accept"
+  ],
+  "description": "沿原要求先审后改或先改后审；后续修订须有当前版patch，不重复有效完成项。",
+  "steps": [
+    {
+      "id": "review-first",
+      "tool": "chapter.review_mode",
+      "when": "review_needed",
+      "required": true,
+      "review_order": "before",
+      "actions": [
+        "revise_review",
+        "revise_review_accept"
+      ],
+      "instruction": "本次要求先审后改，先核当前版真实问题和引文；无据意见不交Writer改稿，已有有效检查不重做。"
+    },
+    {
+      "id": "revise",
+      "tool": "chapter.revise",
+      "when": "revision_needed",
+      "required": true,
+      "depends_on": [
+        "review-first"
+      ],
+      "instruction": "按作者当前明确修改要求或当前版有据意见修最小必要范围；原文唯一定位、版本和保留项一致才落稿，不把选区实际替换称为只给候选。"
+    },
+    {
+      "id": "review-after",
+      "tool": "chapter.review_mode",
+      "when": "review_needed",
+      "required": true,
+      "actions": [
+        "revise_review",
+        "revise_review_accept"
+      ],
+      "depends_on": [
+        "revise"
+      ],
+      "instruction": "审核修后新版与必要相邻影响，核保留事实、指代、人物认知和物件状态；未授权接受时只交报告。"
+    },
+    {
+      "id": "repair-two",
+      "tool": "chapter.revise",
+      "when": "revision_needed",
+      "required": false,
+      "default": true,
+      "round": 2,
+      "actions": [
+        "revise_review",
+        "revise_review_accept"
+      ],
+      "depends_on": [
+        "review-after"
+      ],
+      "instruction": "仅修当前版本已核实且属于原授权的问题和必要衔接，保留其余内容、人物知情与物件状态。资料不足或判断未定先核依据，不用改稿消除无依据指控。"
+    },
+    {
+      "id": "recheck-two",
+      "tool": "chapter.review_mode",
+      "when": "review_needed",
+      "required": true,
+      "round": 2,
+      "actions": [
+        "revise_review",
+        "revise_review_accept"
+      ],
+      "depends_on": [
+        "repair-two"
+      ],
+      "instruction": "核第二轮当前版结果，问题仍未解决就保留缺口，不能再开无变化循环或把已返回当通过。"
+    },
+    {
+      "id": "accept",
+      "tool": "chapter.accept",
+      "when": "ready_to_accept",
+      "required": true,
+      "actions": [
+        "revise_review_accept"
+      ],
+      "depends_on": [
+        "recheck-two"
+      ],
+      "instruction": "仅在原目标明确包含接受、当前正文与来源版本一致、必要审核及记忆条件满足时，交原引擎正式接受；不以技能或模型自述代替门禁，已提交结果不重复写入。"
+    }
+  ]
+}

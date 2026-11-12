@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "display_name": "规划追问",
+  "roles": [
+    "coordinator"
+  ],
+  "activation": "automatic",
+  "contracts": [
+    "coordinator.grill"
+  ],
+  "when": "作者要求先推敲或主动点名，或原规划追问节点存在真正影响下一步的未决取舍时使用。",
+  "not_when": "明确可执行任务、可自行查明的事实、普通缺章号、重复已答问题或作者要求停止追问时不用。",
+  "inputs": [
+    "当前原话、已存目标和有效待答",
+    "已确认答案与可得小说资料"
+  ],
+  "outputs": [
+    "原TerminalIntent里的clarification_questions和共识",
+    "有授权时回原规划流程，未授权则只归纳讨论"
+  ],
+  "tasks": [
+    "核事实和已答选择",
+    "识别决策依赖",
+    "提出少量独立问题",
+    "收敛并回原目标"
+  ],
+  "references": [
+    {
+      "path": "references/questions.md"
+    }
+  ],
+  "steps": []
+}

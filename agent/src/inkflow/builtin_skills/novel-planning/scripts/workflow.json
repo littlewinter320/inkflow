@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "executor": "registered_workflow",
+  "actions": [
+    "plan",
+    "outline",
+    "redesign_story",
+    "plan_next_arc",
+    "plan_brief"
+  ],
+  "description": "调用本次已授权的原规划整体入口，候选生成、责任审核、版本与发布事务保持原引擎约束。"
+}

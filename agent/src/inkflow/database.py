@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 import uuid
 from collections import Counter
@@ -266,17 +267,22 @@ def _adapt_stored_record(record: dict[str, Any]) -> dict[str, Any]:
 
 
 class ProjectDatabase:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, read_only: bool = False):
+        """以只读方式投影当前记忆时不初始化、迁移或回写书库。"""
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.initialize()
+        self.read_only = read_only
+        if not read_only:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.initialize()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
+        connection = (sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)
+                      if self.read_only else sqlite3.connect(self.path))
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA journal_mode=WAL")
+        if not self.read_only:
+            connection.execute("PRAGMA journal_mode=WAL")
         try:
             yield connection
         finally:
@@ -285,6 +291,9 @@ class ProjectDatabase:
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            # 统一知识是可重建的派生层，与现有书库共用事务和备份位置。
+            from .knowledge import SCHEMA as KNOWLEDGE_SCHEMA
+            connection.executescript(KNOWLEDGE_SCHEMA)
             # Existing rows belong to the legacy protocol. Additive defaults keep
             # their original role names while making later records unambiguous.
             role_columns = {
@@ -897,6 +906,69 @@ class ProjectDatabase:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def narrative_history_rows(self, before_chapter: int, *, connection=None) -> list[dict[str, Any]]:
+        if connection is None:
+            with self.connect() as opened:
+                return self.narrative_history_rows(before_chapter, connection=opened)
+        rows = connection.execute(
+            """SELECT chapter.chapter_no,chapter.version,chapter.content_hash,chapter.content_text,
+                      chapter.updated_at,patch.data_json,patch.committed_at,cache.value_json AS event_index_json
+               FROM chapters AS chapter LEFT JOIN memory_patches AS patch
+                 ON patch.chapter_no=chapter.chapter_no
+               LEFT JOIN metadata AS cache ON cache.key='narrative_events_rebuild:' || chapter.chapter_no
+               WHERE chapter.status='accepted' AND chapter.chapter_no<? ORDER BY chapter.chapter_no""",
+            (before_chapter,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _validate_narrative_patch(self, connection, patch: MemoryPatch, content: str) -> None:
+        if patch.threads:
+            from types import SimpleNamespace
+            from .story_promises import planning_promises, thread_catalog, thread_patch_gaps
+            from .narrative_memory import event_history
+            history = event_history(self.narrative_history_rows(patch.chapter_no, connection=connection))
+            bundle = self.get_current_plan_bundle()
+            gaps = thread_patch_gaps(patch, content,
+                prior_threads=thread_catalog(SimpleNamespace(db=self), bundle, before_chapter=patch.chapter_no),
+                plans=planning_promises(bundle), sources=history["sources"], source_bindings=history["source_bindings"])
+            if gaps:
+                raise ValueError("伏笔与钩子尚未通过来源及条件核验：" + "；".join(gaps))
+        if not patch.narrative_events:
+            return
+        from .narrative_memory import event_history, event_patch_gaps
+        history = event_history(self.narrative_history_rows(patch.chapter_no, connection=connection))
+        gaps = event_patch_gaps(patch, content, prior_events=history["events"], sources=history["sources"],
+                               source_bindings=history["source_bindings"])
+        if gaps:
+            raise ValueError("事件记忆尚未通过来源与时间关系核验：" + "；".join(gaps))
+
+    def save_rebuilt_narrative_events(self, proposal: dict[str, Any], *, actor: str,
+                                      task_id: str, run_id: str) -> dict[str, Any]:
+        """Cache same-call, full-source event proposals without changing accepted history."""
+        from .schemas import NarrativeEventRebuild
+        proposal = NarrativeEventRebuild.model_validate(proposal)
+        if (actor not in {"editor", "reviewer", "memory_keeper"} or not isinstance(task_id, str)
+                or not task_id.strip() or not isinstance(run_id, str) or not run_id.strip()):
+            raise ValueError("事件索引重建须绑定记忆责任角色和原任务运行")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            source = connection.execute(
+                "SELECT status,version,content_hash,content_text FROM chapters WHERE chapter_no=?",
+                (proposal.chapter_no,)).fetchone()
+            if (not source or source["status"] != "accepted" or source["version"] != proposal.source_version
+                    or source["content_hash"] != proposal.source_hash or not source["content_text"]
+                    or content_hash(source["content_text"]) != proposal.source_hash):
+                raise ValueError("事件索引重建的完整正史来源已失效，未保存缓存")
+            self._validate_narrative_patch(connection, proposal.as_patch(), source["content_text"])
+            cache = {**proposal.model_dump(mode="json"), "actor": actor, "task_id": task_id,
+                "run_id": run_id, "authority": "derived_event_index", "created_at": utc_now()}
+            connection.execute(
+                "INSERT INTO metadata(key,value_json,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                (f"narrative_events_rebuild:{proposal.chapter_no}", json_dumps(cache, indent=None), cache["created_at"]))
+            connection.commit()
+        return cache
+
     def save_review(
         self, chapter_no: int, chapter_version: int, report: ReviewReport, path: str,
         *, role_protocol_version: int | None = None, review_role: str = "editor",
@@ -984,7 +1056,8 @@ class ProjectDatabase:
             "canonical_role": stored["review_role"], "mode_bundle": mode_bundle,
         }
 
-    def current_facts(self) -> list[dict[str, Any]]:
+    def current_facts(self, *, include_evidence: bool = True) -> list[dict[str, Any]]:
+        """读取当前同版事实；列表投影可省去额外的引文读取。"""
         with self.connect() as connection:
             has_canonical_text = any(str(row["name"]) == "content_text"
                                      for row in connection.execute("PRAGMA table_info(chapters)"))
@@ -1010,6 +1083,7 @@ class ProjectDatabase:
                       JOIN chapters AS newer_source ON newer_source.chapter_no=newer.source_chapter
                       WHERE newer.subject=fact.subject
                         AND newer.predicate=fact.predicate
+                        AND newer.epistemic_kind=fact.epistemic_kind
                         AND newer.status='active'
                         AND newer.valid_to_chapter IS NULL
                         AND newer.branch_id=fact.branch_id
@@ -1027,6 +1101,8 @@ class ProjectDatabase:
             item = dict(row)
             item["value"] = json.loads(item.pop("value_json"))
             result.append(item)
+        if not include_evidence:
+            return result
         from .memory_records import attach_evidence
         return attach_evidence(self, result)
 
@@ -1064,6 +1140,7 @@ class ProjectDatabase:
                       SELECT 1 FROM facts AS newer
                       JOIN chapters AS newer_source ON newer_source.chapter_no=newer.source_chapter
                       WHERE newer.subject=fact.subject AND newer.predicate=fact.predicate
+                        AND newer.epistemic_kind=fact.epistemic_kind
                         AND newer.branch_id=fact.branch_id
                         AND newer.status IN ('active','superseded')
                         AND newer.source_chapter>fact.source_chapter
@@ -1245,6 +1322,9 @@ class ProjectDatabase:
 
         now = utc_now()
         with self.connect() as connection:
+            if patch.chapter_no != chapter_no:
+                raise ValueError("临时事件记忆的章节身份不一致")
+            self._validate_narrative_patch(connection, patch, content)
             connection.execute(
                 """
                 INSERT INTO provisional_memory_patches(
@@ -1331,8 +1411,9 @@ class ProjectDatabase:
         review_role: str, role_protocol_version: int | None = None,
         previous_memory_json: str | None = None,
         revised_memory: MemoryPatch | None = None,
+        work_reference_cleanup: list[dict[str, str]] | None = None,
     ) -> int:
-        """Commit a bounded, independently checked repair without demoting canon."""
+        """事务提交独立核对的局部修订；旧章章号清理还核对精确差异、后续身份及原记忆。"""
         self._require_canonical_content_schema()
         new_hash = content_hash(content)
         if new_hash == expected_hash:
@@ -1343,7 +1424,7 @@ class ProjectDatabase:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
-                "SELECT status,version,content_hash,content_text FROM chapters WHERE chapter_no=?", (chapter_no,)
+                "SELECT status,version,content_hash,content_text,summary FROM chapters WHERE chapter_no=?", (chapter_no,)
             ).fetchone()
             latest = connection.execute(
                 "SELECT COALESCE(MAX(chapter_no),0) FROM chapters WHERE status='accepted'"
@@ -1368,10 +1449,52 @@ class ProjectDatabase:
             if (not current or current["status"] != "accepted"
                     or int(current["version"]) != expected_version
                     or current["content_hash"] != expected_hash
-                    or int(latest) != chapter_no
+                    or (int(latest) != chapter_no and not work_reference_cleanup)
                     or not review or int(review["id"]) != expected_review_id
                     or (int(review["chapter_version"]) != expected_version and not prior_verified)):
                 raise ValueError("正史、依赖章节或审查版本已变化；没有覆盖当前正文。")
+            if work_reference_cleanup:
+                # 只给明确授权并独立核过的工作引用清理开口；不能借此修改旧章剧情或放宽普通修订。
+                if (review_role not in {"editor", "reviewer"}
+                        or verification.get("verdict") != "resolved" or verification.get("meaning_preserved") is not True
+                        or type(verification.get("confidence")) not in {int, float} or not 0.8 <= verification["confidence"] <= 1
+                        or not verification.get("anchor_excerpt") or verification["anchor_excerpt"] not in content
+                        or not 0 < len(work_reference_cleanup) <= 4):
+                    raise ValueError("旧章工作引用清理缺少独立的含义保持核对。")
+                downstream = [dict(row) for row in connection.execute(
+                    "SELECT chapter_no,version,content_hash FROM chapters WHERE status='accepted' AND chapter_no>? ORDER BY chapter_no",
+                    (chapter_no,))]
+                if verification.get("downstream_sources") != downstream:
+                    raise ValueError("后续正史在局部核对期间已变化，未覆盖候选或依赖。")
+                expected = current["content_text"]
+                for edit in work_reference_cleanup:
+                    target, replacement = edit.get("target_excerpt", ""), edit.get("replacement", "")
+                    if (not target or expected.count(target) != 1 or len(target) > 500 or len(replacement) > 800
+                            or not re.search(r"第\s*[0-9一二三四五六七八九十百零〇两]+\s*章", target)
+                            or re.search(r"第\s*[0-9一二三四五六七八九十百零〇两]+\s*章", replacement)
+                            or "\n" in target or expected[:expected.find(target)].rsplit("\n", 1)[-1].lstrip().startswith("#")):
+                        raise ValueError("旧章清理只能替换唯一定位的正文工作章号，不能改标题或其他内容。")
+                    expected = expected.replace(target, replacement, 1)
+                if expected != content:
+                    raise ValueError("候选包含授权章号清理之外的变化。")
+                # 带版本哈希的下游事件关系不能静默重绑；需要这类来源时继续原历史影响审查。
+                dependent = connection.execute(
+                    "SELECT 1 FROM memory_patches WHERE chapter_no<>? AND instr(data_json,?)>0 LIMIT 1",
+                    (chapter_no, expected_hash)).fetchone()
+                bound_index = connection.execute(
+                    "SELECT 1 FROM metadata WHERE key LIKE 'narrative_events_rebuild:%' "
+                    "AND instr(value_json,?)>0 LIMIT 1", (expected_hash,)).fetchone()
+                if dependent or bound_index:
+                    raise ValueError("工作引用清理涉及下游绑定来源，候选保留，须先核对这部分依赖。")
+                evidence_rows = connection.execute(
+                    "SELECT key,value_json FROM metadata WHERE key LIKE 'memory.evidence:%' AND instr(value_json,?)>0",
+                    (expected_hash,)).fetchall()
+                for row in evidence_rows:
+                    for ref in json.loads(row["value_json"]):
+                        if ref.get("source_hash") == expected_hash and not ref.get("retired") and (
+                                ref.get("source_chapter") != chapter_no or ref.get("source_version") != expected_version
+                                or not ref.get("quote") or ref["quote"] not in content):
+                            raise ValueError("清理影响已记录的事实证据，须先由记忆责任角色核对。")
             stored_memory = connection.execute(
                 "SELECT data_json FROM memory_patches WHERE chapter_no=?", (chapter_no,)
             ).fetchone()
@@ -1387,6 +1510,21 @@ class ProjectDatabase:
             if revised_memory is not None:
                 if not current_memory_json or revised_memory.chapter_no != chapter_no or revised_memory.unresolved_conflicts:
                     raise ValueError("记忆更新缺少有效旧版本或仍有冲突。")
+                if {event.event_id for event in revised_memory.narrative_events} != {
+                        event.event_id for event in previous_memory.narrative_events}:
+                    raise ValueError("局部记忆更新不能擅自增删既有事件身份。")
+                if work_reference_cleanup:
+                    if revised_memory != previous_memory or any(fact.evidence not in content for fact in previous_memory.facts):
+                        raise ValueError("旧章工作引用清理不得顺带改变记忆，原事实证据必须仍然成立。")
+                    from .narrative_memory import event_patch_gaps, event_history
+                    history = event_history(self.narrative_history_rows(chapter_no, connection=connection))
+                    if event_patch_gaps(previous_memory, content, prior_events=history["events"],
+                            sources=history["sources"], source_bindings=history["source_bindings"]):
+                        raise ValueError("旧章清理使事件证据或时间绑定失效，未提交。")
+                    if any(thread.evidence and thread.evidence not in content for thread in previous_memory.threads):
+                        raise ValueError("旧章清理使伏笔原句失效，未提交。")
+                else:
+                    self._validate_narrative_patch(connection, revised_memory, content)
                 old_facts = {fact.fact_id: fact for fact in previous_memory.facts}
                 new_facts = {fact.fact_id: fact for fact in revised_memory.facts}
                 if (revised_memory.operations != previous_memory.operations or set(old_facts) != set(new_facts)
@@ -1404,7 +1542,7 @@ class ProjectDatabase:
                 """UPDATE chapters SET version=?,content_hash=?,content_text=?,summary=?,updated_at=?
                    WHERE chapter_no=?""",
                 (new_version, new_hash, content,
-                 revised_memory.chapter_summary if revised_memory is not None else None,
+                 revised_memory.chapter_summary if revised_memory is not None else current["summary"] if work_reference_cleanup else None,
                  now, chapter_no),
             )
             if revised_memory is not None:
@@ -1466,11 +1604,32 @@ class ProjectDatabase:
                  review_role, role_protocol_version,
                  json_dumps({"source_review_id": expected_review_id,
                              "old_hash": expected_hash, "new_hash": new_hash,
-                             "diagnosis": diagnosis, "verification": verification}, indent=None), now),
+                             "diagnosis": diagnosis, "verification": verification,
+                             **({"work_reference_cleanup": work_reference_cleanup} if work_reference_cleanup else {})}, indent=None), now),
             )
             if revised_memory is not None:
-                from .memory_records import commit_evidence
-                commit_evidence(connection, revised_memory.model_copy(update={"operations": []}), chapter_no, new_version, content)
+                if work_reference_cleanup:
+                    # 仅重绑仍逐字成立的引文。保留旧引用、后来补证和审计，不能重交整包而抹掉下游补证。
+                    from .memory_records import evidence_record, journal, write_meta
+                    from .schemas import MemoryEvidence
+                    for row in evidence_rows:
+                        before = json.loads(row["value_json"])
+                        after = []
+                        for ref in before:
+                            if ref.get("source_hash") != expected_hash or ref.get("retired"):
+                                after.append(ref)
+                                continue
+                            after.append({**ref, "retired": True, "retired_at_chapter": int(latest),
+                                          "retired_reason": "已独立核对的工作章号清理，原句仍成立，引用重绑新版本"})
+                            after.append(evidence_record(connection, MemoryEvidence(source_chapter=chapter_no,
+                                quote=ref["quote"], relation=ref["relation"]),
+                                ref.get("recorded_at_chapter", chapter_no), new_version, content))
+                        write_meta(connection, row["key"], after)
+                        journal(connection, "work_reference_source_rebind", row["key"].split(":", 1)[1],
+                                before, after, "已独立核对含义保持，仅更新仍成立原句的版本绑定", chapter_no)
+                else:
+                    from .memory_records import commit_evidence
+                    commit_evidence(connection, revised_memory.model_copy(update={"operations": []}), chapter_no, new_version, content)
             connection.commit()
         return new_version
 
@@ -1552,11 +1711,18 @@ class ProjectDatabase:
                 staged_patch = MemoryPatch.model_validate_json(staged["data_json"])
                 if staged_patch.model_dump(mode="json") != patch.model_dump(mode="json"):
                     raise ValueError(f"第 {chapter_no} 章待提升补丁与临时记忆不一致")
+            if patch.chapter_no != chapter_no:
+                raise ValueError("事件记忆的章节身份与接受目标不一致")
+            self._validate_narrative_patch(connection, patch, content)
             for fact in patch.facts:
                 from .memory_records import journal
+                # A later rumor or character belief must not retire an objective fact.
+                kind = ("belief" if fact.epistemic_kind == "objective" and fact.predicate.startswith(("believes.", "knows."))
+                    else "rumor" if fact.epistemic_kind == "objective" and fact.predicate.startswith("rumor.")
+                    else fact.epistemic_kind)
                 previous_facts = [dict(row) for row in connection.execute(
-                    "SELECT * FROM facts WHERE subject=? AND predicate=? AND status='active'",
-                    (fact.subject, fact.predicate))]
+                    "SELECT * FROM facts WHERE subject=? AND predicate=? AND epistemic_kind=? AND branch_id='main' AND status='active'",
+                    (fact.subject, fact.predicate, kind))]
                 existing_identity = connection.execute(
                     "SELECT subject, predicate, source_chapter FROM facts WHERE fact_id=?",
                     (fact.fact_id,),
@@ -1571,9 +1737,10 @@ class ProjectDatabase:
                     """
                     UPDATE facts SET valid_to_chapter=?, status='superseded'
                     WHERE subject=? AND predicate=? AND status='active'
+                      AND epistemic_kind=? AND branch_id='main'
                       AND valid_to_chapter IS NULL AND source_chapter <= ?
                     """,
-                    (chapter_no - 1, fact.subject, fact.predicate, chapter_no),
+                    (chapter_no - 1, fact.subject, fact.predicate, kind, chapter_no),
                 )
                 connection.execute(
                     """
@@ -1592,7 +1759,7 @@ class ProjectDatabase:
                         chapter_no,
                         fact.confidence,
                         fact.evidence,
-                        "belief" if fact.epistemic_kind == "objective" and fact.predicate.startswith(("believes.", "knows.")) else ("rumor" if fact.epistemic_kind == "objective" and fact.predicate.startswith("rumor.") else fact.epistemic_kind),
+                        kind,
                         fact.event_time,
                         fact.narrative_time or f"第{chapter_no}章",
                         int(current["version"]),
@@ -1890,6 +2057,15 @@ class ProjectDatabase:
             result.append(item)
         return result
 
+    def get_agent_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM agent_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
+        if row is None:
+            return None
+        result = _adapt_stored_record(dict(row))
+        result["data"] = json.loads(result.pop("data_json"))
+        return result
+
     def select_agent_artifact(self, artifact_id: str) -> dict[str, Any]:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM agent_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
@@ -1972,7 +2148,10 @@ class ProjectDatabase:
                 )
             else:
                 current_version = int(chapter.get("version") or 0)
-                if chapter.get("status") == "accepted" and item.get("message_type") == "task_assignment":
+                if (chapter.get("status") == "accepted" and (
+                        item.get("message_type") == "task_assignment" or
+                        (item.get("message_type") == "handoff" and chapter_version is not None
+                         and int(chapter_version) == current_version))):
                     stale_ids.append(message_id)
                     continue
                 if chapter_version is not None and int(chapter_version) != current_version:
@@ -2153,6 +2332,21 @@ class ProjectDatabase:
                 (event_id, event_type, chapter_no, chapter_version, json_dumps(stored_payload, indent=None), utc_now()),
             )
             connection.commit()
+        if event_type in {"review_recovery", "comparison", "accepted"}:
+            # 与正史/作者偏好分库；只复制有来源的反馈，保留原事件作为审计入口。
+            from .learning import WorkflowMemory
+            import warnings
+            fields = ("action", "status", "role", "issue_categories", "method_feedback", "task_id",
+                      "review_id", "source_hash", "recovery_trace_id", "feedback_kind", "source_quote", "source_run_id")
+            experience = {key: payload[key] for key in fields if key in payload}
+            if event_type == "accepted":
+                experience.update(status="accepted", chapter_no=chapter_no, chapter_version=chapter_version,
+                    assessment="已通过本章实际接受门禁；只证明这一版本完成，不能保证其他章节或缓存目标。")
+            try:
+                WorkflowMemory(self.path.parent).record(event_id, str(payload.get("role") or "writer"),
+                    "review_recovery" if event_type == "review_recovery" else "accepted_result" if event_type == "accepted" else "author_feedback", experience)
+            except (OSError, sqlite3.Error) as exc:
+                warnings.warn(f"工作经验未保存（{type(exc).__name__}），原学习事件仍保留。", RuntimeWarning)
         return event_id
 
     def list_learning_events(self, limit: int = 30) -> list[dict[str, Any]]:
@@ -2420,14 +2614,64 @@ class ProjectDatabase:
             raise ValueError("检索反馈只能是 cited、ignored 或 misleading")
         feedback_id = f"retrieval-{uuid.uuid4().hex}"
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            binding = None
+            manifest_row = connection.execute("SELECT value_json FROM metadata WHERE key=?",
+                ("retrieval.packet:" + packet_id,)).fetchone() if packet_id else None
+            if manifest_row:
+                try:
+                    manifest = json.loads(manifest_row[0])
+                except (ValueError, TypeError):
+                    manifest = {}
+                if not isinstance(manifest, dict) or not isinstance(manifest.get("sources", {}), dict):
+                    manifest = {}
+                fingerprint = manifest.get("sources", {}).get(source_id)
+                if (fingerprint and manifest.get("query_hash") and manifest.get("role") == role
+                        and manifest.get("chapter_no") == chapter_no):
+                    binding = {"source_fingerprint": fingerprint, "query_hash": manifest["query_hash"]}
+            query_hash = binding["query_hash"] if binding else content_hash(query)
+            previous = connection.execute("""SELECT feedback_id,outcome FROM retrieval_feedback
+                WHERE query_hash=? AND source_id=? AND role=?
+                  AND chapter_no IS ? AND packet_id IS ? ORDER BY rowid DESC LIMIT 1""",
+                (query_hash, source_id, role, chapter_no, packet_id)).fetchone() if packet_id else None
+            if previous and previous["outcome"] == outcome:
+                return str(previous[0])
             connection.execute(
                 "INSERT INTO retrieval_feedback(feedback_id,query_hash,source_id,outcome,role,chapter_no,packet_id,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                (feedback_id, content_hash(query), source_id, outcome, role, chapter_no, packet_id, utc_now()),
+                (feedback_id, query_hash, source_id, outcome, role, chapter_no, packet_id, utc_now()),
             )
+            if binding:
+                connection.execute("INSERT INTO metadata(key,value_json,updated_at) VALUES (?,?,?)",
+                    ("retrieval.feedback:" + feedback_id, json_dumps(binding, indent=None), utc_now()))
             connection.commit()
         return feedback_id
 
-    def retrieval_feedback_scores(self) -> dict[str, float]:
+    def retrieval_feedback_scores(self, *, query: str | None = None, role: str = "",
+                                  chapter_no: int = 0, fingerprints: dict[str, str] | None = None) -> dict[str, float]:
+        if query is not None:
+            with self.connect() as connection:
+                rows = connection.execute("""SELECT f.source_id,f.outcome,f.packet_id,m.value_json FROM retrieval_feedback f
+                    JOIN metadata m ON m.key='retrieval.feedback:' || f.feedback_id
+                    WHERE f.query_hash=? AND f.role=? AND f.chapter_no<=?
+                    ORDER BY f.rowid DESC LIMIT 256""",
+                    (content_hash(query), role, chapter_no)).fetchall()
+            scores: dict[str, float] = {}
+            seen = set()
+            for row in rows:
+                binding = json.loads(row["value_json"])
+                if not isinstance(binding, dict):
+                    raise ValueError("检索反馈来源绑定损坏，不能参与排序")
+                identity = row["source_id"]
+                event = (identity, row["packet_id"])
+                if event in seen:
+                    continue
+                seen.add(event)
+                if binding.get("source_fingerprint") != (fingerprints or {}).get(identity):
+                    continue
+                # Ignoring a source is not evidence that it is wrong. Feedback never changes authority.
+                weight = {"cited": 0.0005, "ignored": 0.0, "misleading": -0.001}.get(row["outcome"], 0.0)
+                scores[identity] = scores.get(identity, 0.0) + weight
+            return {identity: max(-0.003, min(0.003, score)) for identity, score in scores.items()}
         weights = {"cited": 0.15, "ignored": -0.02, "misleading": -0.5}
         with self.connect() as connection:
             rows = connection.execute(
@@ -2437,6 +2681,47 @@ class ProjectDatabase:
         for row in rows:
             scores[str(row["source_id"])] = scores.get(str(row["source_id"]), 0.0) + weights[str(row["outcome"])] * int(row["count"])
         return scores
+
+    def maintain_retrieval_cache(self, known_hashes: dict[str, str], *, revision: str) -> dict[str, Any]:
+        """Bounded lazy maintenance of reproducible vectors; source history and feedback are retained."""
+        now = datetime.now(timezone.utc)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT value_json FROM metadata WHERE key='retrieval.maintenance'").fetchone()
+            invalid_state = False
+            try:
+                state = json.loads(row[0]) if row else {}
+                if not isinstance(state, dict):
+                    raise ValueError("检索缓存维护记录无效")
+                last_checked = datetime.fromisoformat(state["checked_at"]) if state.get("checked_at") else None
+                cursor = int(state.get("cursor", 0))
+                if last_checked is not None and last_checked.tzinfo is None:
+                    raise ValueError("检索缓存维护时间缺少时区")
+            except (ValueError, TypeError):
+                state, last_checked, cursor, invalid_state = {}, None, 0, True
+            if (state.get("revision") == revision and state.get("checked_at")
+                    and last_checked > now - timedelta(days=1)):
+                return {**state, "ran": False}
+            rows = connection.execute("SELECT rowid,* FROM retrieval_embeddings WHERE rowid>? ORDER BY rowid LIMIT 128",
+                                      (cursor,)).fetchall()
+            if not rows and cursor:
+                rows = connection.execute("SELECT rowid,* FROM retrieval_embeddings ORDER BY rowid LIMIT 128").fetchall()
+            removed = 0
+            cutoff = (now - timedelta(days=30)).isoformat()
+            for item in rows:
+                current = known_hashes.get(item["source_id"])
+                if item["updated_at"] < cutoff or (current is not None and current != item["content_hash"]):
+                    removed += connection.execute("DELETE FROM retrieval_embeddings WHERE rowid=? AND content_hash=? AND updated_at=?",
+                        (item["rowid"], item["content_hash"], item["updated_at"])).rowcount
+            result = {"revision": revision, "checked_at": now.isoformat(), "cursor": rows[-1]["rowid"] if rows else 0,
+                "scanned": len(rows), "removed_vectors": removed, "ran": True,
+                "previous_state_invalid": invalid_state,
+                "policy": "资料版本变化或下次使用时距上次满24小时，最多整理128条向量；30天仅是缓存保留期，不是事实有效期。"}
+            connection.execute("INSERT INTO metadata(key,value_json,updated_at) VALUES ('retrieval.maintenance',?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at",
+                (json_dumps(result, indent=None), now.isoformat()))
+            connection.commit()
+        return result
 
     def project_status(self) -> dict[str, Any]:
         with self.connect() as connection:

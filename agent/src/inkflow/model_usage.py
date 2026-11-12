@@ -10,8 +10,9 @@ import os
 import sqlite3
 import time
 import warnings
-from contextlib import contextmanager
-from datetime import date
+from hashlib import sha256
+from contextlib import contextmanager, closing
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, DecimalException, ROUND_CEILING
 from pathlib import Path
 from typing import Any, Iterator
@@ -38,7 +39,7 @@ def project_identity(settings: Settings) -> str:
 
 
 def price_snapshot(settings: Settings, model: str) -> dict[str, Any]:
-    """Snapshot explicit CNY rates, or a dated official DeepSeek peak estimate."""
+    """保留用户报价；官方接口按已核价表与北京时间估算，峰时不猜法定假日。"""
     base = {"currency": "CNY", "model": model, "observed_at": utc_now()}
     input_price, output_price = settings.input_price_per_million, settings.output_price_per_million
     from .task_settings import active_task_settings
@@ -66,7 +67,8 @@ def price_snapshot(settings: Settings, model: str) -> dict[str, Any]:
     endpoint = urlparse(settings.base_url)
     # Do not apply official prices to third-party proxies with similar names.
     official = endpoint.scheme == "https" and endpoint.hostname == "api.deepseek.com"
-    if official and date(2026, 9, 23) <= date.today() <= date(2026, 10, 23):
+    now = datetime.now(timezone(timedelta(hours=8)))
+    if official and date(2026, 10, 26) <= now.date() <= date(2026, 11, 25):
         rates = {
             "deepseek-flash": ("2", "0.04", "8"),
             "deepseek-v4-flash": ("2", "0.04", "8"),
@@ -74,8 +76,13 @@ def price_snapshot(settings: Settings, model: str) -> dict[str, Any]:
             "deepseek-v4-pro": ("9", "0.30", "27"),
         }.get(model)
         if rates:
+            # 峰时可能遇法定假日，保守显示上界估算；非峰时间不需要假日表也能确定折半。
+            peak = now.weekday() < 5 and (9 <= now.hour < 12 or 14 <= now.hour < 18)
+            factor = Decimal(1) if peak else Decimal("0.5")
+            rates = tuple(str(Decimal(rate) * factor) for rate in rates)
             return {**base, "source": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
-                    "version": "2026-09-23", "kind": "peak_price_estimate",
+                    "version": "2026-10-26", "kind": "peak_price_upper_estimate" if peak else "off_peak_price_estimate",
+                    "billing_timezone": "Asia/Shanghai", "valid_until": "2026-11-25",
                     "input": rates[0], "cache_read": rates[1], "output": rates[2]}
     return {**base, "source": "unconfigured", "kind": "unknown"}
 
@@ -100,6 +107,15 @@ def cache_endpoint(base_url: str) -> str | None:
         return None
 
 
+def input_prefix_fingerprints(serialized_input: str) -> str:
+    """每16384字符记录实际消息的累计指纹；只定位复用下界，不保存原文或估称命中token。"""
+    digest, fingerprints = sha256(), []
+    for offset in range(0, len(serialized_input) - 16384 + 1, 16384):
+        digest.update(serialized_input[offset:offset + 16384].encode("utf-8"))
+        fingerprints.append(digest.hexdigest())
+    return ",".join(fingerprints)
+
+
 def _task_attempt_limit_error(message: str) -> ProviderError:
     error = ProviderError(message + "；尚未发送额外模型请求。")
     error.recovery_node = "provider.task_attempt_limit"
@@ -107,8 +123,20 @@ def _task_attempt_limit_error(message: str) -> ProviderError:
     return error
 
 
+def _safe_stream_progress(value: Any) -> dict[str, Any]:
+    """断流审计仅保留非负计数和布尔状态，禁止片段原文或供应商任意字段进入账本。"""
+    if not isinstance(value, dict):
+        return {}
+    counts = {key: value[key] for key in ("event_count", "content_chars", "reasoning_chars", "received_bytes", "idle_timeout_ms",
+                                         "last_model_output_ms", "model_text_idle_ms")
+              if type(value.get(key)) is int and value[key] >= 0}
+    flags = {key: value[key] for key in ("pending_event", "connection_closed", "done_received")
+             if type(value.get(key)) is bool}
+    return {**counts, **flags}
+
+
 def normalized_usage(usage: dict[str, Any], *, anthropic: bool = False) -> dict[str, int | None]:
-    """Raw token counts; discounts and reasoning subcounts never change totals."""
+    """读取真实用量；主字段空值时取已有兼容字段，缺报仍保持未知，不改计费总量。"""
     if anthropic:
         uncached = _count(usage.get("input_tokens"))
         output = _count(usage.get("output_tokens"))
@@ -116,11 +144,17 @@ def normalized_usage(usage: dict[str, Any], *, anthropic: bool = False) -> dict[
         write = _count(usage.get("cache_creation_input_tokens", 0))
         prompt = uncached + hit + write if None not in (uncached, hit, write) else None
     else:
-        prompt = _count(usage.get("prompt_tokens", usage.get("input_tokens")))
-        output = _count(usage.get("completion_tokens", usage.get("output_tokens")))
+        prompt = _count(usage.get("prompt_tokens"))
+        if prompt is None:
+            prompt = _count(usage.get("input_tokens"))
+        output = _count(usage.get("completion_tokens"))
+        if output is None:
+            output = _count(usage.get("output_tokens"))
         details = usage.get("prompt_tokens_details")
         details = details if isinstance(details, dict) else {}
-        hit = _count(usage.get("prompt_cache_hit_tokens", details.get("cached_tokens")))
+        hit = _count(usage.get("prompt_cache_hit_tokens"))
+        if hit is None:
+            hit = _count(details.get("cached_tokens"))
         miss = _count(usage.get("prompt_cache_miss_tokens"))
         if prompt is not None and hit is None and miss is not None and miss <= prompt:
             hit = prompt - miss
@@ -237,8 +271,9 @@ class UsageLedger:
             db.close()
 
     def begin(self, settings: Settings, *, request_id: str, model: str, role: str,
-              input_estimate: int, max_output_tokens: int, input_bound: int,
+              input_estimate: int, max_output_tokens: int | None, input_bound: int,
               task_id: str = "", prompt_family: str = "", diagnostic: dict[str, Any] | None = None) -> str:
+        """Persist one actual attempt, including its task identity and frozen input budget."""
         novel_id = project_identity(settings)
         price = price_snapshot(settings, model)
         pending_cost = _cost_micros({"input_tokens": input_bound, "output_tokens": max_output_tokens,
@@ -253,28 +288,84 @@ class UsageLedger:
                 (attempt_id, request_id, task_id, novel_id, "production", "", "",
                  settings.provider_kind, urlparse(settings.base_url).hostname or "", model, role,
                  prompt_family, utc_now(),
-                 input_estimate, max_output_tokens, json.dumps(price), pending_cost))
-            safe = {key: value if key in {"request_timeout_seconds", "soft_wait_seconds"}
+                 input_estimate, max_output_tokens if max_output_tokens is not None else -1, json.dumps(price), pending_cost))
+            safe = {key: value if key in {"request_timeout_seconds", "soft_wait_seconds", "stream_idle_timeout_seconds", "mimo_retry_policy_version"}
                     and (value is None or type(value) in (int, float)) else str(value)
                     for key, value in (diagnostic or {}).items() if key in {
-                "system_contract_hash", "user_prefix_4096_hash", "reference_prefix_hash", "materials_hash", "quality_hash", "stage",
-                "cache_policy", "message_layout", "thinking", "reference_prefix_tokens",
-                "request_timeout_seconds", "soft_wait_seconds", "timeout_policy", "batch_chapter_count"}}
+                "system_contract_hash", "user_prefix_4096_hash", "reference_prefix_hash", "materials_hash", "input_prefix_16k_hashes", "input_characters", "quality_hash", "stage",
+                "cache_policy", "message_layout", "thinking", "reference_prefix_tokens", "cache_continuation", "logical_input_hash",
+                "session_context_status", "session_context_revision", "session_context_reused_blocks",
+                "session_context_patched_blocks",
+                "session_context_compaction_pending", "session_context_natural_boundary",
+                "session_context_emergency_compaction", "session_context_inactive_blocks", "session_context_handoff_records",
+                "session_context_inactive_estimated_tokens", "session_context_retired_material_pressure",
+                "request_timeout_seconds", "soft_wait_seconds", "stream_idle_timeout_seconds", "mimo_retry_policy_version",
+                "timeout_policy", "batch_chapter_count", "run_id", "budget_source_run_id", "budget_max_calls", "budget_max_tokens"}}
+            # 技能身份由共享编译器绑定，仅保存短身份，不接纳模型或外部文件声明的费用归因。
+            binding = (diagnostic or {}).get("skill_binding")
+            if isinstance(binding, dict) and isinstance(binding.get("skills"), list):
+                safe["skill_binding"] = {"contract": str(binding.get("contract", ""))[:120],
+                    "binding_hash": str(binding.get("binding_hash", ""))[:64],
+                    "skills": [{"id": str(item.get("id", ""))[:80], "hash": str(item.get("hash", ""))[:64]}
+                        for item in binding["skills"][:32] if isinstance(item, dict)]}
             safe["context_limit_tokens"] = settings.context_budget_for(
                 role if role in {"coordinator", "writer", "editor", "reviewer", "memory_keeper"} else None,
                 model_override=model)[1]
+            safe.update(context_policy_version=settings.retrieval_policy_version,
+                quality_preset=settings.quality_preset, quality_custom_context=settings.quality_custom_context,
+                context_capacity_scale=1.0)
+            for name in ("hard_rule_reserved_tokens", "protected_system_tokens", "protected_hard_tokens", "hard_rule_unfilled_reserve_tokens", "effective_input_ceiling_tokens"):
+                if (value := _count((diagnostic or {}).get(name))) is not None:
+                    safe[name] = value
+            if (diagnostic or {}).get("output_policy") in {"provider_default", "provider_required_model_limit", "model_capacity"}:
+                # The legacy NOT NULL column retains a reservation upper bound,
+                # not a request cap. -1 explicitly denotes an unknown upper
+                # bound without rebuilding or rewriting historical rows.
+                safe.update(output_policy=diagnostic["output_policy"],
+                    output_policy_source=(diagnostic or {}).get("output_policy_source", "current_application_policy"),
+                    request_output_limit=(diagnostic or {}).get("request_output_limit"),
+                    reservation_kind="official_upper_bound" if max_output_tokens is not None else "unknown",
+                    output_reservation_upper=max_output_tokens)
             endpoint = cache_endpoint(settings.base_url)
             if endpoint is not None:
                 safe["request_endpoint"] = endpoint
             db.execute("UPDATE model_attempts SET diagnostic_json=?,request_sent=0 WHERE attempt_id=?", (json.dumps(safe), attempt_id))
         return attempt_id
 
-    def mark_request_sent(self, attempt_id: str, *, max_task_role_attempts: int | None = None) -> None:
+    def task_role_sent_count(self, task_id: str, role: str) -> int:
+        with self._connect() as db:
+            row = db.execute("SELECT COALESCE(SUM(request_sent=1),0) AS sent, COALESCE(SUM(request_sent IS NULL),0) AS unknown FROM model_attempts WHERE task_id=? AND role=?",
+                             (task_id, role)).fetchone()
+        if row["unknown"]:
+            raise _task_attempt_limit_error("原任务存在发送状态未知的模型尝试，无法核验新增授权")
+        return int(row["sent"])
+
+    def request_sent_count(self, task_id: str, request_id: str, role: str) -> int:
+        with self._connect() as db:
+            row = db.execute("SELECT COUNT(*) AS count, COALESCE(SUM(request_sent=1),0) AS sent, "
+                "COALESCE(SUM(request_sent IS NULL),0) AS unknown FROM model_attempts WHERE task_id=? AND request_id=? AND role=?",
+                (task_id, request_id, role)).fetchone()
+        if not row["count"] or row["unknown"]:
+            raise _task_attempt_limit_error("原故障步骤的发送记录不完整，先核对回执，不自动增加请求")
+        return int(row["sent"])
+
+    def mark_request_sent(self, attempt_id: str, *, max_task_role_attempts: int | None = None,
+                          max_request_attempts: int | None = None) -> None:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT task_id,role,request_sent FROM model_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+            row = db.execute("SELECT task_id,request_id,role,request_sent FROM model_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
             if row is None:
                 raise ValueError("模型尝试记录不存在，不能核验发送次数")
+            if row["request_sent"] == 1:
+                return  # 同一已登记发送不能再次扣减共享额度。
+            if max_request_attempts is not None:
+                previous = db.execute("SELECT COALESCE(SUM(request_sent=1),0) AS sent, "
+                    "COALESCE(SUM(request_sent IS NULL),0) AS unknown FROM model_attempts "
+                    "WHERE task_id=? AND request_id=? AND role=? AND attempt_id!=?",
+                    (row["task_id"], row["request_id"], row["role"], attempt_id)).fetchone()
+                if (not isinstance(max_request_attempts, int) or max_request_attempts < 1
+                        or previous["unknown"] or previous["sent"] >= max_request_attempts):
+                    raise _task_attempt_limit_error("原故障步骤已用完尝试或有未确认回执，未重新发送；已完成结果保留")
             if max_task_role_attempts is not None:
                 if _count(max_task_role_attempts) in (None, 0) or not str(row["task_id"] or "").strip():
                     raise _task_attempt_limit_error("本任务请求次数限制缺少有效上限或任务身份，无法核验授权")
@@ -286,7 +377,32 @@ class UsageLedger:
                 if previous["unknown"]:
                     raise _task_attempt_limit_error("原任务存在发送状态未知的模型尝试，无法核验剩余授权次数")
                 if previous["sent"] >= max_task_role_attempts:
-                    raise _task_attempt_limit_error(f"本任务的写作角色已用完获准的 {max_task_role_attempts} 次请求")
+                    label = {"writer": "写作", "reviewer": "专项审查", "editor": "编辑", "memory_keeper": "记忆整理", "coordinator": "调度"}.get(row["role"], "模型")
+                    raise _task_attempt_limit_error(f"本任务的{label}角色已用完获准的 {max_task_role_attempts} 次请求")
+            # 同一原执行片段的前台/后台请求在同一事务内核算，重启和新run不能重置余额。
+            diagnostic_row = db.execute("SELECT diagnostic_json FROM model_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+            limits = json.loads(diagnostic_row["diagnostic_json"] or "{}")
+            origin = limits.get("budget_source_run_id")
+            if origin:
+                calls = int(limits["budget_max_calls"])
+                token_limit = limits.get("budget_max_tokens")
+                token_limit = None if token_limit in (None, "None") else int(token_limit)
+                previous = db.execute("SELECT request_sent,input_tokens,output_tokens,input_estimate,max_output_tokens FROM model_attempts "
+                    "WHERE task_id=? AND attempt_id!=? AND COALESCE(json_extract(diagnostic_json,'$.budget_source_run_id'),json_extract(diagnostic_json,'$.run_id'))=?",
+                    (row["task_id"], attempt_id, origin)).fetchall()
+                if any(item["request_sent"] is None for item in previous) or sum(item["request_sent"] == 1 for item in previous) >= calls:
+                    raise _task_attempt_limit_error("原执行片段的前台与后台已达到共享请求上限或有未知发送记录，进度保留。")
+                if token_limit is not None:
+                    current = db.execute("SELECT input_estimate,max_output_tokens FROM model_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+                    used = 0
+                    for item in previous:
+                        if item["request_sent"] != 1:
+                            continue
+                        if item["input_tokens"] is None or item["output_tokens"] is None:
+                            raise _task_attempt_limit_error("原执行片段存在未知用量，不能把它当作零来分配后台预算。")
+                        used += item["input_tokens"] + item["output_tokens"]
+                    if current["input_estimate"] is None or current["max_output_tokens"] < 0 or used + current["input_estimate"] + current["max_output_tokens"] > token_limit:
+                        raise _task_attempt_limit_error("原执行片段的共享Token预算不足，后台候选及已完成成果保留。")
             db.execute("UPDATE model_attempts SET request_sent=1 WHERE attempt_id=?", (attempt_id,))
 
     def settle(self, attempt_id: str, usage: dict[str, Any], *, anthropic: bool = False,
@@ -321,10 +437,21 @@ class UsageLedger:
                  counts["cache_hit_tokens"], counts["cache_write_tokens"], cost, known, attempt_id))
 
     def finish(self, attempt_id: str, outcome: str, error_type: str = "", *, duration_ms: int | None = None,
-               request_sent: bool | None = None) -> None:
+               request_sent: bool | None = None, stream_progress: dict[str, Any] | None = None) -> None:
+        """结算实际尝试并保存脱敏断流进度；未知token保持未知，不重开已结算记录。"""
         with self._connect() as db:
-            db.execute("UPDATE model_attempts SET finished_at=?,outcome=?,error_type=?,duration_ms=?,request_sent=? WHERE attempt_id=? AND outcome='pending'",
+            changed = db.execute("UPDATE model_attempts SET finished_at=?,outcome=?,error_type=?,duration_ms=?,request_sent=? WHERE attempt_id=? AND outcome='pending'",
                        (utc_now(), outcome, error_type, _count(duration_ms), int(request_sent) if type(request_sent) is bool else None, attempt_id))
+            progress = _safe_stream_progress(stream_progress)
+            if changed.rowcount and progress:
+                row = db.execute("SELECT diagnostic_json FROM model_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+                try:
+                    diagnostic = json.loads(row["diagnostic_json"] or "{}")
+                except (ValueError, TypeError):
+                    diagnostic = None
+                if isinstance(diagnostic, dict):
+                    db.execute("UPDATE model_attempts SET diagnostic_json=? WHERE attempt_id=?",
+                               (json.dumps({**diagnostic, "stream": progress}), attempt_id))
 
     def summary(self, novel_id: str | None = None) -> dict[str, Any]:
         where, params = (" WHERE novel_id=?", (novel_id,)) if novel_id is not None else ("", ())
@@ -336,13 +463,15 @@ class UsageLedger:
                 COALESCE(SUM(usage_state!='reported'),0) AS unknown_usage_calls,
                 COALESCE(SUM(cost_estimate_micros IS NULL),0) AS unknown_cost_calls,
                 COALESCE(SUM(cost_estimate_micros),0) AS estimated_micros,
-                COALESCE(SUM(pending_estimate_micros),0) AS pending_estimated_micros
+                COALESCE(SUM(pending_estimate_micros),0) AS pending_estimated_micros,
+                COALESCE(SUM(usage_state!='reported' AND pending_estimate_micros IS NULL),0) AS pending_unknown_calls
                 FROM model_attempts""" + where, params).fetchone()
         return {**dict(row), "currency": "CNY", "hard_limit_cny": None,
                 "estimated_cost": row["estimated_micros"] / 1_000_000,
-                "pending_estimated_cost": row["pending_estimated_micros"] / 1_000_000,
+                "pending_estimated_cost": None if row["pending_unknown_calls"] else row["pending_estimated_micros"] / 1_000_000,
+                "known_pending_estimated_cost": row["pending_estimated_micros"] / 1_000_000,
                 "scope": "novel" if novel_id is not None else "all_projects",
-                "price_note": "按请求时价格快照估算；内置DeepSeek参考采用高峰价，未配置或缺失usage不计作零费用。"}
+                "price_note": "按各次请求保存的价格快照估算；DeepSeek新快照区分空闲价和峰时上界，历史快照保留，未配置或缺失usage不计作零费用。"}
 
     def recent_deepseek_cache(self, novel_id: str, limit: int = 20,
                               *, qualified_task_products: dict[str, int] | None = None) -> dict[str, Any]:
@@ -397,15 +526,20 @@ class UsageLedger:
         """Group actual requests by frozen route/model; retain unscoped history."""
         with self._connect() as db:
             rows = [dict(row) for row in db.execute("""SELECT provider,endpoint,model,role,prompt_family,
-                input_tokens,output_tokens,cache_hit_tokens,request_sent,diagnostic_json,started_at
+                input_tokens,output_tokens,cache_hit_tokens,request_sent,diagnostic_json,started_at,outcome
                 FROM model_attempts WHERE novel_id=? ORDER BY started_at,rowid""", (novel_id,))]
 
         def totals(items: list[dict[str, Any]]) -> dict[str, Any]:
+            """汇总实际发送记录，保留未知用量并区分在途与已结束缺报，不改变命中率分母。"""
             attempted = [item for item in items if item["request_sent"] != 0]
             inputs = [item for item in attempted if _count(item["input_tokens"]) is not None]
             outputs = [item for item in attempted if _count(item["output_tokens"]) is not None]
             reported = [item for item in inputs if _count(item["cache_hit_tokens"]) is not None
                         and item["cache_hit_tokens"] <= item["input_tokens"]]
+            # 在途请求的统计尚未结算，不能把它与已结束却未报告缓存的请求混为一类。
+            pending = sum(item["outcome"] == "pending" and not (
+                _count(item["input_tokens"]) is not None and _count(item["cache_hit_tokens"]) is not None
+                and item["cache_hit_tokens"] <= item["input_tokens"]) for item in attempted)
             prompt = sum(item["input_tokens"] for item in inputs)
             output = sum(item["output_tokens"] for item in outputs)
             denominator = sum(item["input_tokens"] for item in reported)
@@ -416,6 +550,8 @@ class UsageLedger:
                 "input_unknown_calls": len(attempted) - len(inputs),
                 "output_unknown_calls": len(attempted) - len(outputs),
                 "cache_reported_calls": len(reported), "cache_unknown_calls": len(attempted) - len(reported),
+                "cache_pending_calls": pending,
+                "cache_unknown_finished_calls": len(attempted) - len(reported) - pending,
                 "cache_reported_input_tokens": denominator,
                 "cache_unknown_prompt_tokens": prompt - denominator,
                 "prompt_cache_hit_tokens": hit, "prompt_cache_miss_tokens": denominator - hit,
@@ -423,6 +559,10 @@ class UsageLedger:
                 "prompt_cache_miss_rate": round((denominator - hit) / denominator, 4) if denominator else None,
                 "average_prompt_tokens": round(prompt / len(inputs)) if inputs else None,
                 "average_completion_tokens": round(output / len(outputs)) if outputs else None}
+
+        def recent(items: list[dict[str, Any]]) -> dict[str, Any]:
+            sent = [item for item in items if item["request_sent"] != 0][-5:]
+            return {"window": 5, "last_at": sent[-1]["started_at"] if sent else None, **totals(sent)}
 
         grouped: dict[tuple[str, str | None, str, str, str], list[dict[str, Any]]] = {}
         for row in rows:
@@ -446,13 +586,13 @@ class UsageLedger:
                 contracts.setdefault(key, []).append(row)
             history.append({"provider": provider, "endpoint": endpoint, "legacy_endpoint_host": legacy_host or None,
                 "model": model, "role": role, "scope_known": endpoint is not None,
-                "last_at": items[-1]["started_at"], **totals(items),
+                "last_at": items[-1]["started_at"], **totals(items), "recent": recent(items),
                 "by_contract": [{"prompt_family": key[0], "system_contract_hash": key[1], "quality_hash": key[2],
                     "thinking": key[3], "cache_policy": key[4], "message_layout": key[5],
                     "reference_prefix_tokens_estimated": value[-1]["diagnostic"].get("reference_prefix_tokens"),
                     "stage": value[-1]["diagnostic"].get("stage"),
                     "response_models": sorted({item["diagnostic"]["response_model"] for item in value
-                        if isinstance(item["diagnostic"].get("response_model"), str)}), **totals(value)}
+                        if isinstance(item["diagnostic"].get("response_model"), str)}), **totals(value), "recent": recent(value)}
                     for key, value in contracts.items()]})
         selected_endpoint = cache_endpoint(settings.base_url)
         current = {}
@@ -461,7 +601,8 @@ class UsageLedger:
             selected = next((group for group in history if group["provider"] == settings.provider_kind
                 and group["endpoint"] == selected_endpoint and group["scope_known"] and group["model"] == model and group["role"] == role), None)
             current[role] = selected or {"provider": settings.provider_kind, "endpoint": selected_endpoint,
-                "model": model, "role": role, "scope_known": selected_endpoint is not None, "by_contract": [], **totals([])}
+                "model": model, "role": role, "scope_known": selected_endpoint is not None, "by_contract": [],
+                "recent": recent([]), **totals([])}
         return {"available": True, "provider": settings.provider_kind, "endpoint": selected_endpoint,
                 "cache_policy": settings.prompt_cache_policy,
                 "by_agent_role": current, "history_groups": sorted(history, key=lambda item: item["last_at"], reverse=True),
@@ -571,11 +712,22 @@ class ModelAttempt:
     """Accounting failures remain visible without inventing zero-cost usage."""
 
     def __init__(self, settings: Settings, **fields: Any):
+        """Bind accounting to the current run before recording any remote attempt."""
         from .runtime import active_runtime
         self.runtime = active_runtime.get()
+        self.workspace_root = settings.workspace_root
         self.started = time.monotonic()
+        self.request_started_at = utc_now()
         self.fields = fields
         self.fields["diagnostic"] = {**fields.get("diagnostic", {})}
+        if settings.prompt_cache_layout_version >= 22:
+            from .skill_runtime import active_skill_binding
+            if (binding := active_skill_binding.get()) is not None:
+                self.fields["diagnostic"]["skill_binding"] = binding
+        if self.runtime:
+            self.fields["diagnostic"].update(run_id=self.runtime.run_id,
+                budget_source_run_id=self.runtime.budget_source_run_id or self.runtime.run_id,
+                budget_max_calls=self.runtime.max_calls, budget_max_tokens=self.runtime.max_tokens)
         endpoint = cache_endpoint(settings.base_url)
         if endpoint is not None:
             self.fields["diagnostic"]["request_endpoint"] = endpoint
@@ -616,15 +768,23 @@ class ModelAttempt:
             except (OSError, sqlite3.Error) as exc:
                 self._unavailable(exc)
 
-    def mark_request_sent(self, *, max_task_role_attempts: int | None = None) -> None:
+    def mark_request_sent(self, *, max_task_role_attempts: int | None = None,
+                          max_request_attempts: int | None = None) -> None:
+        limits = self.runtime.role_attempt_limits if self.runtime else {}
+        role = self.fields.get("role", "")
+        if role in limits:
+            if limits[role] <= 0:
+                raise _task_attempt_limit_error("本次仅授权补核指定角色，其他角色不得新增模型请求")
+            max_task_role_attempts = min(max_task_role_attempts, limits[role]) if max_task_role_attempts is not None else limits[role]
         if self.ledger:
             try:
-                self.ledger.mark_request_sent(self.attempt_id, max_task_role_attempts=max_task_role_attempts)
+                self.ledger.mark_request_sent(self.attempt_id, max_task_role_attempts=max_task_role_attempts,
+                                              max_request_attempts=max_request_attempts)
             except (OSError, sqlite3.Error, ValueError) as exc:
                 self._unavailable(exc)
-                if max_task_role_attempts is not None:
+                if max_task_role_attempts is not None or max_request_attempts is not None:
                     raise _task_attempt_limit_error("用量账本不可核验，无法执行本任务的模型请求次数限制") from exc
-        elif max_task_role_attempts is not None:
+        elif max_task_role_attempts is not None or max_request_attempts is not None:
             raise _task_attempt_limit_error("用量账本不可用，无法执行本任务的模型请求次数限制")
         self.request_sent = True
 
@@ -634,6 +794,7 @@ class ModelAttempt:
         self.finished = True
         duration_ms = max(0, round((time.monotonic() - self.started) * 1000))
         fragment = {"attempt_id": self.attempt_id or "unrecorded-" + uuid4().hex,
+                    "started_at": self.request_started_at,
                     "request_id": self.fields.get("request_id", ""), "task_id": self.fields.get("task_id", ""),
                     "role": self.fields.get("role", "unspecified"), "model": self.model, "provider": self.provider,
                     "prompt_family": self.fields.get("prompt_family", ""), "outcome": self.outcome,
@@ -641,14 +802,25 @@ class ModelAttempt:
                     "usage_state": "reported" if self.counts["input_tokens"] is not None and self.counts["output_tokens"] is not None else "unknown_or_partial",
                     "ledger_available": self.ledger is not None,
                     "request_sent": self.request_sent,
-                    "diagnostic": {key: value if key in {"request_timeout_seconds", "soft_wait_seconds"}
+                    "diagnostic": {key: value if key in {"request_timeout_seconds", "soft_wait_seconds", "stream_idle_timeout_seconds", "mimo_retry_policy_version"}
                                    and (value is None or type(value) in (int, float)) else str(value)
                                    for key, value in self.fields.get("diagnostic", {}).items()
-                                   if key in {"system_contract_hash", "user_prefix_4096_hash", "reference_prefix_hash", "materials_hash", "quality_hash", "stage", "request_endpoint", "response_model", "cache_policy", "message_layout", "thinking", "reference_prefix_tokens", "request_timeout_seconds", "soft_wait_seconds", "timeout_policy", "batch_chapter_count"}}}
+                                   if key in {"system_contract_hash", "user_prefix_4096_hash", "reference_prefix_hash", "materials_hash", "input_prefix_16k_hashes", "input_characters", "quality_hash", "stage", "request_endpoint", "response_model", "cache_policy", "message_layout", "thinking", "reference_prefix_tokens", "cache_continuation", "request_timeout_seconds", "soft_wait_seconds", "stream_idle_timeout_seconds", "mimo_retry_policy_version", "timeout_policy", "batch_chapter_count"}}}
+        if self.fields.get("diagnostic", {}).get("output_policy") in {"provider_default", "provider_required_model_limit", "model_capacity"}:
+            policy = self.fields["diagnostic"]
+            upper = self.fields.get("max_output_tokens")
+            fragment["diagnostic"].update(output_policy=policy["output_policy"],
+                output_policy_source=policy.get("output_policy_source", "current_application_policy"),
+                request_output_limit=policy.get("request_output_limit"),
+                output_reservation_upper=upper,
+                reservation_kind="official_upper_bound" if upper is not None else "unknown")
+        progress = _safe_stream_progress(self.fields.get("diagnostic", {}).get("stream"))
+        if progress:
+            fragment["diagnostic"]["stream"] = progress
         if self.ledger:
             try:
                 self.ledger.finish(self.attempt_id, self.outcome, self.failure, duration_ms=duration_ms,
-                                   request_sent=self.request_sent)
+                                   request_sent=self.request_sent, stream_progress=progress)
             except (OSError, sqlite3.Error) as exc:
                 self._unavailable(exc)
         if self.runtime:
@@ -659,3 +831,16 @@ class ModelAttempt:
                 # A diagnostics consumer must not turn a paid, completed model
                 # response into a provider retry. The fragment was appended first.
                 warnings.warn(f"用量片段通知暂未送达（{type(exc).__name__}）；未重试模型请求。", RuntimeWarning, stacklevel=2)
+        if self.workspace_root and self.request_sent:
+            # 经验库失败不能触发付费重发；学习暂停也覆盖缓存经验，不更改原账本。
+            try:
+                from .learning import WorkflowMemory
+                database = self.workspace_root / ".inkflow" / "inkflow.db"
+                if database.is_file():
+                    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=5)) as connection:
+                        row = connection.execute("SELECT value_json FROM metadata WHERE key='learning_settings'").fetchone()
+                    enabled = not row or json.loads(row[0]).get("enabled") is not False
+                    if enabled:
+                        WorkflowMemory(database.parent).record_cache(fragment)
+            except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+                warnings.warn(f"缓存经验未保存（{type(exc).__name__}），真实用量仍以原账本为准；未重发。", RuntimeWarning, stacklevel=2)

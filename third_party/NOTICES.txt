@@ -1,0 +1,189 @@
+# 第三方组件声明
+
+墨流引擎使用 pypdf（https://github.com/py-pdf/pypdf，BSD-3-Clause）读取 PDF 文字层。依赖版本约束为 >=7.0.1,<8，许可证随引擎中的 pypdf 包元数据交付。
+
+Humanizer 写法适配
+来源：https://github.com/blader/humanizer ，SKILL.md自报版本3.1.0；2026-10-26核对。
+用途：agent/src/inkflow/humanizer.py 中独立编写中文小说适配规则，补充既有Humanizer-zh，不嵌入上游完整示例，不新增运行时下载或模型。
+
+MIT License
+
+Copyright (c) 2025 Siqi Chen
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Grill Me 询问流程参考
+来源：https://www.aihero.dev/skills-grill-me 与 https://github.com/mattpocock/skills/tree/main/skills/productivity/grilling ；2026-10-26核对。
+用途：agent/src/inkflow/grilling.py 中独立编写面向小说的依赖分轮追问约束，复用墨流问题卡及权限门禁，未复制原始技能正文或安装外部运行依赖。
+
+墨流安装包包含 edge-tts（https://github.com/rany2/edge-tts）Python 组件，用于通过网络请求生成语音。该组件的版本约束为 >=7.3.1,<8；其许可证区分 srt_composer.py 的 MIT 与其余文件的 LGPLv3，原文见随安装包提供的 edge-tts-LICENSE。组件源码与维护信息见上游仓库。墨流未宣称与 Microsoft Edge 语音服务存在官方 API 合作关系。
+
+墨宝媒体开发处理使用 rembg（https://github.com/danielgatis/rembg，MIT）与 SkyTNT/anime-segmentation（https://github.com/SkyTNT/anime-segmentation）的 ISNet 动漫分割模型（Apache-2.0），结合 OpenCV GrabCut 生成透明视频。这些是开发素材处理工具，不是桌面端的运行依赖；模型缓存保留开发机 D 盘，不随安装包或 Git 仓库分发。原始项目及各自许可证以上游仓库为准。运行素材位于 desktop/src/assets/mascot/ 与 extension/media/mascot/；历史处理记录不随安装包分发。
+
+Heroicons UI图标
+来源：https://github.com/tailwindlabs/heroicons
+本地用途：desktop/src/assets/ui/icons/，保存原始SVG并将其路径适配为内联SVG，无新增运行依赖。
+
+MIT License
+
+Copyright (c) Tailwind Labs, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+
+jsonpatch 持续上下文增量
+来源：https://github.com/stefankoegl/python-json-patch
+用途：复用现有运行环境中的jsonpatch 1.37，生成与本地核验RFC6902结构化资料补丁；不复制第三方源码。
+
+Copyright (c) 2011 Stefan Kögl <stefan@skoegl.net>
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+Agent Skills runtime adapters — 2026-10-31
+Source and adapted packages: https://agentskills.io/specification ; https://github.com/op7418/Humanizer-zh ; https://github.com/DietrichGebert/ponytail ; https://github.com/f/prompts.chat . Humanizer-zh Git blob ef07b54da21a41d4a7e4fe0b0afb928f597eb684; Ponytail blob d64edd32265ba21cbf5270158f04e97d96925f27; prompts.chat prompt-lookup blob dc04ac1dbf9a72eaad7c88ae764df46e6c13a43e.
+Headroom (https://github.com/headroomlabs-ai/headroom, Apache-2.0) is a method reference only: no proxy, compressor, model, or upstream runtime code installed. prompts.chat source/site MIT and contributed prompt data CC0 are distinct. PyYAML (https://github.com/yaml/pyyaml, MIT) parses standard frontmatter using safe_load.
+Complete applicable license texts follow and also ship in builtin_skills/skill-authoring/assets/THIRD_PARTY_LICENSES.txt.
+
+Humanizer-zh — https://github.com/op7418/Humanizer-zh
+MIT License
+
+Copyright (c) 2026 歸藏
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+Ponytail — https://github.com/DietrichGebert/ponytail
+MIT License
+
+Copyright (c) 2026 DietrichGebert
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+prompts.chat plugin template — https://github.com/f/prompts.chat
+MIT License
+
+Copyright (c) 2022-present Fatih Kadir Akin and contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+Graphify (graphifyy 0.9.107) — https://github.com/Graphify-Labs/graphify
+Licensed under Apache-2.0 with retained MIT portions. The complete license and
+attribution files are provided as graphify-LICENSE, graphify-LICENSE-MIT and
+graphify-NOTICE alongside this notice or in the application's licenses folder.
+InkFlow uses the local graph library. It does not install assistant hooks or use
+Graphify Cloud, automatic API-key discovery, or Graphify's model backends.
+
+PyYAML — https://github.com/yaml/pyyaml
+Copyright (c) 2017-2021 Ingy döt Net
+Copyright (c) 2006-2016 Kirill Simonov
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+

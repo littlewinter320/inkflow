@@ -2,7 +2,7 @@
   "name": "inkflow-vscode",
   "displayName": "inkflow墨流",
   "description": "墨流中文长篇小说创作工作台",
-  "version": "0.7.5",
+  "version": "0.8.0",
   "publisher": "inkflow",
   "license": "MIT",
   "icon": "media/mobao.png",
@@ -49,7 +49,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js",
-    "package": "npm run build && vsce package --no-dependencies -o D:/墨流/release/0.7.5/extension/inkflow-vscode-0.7.5.vsix"
+    "package": "npm run build && node -e \"require('node:fs').copyFileSync('../README.md','dist/README.txt')\" && vsce package --no-dependencies --readme-path dist/README.txt -o D:/墨流/release/0.8.0/extension/inkflow-vscode-0.8.0.vsix"
   },
   "dependencies": {
     "jsonc-parser": "^3.3.1"
@@ -282,7 +282,7 @@
             "title": "导入并检查模型 API",
             "description": "[导入第三方 JSON/JSONC 配置](command:inkflow.importApi)，预览并保存后，再[检查连接](command:inkflow.checkConnection)。检查会发短模型请求，可能计费；不需要先打开小说。",
             "media": {
-              "markdown": "media/walkthrough-api.md"
+              "markdown": "media/guides/api.txt"
             }
           },
           {
@@ -290,7 +290,7 @@
             "title": "打开墨流小说项目",
             "description": "先用桌面版新建小说，或打开已有的墨流项目文件夹。",
             "media": {
-              "markdown": "media/walkthrough-open.md"
+              "markdown": "media/guides/open.txt"
             }
           },
           {
@@ -298,15 +298,15 @@
             "title": "生成三层规划",
             "description": "先由 Coordinator 理解方向，再安排生成全书大纲、卷与篇章细纲、近期章节规划。",
             "media": {
-              "markdown": "media/walkthrough-plan.md"
+              "markdown": "media/guides/plan.txt"
             }
           },
           {
             "id": "draft",
             "title": "写作与审查",
-            "description": "写作角色生成草稿，审查角色给出证据与扣分；你确认后才进入正史。",
+            "description": "写作角色生成草稿，审查角色给出证据；通过必要门禁并获得接受授权后，由引擎提交正史。",
             "media": {
-              "markdown": "media/walkthrough-draft.md"
+              "markdown": "media/guides/draft.txt"
             }
           },
           {
@@ -314,7 +314,7 @@
             "title": "连接编程助手",
             "description": "把墨流合并到当前工作区的 MCP 配置，用自然语言调用同一套引擎。",
             "media": {
-              "markdown": "media/walkthrough-connect.md"
+              "markdown": "media/guides/connect.txt"
             }
           }
         ]

@@ -26,11 +26,6 @@ development/
 .claude/
 .trae/
 /.inkflow-dev/
-/docs/research/vendor/
-CLAUDE.md
-AGENTS.md
-*_PLAN.md
-*_DESIGN.md
 
 # InkFlow project runtime data
 **/.inkflow/inkflow.db*
@@ -42,3 +37,12 @@ AGENTS.md
 **/.inkflow/trash/
 **/.inkflow/transactions/
 **/.inkflow/context-status.json
+
+# Source documentation is limited to the root rules, guide, and changelog.
+*.md
+!/AGENTS.md
+!/README.md
+!/CHANGELOG.md
+
+# 本次授权的运行时技能说明是产品资源，不是第二套项目协作规则。
+!/agent/src/inkflow/builtin_skills/**/*.md

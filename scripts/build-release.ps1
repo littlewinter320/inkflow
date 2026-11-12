@@ -50,6 +50,10 @@ if ($LASTEXITCODE -ne 0) {
     throw "Python dependency installation failed with exit code $LASTEXITCODE."
 }
 
+# 提示词目录是产品设置的只读资源，由实际源码生成，不调用模型或执行工作流。
+& $python (Join-Path $agentRoot 'scripts\generate_prompt_catalog.py')
+if ($LASTEXITCODE -ne 0) { throw 'Prompt catalogue generation failed.' }
+
 & $pyinstaller `
     --noconfirm `
     --clean `
@@ -59,7 +63,18 @@ if ($LASTEXITCODE -ne 0) {
     --collect-submodules mcp.server `
     --collect-submodules mcp.shared `
     --collect-data mcp `
+    --collect-data inkflow `
+    --collect-submodules langgraph `
+    --collect-submodules langchain.tools `
+    --copy-metadata langchain `
+    --copy-metadata langchain-core `
+    --copy-metadata langgraph `
+    --copy-metadata langsmith `
     --collect-all edge_tts `
+    --copy-metadata edge-tts `
+    --copy-metadata pypdf `
+    --copy-metadata graphifyy `
+    --collect-data graphify `
     --hidden-import mcp.types `
     --exclude-module mcp.cli `
     --distpath $engineOutput `
@@ -79,9 +94,14 @@ if ($IncludeExtension) {
     New-Item -ItemType Directory -Force -Path $extensionBin | Out-Null
     New-Item -ItemType Directory -Force -Path $extensionRelease | Out-Null
     Copy-Item -LiteralPath (Join-Path $engineOutput 'inkflow-engine.exe') -Destination (Join-Path $extensionBin 'inkflow-engine.exe') -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'third_party\NOTICES.txt') -Destination (Join-Path $extensionBin 'NOTICES.txt') -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'third_party\edge-tts-LICENSE') -Destination (Join-Path $extensionBin 'edge-tts-LICENSE') -Force
+    foreach ($notice in @('graphify-LICENSE', 'graphify-LICENSE-MIT', 'graphify-NOTICE')) {
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot "third_party\$notice") -Destination (Join-Path $extensionBin $notice) -Force
+    }
     Push-Location (Join-Path $repositoryRoot 'extension')
     try {
-        npm install
+        npm ci
         if ($LASTEXITCODE -ne 0) { throw "VS Code dependency installation failed with exit code $LASTEXITCODE." }
         npm run package
         if ($LASTEXITCODE -ne 0) { throw "VSIX packaging failed with exit code $LASTEXITCODE." }
@@ -91,9 +111,10 @@ if ($IncludeExtension) {
     }
 }
 
+$previousGithubToken = $env:GH_TOKEN
 Push-Location (Join-Path $repositoryRoot 'desktop')
 try {
-    npm install
+    npm ci
     if ($LASTEXITCODE -ne 0) { throw "Desktop dependency installation failed with exit code $LASTEXITCODE." }
     if ($Publish) {
         $tag = "v$desktopVersion"
@@ -132,7 +153,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Desktop packaging failed with exit code $LASTEXITCODE." }
 }
 finally {
-    Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+    $env:GH_TOKEN = $previousGithubToken
     Pop-Location
 }
 

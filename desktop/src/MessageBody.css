@@ -1,0 +1,7 @@
+/* 旧角色报告的折叠只作用于消息正文，使用当前主题，不改变原记录、复制或任务状态。 */
+.message-review-summary { display: grid; gap: 10px; min-width: 0; }
+.message-review-summary > p { margin: 0; }
+.message-review-summary .message-review-groups { color: var(--muted); font-size: 13px; line-height: 1.7; }
+.message-full-explanation { margin-top: 4px; border-top: 1px solid var(--line-soft); padding-top: 10px; }
+.message-full-explanation > summary { color: color-mix(in srgb, var(--accent-dim) 35%, var(--text)); cursor: pointer; font-size: 13px; }
+.message-full-explanation > div { max-height: 540px; overflow: auto; margin-top: 12px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.9; }

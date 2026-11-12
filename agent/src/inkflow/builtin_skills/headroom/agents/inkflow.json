@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "display_name": "上下文余量管理",
+  "roles": [
+    "coordinator",
+    "writer",
+    "editor",
+    "reviewer",
+    "memory_keeper"
+  ],
+  "activation": "manual",
+  "contracts": [
+    "writer.*",
+    "review.*",
+    "memory.*",
+    "coordinator.*"
+  ],
+  "when": "作者主动点名@headroom或要求使用上下文余量管理，且原任务正在准备实际角色输入时使用。",
+  "not_when": "不会被动常驻、刷缓存、删关键证据、自动提容量或安装外部压缩代理与模型。",
+  "inputs": [
+    "冻结的角色设置、当前步骤与实际材料统计"
+  ],
+  "outputs": [
+    "容量读取回执、保留项与缺口说明",
+    "原引擎的输入检查结果"
+  ],
+  "tasks": [
+    "读实际角色容量",
+    "辨必要证据和可选说明",
+    "按需装入技能引用",
+    "沿现有自然边界整理"
+  ],
+  "references": [
+    {
+      "path": "references/context-policy.md"
+    }
+  ],
+  "steps": [
+    {
+      "tool": "skill.scope"
+    },
+    {
+      "tool": "context.inspect",
+      "script": "scripts/inspect.json"
+    },
+    {
+      "tool": "skill.resources"
+    }
+  ]
+}

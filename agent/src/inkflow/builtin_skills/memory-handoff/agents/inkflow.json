@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "display_name": "记忆交接",
+  "roles": [
+    "editor",
+    "memory_keeper"
+  ],
+  "activation": "automatic",
+  "contracts": [
+    "memory.*",
+    "check.memory"
+  ],
+  "when": "当前模式的memory_owner进入主交接、记忆修补或引文选择节点时使用，不重复另一角色同职责。",
+  "not_when": "纯表达或逻辑审查、尚未发生的规划、无源事实、重复交接或企图直接写正史时不用。",
+  "inputs": [
+    "当前同版正文、已有正史与有效记忆",
+    "实际memory归属、候选及来源清单"
+  ],
+  "outputs": [
+    "当前MemoryPatch或ModeCheckOutput内的候选增量",
+    "逐项引用、时间与版本身份、未解决冲突"
+  ],
+  "tasks": [
+    "核对正文及来源身份",
+    "分离事实与人物认识",
+    "整理增量与事件",
+    "处理设定和承诺",
+    "交候选与缺口"
+  ],
+  "references": [
+    {
+      "path": "references/memory-standard.md",
+      "contracts": [
+        "memory.keeper",
+        "memory.repair",
+        "check.memory"
+      ]
+    },
+    {
+      "path": "references/derived-repair.md",
+      "contracts": [
+        "memory.keeper",
+        "check.memory"
+      ]
+    },
+    {
+      "path": "references/evidence-selection.md",
+      "contracts": [
+        "memory.evidence"
+      ]
+    }
+  ],
+  "steps": [
+    {
+      "tool": "skill.scope",
+      "script": "scripts/scope.json"
+    },
+    {
+      "tool": "skill.resources",
+      "script": "scripts/resources.json"
+    },
+    {
+      "tool": "skill.output",
+      "script": "scripts/output.json"
+    }
+  ]
+}

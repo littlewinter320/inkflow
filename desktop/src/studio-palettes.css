@@ -1,0 +1,86 @@
+/* 背景、表面和文字由appearance.ts统一赋值；此处将旧固定底色接回语义变量。 */
+:root[data-theme] { color: var(--text); background: var(--bg); }
+:root[data-theme] :is(.topbar, .statusbar, .settings-nav, .settings-dialog, .modal, .markdown-preview, .editor-toolbar) { color: var(--text); background-color: var(--panel); }
+:root[data-theme] :is(.settings-modal, .settings-dialog) :is(.setting-group, .settings-presets, .agent-tuning, .advanced-toggle, .update-card > div) { background-color: var(--panel-2); border-color: var(--line); color: var(--text); }
+:root[data-theme] :is(input, textarea, select) { background-color: var(--panel); color: var(--text); border-color: var(--line); caret-color: var(--accent); }
+/* 原生下拉弹层不总继承闭合控件的表面色，显式同步明暗模式及选项，保留键盘操作。 */
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+:root[data-theme] select :is(option, optgroup) { background-color: var(--panel); color: var(--text); }
+:root[data-theme] :is(input, textarea)::placeholder { color: var(--muted); opacity: .8; }
+:root[data-theme] :is(input, textarea, select):focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 17%, transparent); }
+:root[data-theme] .composer textarea { background: transparent; border: 0; box-shadow: none; }
+:root[data-theme] :is(.preset-grid, .choice-row) button { color: var(--text); background: var(--panel); border-color: var(--line); }
+:root[data-theme] :is(.preset-grid, .choice-row) button.active { background: var(--accent-soft); border-color: var(--accent); box-shadow: inset 3px 0 var(--accent); }
+:root[data-theme] button.primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+:root[data-theme] button.primary:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 88%, var(--text)); border-color: var(--accent); }
+.ui-icon { display: inline-block; flex: 0 0 17px; width: 17px; height: 17px; background: none; fill: none; stroke: currentColor; vertical-align: -3px; overflow: visible; }
+/* 自绘静态纸纹与外部图标分目录；纹理只低透明叠一层，不随鼠标或时间重绘。 */
+.workspace-grid::before { content: ""; position: absolute; inset: 0; pointer-events: none; background: url("./assets/ui/textures/paper-grain.svg") repeat; opacity: .035; z-index: 0; }
+
+/* 五条色带对应实际主辅色；不再用三色预览掩盖完整组合。 */
+.palette-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.palette-grid button { position: relative; display: flex; align-items: center; gap: 12px; min-width: 0; min-height: 78px; padding: 12px; text-align: left; background: var(--panel); }
+.palette-grid button > .palette-copy { display: flex; flex: 1; flex-direction: column; gap: 5px; min-width: 0; }
+.palette-copy strong { display: flex; align-items: center; gap: 5px; font-size: 13px; font-weight: 600; color: var(--text); }
+.palette-copy small { color: var(--muted); font-size: 11px; line-height: 1.55; }
+.palette-preview { display: flex; flex: 0 0 80px; height: 43px; overflow: hidden; border: 1px solid var(--line-soft); border-radius: 11px; }
+.palette-grid .palette-preview i { width: auto; height: auto; flex: 1; border-radius: 0; box-shadow: none; }
+.palette-check { flex: 0 0 17px; color: var(--accent); font-weight: 700; opacity: 0; }
+.palette-grid button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent-dim); }
+.palette-grid button[aria-pressed="true"] .palette-check { opacity: 1; }
+@media (max-width: 620px) { .palette-grid { grid-template-columns: 1fr; } }
+
+/* 本书聊天的入口、分类与管理分层，长列表只在目录内部滚动。 */
+.novel-conversations .conversation-catalog-heading { display: flex; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap; }
+.conversation-catalog-heading > strong { display: flex; align-items: center; gap: 5px; font-size: 12px; }
+.conversation-catalog-heading > strong small { font-size: 10px; font-weight: 400; color: var(--muted); }
+.novel-conversations .conversation-new { display: inline-flex; align-items: center; gap: 3px; padding: 5px 8px; font-size: 11px; color: var(--accent); }
+.conversation-categories { display: flex; gap: 3px; margin: 9px 0 7px; }
+.conversation-categories button { display: flex; justify-content: center; flex: 1; gap: 4px; min-width: 0; padding: 6px 3px; border-color: transparent; font-size: 11px; color: var(--muted); }
+.conversation-categories button span { font-size: 9px; opacity: .75; }
+.conversation-categories button[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-dim); }
+.workspace-menu-content .conversation-delete { color: var(--red); }
+.conversation-catalog-row { animation: studio-feedback-in var(--motion-reveal) var(--motion-ease) both; display: grid; grid-template-columns: minmax(0, 1fr) 30px; align-items: center; gap: 3px; }
+.novel-conversations .conversation-open { min-width: 0; border-radius: 10px; }
+.novel-conversations .conversation-open > strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.novel-conversations .conversation-manage { display: grid; place-items: center; width: 30px; height: 30px; padding: 0; border-color: transparent; font-size: 18px; }
+.conversation-rename { grid-column: 1 / -1; padding: 8px; border-radius: 9px; background: var(--panel-2); }
+.conversation-rename label { display: grid; gap: 5px; font-size: 11px; }
+.conversation-rename input { padding: 7px; font-size: 12px; }
+.conversation-rename > div { display: flex; justify-content: flex-end; gap: 5px; margin-top: 7px; }
+.novel-conversations .conversation-rename button { width: auto; padding: 5px 8px; font-size: 11px; }
+.novel-conversations .conversation-catalog-empty { padding: 7px 2px; }
+.app-recovery { display: grid; place-items: center; height: 100%; padding: 28px; color: var(--text); background: var(--bg); }
+.app-recovery > section { width: min(520px, 100%); padding: 28px; border: 1px solid var(--line); border-radius: 18px; background: var(--panel); }
+.app-recovery h1 { font-size: 23px; }
+.app-recovery p { line-height: 1.8; overflow-wrap: anywhere; }
+.app-recovery button { margin-top: 14px; }
+
+/* 狭窄工程栏保持单行页签；正文随可用宽度调整，不用多行大按钮吃掉阅读高度。 */
+:root[data-theme] .engineering-workbench > .tabbar { flex-wrap: nowrap; overflow-x: auto; min-width: 0; }
+.engineering-workbench > .tabbar button { flex: 0 0 auto; white-space: nowrap; font-size: 12px; }
+.engineering-panel > .workspace-panel-content { container-type: inline-size; }
+.engineering-workbench .markdown-preview > :is(p, h1, h2, h3, h4, ul, ol, blockquote, pre, table) { max-width: 76ch; margin-inline: auto; }
+@container (max-width: 480px) {
+  .engineering-workbench .markdown-preview { padding: 20px 18px; font-size: 14px; line-height: 1.85; }
+  .engineering-workbench .markdown-preview h1 { font-size: 24px; }
+  .engineering-workbench .editor-toolbar { flex-wrap: wrap; gap: 5px; padding: 8px; }
+}
+
+/* 资料分类继续保留身份与占比，只让色阶跟随当前组合；图例和区段共用同一颜色。 */
+:root[data-theme] .context-materials {
+  --context-color-task: var(--accent);
+  --context-color-canon: var(--theme-secondary);
+  --context-color-settings: var(--theme-fourth);
+  --context-color-planning: color-mix(in srgb, var(--theme-fifth) 65%, var(--accent));
+  --context-color-prose: var(--theme-warm);
+  --context-color-voice: var(--theme-fifth);
+  --context-color-dialogue: color-mix(in srgb, var(--theme-warm) 62%, var(--text));
+  --context-color-threads: color-mix(in srgb, var(--accent) 65%, var(--text));
+  --context-color-rules: var(--muted);
+  --context-color-reference: color-mix(in srgb, var(--theme-secondary) 70%, var(--panel));
+  --context-color-other: color-mix(in srgb, var(--muted) 70%, var(--panel));
+}
+
+:root[data-theme] .message.pending { opacity: 1; }

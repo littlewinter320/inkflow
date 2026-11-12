@@ -17,11 +17,11 @@ from typing import Any, Awaitable, Callable
 from pydantic import ValidationError
 
 from . import __version__
-from .config import PROVIDER_KINDS, Settings, adapt_settings, api_key_status, mimo_endpoint_for_key, save_api_key_to_keyring, save_user_settings
+from .config import PROVIDER_KINDS, Settings, adapt_settings, api_key_status, mimo_endpoint_for_key, save_api_key_to_keyring, save_user_settings, creation_preset_mappings
 from .coordinator import Coordinator
 from .craft import AUTHOR_VOICE_CONTRACT
 from .engine import InkFlowEngine
-from .errors import ConfigurationError, InkFlowError, ProjectBusyError, ProjectError, ProviderError
+from .errors import ConfigurationError, InkFlowError, ProjectBusyError, ProjectError, ProviderError, ValidationGateError
 from .learning import LearningService
 from .project import InkFlowProject
 from .project_lock import project_lock_wait_policy, project_write_lock, project_write_lock_sync
@@ -33,16 +33,24 @@ from .review_verifier import verify_review
 from .studio import StudioDatabase, StudioService, bind_active_collaboration, chapter_retry_state, text_statistics
 from .terminal_session import TerminalSession, _suggestions_forbidden
 from .trace import TraceRecorder, recent_trace_runs
-from .runtime import RunRuntime, active_runtime
+from .runtime import COMPLETION_ATTEMPT_LIMIT, RunRuntime, active_generation_attempt_limit, active_runtime
 from .model_usage import UsageLedger, normalized_usage, usage_attempts
 from .planning_cleanup import cleanup_apply, cleanup_keep, cleanup_preview
-from .conversation_scope import active_conversation, conversation_id, conversation_key
+from .conversation_scope import active_conversation, conversation_id, conversation_key, create_conversation, list_conversations, remember_conversation_title, update_conversation, delete_conversation, ensure_conversation_available
 from .task_settings import active_task_settings, capture_task_settings, restore_task_settings, use_task_settings
-from .utils import content_hash, estimate_tokens, project_source_revision, workflow_failure_reason, workflow_result_status
+from .utils import content_hash, estimate_tokens, json_dumps, project_source_revision, restored_completed_dialogue, workflow_failure_reason, workflow_result_status, workflow_result_summary, utc_now
 from .voice import VOICE_SETTING_NAMES, VoiceRuntime, _project_key
 
 
 EventSink = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+def _is_running_status_question(message: str) -> bool:
+    text = re.sub(r"[\s。！!？?，,]", "", message)
+    return bool(re.fullmatch(
+        r"(?:墨宝|你)?(?:还在(?:工作|运行|处理)(?:吗|么)|在工作吗|在吗|卡住了吗|"
+        r"现在(?:怎么样了|进展如何|到哪一步了)|进展怎么样|有进展吗)"
+        r"(?:如果(?:有在|还在)工作请你回复我|请(?:你)?回复(?:我)?(?:一下)?|说一下进度)?", text))
 
 
 _COLLABORATION_MODES = {
@@ -82,6 +90,20 @@ def _requested_task_mode(method: str, params: dict[str, Any]) -> str | None:
     return "adaptive" if mode == "adaptive" else new_task_mode(mode)
 
 
+def _mark_attachment_history(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """从按更新时间倒序的回执识别已被同一附件新执行接管的旧任务。"""
+    seen: set[str] = set()
+    for task in tasks:
+        if task.get("method") != "memory.attachments":
+            continue
+        work_id = (task.get("params") or {}).get("work_id")
+        if isinstance(work_id, str) and work_id:
+            if work_id in seen and task["status"] not in {"queued", "running"}:
+                task.update(historical=True, retryable=False, next_step="此附件已有更新的执行回执，请查看最新记录。")
+            seen.add(work_id)
+    return tasks
+
+
 def _task_rows_with_history(project: InkFlowProject, limit: int, instance_id: str) -> list[dict[str, Any]]:
     """Use one task interpretation in the project page and collaboration panel."""
     studio = StudioService(project)
@@ -90,7 +112,7 @@ def _task_rows_with_history(project: InkFlowProject, limit: int, instance_id: st
         studio.db.reconcile_interrupted_tasks(instance_id)
     except sqlite3.OperationalError:
         reconciliation_pending = True
-    tasks = studio.db.list_tasks(limit)
+    tasks = _mark_attachment_history(studio.db.list_tasks(limit))
     with project.db.connect() as connection:
         work_rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
     completed_tasks = {item["source"]["task_id"]: item for row in work_rows
@@ -153,7 +175,9 @@ def _task_rows_with_history(project: InkFlowProject, limit: int, instance_id: st
                 task["retryable"] = False
                 task["retry_note"] = "无法核实目标章节版本，因此没有开放整条任务重放。"
                 task["next_step"] = "请刷新项目并核对当前草稿；确认版本后再从未完成步骤续接。"
-        if task["status"] in {"failed", "cancelled", "interrupted", "waiting_condition", "waiting_user"}:
+        if task["status"] in {"failed", "cancelled", "interrupted", "waiting_condition", "waiting_user"} and task.get("method") not in {
+            "memory.attachments", "preferences.materials.analyze",
+        }:
             if task.get("task_id") in completed_tasks:
                 task.update(historical=True, retryable=False,
                     next_step="原任务后续已完成并保存实际进度，旧断点留作历史；当前无需重试此记录。")
@@ -254,6 +278,162 @@ def _batch_source_run(project: InkFlowProject, db: StudioDatabase, manifest: dic
     return db.latest_task_run_for_settings(str(task_id)) if task_id else None
 
 
+def _chapter_accept_question(project, task):
+    """只读取得这条后台接收记录的原题；私有会话编号从可信版本来源派生。"""
+    params = task.get("params") or {}
+    chapter_no, version, source_hash = (params.get(key) for key in ("chapter_no", "expected_version", "expected_hash"))
+    if (task.get("method") != "workflow.run" or task.get("action") != "review_accept"
+            or type(chapter_no) is not int or chapter_no < 1 or type(version) is not int or version < 1
+            or not isinstance(source_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", source_hash)):
+        return None
+    token = active_conversation.set(f"chapter-accept-{chapter_no}-{source_hash[:16]}")
+    try:
+        pending = TerminalSession._pending_question(project)
+    finally:
+        active_conversation.reset(token)
+    # 题目的 ticket_id 与预算 task_id 不同，不能混用，也不能借别章的题目恢复新预算。
+    if not pending or pending.get("snapshot_task_id") != task.get("task_id"):
+        return None
+    intent = pending.get("intent") or {}
+    if (intent.get("action") not in {"review_accept", "accept"} or intent.get("chapter_no") != chapter_no
+            or intent.get("end_chapter_no") not in {None, chapter_no}):
+        raise ValidationGateError("这份待答涉及原章节核对之外的安排；请到主对话明确处理，没有扩大后台权限。")
+    return pending
+
+
+def _chapter_accept_binding(project, params):
+    """把工具栏的接收操作绑定已保存的章、版和正文，旧断点继续沿用原账本。"""
+    chapter_no, version = params.get("chapter_no"), params.get("expected_version")
+    expected_hash = params.get("expected_hash")
+    if (type(chapter_no) is not int or chapter_no < 1 or type(version) is not int or version < 1
+            or not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)):
+        raise ValidationGateError("请重新打开当前草稿后再转为正史；本次缺少可核对的章节版本。")
+    chapter = project.db.get_chapter(chapter_no)
+    if (not chapter or chapter["version"] != version or chapter["content_hash"] != expected_hash):
+        raise ValidationGateError("这章在点击后已有其他修改；请刷新并核对当前版本，没有按旧页面提交正史。")
+    path = project.resolve_user_path(chapter["path"])
+    if not path.is_file() or content_hash(path.read_text(encoding="utf-8")) != expected_hash:
+        raise ValidationGateError("已保存文件与章节记录不一致；请先保存并核对正文，没有使用另一份旧稿。")
+    if chapter["status"] not in {"draft", "accepted"}:
+        raise ValidationGateError("当前版本不是可审核的草稿，请先查看章节状态。")
+    record = project.db.latest_review_record(chapter_no)
+    # 正史也可能仍有提交尾项；再次点击只走原接收回执，不能因status=accepted假报全完成。
+    binding = {"chapter_no": chapter_no,
+        "message": f"接受第{chapter_no}章" if chapter["status"] == "accepted" else f"审查并验收第{chapter_no}章",
+        "run_id": None, "task_id": None}
+    if "question_answer" not in params and any(params.get(key) for key in ("expected_question_id", "expected_question_task_id")):
+        raise ValidationGateError("请从后台原题重新提交你的答案；这里不会自动重发旧答案或改开新审查。")
+    if "question_answer" in params:
+        # 答案只能续接用户打开的那条后台原题；页面传来的私有会话编号不参与授权。
+        answer = params["question_answer"]
+        if not isinstance(answer, str) or not answer.strip() or len(answer) > 12000:
+            raise ValidationGateError("请先填写这份原题的答案；本次未启动新的审核。")
+        if not answer.startswith("我来回答刚才的问题：\n") or not params.get("source_run_id"):
+            raise ValidationGateError("请在后台任务的原题里填写并提交答案，没有把新指令当成原题回答。")
+        source = StudioService(project).db.get_task(str(params.get("source_run_id") or ""))
+        if (source.get("status") != "waiting_user" or any((source.get("params") or {}).get(key) != params[key]
+                for key in ("chapter_no", "expected_version", "expected_hash"))):
+            raise ValidationGateError("原任务或章节版本已经变化；答案仍保留，请重新打开当前待答核对。")
+        question = _chapter_accept_question(project, source)
+        if (not question or question.get("id") != params.get("expected_question_id")
+                or question.get("task_id") != params.get("expected_question_task_id")):
+            raise ValidationGateError("这份原题已被处理或替换；答案仍保留，请重新打开待答核对。")
+        if any(card.get("id") in {"planning-publish", "chapter-improvement", "pending-work", "complex-preparation"}
+                for card in question.get("questions", []) if isinstance(card, dict)):
+            raise ValidationGateError("这份问题涉及改稿或额外规划；请在主对话明确安排，后台只继续原章核对和接收。")
+        return {**binding, "message": answer.strip(), "run_id": source["run_id"],
+            "task_id": source["task_id"], "question_id": question["id"], "question_task_id": question["task_id"]}
+    token = active_conversation.set(f"chapter-accept-{chapter_no}-{expected_hash[:16]}")
+    try:
+        pending = TerminalSession._pending_question(project)
+    finally:
+        active_conversation.reset(token)
+    if pending and pending.get("snapshot_task_id"):
+        source = StudioService(project).db.latest_task_run_for_settings(pending["snapshot_task_id"])
+        if (source and source.get("status") == "waiting_user"
+                and all((source.get("params") or {}).get(key) == params[key]
+                    for key in ("chapter_no", "expected_version", "expected_hash"))
+                and _chapter_accept_question(project, source)):
+            raise ValidationGateError("这章正在等你回答原题，请打开“后台任务”中的“查看并回答原题”；没有绕过待答重新启动审核。")
+    if chapter["status"] == "draft":
+        # 多角色汇总前失败也可能已有付费完整产物；优先续该原任务，不能退回旧报告或新开预算。
+        # 这里只关联配置和次数；原输入、剧情来源、角色和语义仍由共享审查引擎逐项核验。
+        candidates = project.db.list_agent_artifacts(chapter_no=chapter_no,
+            artifact_type="mode_check_candidate", limit=200)
+        for task in StudioService(project).db.list_tasks(limit=50):
+            if (task.get("method") != "workflow.run" or task.get("action") != "review_accept"
+                    or task.get("status") not in {"failed", "interrupted", "waiting_condition"}
+                    or not task.get("task_id")
+                    or any((task.get("params") or {}).get(key) != params[key]
+                        for key in ("chapter_no", "expected_version", "expected_hash"))):
+                continue
+            snapshot = task.get("settings_snapshot", {})
+            if snapshot.get("status") != "captured":
+                continue
+            # artifact.run_id是引擎追踪编号，桌面任务编号不同；用同任务快照与真实产物时间关联。
+            if any(item.get("status") == "verified"
+                    and item.get("chapter_version") == version
+                    and item.get("data", {}).get("source_hash") == expected_hash
+                    and item.get("data", {}).get("snapshot_hash") == snapshot.get("snapshot_hash")
+                    and task.get("started_at", "") <= item.get("created_at", "") <= task.get("updated_at", "")
+                    and (not record or item.get("created_at", "") > record.get("created_at", ""))
+                    for item in candidates):
+                return {**binding, "run_id": task["run_id"], "task_id": task["task_id"]}
+    # 未通过的同版报告只能续接其真实原输入，不能换成一次新审查来清空失败次数。
+    if (record and record["chapter_version"] == version and record["report"].source_hash == expected_hash):
+        if record["report"].verdict == "unknown" and chapter["status"] == "draft":
+            binding["message"] = (f"继续第{chapter_no}章v{version}的原审查断点（审查记录{record['id']}），"
+                "不重复完整审查，不新增Writer请求，不改正文；必要检查和同版记忆交接通过后接受为正史。")
+            original = TerminalSession._review_evidence_resume(project, binding["message"])
+            if not original:
+                raise ValidationGateError("原审查断点尚不能核实；请先查看待核原因，没有新建替代审查。")
+            # 原报告可能属于批次生产快照；不能只沿其对话运行恢复成另一份路由快照。
+            return {**binding, "run_id": original["run_id"], "task_id": original["task_id"],
+                "batch_review_origin": original.get("batch_review_origin", {})}
+        snapshot = (record.get("mode_bundle") or {}).get("snapshot_hash")
+        if not snapshot:
+            raise ValidationGateError("同版审查缺少原任务配置证明；请查看原报告，没有新建替代预算。")
+        db = StudioService(project).db
+        with db.connect() as connection:
+            rows = connection.execute("SELECT task_id FROM task_settings_snapshots WHERE novel_id=? AND snapshot_hash=?",
+                (project.project_id, snapshot)).fetchall()
+        source = db.latest_task_run_for_settings(rows[0]["task_id"]) if len(rows) == 1 else None
+        if not source or source.get("settings_snapshot", {}).get("snapshot_hash") != snapshot:
+            raise ValidationGateError("同版审查缺少原任务配置关联；请查看任务记录，没有重置已有用量和次数。")
+        binding.update(run_id=source["run_id"], task_id=rows[0]["task_id"])
+    if chapter["status"] == "accepted" and not binding["task_id"]:
+        raise ValidationGateError("正文已转为正史，但原接收回执尚无法关联；请查看原任务收尾，未重复提交记忆。")
+    return binding
+
+
+def _chapter_accept_running_task(project, instance_id, params, binding, *, exclude_run_id):
+    """按真实任务绑定找同章在途操作；原话和任务标题不作为章节授权证明。"""
+    db = StudioService(project).db
+    with db.connect() as connection:
+        running = connection.execute("SELECT r.run_id,r.method,r.action,r.params_json,s.task_id FROM task_runs r "
+            "LEFT JOIN task_run_settings s ON s.run_id=r.run_id WHERE r.status='running' AND r.owner_id=? AND r.run_id!=?",
+            (instance_id, exclude_run_id)).fetchall()
+    with project.db.connect() as connection:
+        pending = [json.loads(row["value_json"]) for row in connection.execute(
+            "SELECT value_json FROM metadata WHERE key='pending_creation_task' OR key LIKE 'conversation:%:pending_creation_task'")]
+    chapter_no = params["chapter_no"]
+    for row in running:
+        stored = json.loads(row["params_json"])
+        intents = [item.get("intent", {}) for item in pending if isinstance(item, dict)
+            and item.get("run_id") == row["run_id"] and item.get("status") == "running"]
+        if row["method"] == "workflow.run":
+            intents.append(stored)
+        # 真实单章/批次范围优先；若原账本正在工作却没有可靠范围，先显示原工作待核。
+        ranges = [(item.get("chapter_no") or item.get("start_chapter_no"), item.get("end_chapter_no")) for item in intents]
+        matched = any(type(first) is int and first <= chapter_no <= (last if type(last) is int else first)
+            for first, last in ranges)
+        if matched or (not any(type(first) is int for first, _ in ranges)
+                and binding.get("task_id") and row["task_id"] == binding["task_id"]):
+            return {"status": "running", "existing_run_id": row["run_id"], "chapter_no": chapter_no,
+                "reused": True, "summary": f"第{chapter_no}章已有原任务在处理，继续保留原版本和次数；没有重复启动审核。"}
+    return None
+
+
 class InkFlowAppService:
     """桌面端与编辑器共享的本地应用服务。"""
 
@@ -261,50 +441,151 @@ class InkFlowAppService:
         self.instance_id = instance_id or f"server-{os.getpid()}-{uuid.uuid4().hex}"
         self.voice = VoiceRuntime()
         self._manual_workers: dict[str, asyncio.Task] = {}
+        self._attachment_workers: dict[str, asyncio.Task] = {}
+        self._knowledge_workers: dict[str, asyncio.Task] = {}
+        self._attachment_runs: dict[tuple[str, str], str] = {}
+        self._start_background_task: Callable[[str, dict[str, Any]], asyncio.Task | None] | None = None
+        self._chapter_accept_runs: dict[tuple[str, int], str] = {}
+        self._conversation_deleting: set[tuple[str, str]] = set()
+        self._conversation_is_running: Callable[[Path, str], bool] = lambda root, identity: False
+
+    def _schedule_knowledge(self, project):
+        """已启用的全书维护按来源变动排队，不重复启动、重试失败或占用正文写锁。"""
+        key = str(project.root)
+        if self._start_background_task is None or key in self._knowledge_workers and not self._knowledge_workers[key].done():
+            return
+        async def schedule():
+            from .knowledge import KnowledgeService
+            from .knowledge_worker import dispatch_knowledge, saved_model_outputs
+            control = project.db.get_metadata("knowledge.control", {})
+            if not control.get("auto", True) or control.get("status") in {"running", "queued", "interrupted", "cancelled"}:
+                return
+            resume = False
+            if control.get("status") == "failed":
+                # 旧版本已返回完整提案却停在别名核对：自主模式只补核一次，未知网络结果仍不重发。
+                if (not control.get("autonomous") or control.get("identity_recovery_applied")
+                        or control.get("error") != "知识提案中的对象称呼与已有身份不一致，需要先核对别名。"):
+                    return
+                candidates = await asyncio.to_thread(saved_model_outputs, project, {control.get("task_id", "")})
+                if not any(isinstance(data.get("source"), dict) and isinstance(result.get("claims"), list) for data, result in candidates):
+                    return
+                control = {**control, "identity_recovery_applied": True}
+                project.db.set_metadata("knowledge.control", control)
+                resume = True
+            try:
+                progress = await asyncio.to_thread(KnowledgeService(project).sync)
+                # 已读完但另有设定缺口时仍可自动整理新增来源。原阅读未完则保留原预算和断点。
+                blocked = control.get("status") == "waiting_condition" and not control.get("read_complete")
+                if (progress["pending"] and not blocked) or resume:
+                    await dispatch_knowledge(self, "knowledge.start", {"project_root": key, "resume": resume}, lambda event: asyncio.sleep(0))
+            except Exception as exc:
+                project.db.set_metadata("knowledge.control", {**control, "status": "failed", "error": str(exc), "updated_at": utc_now()})
+        self._knowledge_workers[key] = asyncio.create_task(schedule())
 
     def _schedule_manual_reviews(self, project):
         from .config import Settings
         from .manual_edits import ManualEditsService
-        from .runtime import RunRuntime
         key = str(project.root)
-        if key in self._manual_workers and not self._manual_workers[key].done():
+        if self._start_background_task is None or key in self._manual_workers and not self._manual_workers[key].done():
             return
         async def work():
-            def prepare():
-                settings = Settings.from_env(project.root)
-                if not settings.manual_edit_review_enabled:
-                    return None
-                if any(task["status"] == "running" for task in StudioService(project).db.list_tasks(100)):
-                    return None
-                if not any(item["status"] == "pending" for item in ManualEditsService(project).jobs().values()):
-                    return None
-                return StudioService(project).db.prepare_task_settings(f"manual-run-{uuid.uuid4().hex}",
-                    novel_id=project.project_id, settings=settings, workspace_root=project.root)
-            # Settings snapshots may wait for a project lock. Keep that wait
-            # off the RPC event loop so a finished foreground request can reply.
-            scope = await asyncio.to_thread(prepare)
-            if scope is None:
-                return
-            settings_token = active_task_settings.set(scope)
-            runtime_token = active_runtime.set(RunRuntime(publish=lambda event: None,task_id=scope.task_id,run_id=scope.task_id))
-            conversation_token = active_conversation.set("manual-review")
-            try:
-                service = ManualEditsService(project)
-                for _ in range(4):
-                    pending = [job for job in service.jobs().values() if job["status"] == "pending"]
-                    if not pending or not Settings.from_env(project.root).manual_edit_review_enabled:
-                        break
-                    for job in pending:
-                        try:
-                            await service.review(job["job_id"], self._engine(project.root))
-                        except Exception:
-                            # Persistent job state contains the actionable error; do not regenerate text.
-                            continue
-            finally:
-                active_conversation.reset(conversation_token)
-                active_runtime.reset(runtime_token)
-                active_task_settings.reset(settings_token)
+            seen = set()
+            def pending_jobs():
+                if not Settings.from_env(project.root).manual_edit_review_enabled:
+                    return []
+                with StudioService(project).db.connect() as connection:
+                    registered = {row[0] for row in connection.execute(
+                        "SELECT run_id FROM task_runs WHERE method='manual_edits.review'")}
+                pending = []
+                for job in ManualEditsService(project).jobs().values():
+                    if job["status"] != "pending" or job.get("requires_explicit_review"):
+                        continue
+                    revision = json_dumps({name: job.get(name) for name in (
+                        "updated_at", "attempts", "user_decision", "user_reason")}, indent=None)
+                    child_run_id = "manual-audit-" + job["job_id"] + "-" + content_hash(revision)[:12]
+                    if child_run_id not in registered and child_run_id not in seen:
+                        pending.append({**job, "_background_pending_revision": revision,
+                            "_background_run_id": child_run_id})
+                return pending
+            for _ in range(4):
+                # Preparing and scanning are passive; only a registered review is active work.
+                pending = await asyncio.to_thread(pending_jobs)
+                if not pending:
+                    break
+                for job in pending:
+                    if not Settings.from_env(project.root).manual_edit_review_enabled:
+                        return
+                    seen.add(job["_background_run_id"])
+                    child = self._start_background_task("manual_edits.review", {
+                        "project_root": str(project.root), "job_id": job["job_id"],
+                        "conversation_id": active_conversation.get(),
+                        "_background_pending_revision": job["_background_pending_revision"],
+                    })
+                    if child is None:
+                        return
+                    await child
         self._manual_workers[key] = asyncio.create_task(work())
+
+    def _schedule_thread_attachments(self, project):
+        """登记已接受章节的原附件工作；关闭面板不取消，明确停止或失败不自动重放。"""
+        key = str(project.root)
+        if self._start_background_task is None or key in self._attachment_workers and not self._attachment_workers[key].done():
+            return
+
+        def pending_jobs():
+            """读取原工作和实际回执，避免重新执行已完成的相同版本。"""
+            with project.db.connect() as connection:
+                rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
+            with StudioService(project).db.connect() as connection:
+                task_rows = connection.execute("SELECT run_id,method,status,params_json FROM task_runs WHERE method='memory.attachments' ORDER BY updated_at DESC").fetchall()
+            tasks = [{**dict(row), "params": json.loads(row["params_json"])} for row in task_rows]
+            from .story_promises import thread_attachment_index_valid, planning_promises
+            jobs = []
+            for row in rows:
+                work = json.loads(row["value_json"])
+                source = work.get("source", {})
+                if work.get("kind") != "context_source" or source.get("attachment_kind") != "promise_threads":
+                    continue
+                chapter = project.db.get_chapter(source.get("chapter_no"))
+                if not chapter or chapter["status"] != "accepted":
+                    continue
+                receipt = project.db.get_metadata("promise_attachment:" + work["id"], {})
+                index = project.db.get_metadata("promise_thread_index:" + work["id"], {})
+                same = thread_attachment_index_valid(project, index) if index.get("status") == "verified" else False
+                if (work.get("status") in {"cancelled", "rejected", "superseded"}
+                        or receipt.get("status") == "cancelled" or index.get("status") == "verified" and same):
+                    continue
+                previous = next((task for task in tasks if task["method"] == "memory.attachments"
+                    and task["params"].get("work_id") == work["id"]), None)
+                if previous and previous["status"] not in {"interrupted", "completed"}:
+                    continue
+                if previous and previous["status"] == "completed" and same:
+                    continue
+                if receipt.get("status") in {"failed", "waiting_condition"}:
+                    # 已知失败只有来源真变才自动续接；旧未知请求仍由服务先核原回执。
+                    basis = receipt.get("request_basis") or {}
+                    requested = {item.get("thread_id") for item in source.get("candidates", [])}
+                    plan_hash = content_hash(json_dumps([plan for plan in planning_promises(project.db.get_current_plan_bundle())
+                        if plan["thread_id"] in requested]))
+                    if (not basis or basis.get("version") == chapter["version"]
+                            and basis.get("content_hash") == chapter["content_hash"] and basis.get("plan_hash") == plan_hash):
+                        continue
+                jobs.append((index.get("status") == "verified", {"work_id": work["id"], "chapter_no": source["chapter_no"],
+                    "parent_run_id": source.get("parent_run_id", ""),
+                    "conversation_id": (previous or {}).get("params", {}).get("conversation_id", active_conversation.get()),
+                    "_background_pending_revision": json_dumps([chapter["version"], chapter["content_hash"],
+                        previous["run_id"] if previous else ""])}))
+            return jobs
+
+        async def schedule():
+            """已失效的索引按前史顺序补核；前台和独立新任务不等补核。"""
+            jobs = await asyncio.to_thread(pending_jobs)
+            for recheck, job in sorted(jobs, key=lambda item: (item[0], item[1]["chapter_no"])):
+                task = self._start_background_task("memory.attachments", {"project_root": str(project.root), **job})
+                if recheck and task is not None:
+                    # 旧索引彼此依赖，先让较早记录提交，再让后章读取新前史。
+                    await asyncio.gather(task, return_exceptions=True)
+        self._attachment_workers[key] = asyncio.create_task(schedule())
 
     async def dispatch(
         self,
@@ -313,8 +594,72 @@ class InkFlowAppService:
         emit: EventSink,
         consume_steering: Callable[[], Awaitable[list[str]]] | None = None,
     ) -> Any:
-        if method.startswith("voice.") and self.voice.migrating and method != "voice.status":
+        if method.startswith("knowledge.") and method != "knowledge.maintain":
+            from .knowledge_worker import dispatch_knowledge
+            return await dispatch_knowledge(self, method, params, emit)
+        if method.startswith("skills."):
+            # 技能文件管理独立于模型设置和小说写入；未打开小说时仍可管理个人库。
+            from .skills import SkillLibrary, parse_skill, public_skill
+            from .skill_management import prompt_inventory
+            from .skill_runtime import skill_usage, recent_skill_usage
+            root = self._validated_project_root(params) if params.get("project_root") else None
+            library = SkillLibrary(root)
+            if method == "skills.list":
+                return await asyncio.to_thread(library.list)
+            if method == "skills.get":
+                item = await asyncio.to_thread(library.get, str(params.get("id", "")))
+                return public_skill(item, include_texts=True)
+            if method == "skills.prompts":
+                return prompt_inventory()
+            if method == "skills.preview":
+                return await asyncio.to_thread(library.preview, str(params.get("source", "")))
+            if method == "skills.create":
+                return await asyncio.to_thread(library.create, name=str(params.get("name", "")),
+                    description=str(params.get("description", "")), scope=str(params.get("scope", "personal")),
+                    files=params.get("files"))
+            if method == "skills.import":
+                return await asyncio.to_thread(library.import_skill, source=str(params.get("source", "")),
+                    scope=str(params.get("scope", "personal")), expected_hash=str(params.get("expected_hash", "")))
+            if method == "skills.clone":
+                return await asyncio.to_thread(library.clone, str(params.get("id", "")),
+                    scope=str(params.get("scope", "personal")), expected_hash=str(params.get("expected_hash", "")))
+            if method == "skills.configure":
+                return await asyncio.to_thread(library.configure, str(params.get("id", "")),
+                    enabled=params.get("enabled"), automatic=params.get("automatic"),
+                    expected_hash=str(params.get("expected_hash", "")), control_scope=params.get("control_scope"))
+            if method == "skills.inherit":
+                return await asyncio.to_thread(library.inherit, str(params.get("id", "")))
+            if method == "skills.update_policy":
+                return await asyncio.to_thread(library.set_update_policy, str(params.get("update_policy", "")))
+            if method == "skills.directory":
+                identity = str(params.get("id") or "")
+                if identity:
+                    item = await asyncio.to_thread(library.get, identity)
+                    return {"directory": item["directory"]}
+                return {"directory": await asyncio.to_thread(library.directory, str(params.get("scope", "personal")))}
+            if method == "skills.validate":
+                files = params.get("files", {})
+                if not isinstance(files, dict) or any(not isinstance(value, str) for value in files.values()):
+                    raise ValueError("技能校验需要包内路径到文字内容的映射。")
+                return public_skill(parse_skill({key: value.encode("utf-8") for key, value in files.items()}), include_texts=True)
+            if method == "skills.usage":
+                from .skill_workflows import recent_workflow_plans
+                identity = str(params.get("task_id") or "")
+                if identity:
+                    return {"usage": skill_usage(identity), "plans": recent_workflow_plans([identity])}
+                novel_id = InkFlowProject(root, recover_on_open=False).project_id if root else None
+                usage = recent_skill_usage(novel_id)
+                return {"usage": usage, "plans": recent_workflow_plans(list({entry["task_id"] for entry in usage}))}
+            if method == "skills.learning":
+                from .skill_learning import skill_learning_overview
+                if root is None:
+                    raise ValueError("请先打开小说，再查看本书反馈和改进候选。")
+                return await asyncio.to_thread(skill_learning_overview, InkFlowProject(root, recover_on_open=False))
+            raise ValueError("未知技能管理操作。")
+        if method.startswith("voice.") and self.voice.migrating and method not in {"voice.status", "voice.background"}:
             raise ValueError("语音资料正在迁移，请完成后再录音或朗读。小说写作可以继续。")
+        if method == "memory.attachments" and active_task_settings.get() is None:
+            raise ValidationGateError("附件补全须先关联原任务登记与配置，未创建替代预算。")
         if method in _TASK_SETTINGS_METHODS and active_task_settings.get() is None:
             if method in {"project.ideate", "prompt.optimize", "provider.test"}:
                 root = Path(str(params.get("project_root") or params.get("workspace_root") or Path.cwd())).resolve()
@@ -325,9 +670,12 @@ class InkFlowAppService:
                 )
             else:
                 project = await asyncio.to_thread(self._project, params)
-                scope = StudioService(project).db.prepare_task_settings(
+                scope = (await asyncio.to_thread(TerminalSession.prepare_saved_length_task, project,
+                    str(params.get("message") or ""), f"app-{uuid.uuid4().hex}")) if method == "conversation.send" else None
+                scope = scope or StudioService(project).db.prepare_task_settings(
                     f"app-{uuid.uuid4().hex}", novel_id=project.project_id,
-                    settings=lambda: Settings.from_env(project.root), workspace_root=project.root,
+                    settings=lambda: TerminalSession.writer_grant_settings(Settings.from_env(project.root),
+                        str(params.get("message") or "") if method == "conversation.send" else ""), workspace_root=project.root,
                     collaboration_mode=_requested_task_mode(method, params),
                 )
             with use_task_settings(scope):
@@ -335,10 +683,23 @@ class InkFlowAppService:
         if method == "story_settings.templates":
             from .story_settings import StorySettingsService
             return {"templates": StorySettingsService.templates()}
+        if method == "knowledge.maintain":
+            from .knowledge_worker import dispatch_knowledge
+            return await dispatch_knowledge(self, method, params, emit)
+        if method == "story_settings.maintenance":
+            # 通知轮询不打开可恢复项目，也不绑定写任务；只读入口仍核同一项目路径边界。
+            from .story_settings import read_setting_maintenance
+            return await asyncio.to_thread(read_setting_maintenance, self._validated_project_root(params))
         if method == "memory.audit":
             from .memory_records import memory_overview
             project = InkFlowProject(self._validated_project_root(params), recover_on_open=False)
             return memory_overview(project.db)
+        if method == "memory.index":
+            from .database import ProjectDatabase
+            from .memory_records import memory_index
+
+            root = self._validated_project_root(params)
+            return await asyncio.to_thread(memory_index, ProjectDatabase(root / ".inkflow" / "inkflow.db", read_only=True))
         if method == "preferences.manage":
             from .preferences import author_connection, change_item, history, list_items
             level = str(params.get("level", "author"))
@@ -386,6 +747,9 @@ class InkFlowAppService:
                         "source_ref", "reason", "topic", "supersedes", "expected_revision"
                     ) if key in params})
             raise ValueError("未知的偏好管理操作")
+        if method in {"preferences.materials.start", "preferences.materials.list", "preferences.materials.decide",
+                      "preferences.materials.analyze"}:
+            return await self._preference_materials(method, params, emit)
         if method == "app.initialize":
             return {
                 "product": "墨流（InkFlow）",
@@ -413,9 +777,11 @@ class InkFlowAppService:
             }
         if method == "provider.status":
             settings = Settings.from_env(params.get("workspace_root"))
-            if any(key in params for key in ("provider_kind", "base_url", "model", "role_models")):
+            if any(key in params for key in ("provider_kind", "base_url", "model", "role_models", "context_input_limit_tokens",
+                                           "agent_context_budgets", "context_budget_mode", "context_hard_tokens", "context_soft_tokens")):
                 from dataclasses import replace
-                names = ("provider_kind", "base_url", "model", "role_models")
+                names = ("provider_kind", "base_url", "model", "role_models", "context_input_limit_tokens",
+                         "agent_context_budgets", "context_budget_mode", "context_hard_tokens", "context_soft_tokens")
                 preview = Settings.from_mapping({**{key: getattr(settings, key) for key in names},
                     **{key: params[key] for key in names if key in params}, "max_output_tokens": 1})
                 settings = replace(settings, **{key: getattr(preview, key) for key in names})
@@ -429,27 +795,30 @@ class InkFlowAppService:
                 "model": settings.model,
                 "cache_policy": settings.prompt_cache_policy,
                 "reasoning_effort": settings.reasoning_effort,
+                "openai_recommended_reasoning": settings.openai_recommended_reasoning,
+                "agent_thinking": settings.agent_thinking,
                 "context_soft_tokens": settings.context_soft_tokens,
                 "context_hard_tokens": settings.context_hard_tokens,
+                "context_input_limit_tokens": settings.context_input_limit_tokens,
                 "context_budget_mode": settings.context_budget_mode,
                 "agent_context_budgets": settings.agent_context_budgets,
-                "max_output_tokens": settings.max_output_tokens,
-                "automatic_output_tokens": settings.automatic_output_tokens,
-                "request_timeout_seconds": settings.request_timeout_seconds,
-                "planning_timeout_seconds": settings.planning_timeout_seconds,
+                "generation_output_policy": settings.generation_output_policy,
+                "output_limit_tokens": settings.request_output_limit(0),
+                "generation_wait_policy": "unlimited",
                 "writer_task_attempt_limit": settings.writer_task_attempt_limit,
                 "model_limits": settings.model_limits(),
-                "effective_output_tokens": settings.effective_output_tokens(settings.max_output_tokens),
+                "effective_output_tokens": None,
                 "role_output_limits": {role: {"model": settings.model_for(role),
                     "model_limits": settings.model_limits(settings.model_for(role)),
                     "capabilities": settings.parameter_capabilities(settings.model_for(role)),
                     "context_tokens": settings.context_budget_for(role)[1],
-                    "max_output_tokens": settings.effective_output_tokens(settings.context_budget_for(role)[1]
-                        if settings.automatic_output_tokens else settings.max_output_tokens, role)}
+                    "output_policy": "model_capacity" if settings.request_output_limit(0, role) is not None else "provider_default",
+                    "max_output_tokens": settings.request_output_limit(0, role)}
                     for role in settings.agent_generation},
                 "inquiry_frequency": settings.inquiry_frequency,
                 "hook_strategy": settings.hook_strategy,
                 "quality_preset": settings.quality_preset,
+                "creation_presets": list(creation_preset_mappings(settings).values()),
                 "quality_custom_context": settings.quality_custom_context,
                 "collaboration_preset": settings.collaboration_preset,
                 "chapter_length_tolerance": settings.chapter_length_tolerance,
@@ -499,14 +868,13 @@ class InkFlowAppService:
                     "base_url",
                     "model",
                     "reasoning_effort",
+                    "openai_recommended_reasoning",
+                    "agent_thinking",
                     "context_soft_tokens",
                     "context_hard_tokens",
+                    "context_input_limit_tokens",
                     "context_budget_mode",
                     "agent_context_budgets",
-                    "max_output_tokens",
-                    "automatic_output_tokens",
-                    "request_timeout_seconds",
-                    "planning_timeout_seconds",
                     "writer_task_attempt_limit",
                     "inquiry_frequency",
                     "hook_strategy",
@@ -561,7 +929,8 @@ class InkFlowAppService:
                         if not worker.done():
                             worker.cancel()
             current = await asyncio.to_thread(Settings.from_env, params.get("workspace_root"))
-            return {"configured": True, **api_key_status(current.provider_kind),
+            credential = api_key_status(current.provider_kind)
+            return {"settings_saved": True, "configured": credential["api_key_configured"], **credential,
                     **{name: getattr(current, name) for name in allowed},
                     "provider_kind": current.provider_kind, "base_url": current.base_url, "model": current.model}
         if method == "provider.capabilities":
@@ -572,22 +941,30 @@ class InkFlowAppService:
             return {"models": await create_provider(settings).list_models()}
         if method == "provider.test":
             settings = active_task_settings.get().settings
+            expected = params.get("expected_connection")
+            if expected is not None and expected != {"provider_kind": settings.provider_kind,
+                    "base_url": settings.base_url, "model": settings.model}:
+                raise ConfigurationError("保存的连接与本次要检查的设置不一致。请重新打开模型设置核对，尚未发送请求。")
+            # 单次连接检查先验证凭据，再限制发送次数和等待时间。
+            settings.require_api_key()
             await emit({"type": "provider.testing", "summary": "正在验证生成接口是否可用"})
-            result = await create_provider(settings).generate_json(
-                system_prompt="你只负责返回 API 连通性检查结果。",
-                user_prompt=(
-                    "请用一句简短中文向用户打招呼，明确表示你收到了这次请求；"
-                    "status 返回 ok，并用一句公开说明解释本次只验证了模型能够接收请求和按格式回复。"
-                ),
-                output_model=ProviderProbe,
-                effort="low",
-                max_tokens=160,
-                thinking=False,
-                timeout_seconds=min(settings.request_timeout_seconds, 60.0),
-            )
+            limit = active_generation_attempt_limit.set(1)
+            try:
+                result = await asyncio.wait_for(create_provider(settings).generate_json(
+                    system_prompt="你只负责返回 API 连通性检查结果。",
+                    user_prompt="返回 status 为 ok、reply 为一句简短问候、public_reasoning_summary 为一句检查说明的 JSON。",
+                    output_model=ProviderProbe,
+                    effort="low",
+                    max_tokens=256,
+                    thinking=False,
+                ), timeout=min(settings.request_timeout_seconds, 60.0))
+            except asyncio.TimeoutError as cause:
+                raise ProviderError("本次生成连接检查超时，未确认模型可用。请核对网络和服务状态。") from cause
+            finally:
+                active_generation_attempt_limit.reset(limit)
             return {
-                "connected": result.data.status == "ok",
-                "message": f"连接成功，当前模型：{result.model}",
+                "connected": True,
+                "message": f"生成连接检查通过。请求模型 {settings.model}，服务返回 {result.model}，回复格式校验通过。",
                 "model": result.model,
                 "reply": result.data.reply,
                 "public_reasoning_summary": result.data.public_reasoning_summary,
@@ -596,7 +973,7 @@ class InkFlowAppService:
             if params.get("input_only") is True:
                 self.voice.prepare_input()
             if params.get("input_only") is not True and not self.voice.migrating:
-                self.voice.schedule_edge_update_check()
+                self.voice.schedule_edge_update_check(emit)
             # Directory-size checks and optional package discovery can touch a
             # large local model tree. Keep them off the asyncio event loop so
             # a settings click cannot freeze the desktop while status refreshes.
@@ -604,6 +981,15 @@ class InkFlowAppService:
                 self.voice.input_status if params.get("input_only") is True else self.voice.status,
                 params.get("workspace_root") or params.get("project_root"),
             )
+        if method == "voice.background":
+            root = self._validated_project_root(params) if params.get("project_root") else None
+            return await asyncio.to_thread(self.voice.background_status, root)
+        if method == "voice.updates.check":
+            task = self.voice._edge_update_task
+            if task is not None and not task.done():
+                await asyncio.shield(task)
+            task = self.voice._edge_update_task = asyncio.create_task(self.voice.check_component_updates(force=True))
+            return await asyncio.shield(task)
         if method == "voice.settings.get":
             return await asyncio.to_thread(
                 self.voice.settings,
@@ -613,9 +999,9 @@ class InkFlowAppService:
             if params.get("confirmation") != "move_voice_storage":
                 raise ValueError("更改语音位置前需要确认目标文件夹。")
             voice = self.voice
-            tasks = list(voice._jobs.values()) + [voice._edge_install_task, voice._moss_install_task, voice._sherpa_install_task, voice._edge_update_task, voice._asr_prepare_task]
+            tasks = list(voice._jobs.values()) + [voice._edge_install_task, voice._sherpa_install_task, voice._edge_update_task, voice._asr_prepare_task]
             locks = [voice._short_lock, voice._long_lock, voice._inference_lock, voice._asr_lock]
-            if any(task and not task.done() for task in tasks) or any(lock and lock.locked() for lock in locks):
+            if voice._deleting_jobs or any(task and not task.done() for task in tasks) or any(lock and lock.locked() for lock in locks):
                 raise ValueError("请等正在进行的录音识别、朗读或组件更新结束，再更改保存位置。")
             voice.migrating = True
             try:
@@ -630,8 +1016,6 @@ class InkFlowAppService:
                 updates,
                 params.get("workspace_root") or params.get("project_root"),
             )
-        if method == "voice.moss.install":
-            return await self.voice.install_moss(str(params.get("confirmation") or ""), emit)
         if method == "voice.edge.install":
             return await self.voice.install_edge(str(params.get("confirmation") or ""), emit)
         if method in {"voice.asr.install", "voice.light.install"}:
@@ -642,13 +1026,13 @@ class InkFlowAppService:
                 str(params.get("confirmation") or ""),
             )
         if method == "voice.kokoro.install":
-            raise ValueError("Kokoro 已由 MOSS 取代；语音输入请安装本地普通话识别组件。")
+            raise ValueError("朗读使用微软在线语音。语音输入可安装本地普通话识别组件。")
         if method == "voice.profile.list":
             return {"profiles": self.voice.list_profiles()}
         if method == "voice.clone_script.generate":
             return await self._generate_voice_clone_script(params, emit)
         if method == "voice.profile.clone":
-            return await self.voice.create_clone(params)
+            raise ValueError("微软在线朗读使用预设声音。既有克隆录音可在录音库查看。")
         if method == "voice.profile.update":
             return self.voice.update_profile(str(params.get("profile_id") or ""), params)
         if method == "voice.transcribe":
@@ -674,6 +1058,7 @@ class InkFlowAppService:
                     "先批评原提示词中缺失或含糊的目标、上下文、约束、输出格式和验收标准，再综合为一版可直接提交的中文提示词。"
                     "必须保持用户原始意图、语气、禁止项、费用边界、正史边界和授权范围；不得把建议升级为已确认命令，"
                     "不得擅自增加验收、写入正史、删除、发布、付费或其他外部操作。"
+                    "@技能标识和以‘技能参数’开头的填写行必须逐字保留，不增加、删除或改写技能调用。"
                     "不要冗长扩写，不要虚构项目事实，不要输出原始思维链。"
                     "optimized_prompt 只放优化后的提示词；change_summary 用 1～6 条短句说明可见修改；"
                     "preserved_constraints 逐条列出从原文保留的关键约束。"
@@ -686,9 +1071,16 @@ class InkFlowAppService:
                 thinking=False,
                 timeout_seconds=min(settings.request_timeout_seconds, 90.0),
             )
+            optimized = result.data.model_dump()
+            # 不靠模型承诺保护技能身份；校验失败保留原文，不为修好优化器再付一次请求。
+            invocation = r"(?<![\w/@])@(?:(?:builtin|personal|book)/)?[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*"
+            parameter_lines = lambda text: [line for line in text.splitlines() if line.startswith("技能参数")]
+            if (re.findall(invocation, prompt) != re.findall(invocation, optimized["optimized_prompt"])
+                    or parameter_lines(prompt) != parameter_lines(optimized["optimized_prompt"])):
+                optimized.update(optimized_prompt=prompt, change_summary=["为保留原技能指定与参数，已保留原提示词。"])
             return {
                 "original_prompt": prompt,
-                **result.data.model_dump(),
+                **optimized,
                 "model": result.model,
                 "source_method": "critique_then_synthesize",
             }
@@ -838,7 +1230,7 @@ class InkFlowAppService:
         if method in {
             "voice.roles.get", "voice.roles.set", "voice.roles.analyze",
             "voice.job.create", "voice.job.list", "voice.job.status",
-            "voice.job.pause", "voice.job.resume", "voice.job.cancel",
+            "voice.job.pause", "voice.job.resume", "voice.job.cancel", "voice.job.delete",
         }:
             # Voice role maps and job manifests are stored outside the novel
             # database. Do not construct InkFlowProject here: its recovery
@@ -853,7 +1245,7 @@ class InkFlowAppService:
             if method == "voice.job.create":
                 return self.voice.create_job(root, params, emit)
             if method == "voice.job.list":
-                return {"jobs": self.voice.list_jobs(root)}
+                return {"jobs": await asyncio.to_thread(self.voice.list_jobs, root)}
 
             job_id = str(params.get("job_id") or "")
             job = self.voice.job_status(job_id)
@@ -865,6 +1257,15 @@ class InkFlowAppService:
                 return self.voice.pause_job(job_id)
             if method == "voice.job.resume":
                 return self.voice.resume_job(job_id, emit)
+            if method == "voice.job.delete":
+                # Reserve this job before yielding so a concurrent resume cannot race deletion.
+                if job_id in self.voice._deleting_jobs:
+                    raise ValueError("本任务的音频正在删除，请稍候。")
+                self.voice._deleting_jobs.add(job_id)
+                try:
+                    return await asyncio.to_thread(self.voice.delete_job, job_id, str(params.get("confirmation") or ""))
+                finally:
+                    self.voice._deleting_jobs.discard(job_id)
             return self.voice.cancel_job(job_id)
 
         if method == "task.rename":
@@ -899,19 +1300,41 @@ class InkFlowAppService:
 
             reconciled = await asyncio.to_thread(reconcile_task_owner)
             task = await asyncio.to_thread(db.get_task, str(params["task_id"]))
-            updates = await asyncio.to_thread(
-                lambda: _recorded_user_updates(InkFlowProject(root, recover_on_open=False), str(task["run_id"]))
-            )
+            def read_task_details():
+                """后台原题只在该记录中展示，不搬进主对话的待答状态。"""
+                project = InkFlowProject(root, recover_on_open=False)
+                question, question_problem = None, ""
+                if task["status"] == "waiting_user" and task.get("action") == "review_accept":
+                    try:
+                        pending = _chapter_accept_question(project, task)
+                        if pending:
+                            question = {key: pending[key] for key in ("id", "task_id", "questions")}
+                        else:
+                            question_problem = "原题已处理或来源待核，请刷新任务记录；没有把旧答案交给其他问题。"
+                    except ValidationGateError as exc:
+                        question_problem = str(exc)
+                return (_recorded_user_updates(project, str(task["run_id"])), question, question_problem)
+
+            updates, question, question_problem = await asyncio.to_thread(read_task_details)
             return {
                 "task": {key: task[key] for key in (
                     "run_id", "title", "status", "summary", "error_message", "retryable", "retry_note", "next_step"
                 )},
                 "user_updates": updates,
+                "pending_question": question,
+                "question_problem": question_problem,
                 "reconciled": reconciled,
             }
 
         if method == "task.list":
             root = self._validated_project_root(params)
+            if params.get("background") is True:
+                # 常驻进度只读取回执，不反复重算全书恢复依赖；真正续接仍由原入口核验。
+                def read_background_tasks():
+                    db = StudioDatabase(root / ".inkflow" / "studio.db")
+                    db.reconcile_interrupted_tasks(self.instance_id)
+                    return _mark_attachment_history(db.list_tasks(int(params.get("limit", 50))))
+                return {"tasks": await asyncio.to_thread(read_background_tasks)}
 
             def read_tasks() -> list[dict[str, Any]]:
                 project = InkFlowProject(root, recover_on_open=False)
@@ -924,6 +1347,19 @@ class InkFlowAppService:
             result = await asyncio.to_thread(self._engine(root).checkpoint_list, root, int(params.get("limit", 50)))
             return result
 
+        if method == "project.preload":
+            root = self._validated_project_root(params)
+
+            def preload_project() -> dict[str, bool]:
+                """Warm a few read-only SQLite pages without migrations, recovery or task creation."""
+                path = root / ".inkflow" / "inkflow.db"
+                with sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=0.1) as connection:
+                    connection.execute("SELECT chapter_no, content_hash FROM chapters ORDER BY chapter_no LIMIT 100").fetchall()
+                    connection.execute("SELECT key FROM metadata LIMIT 20").fetchall()
+                return {"ready": True}
+
+            return await asyncio.to_thread(preload_project)
+
         if method == "project.open":
             # A chapter run can hold the mutation lock throughout a remote
             # model call. Opening the read-only workspace must not queue
@@ -932,16 +1368,19 @@ class InkFlowAppService:
             project = await asyncio.to_thread(InkFlowProject, root, recover_on_open=False)
             studio = await asyncio.to_thread(StudioService, project)
 
-            def recover_if_idle() -> None:
+            def recover_if_idle() -> bool:
+                """Attempt recovery; return whether a busy lock requires a later retry."""
                 try:
                     with project_write_lock_sync(root, timeout=0.25):
                         project.recover_open_state()
-                except InkFlowError:
-                    project.recovery_warnings = [
-                        "项目正在运行其他任务；本次只读打开，待写锁空闲后再执行恢复检查。"
-                    ]
+                except ProjectBusyError:
+                    # A lock can belong to a short local write, not a model task or a damaged file.
+                    return True
+                except InkFlowError as exc:
+                    project.recovery_warnings.append(f"启动恢复检查尚未完成：{exc}")
+                return False
 
-            await asyncio.to_thread(recover_if_idle)
+            recovery_deferred = await asyncio.to_thread(recover_if_idle)
             try:
                 await asyncio.to_thread(studio.db.reconcile_interrupted_tasks, self.instance_id)
             except sqlite3.OperationalError:
@@ -953,7 +1392,9 @@ class InkFlowAppService:
                     project.canonical_content_migration_status(),
                 )
             )
-            return {"dashboard": dashboard, "tree": tree, "canon_migration": migration}
+            self._schedule_thread_attachments(project)
+            return {"dashboard": dashboard, "tree": tree, "canon_migration": migration,
+                    "recovery_deferred": recovery_deferred}
 
         if method == "batch.progress":
             root = self._validated_project_root(params)
@@ -961,6 +1402,11 @@ class InkFlowAppService:
                 lambda: _list_batch_summaries(InkFlowProject(root, recover_on_open=False))
             )}
 
+        if method == "usage.overview":
+            # 统计独立读取已提交账本，不等全量协作/待办扫描，也不触发打开项目的恢复写入。
+            root = self._validated_project_root(params)
+            return await asyncio.to_thread(lambda: _usage_overview(
+                InkFlowProject(root, recover_on_open=False), Settings.from_env(root), include_history=False))
         if method == "collaboration.overview":
             # The desktop refresh awaits this alongside project.open. It only
             # reads committed records and should not wait for a long Writer call.
@@ -970,13 +1416,15 @@ class InkFlowAppService:
                 project = InkFlowProject(root, recover_on_open=False)
                 engine = self._engine(root)
                 project.reconcile_pending_work(current_pass=lambda number: engine.current_pass_review(project, number))
+                # 同版正文已接受但设定附件未齐时单列后台维护，避免旧章收尾占用
+                # 当前待办计数；原任务/附件状态保留，不能以此假报全部完成。
+                pending = project.pending_work_snapshot()
                 return {
                     "threads": project.db.list_collaboration_threads(),
                     "messages": project.db.list_collaboration_messages(active_only=False, limit=int(params.get("limit", 80))),
                     "tasks": _task_rows_with_history(project, int(params.get("task_limit", 30)), self.instance_id),
                     "batches": _list_batch_summaries(project),
-                    "pending_work": project.pending_work(),
-                    "rejected_work": [work for work in project.pending_work(include_rejected=True) if work["status"] == "rejected"],
+                    **pending,
                     "learning_events": project.db.list_learning_events(int(params.get("learning_limit", 12))),
                     "artifacts": project.db.list_agent_artifacts(limit=30),
                     "trace_runs": recent_trace_runs(root, int(params.get("trace_limit", 12))),
@@ -1003,9 +1451,33 @@ class InkFlowAppService:
         # lock.  Keep that wait off the asyncio event loop so a concurrent
         # Writer/Editor task can make progress and release its own lock.
         project = await asyncio.to_thread(self._project, params)
+        # 聊天目录与新增身份不初始化工作台或绑定创作协作，更不恢复、复制旧任务。
+        if method == "conversation.list":
+            return await asyncio.to_thread(list_conversations, project)
+        if method == "conversation.create":
+            return await asyncio.to_thread(create_conversation, project)
+        if method == "conversation.update":
+            return await asyncio.to_thread(update_conversation, project, params.get("target_conversation_id"), params.get("changes"))
+        if method == "conversation.delete":
+            if not isinstance(params.get("target_conversation_id"), str):
+                raise ProjectError("请选择要删除的聊天。")
+            identity = conversation_id(params.get("target_conversation_id"))
+            key = (str(project.root.resolve()).casefold(), identity)
+            if key in self._conversation_deleting or self._conversation_is_running(project.root, identity):
+                raise ProjectBusyError("这份聊天还有请求正在处理，请等待任务停止和保存收尾后再删除。")
+            self._conversation_deleting.add(key)
+            try:
+                return await asyncio.to_thread(delete_conversation, project, identity)
+            finally:
+                self._conversation_deleting.discard(key)
+        ensure_conversation_available(project)
         studio = StudioService(project)
-        if method not in {"conversation.send", "workflow.run", "collaboration.reply", "manual_edits.review"}:
+        if method not in {"conversation.send", "workflow.run", "collaboration.reply", "manual_edits.review", "memory.attachments"}:
             bind_active_collaboration(project, method)
+        if method == "memory.attachments":
+            from .story_promises import complete_thread_attachment
+            return await complete_thread_attachment(self._engine(project.root), project, str(params["work_id"]),
+                resume=params.get("_resume") is True)
         if method.startswith("manual_edits."):
             from .manual_edits import ManualEditsService
             manual = ManualEditsService(project)
@@ -1016,7 +1488,8 @@ class InkFlowAppService:
                 self._schedule_manual_reviews(project)
                 return result
             if method == "manual_edits.review":
-                return await manual.review(str(params["job_id"]), self._engine(project.root))
+                return await manual.review(str(params["job_id"]), self._engine(project.root),
+                    resume=params.get("_background") is not True)
             if method == "manual_edits.decide":
                 result = await asyncio.to_thread(manual.decide, str(params["job_id"]), str(params["decision"]),
                     str(params.get("reason") or ""), str(params["expected_hash"]))
@@ -1028,7 +1501,8 @@ class InkFlowAppService:
             if method == "story_settings.templates":
                 return {"templates": service.templates()}
             if method == "story_settings.list":
-                return {"collections": service.list_collections(include_archived=bool(params.get("include_archived")), include_review_links=True)}
+                collections = service.list_collections(include_archived=bool(params.get("include_archived")), include_review_links=True)
+                return {"collections": collections, "maintenance": service.maintenance_status(collections)}
             if method == "story_settings.records":
                 return {"records": service.records(str(params["collection_id"]),include_archived=bool(params.get("include_archived")))}
             if method == "story_settings.save":
@@ -1055,6 +1529,19 @@ class InkFlowAppService:
                         kind="setting_record", chapter_no=result.get("source_chapter"), record_revision=result["revision"])
                     self._schedule_manual_reviews(project)
                 return {"record": result}
+            if method == "story_settings.candidate.decide":
+                # 候选决定与实际记录分开；只有明确采用产生的新修订才进入既有人工改设定审核。
+                result = await asyncio.to_thread(service.decide_candidate, str(params.get("candidate_hash") or ""),
+                    decision=str(params.get("decision") or ""), record_id=str(params.get("record_id") or ""),
+                    expected_revision=params.get("expected_revision"), source_chapter=params.get("source_chapter"),
+                    reason=str(params.get("reason") or ""))
+                record = result.get("record")
+                if record and record.get("changed"):
+                    from .manual_edits import ManualEditsService
+                    ManualEditsService(project).enqueue("story-setting:" + record["record_id"], json.dumps(record, ensure_ascii=False),
+                        kind="setting_record", chapter_no=record.get("source_chapter"), record_revision=record["revision"])
+                    self._schedule_manual_reviews(project)
+                return result
             if method == "story_settings.record.archive":
                 result=await asyncio.to_thread(service.archive_record,str(params["record_id"]),expected_revision=params.get("expected_revision"))
                 from .manual_edits import ManualEditsService
@@ -1087,17 +1574,128 @@ class InkFlowAppService:
         if method == "project.canon_migration.apply":
             return project.apply_canonical_content_migration(str(params.get("confirmation_token") or ""))
         if method == "conversation.history":
-            settings = Settings.from_env(project.root)
-            return {
-                "entries": TerminalSession.history(
-                    project.root, settings.dialogue_history_limit
-                ),
-                "settings": {
-                    "dialogue_history_mode": settings.dialogue_history_mode,
-                    "dialogue_history_interval": settings.dialogue_history_interval,
-                    "dialogue_history_limit": settings.dialogue_history_limit,
-                },
-            }
+            def read_history() -> dict[str, Any]:
+                """Restore saved conversation receipts and process records off the RPC event loop."""
+                settings = Settings.from_env(project.root)
+                entries = TerminalSession.history(project.root, settings.dialogue_history_limit)
+                with studio.db.connect() as connection:
+                    live_ids = {row[0] for row in connection.execute(
+                        "SELECT run_id FROM task_runs WHERE owner_id=? AND status='running'",
+                        (self.instance_id,))}
+                producers = [task for task in studio.db.list_tasks(200)
+                    if task["method"] in {"conversation.send", "workflow.run", "document.revise_selection"}
+                    and not task["params"].get("running_run_id")
+                    and not task["params"].get("_background")
+                    and str(task["params"].get("conversation_id") or "main") == active_conversation.get()]
+                active_task = next((task for task in producers if task["status"] == "running" and task["run_id"] in live_ids), None)
+                retained_task = producers[0] if producers and producers[0]["status"] in {"interrupted", "cancelled", "waiting_user", "waiting_condition"} else None
+                # producers已限定当前项目自己的Studio数据库及当前会话；按精确运行身份复用，不逐条再查任务。
+                producers_by_run = {task["run_id"]: task for task in producers}
+                for entry in entries:
+                    if entry.get("run_id"):
+                        task = producers_by_run.get(entry["run_id"])
+                        # 通用异常曾先落占位回复，外层随后才保存完整自然话错误。
+                        # 仅恢复同一次原话的旧占位；已有实质答复、其他会话和未知状态不能被任务摘要覆盖。
+                        if (entry.get("assistant") == "运行遇到异常，已有内容保留；请查看任务提示。"
+                                and entry.get("action_note") == "任务异常"
+                                and task and task["method"] == "conversation.send" and task["status"] == "failed"
+                                and task["params"].get("message") == entry.get("user")
+                                and isinstance(task.get("error_message"), str) and task["error_message"].strip()):
+                            entry["assistant"] = task["error_message"]
+                        try:
+                            process = studio.db.task_public_process(entry["run_id"], conversation=active_conversation.get())
+                            if process:
+                                entry["process"] = process
+                                # 旧成功条目曾只存路由意图；只读复原同一次提交实证，不改历史文件或实质回复。
+                                restored_reply = restored_completed_dialogue(entry, task, process,
+                                    project_root=project.root, conversation=active_conversation.get(),
+                                    # 任务参数白名单省略项目路径，所属项目由本次实际读取的数据库独立作证。
+                                    task_database_path=studio.db.path) if task else ""
+                                if restored_reply:
+                                    entry["saved_assistant"] = entry["assistant"]
+                                    entry["assistant"] = restored_reply
+                                    entry["restored_result_source"] = "same_run_engine_commit"
+                        except ProjectError:
+                            # Old dialogue remains readable without a linked run.
+                            pass
+                pending_messages = []
+                received_updates = project.db.list_agent_artifacts(artifact_type="user_steering", limit=200)
+                steered_ids = {(item["data"].get("message_id"), item["data"].get("message"), item["run_id"]) for item in received_updates
+                    if str(item["data"].get("conversation_id") or "main") == active_conversation.get()}
+                receipts = []
+                receipt_scope = {"project_root": str(project.root), "conversation_id": active_conversation.get()}
+                for artifact_type in ("conversation_message", "user_steering"):
+                    artifacts = received_updates if artifact_type == "user_steering" else project.db.list_agent_artifacts(artifact_type=artifact_type, limit=200)
+                    for artifact in artifacts:
+                        data = artifact["data"]
+                        if str(data.get("conversation_id") or "main") != active_conversation.get():
+                            continue
+                        if artifact_type == "conversation_message":
+                            receipts.append({**receipt_scope, "id": data.get("message_id"), "status": artifact["status"],
+                                "message": data.get("message", ""), "reply": data.get("reply", ""),
+                                "message_kind": data.get("message_kind")})
+                            if (data.get("message_id"), data.get("message"), artifact["run_id"]) in steered_ids:
+                                continue
+                        elif data.get("message_id"):
+                            receipts.append({**receipt_scope, "id": data["message_id"], "status": artifact["status"],
+                                "message": data.get("message", ""), "reply": data.get("reply", ""),
+                                "message_kind": "query" if data.get("response_kind") == "status_question" else "task_revision"})
+                        if (artifact["status"] not in {"pending", "prepared", "deferred"}
+                                or artifact["status"] == "pending" and artifact["run_id"] in live_ids
+                                or str(data.get("conversation_id") or "main") != active_conversation.get()
+                                or not data.get("message_id")):
+                            continue
+                        pending_messages.append({"id": data["message_id"], "root": str(project.root),
+                            "message": data["message"], "createdAt": artifact["created_at"],
+                            "artifactId": artifact["artifact_id"], "sourceRunId": artifact["run_id"]})
+                # A request can be durably received and fail before a dialogue/artifact is saved.
+                # Resolve exact outbox identities even when their tasks are older than the recent-task limit.
+                message_ids = params.get("message_ids") if isinstance(params.get("message_ids"), list) else []
+                # 后台恢复的工件也必须查两个接收入口；不能只查浏览器尚记得的队列。
+                message_ids = [*message_ids[:100], *(item["id"] for item in pending_messages)]
+                for message_id in dict.fromkeys(value for value in message_ids
+                        if isinstance(value, str) and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,179}", value)):
+                    for run_id in (f"desktop-{message_id}", f"desktop-message-{message_id}"):
+                        try:
+                            task = studio.db.get_task(run_id)
+                        except ProjectError:
+                            continue
+                        saved = task["params"]
+                        if (task["method"] != "conversation.send" or saved.get("message_id") != message_id
+                                or str(saved.get("conversation_id") or "main") != active_conversation.get()
+                                or not isinstance(saved.get("message"), str)):
+                            continue
+                        receipts.append({**receipt_scope, "id": message_id, "status": task["status"], "message_kind": "task_receipt",
+                            "message": saved["message"], "run_id": run_id, "created_at": task["started_at"],
+                            "reply": task.get("error_message") or task.get("summary") or task.get("next_step") or "这条消息已接收，原处理结果可在任务记录中查看。",
+                            "process": studio.db.task_public_process(run_id, conversation=active_conversation.get())})
+                        # 直接发送和运行中补充可能同时有记录，全部保留，不能漏掉其中一份回执。
+                pending_question = TerminalSession._pending_question(project)
+                return {
+                    **receipt_scope,
+                    "entries": entries,
+                    "message_receipts": receipts,
+                    "questions": (pending_question or {}).get("questions", []),
+                    # 卡片自身的 id 只是题型；答复必须绑定后端保存的整组问题及任务身份。
+                    "pending_question": ({"id": pending_question["id"], "task_id": pending_question.get("task_id")}
+                        if pending_question else None),
+                    "pending_messages": sorted(pending_messages, key=lambda item: item["createdAt"]),
+                    "active_task": ({"run_id": active_task["run_id"], "started_at": active_task["started_at"],
+                        "message": str(active_task["params"].get("message") or ""),
+                        "process": studio.db.task_public_process(active_task["run_id"], conversation=active_conversation.get())}
+                        if active_task else None),
+                    "retained_task": ({"run_id": retained_task["run_id"], "status": retained_task["status"],
+                        "summary": retained_task.get("summary") or "上次工作保留在未完成的位置。",
+                        "process": studio.db.task_public_process(retained_task["run_id"], conversation=active_conversation.get())}
+                        if retained_task else None),
+                    "settings": {
+                        "dialogue_history_mode": settings.dialogue_history_mode,
+                        "dialogue_history_interval": settings.dialogue_history_interval,
+                        "dialogue_history_limit": settings.dialogue_history_limit,
+                    },
+                }
+
+            return await asyncio.to_thread(read_history)
         if method == "conversation.history.save":
             return TerminalSession.save_manual_entry(
                 project.root,
@@ -1105,7 +1703,9 @@ class InkFlowAppService:
                 str(params.get("reply") or ""),
             )
         if method == "project.status":
-            return studio.dashboard()
+            # Statistics and source checks must not block chat/animation IPC while reading a large book.
+            self._schedule_knowledge(project)
+            return await asyncio.to_thread(studio.dashboard)
         if method == "project.pending_decide":
             identity = params.get("work_id")
             decision = params.get("decision")
@@ -1116,8 +1716,7 @@ class InkFlowAppService:
                 raise ProjectError("待办决定字段格式不正确，未修改安排。")
             await asyncio.to_thread(project.decide_pending_work, identity, decision=decision,
                                     reason=reason, expected_updated_at=expected)
-            return {"status": "completed", "pending_work": project.pending_work(),
-                    "rejected_work": [work for work in project.pending_work(include_rejected=True) if work["status"] == "rejected"],
+            return {"status": "completed", **project.pending_work_snapshot(),
                     "reply": "决定已保存。已有成果和必要门禁保持原状。"}
         if method == "context.pins.list":
             chapter_no = int(params["chapter_no"]) if params.get("chapter_no") is not None else None
@@ -1131,7 +1730,7 @@ class InkFlowAppService:
                     pinned=bool(params.get("pinned", True)),
                 )
         if method == "project.tree":
-            return studio.tree()
+            return await asyncio.to_thread(studio.tree)
         if method == "planning.cleanup.preview":
             return cleanup_preview(project)
         if method == "planning.cleanup.keep":
@@ -1146,7 +1745,7 @@ class InkFlowAppService:
                 return cleanup_apply(project, confirmation_token=str(params.get("confirmation_token") or ""),
                                      selected_paths=paths)
         if method == "document.read":
-            return studio.read_document(str(params["relative_path"]))
+            return await asyncio.to_thread(studio.read_document, str(params["relative_path"]))
         if method == "document.read_reference":
             # 运行记录位于 .inkflow 内部目录，只允许只读预览；前端不会再把
             # 这类证据交给系统 shell 打开，也不能借此绕过通用文件写入门禁。
@@ -1645,8 +2244,6 @@ class InkFlowAppService:
                         context_packet_id=str(thread.get("context_packet_id") or ""), status="escalated",
                     )
             return {"thread": state, "message": response, "model": result.model, "usage": result.usage}
-        if method == "usage.overview":
-            return _usage_overview(project, Settings.from_env(project.root))
         if method == "learning.settings.get":
             saved = project.db.get_metadata("learning_settings", {})
             return {"enabled": saved.get("enabled", True) is not False}
@@ -1668,18 +2265,21 @@ class InkFlowAppService:
                 return {"pair_id": project.db.save_preference_pair(str(params["chosen_artifact_id"]), str(params["rejected_artifact_id"]), dict(params.get("features") or {}))}
         if method == "learning.overview":
             return LearningService(project).overview()
+        if method == "learning.workflow.feedback":
+            return LearningService(project).workflow_feedback(str(params["sample_id"]),
+                str(params["outcome"]), str(params.get("source_quote") or ""))
         if method == "retrieval.feedback":
             with project_write_lock_sync(project.root):
-                return {
-                    "feedback_id": project.db.record_retrieval_feedback(
-                        query=str(params["query"]),
-                        source_id=str(params["source_id"]),
-                        outcome=str(params["outcome"]),
-                        role=str(params.get("role") or "coordinator"),
-                        chapter_no=int(params["chapter_no"]) if params.get("chapter_no") is not None else None,
-                        packet_id=str(params.get("packet_id") or "") or None,
-                    )
-                }
+                feedback_id = project.db.record_retrieval_feedback(
+                    query=str(params.get("query") or ""),
+                    source_id=str(params["source_id"]),
+                    outcome=str(params["outcome"]),
+                    role=str(params.get("role") or "coordinator"),
+                    chapter_no=int(params["chapter_no"]) if params.get("chapter_no") is not None else None,
+                    packet_id=str(params.get("packet_id") or "") or None,
+                )
+                return {"feedback_id": feedback_id,
+                    "ranking_eligible": bool(project.db.get_metadata("retrieval.feedback:" + feedback_id))}
         if method == "conversation.send":
             requested_mode = _requested_task_mode(method, params)
             task_scope = active_task_settings.get()
@@ -1691,8 +2291,47 @@ class InkFlowAppService:
             message = str(params.get("message") or "").strip()
             if not message:
                 raise ValueError("消息不能为空。")
+            await asyncio.to_thread(remember_conversation_title, project, message)
+            question_id, question_task_id = params.get("expected_question_id"), params.get("expected_question_task_id")
+            TerminalSession._check_question_identity(project, question_id, question_task_id)
+            if (question_id is not None or question_task_id is not None) and params.get("running_run_id"):
+                # 待答提交不能被运行中消息分流误当成新引导，或取消、重启正在处理的原任务。
+                raise ValidationGateError("当前工作仍在处理，这份待答暂时只供查看。答案已保留，请等原任务结束后重新核对再提交。")
+            artifact_id = str(params.get("steering_artifact_id") or "")
+            if artifact_id and not params.get("running_run_id"):
+                artifact = project.db.get_agent_artifact(artifact_id)
+                if (not artifact or artifact["artifact_type"] not in {"user_steering", "conversation_message"}
+                        or artifact["run_id"] != str(params.get("source_run_id") or "")
+                        or artifact["data"].get("message_id") != params.get("message_id")
+                        or artifact["data"].get("message") != message
+                        or str(artifact["data"].get("conversation_id") or "main") != active_conversation.get()
+                        or artifact["status"] not in {"pending", "prepared", "deferred"}):
+                    raise ValidationGateError("这条待处理消息的身份或处理状态已经变化，未重复执行。请核对原回执。")
             await emit({"type": "controller.routing", "summary": "正在理解目标与执行边界"})
             session = TerminalSession(self._engine(project.root))
+            running_run_id = str(params.get("running_run_id") or "")
+            if running_run_id:
+                running = studio.db.get_task(running_run_id)
+                if (running["method"] not in _TASK_SETTINGS_METHODS
+                        or str(running["params"].get("conversation_id") or "main") != active_conversation.get()):
+                    raise ValidationGateError("当前消息与原任务或小说对话不一致，未修改原任务。")
+                if _is_running_status_question(message):
+                    latest = next((item["summary"] for item in reversed(running.get("progress", []))
+                        if item.get("summary")), running.get("summary") or "尚无新的阶段结果。")
+                    reply = ("这项任务还在处理。" if running["status"] == "running" else "这项任务已经结束。") + str(latest)
+                    session._append_dialogue_entry(project, message, reply, "查询当前任务进展")
+                    result = {"status": "completed", "reply": reply, "message_kind": "query",
+                        "suggested_prompts": [], "session": {"route": "chat", "related_run_id": running_run_id}}
+                else:
+                    result = await session.respond_while_running(project, message, running)
+                async with project_write_lock(project.root):
+                    artifact = project.db.save_agent_artifact(artifact_type="conversation_message",
+                        run_id=running_run_id, role="user", status={"new_task": "deferred", "task_revision": "prepared"}.get(result["message_kind"], "resolved"),
+                        data={"message": message, "message_id": str(params.get("message_id") or ""),
+                            "conversation_id": active_conversation.get(), "message_kind": result["message_kind"],
+                            "reply": result["reply"], "classification_run_id": active_runtime.get().run_id if active_runtime.get() else ""})
+                result = {**result, "artifact_id": artifact["artifact_id"]}
+                return result
             await emit({"type": "workflow.started", "summary": "已交给墨流确定性工作流"})
             result = await session.handle(
                 project.root,
@@ -1701,8 +2340,23 @@ class InkFlowAppService:
                 emit=emit,
                 opened_project=project,
                 include_suggestions=params.get("include_suggestions", True) is True,
+                expected_question_id=question_id,
+                expected_question_task_id=question_task_id,
             )
-            self._schedule_manual_reviews(project)
+            artifact_id = str(params.get("steering_artifact_id") or "")
+            if artifact_id:
+                async with project_write_lock(project.root):
+                    artifact = project.db.get_agent_artifact(artifact_id)
+                    if (artifact and artifact["artifact_type"] in {"user_steering", "conversation_message"}
+                            and artifact["run_id"] == str(params.get("source_run_id") or "")
+                            and artifact["data"].get("message_id") == params.get("message_id")
+                            and artifact["data"].get("message") == message
+                            and workflow_result_status(result) != "failed"):
+                        project.db.set_agent_artifact_status(artifact_id, "resolved")
+            # A separately capped saved-draft expansion explicitly excludes
+            # review; do not start an unrelated background review on its return.
+            if not result.get("skills_managed") and (task_scope is None or project.db.get_metadata("saved_length_task:" + task_scope.task_id) is None):
+                self._schedule_manual_reviews(project)
             session_result = result.get("session") if isinstance(result, dict) else None
             if isinstance(session_result, dict) and session_result.get("task_ticket"):
                 await emit(
@@ -1715,7 +2369,9 @@ class InkFlowAppService:
                     }
                 )
             await emit({"type": f"workflow.{workflow_result_status(result)}", "summary": _visible_result_summary(result)})
-            return result
+            pending_question = TerminalSession._pending_question(project)
+            return {**result, "pending_question": ({"id": pending_question["id"], "task_id": pending_question.get("task_id")}
+                if pending_question else None)}
         if method == "workflow.run":
             return await self._run_workflow(project, params, emit)
         if method == "reference.import":
@@ -1783,6 +2439,29 @@ class InkFlowAppService:
     ) -> Any:
         action = str(params.get("action") or "")
         engine = self._engine(project.root)
+        if action == "review_accept":
+            # 这是独立后台操作；状态、提问与主对话隔离，审核与提交仍走原有责任链。
+            binding = _chapter_accept_binding(project, params)
+            chapter_no = binding["chapter_no"]
+            runtime = active_runtime.get()
+            if runtime is None:
+                raise ValidationGateError("章节接收没有对应的后台运行记录，未启动审核。")
+            previous_source = runtime.chapter_acceptance_source
+            runtime.chapter_acceptance_source = {"chapter_no": chapter_no,
+                "version": params["expected_version"], "content_hash": params["expected_hash"]}
+            conversation = active_conversation.set(f"chapter-accept-{chapter_no}-{params['expected_hash'][:16]}")
+            try:
+                scope = active_task_settings.get()
+                if binding.get("question_id") and (not scope or scope.task_id != binding["task_id"]):
+                    raise ValidationGateError("原题没有沿用原任务预算，未发送模型请求；请查看该后台断点。")
+                result = await TerminalSession(engine).handle(project.root, binding["message"],
+                    opened_project=project, include_suggestions=False, emit=emit,
+                    expected_question_id=binding.get("question_id"),
+                    expected_question_task_id=binding.get("question_task_id"))
+            finally:
+                active_conversation.reset(conversation)
+                runtime.chapter_acceptance_source = previous_source
+            return {**result, "chapter_no": chapter_no, "summary": _visible_result_summary(result)}
         if action == "batch_resume":
             batch_id = str(params.get("batch_id") or "")
             runtime = active_runtime.get()
@@ -1897,7 +2576,7 @@ class InkFlowAppService:
                 ),
                 batch_id=str(params.get("batch_id") or "") or None,
                 batch_review_only=bool(params.get("review_only", False)),
-                max_revision_rounds=int(params.get("max_revision_rounds", 1)),
+                max_revision_rounds=int(params.get("max_revision_rounds", COMPLETION_ATTEMPT_LIMIT)),
                 operation_instruction=str(params.get("instruction") or ""),
                 visible_reason=f"按用户当前操作执行{action}工作流。",
             )
@@ -2041,7 +2720,7 @@ class InkFlowAppService:
                 int(params["start_chapter_no"]),
                 int(params["end_chapter_no"]),
                 instruction=str(params.get("instruction") or ""),
-                max_revision_rounds=int(params.get("max_revision_rounds", 2)),
+                max_revision_rounds=int(params.get("max_revision_rounds", COMPLETION_ATTEMPT_LIMIT)),
                 batch_id=str(params.get("batch_id") or "") or None,
             )
             if workflow_action == "batch_draft_accept" and result.get("status") == "ready_for_acceptance":
@@ -2110,6 +2789,115 @@ class InkFlowAppService:
         await emit({"type": f"workflow.{workflow_result_status(result)}", "action": action, "summary": _visible_result_summary(result)})
         return result
 
+    async def _preference_materials(self, method, params, emit):
+        """排入独立后台分析，并把采用决定绑定到已核对的素材回执。"""
+        from threading import Event
+
+        from pydantic import ValidationError
+        from .preference_materials import MaterialRequest, analyze_material_stream
+        from .preferences import author_connection, change_item, list_items
+
+        root = self._validated_project_root(params)
+        analysis_method = "preferences.materials.analyze"
+        if method in {"preferences.materials.start", analysis_method}:
+            try:
+                request = MaterialRequest.model_validate(params.get("material"))
+            except ValidationError:
+                raise ValueError("素材参数无效。请提供文字素材并确认适用范围、文件数量及大小。") from None
+            if method == "preferences.materials.start":
+                clarification = None
+                if previous_id := params.get("answer_to"):
+                    # 答案只能续接本书当前仍待补充的原题，沿用原管理范围。
+                    project = InkFlowProject(root, recover_on_open=False)
+                    previous = StudioService(project).db.get_task(str(previous_id))
+                    receipt = project.db.get_metadata("preference.material:" + str(previous_id))
+                    answer = params.get("answer")
+                    if (previous["method"] != analysis_method or previous["status"] not in {"waiting_user", "interrupted"}
+                            or not receipt or receipt["preference"] or not isinstance(answer, str)
+                            or not 1 <= len(answer.strip()) <= 2000):
+                        raise ValueError("这道素材问题已更新，或还没有填写有效答案。")
+                    request = request.model_copy(update={"level": receipt["level"], "scope": receipt["scope"]})
+                    clarification = {"question": receipt["question"], "answer": answer.strip()}
+                run_id = "preference-material-" + uuid.uuid4().hex
+                if self._start_background_task is None or self._start_background_task(analysis_method, {
+                    "project_root": str(root), "run_id": run_id, "material": request.model_dump(),
+                    "clarification": clarification, "answer_to": previous_id,
+                }) is None:
+                    raise InkFlowError("后台暂时无法接收素材。请稍后重新提交。")
+                return {"run_id": run_id}
+
+            runtime = active_runtime.get()
+            if runtime is None or not params.get("_background"):
+                raise ValidationGateError("请从作者习惯设置提交后台素材分析。")
+            await emit({"type": "preferences.materials.reading", "summary": "正在读取选中的素材。"})
+            # 取消协程不会终止工作线程，通知解析器在下一块或下一页停止。
+            stop_reading = Event()
+            project = InkFlowProject(root, recover_on_open=False)
+            try:
+                result, coverage = await analyze_material_stream(self._engine(root).provider, request, project, stop_reading, emit, params.get("clarification"))
+            finally:
+                stop_reading.set()
+            # 回执登记每一批实际读取范围，解析或模型任一批失败都不会宣称全文完成。
+            project.db.set_metadata("preference.material:" + runtime.run_id,
+                                    {**result, "level": request.level, "scope": request.scope, "coverage": coverage})
+            if previous_id := params.get("answer_to"):
+                # 新回执落库后才关闭原题，读文件或调用模型失败仍可回来回答。
+                with StudioService(project).db.connect() as connection:
+                    connection.execute("UPDATE task_runs SET status='completed',summary=?,updated_at=? "
+                                       "WHERE run_id=? AND method=? AND status IN ('waiting_user','interrupted')",
+                                       ("已根据你的补充重新分析，请查看新结果。", utc_now(), previous_id, analysis_method))
+                    connection.commit()
+            return {"status": "waiting_user", "summary": (
+                "素材分析成功，已提炼出可核对的习惯建议。请确认是否采用。" if result["preference"]
+                else result["reason"] + " " + result["question"])}
+
+        def read_or_decide():
+            """只返回显示所需的任务状态与来源片段，正文不写入任务参数。"""
+            project = InkFlowProject(root, recover_on_open=False)
+            tasks = StudioService(project).db
+            if method == "preferences.materials.list":
+                tasks.reconcile_interrupted_tasks(self.instance_id)
+                return {"tasks": [{
+                    **{key: task.get(key) for key in ("run_id", "status", "summary", "error_message")},
+                    "analysis": project.db.get_metadata("preference.material:" + task["run_id"]),
+                } for task in tasks.list_tasks(30, method=analysis_method)]}
+            run_id = str(params.get("run_id") or "")
+            decision = params.get("decision")
+            if decision not in ("adopt", "dismiss"):
+                raise ValueError("请选择采用建议或结束这次分析。")
+            with project_write_lock_sync(root):
+                task = tasks.get_task(run_id)
+                if task["method"] != analysis_method or task["status"] not in {"waiting_user", "interrupted"}:
+                    raise ValueError("这项素材任务已经处理或状态已更新，请刷新。")
+                result = project.db.get_metadata("preference.material:" + run_id)
+                if not result:
+                    raise ValueError("这次没有可确认的分析回执。")
+                if decision == "dismiss":
+                    summary = "已结束本次素材分析，未采用为偏好。"
+                else:
+                    if not result["preference"] or not result["strengths"]:
+                        raise ValueError("素材证据不足，请补充素材再分析。")
+                    level = result["level"]
+                    scope = result["scope"]
+                    text = result["preference"]
+                    evidence = result["strengths"]
+                    with (author_connection() if level == "author" else project.db.connect()) as connection:
+                        existing = next((item for item in list_items(connection, active_only=False, level=level)
+                                         if item["scope"] == scope and item["text"] == text), None)
+                        if existing and existing["status"] != "active":
+                            raise ValueError("相同习惯已有记录，请在偏好列表决定是否恢复。")
+                        if not existing:
+                            # 原写入接口的版本检查保护跨窗口及跨项目的并发采用。
+                            change_item(connection, level=level, scope=scope, text=text, topic=result["topic"],
+                                        source_quote="\n\n".join(item["quote"] for item in evidence),
+                                        source_ref="；".join(item["location"] for item in evidence),
+                                        expected_revision=0, reason="作者确认采用素材分析建议")
+                    summary = "这条习惯已在使用。" if existing else "已采用素材分析建议并保存为普通偏好。"
+                tasks.finish_task(run_id, status="completed", summary=summary, retry_allowed=False)
+                return {"summary": summary}
+
+        return await asyncio.to_thread(read_or_decide)
+
     async def _generate_voice_clone_script(
         self,
         params: dict[str, Any],
@@ -2162,7 +2950,9 @@ class InkFlowAppService:
         system_prompt = (
             "你是墨流的 Writer，当前只负责建项前构思，不写正文。面向中文网文读者。"
             "本次只提交 1 个方案。每个方案都必须有清晰主角欲望、持续矛盾、前三章抓手与可升级的长期叙事引擎。"
-            "不要依赖用户已有小说。书名简洁可辨识；premise 至少写清人物、触发事件、目标与主要阻力。"
+            "构思不依赖用户已有小说。书名简洁可辨识。premise 写清主角、触发事件、目标和主要阻力，"
+            "用一条影响主角选择的世界规则或现实限制交代背景。core_selling_point 写清这部书主要让读者期待什么。"
+            "混合题材时，辅助线通过改变主角的选择或代价参与主线。"
             "用户偏好中已经明确说出的受众、主角性别、题材、时代、基调、禁区和开篇方式均是硬约束，"
             "不得为了追求新奇而换掉。出现‘女频’且用户没有另行指定时，默认使用女性主角和女频叙事重点；"
             "出现‘从……开始’时，opening_hook 必须从该事件或场面起笔。把这些明确约束逐条写入 user_rules。"
@@ -2294,7 +3084,8 @@ class InkFlowAppService:
         return InkFlowEngine(create_provider(settings), settings)
 
 
-def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, Any]:
+def _usage_overview(project: InkFlowProject, settings: Settings, *, include_history: bool = True) -> dict[str, Any]:
+    """账本快照可独立读取；旧运行日志只由明确需要历史概览的调用方扫描。"""
     def empty_bucket() -> dict[str, int]:
         return {
             "calls": 0,
@@ -2312,7 +3103,7 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
     overall = empty_bucket()
     by_agent_role: dict[str, dict[str, int]] = {}
     by_stage: dict[str, dict[str, int]] = {}
-    for event_path in (project.internal / "runs").glob("*/events.jsonl"):
+    for event_path in ((project.internal / "runs").glob("*/events.jsonl") if include_history else ()):
         try:
             lines = event_path.read_text(encoding="utf-8").splitlines()
         except OSError:
@@ -2382,6 +3173,11 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
         current_model_cache = ledger.cache_observations(getattr(project, "project_id", ""), settings)
         accounting = {"available": True, "project": ledger.summary(getattr(project, "project_id", "")),
                       "all_projects": ledger.summary()}
+        if not include_history:
+            book = accounting["project"]
+            usage = {"calls": book["calls"], "prompt_tokens": book["input_tokens"],
+                "completion_tokens": book["output_tokens"], "total_tokens": book["input_tokens"] + book["output_tokens"],
+                "history_deferred": True, "input_unknown_calls": book["unknown_usage_calls"]}
         qualified_task_products: dict[str, int] = {}
         accepted_sources = {row["chapter_no"]: row for row in project.db.accepted_chapters()}
         accepted_tasks: dict[int, set[str]] = {}
@@ -2416,8 +3212,10 @@ def _usage_overview(project: InkFlowProject, settings: Settings) -> dict[str, An
         "by_stage": {stage: public_bucket(bucket) for stage, bucket in by_stage.items()},
         "recent_deepseek_cache": recent_deepseek_cache,
         "current_model_cache": current_model_cache,
-        "estimated_cost": round(estimated_cost, 6)
-        if not (overall["input_unknown_calls"] or overall["output_unknown_calls"]) else None,
+        "estimated_cost": (round(estimated_cost, 6)
+            if not (overall["input_unknown_calls"] or overall["output_unknown_calls"]) else None) if include_history
+            else (accounting.get("project", {}).get("estimated_cost")
+                  if accounting.get("available") and not accounting["project"]["unknown_cost_calls"] else None),
         "currency": "CNY",
         "pricing_configured": settings.input_price_per_million > 0 or settings.output_price_per_million > 0,
         "accounting": accounting,
@@ -2437,9 +3235,68 @@ class JsonLineServer:
         self.steering_route_seen: set[str] = set()
         self.steering_sequence: dict[str, int] = {}
         self.run_project_roots: dict[str, Path] = {}
+        self.run_conversation_ids: dict[str, str] = {}
         self.cancel_requested: set[str] = set()
         self.cancel_context: dict[str, dict[str, str]] = {}
         self.dispatch_finished_runs: set[str] = set()
+        self.shutting_down = False
+        self.service._start_background_task = self.start_background_task
+        self.service._conversation_is_running = self._conversation_has_work
+
+    def _conversation_has_work(self, root: Path, identity: str) -> bool:
+        """覆盖尚未落库的已领取请求，删除不能和准备中的模型任务擦肩而过。"""
+        return any(not task.done() and self.task_methods.get(run) in _TASK_SETTINGS_METHODS | {"task.retry"}
+            and self.run_conversation_ids.get(run) == identity and self.run_project_roots.get(run) == root.resolve()
+            for run, task in self.tasks.items())
+
+    def register_task(self, request_id: str, run_id: str, method: str, params: dict[str, Any]) -> asyncio.Task:
+        selected_conversation = conversation_id(params.get("conversation_id"))
+        if params.get("project_root") and method in _TASK_SETTINGS_METHODS | {"task.retry"}:
+            key = (str(Path(str(params["project_root"])).resolve()).casefold(), selected_conversation)
+            if key in self.service._conversation_deleting:
+                raise ProjectBusyError("这份聊天正在删除，未启动新的任务。")
+        if run_id in self.tasks:
+            raise InkFlowError("相同运行编号已经在处理，未重复启动任务。")
+        task = asyncio.create_task(self.process(request_id, run_id, method, params))
+        self.tasks[run_id] = task
+        self.task_methods[run_id] = method
+        self.run_conversation_ids[run_id] = selected_conversation
+        if params.get("project_root"):
+            self.run_project_roots[run_id] = Path(str(params["project_root"])).resolve()
+        def cleanup(_task: asyncio.Task[None], key: str = run_id) -> None:
+            if self.tasks.get(key) is not _task:
+                return
+            self.tasks.pop(key, None)
+            self.task_methods.pop(key, None)
+            self.steering_messages.pop(key, None)
+            self.steering_delivered.pop(key, None)
+            self.steering_applied.pop(key, None)
+            self.steering_route_seen.discard(key)
+            self.steering_sequence.pop(key, None)
+            self.run_project_roots.pop(key, None)
+            self.run_conversation_ids.pop(key, None)
+            self.cancel_requested.discard(key)
+            self.cancel_context.pop(key, None)
+        task.add_done_callback(cleanup)
+        return task
+
+    def start_background_task(self, method: str, params: dict[str, Any]) -> asyncio.Task | None:
+        if self.shutting_down:
+            return None
+        if method == "memory.attachments" and params.get("work_id") and params.get("_background_pending_revision"):
+            run_id = "thread-attachment-" + str(params["work_id"]) + "-" + content_hash(str(params["_background_pending_revision"]))[:12]
+        elif method == "manual_edits.review" and params.get("job_id") and params.get("_background_pending_revision"):
+            run_id = "manual-audit-" + str(params["job_id"]) + "-" + content_hash(str(params["_background_pending_revision"]))[:12]
+        elif method in {"preferences.materials.analyze", "knowledge.maintain"}:
+            run_id = params["run_id"]
+        else:
+            raise InkFlowError("这个后台工作没有对应的已授权核对节点。")
+        if run_id in self.tasks:
+            return self.tasks[run_id]
+        parent = active_runtime.get()
+        return self.register_task("background-" + uuid.uuid4().hex, run_id, method,
+            {**params, "run_id": run_id, "_background": True,
+                "parent_run_id": params.get("parent_run_id") or (parent.run_id if parent is not None else "")})
 
     async def serve(self) -> None:
         while True:
@@ -2470,15 +3327,105 @@ class JsonLineServer:
             if method == "run.steer":
                 run_id = str(params.get("run_id") or "")
                 message = str(params.get("message") or "").strip()
+                message_id = str(params.get("message_id") or request_id)
                 task = self.tasks.get(run_id)
+                root = self.run_project_roots.get(run_id)
+                try:
+                    requested_root = self.service._validated_project_root(params) if params.get("project_root") else None
+                    if root is not None and requested_root is not None and root != requested_root:
+                        raise ValueError("project_mismatch")
+                    root = root or requested_root
+                    if not message_id or len(message_id) > 200:
+                        raise ValueError("message_identity_invalid")
+                    def received_message():
+                        if root is None:
+                            return None
+                        with InkFlowProject(root, recover_on_open=False).db.connect() as connection:
+                            row = connection.execute(
+                                "SELECT artifact_id, status, data_json FROM agent_artifacts "
+                                "WHERE run_id=? AND artifact_type='user_steering' "
+                                "AND json_extract(data_json, '$.message_id')=? ORDER BY created_at LIMIT 1",
+                                (run_id, message_id),
+                            ).fetchone()
+                        return {**dict(row), "data": json.loads(row["data_json"])} if row else None
+                    previous = await asyncio.to_thread(received_message)
+                except Exception as exc:
+                    rejected = str(exc) in {"project_mismatch", "message_identity_invalid"}
+                    await self.write({"jsonrpc": "2.0", "id": request_id, "result": {
+                        "accepted": False, "message_id": message_id,
+                        "reason": str(exc) if rejected else "record_failed",
+                        **({"saved": False} if rejected else {"receipt_unknown": True,
+                            "summary": "暂时无法核对这条消息的接收记录；请保留原消息编号核对，不要复制重发。"}),
+                    }})
+                    continue
+                if previous is not None:
+                    data = previous["data"]
+                    same_message = (data.get("message") == message and
+                        str(data.get("conversation_id") or "main") == conversation_id(params.get("conversation_id")))
+                    live = (task is not None and self.tasks.get(run_id) is task and not task.done()
+                        and not task.cancelling() and run_id not in self.dispatch_finished_runs)
+                    if same_message and previous["status"] == "pending" and not live:
+                        try:
+                            await asyncio.to_thread(lambda: InkFlowProject(root, recover_on_open=False).db
+                                .set_agent_artifact_status(previous["artifact_id"], "deferred"))
+                            previous["status"] = "deferred"
+                        except Exception:
+                            pass
+                    await self.write({"jsonrpc": "2.0", "id": request_id, "result": {
+                        "accepted": same_message and (previous["status"] in {"applied", "resolved"}
+                            or previous["status"] == "pending" and live),
+                        "saved": same_message, "duplicate": same_message, "message_id": message_id,
+                        "artifact_id": previous["artifact_id"], "status": previous["status"],
+                        "deferred": same_message and (previous["status"] == "deferred"
+                            or previous["status"] == "pending" and not live),
+                        "reason": "message_identity_conflict" if not same_message else
+                            "run_finished" if previous["status"] == "deferred"
+                                or previous["status"] == "pending" and not live else "",
+                        **({"status_reply": True, "summary": data["reply"]} if same_message and data.get("reply") else {}),
+                    }})
+                    continue
                 accepted = bool(
                     message
                     and task
                     and not task.done()
+                    and not task.cancelling()
                     and self.task_methods.get(run_id) == "conversation.send"
                     and run_id not in self.dispatch_finished_runs
                     and run_id in self.run_project_roots
                 )
+                if accepted and _is_running_status_question(message):
+                    # A progress question is not new creative guidance. Answer
+                    # from the live record without another model or pausing work.
+                    root = self.run_project_roots[run_id]
+                    def record_status_reply():
+                        project = InkFlowProject(root, recover_on_open=False)
+                        db = StudioService(project).db
+                        current = db.get_task(run_id)
+                        latest = next((item["summary"] for item in reversed(current.get("progress", []))
+                            if item.get("type") != "conversation.progress_reply"), "任务仍在处理，暂时没有新的阶段结果。")
+                        reply = ("我还在处理这项任务。最新进展：" if current["status"] == "running"
+                            else "这项任务已结束。最新记录：") + str(latest)
+                        event = {"run_id": run_id, "type": "conversation.progress_reply", "role": "coordinator",
+                            "summary": reply, "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "conversation_id": str(current["params"].get("conversation_id") or "main")}
+                        project.db.save_agent_artifact(artifact_type="user_steering", run_id=run_id, role="user",
+                            status="resolved", data={"message": message, "reply": reply,
+                                "message_id": message_id, "conversation_id": str(current["params"].get("conversation_id") or "main"),
+                                "target_run_id": run_id, "response_kind": "status_question", "task_revision": 1})
+                        db.record_task_progress(run_id, event["type"], reply, event=event)
+                        return event
+                    try:
+                        event = await asyncio.to_thread(record_status_reply)
+                    except Exception:
+                        # A secondary status query cannot break or steer the
+                        # production request if local bookkeeping is busy.
+                        event = {"run_id": run_id, "type": "conversation.progress_reply", "role": "coordinator",
+                            "summary": "暂时读不到最新进展；这次询问没有修改或重新启动原任务。",
+                            "timestamp": datetime.now(timezone.utc).isoformat()}
+                    await self.write({"jsonrpc": "2.0", "method": "event", "params": event})
+                    await self.write({"jsonrpc": "2.0", "id": request_id,
+                        "result": {"accepted": True, "message_id": message_id, "status_reply": True, "summary": event["summary"]}})
+                    continue
                 if accepted:
                     sequence = self.steering_sequence.get(run_id, 0) + 1
                     self.steering_sequence[run_id] = sequence
@@ -2489,6 +3436,7 @@ class JsonLineServer:
                                 artifact_type="user_steering", run_id=run_id, role="user",
                                 status="pending", data={
                                     "message": message, "sequence": sequence,
+                                    "message_id": message_id, "conversation_id": conversation_id(params.get("conversation_id")),
                                     # Receipt is not permission to alter the
                                     # active task. Its initial revision is 1;
                                     # only a later routed target change may
@@ -2505,15 +3453,32 @@ class JsonLineServer:
                     except Exception:
                         accepted = False
                     else:
+                        # Saving yields to the original run; a receipt cannot revive its exited queue.
+                        if (self.tasks.get(run_id) is not task or task.done() or task.cancelling()
+                                or run_id in self.dispatch_finished_runs
+                                or self.run_project_roots.get(run_id) != root):
+                            try:
+                                await asyncio.to_thread(lambda: InkFlowProject(root, recover_on_open=False).db
+                                    .set_agent_artifact_status(artifact["artifact_id"], "deferred"))
+                                status = "deferred"
+                            except Exception:
+                                status = "pending"
+                            await self.write({"jsonrpc": "2.0", "id": request_id, "result": {
+                                "accepted": False, "saved": True, "deferred": True, "status": status,
+                                "reason": "run_finished", "message_id": message_id,
+                                "artifact_id": artifact["artifact_id"],
+                                "summary": "消息已保存，但原任务已经结束；这条补充尚未应用，已留待后续处理。",
+                            }})
+                            continue
                         self.steering_messages.setdefault(run_id, []).append({
                             "message": message, "artifact_id": artifact["artifact_id"],
-                            "sequence": sequence,
+                            "message_id": message_id, "sequence": sequence,
                         })
                         await self.write({
                             "jsonrpc": "2.0", "method": "event", "params": {
                                 "run_id": run_id, "type": "run.steered",
                                 "summary": "已保存你的补充；将在安全节点处理，若本次来不及应用会保留为待处理输入。",
-                                "artifact_id": artifact["artifact_id"], "proposed_task_revision": sequence + 1,
+                                "message_id": message_id, "artifact_id": artifact["artifact_id"], "proposed_task_revision": sequence + 1,
                             },
                         })
                 reason = "" if accepted else (
@@ -2524,8 +3489,9 @@ class JsonLineServer:
                     "record_failed"
                 )
                 await self.write({"jsonrpc": "2.0", "id": request_id, "result": {
-                    "accepted": accepted, "reason": reason,
-                    **({"artifact_id": artifact["artifact_id"], "proposed_task_revision": sequence + 1} if accepted else {}),
+                    "accepted": accepted, "reason": reason, "message_id": message_id,
+                    **({"receipt_unknown": True} if reason == "record_failed" else {"saved": accepted}),
+                    **({"status": "pending", "artifact_id": artifact["artifact_id"], "proposed_task_revision": sequence + 1} if accepted else {}),
                 }})
                 continue
             run_id = str(params.get("run_id") or f"run-{uuid.uuid4().hex}")
@@ -2545,29 +3511,18 @@ class JsonLineServer:
                     },
                 })
                 continue
-            task = asyncio.create_task(self.process(request_id, run_id, method, params))
-            self.tasks[run_id] = task
-            self.task_methods[run_id] = method
-            if params.get("project_root"):
-                self.run_project_roots[run_id] = Path(str(params["project_root"])).resolve()
-            def cleanup(_task: asyncio.Task[None], key: str = run_id) -> None:
-                if self.tasks.get(key) is not _task:
-                    return
-                self.tasks.pop(key, None)
-                self.task_methods.pop(key, None)
-                self.steering_messages.pop(key, None)
-                self.steering_delivered.pop(key, None)
-                self.steering_applied.pop(key, None)
-                self.steering_route_seen.discard(key)
-                self.steering_sequence.pop(key, None)
-                self.run_project_roots.pop(key, None)
-                self.cancel_requested.discard(key)
-                self.cancel_context.pop(key, None)
-            task.add_done_callback(cleanup)
+            self.register_task(request_id, run_id, method, params)
+        self.shutting_down = True
         if self.tasks:
             await asyncio.gather(*self.tasks.values(), return_exceptions=True)
 
     def cancel_run(self, run_id: str, *, source: str, reason: str) -> dict[str, Any]:
+        if source in {"app_exit", "window_close"}:
+            self.shutting_down = True
+            if not run_id:
+                results = [self.cancel_run(key, source=source, reason=reason) for key in list(self.tasks)]
+                return {"cancelled": any(result.get("cancelled") for result in results),
+                    "interrupted_runs": len(results), "resumable": True}
         task = self.tasks.get(run_id)
         if not task or task.done():
             return {"cancelled": False}
@@ -2577,13 +3532,18 @@ class JsonLineServer:
                 "finalizing": True,
                 "summary": "写作步骤已经返回并进入保存结果阶段；停止请求未撤销已完成的成果。",
             }
+        if run_id in self.cancel_requested:
+            # Repeated exit/stop acknowledgements must not cancel the cleanup
+            # that is already saving this run's interruption checkpoint.
+            return {"cancelled": True, "already_requested": True, **self.cancel_context.get(run_id, {})}
         self.cancel_requested.add(run_id)
         self.cancel_context[run_id] = {
             "source": source,
             "reason": reason,
             "requested_at": datetime.now(timezone.utc).isoformat(),
         }
-        task.cancel()
+        if not task.cancelling():
+            task.cancel({"source": source, "reason": reason})
         return {"cancelled": True, **self.cancel_context[run_id]}
 
     async def _mark_steering(self, run_id: str, records: list[dict[str, Any]], status: str) -> bool:
@@ -2617,8 +3577,9 @@ class JsonLineServer:
         if not records or root is None:
             return
 
-        def bind() -> None:
+        def bind() -> list[dict[str, Any]]:
             project = InkFlowProject(root, recover_on_open=False)
+            applied = []
             with project.db.connect() as connection:
                 for record in records:
                     row = connection.execute(
@@ -2637,12 +3598,19 @@ class JsonLineServer:
                         "UPDATE agent_artifacts SET data_json=?, status='applied' WHERE artifact_id=?",
                         (json.dumps(data, ensure_ascii=False, separators=(",", ":")), record["artifact_id"]),
                     )
+                    applied.append(record)
                 connection.commit()
+            return applied
 
         try:
-            await asyncio.to_thread(bind)
-            self.steering_applied.setdefault(run_id, []).extend(records)
-            self.steering_delivered.pop(run_id, None)
+            applied = await asyncio.to_thread(bind)
+            self.steering_applied.setdefault(run_id, []).extend(applied)
+            self.steering_delivered[run_id] = [record for record in records if record not in applied]
+            if applied:
+                event = {"run_id": run_id, "type": "run.steering_applied", "role": "coordinator",
+                    "summary": "引导已纳入本次任务安排；正文是否完成修改以对应步骤结果为准。",
+                    "metadata": {"message_ids": [record["message_id"] for record in applied if record.get("message_id")]}}
+                await self.write({"jsonrpc": "2.0", "method": "event", "params": event})
         except Exception:
             # The original user text remains pending and will be deferred.
             pass
@@ -2651,10 +3619,23 @@ class JsonLineServer:
         selected_conversation = conversation_id(params.get("conversation_id"))
         conversation_token = active_conversation.set(selected_conversation)
         last_public_event: dict[str, Any] = {}
-        last_operation: dict[str, Any] = {"method": method}
+        last_operation: dict[str, Any] = {"method": method, "run_id": run_id}
+        # 工具栏工作流的action来自实际请求；自然语言任务稍后由已校验的调度单补入。
+        # 角色也参与规划审核，不能拿最后一个Reviewer请求当成“正文已经进入审查”。
+        if method == "workflow.run" and isinstance(params.get("action"), str):
+            last_operation["action"] = params["action"]
+        if isinstance(params.get("chapter_no"), int) and not isinstance(params["chapter_no"], bool) and params["chapter_no"] > 0:
+            last_operation["chapter_no"] = params["chapter_no"]
+        if type(params.get("end_chapter_no")) is int and params["end_chapter_no"] > 0:
+            last_operation["end_chapter_no"] = params["end_chapter_no"]
 
         async def emit(event: dict[str, Any]) -> None:
             event = {**event, "conversation_id": selected_conversation}
+            if method in {"preferences.materials.analyze", "knowledge.maintain"}:
+                event["project_root"] = params.get("project_root")
+            if params.get("_background") is True:
+                event = {**event, "_background": True, "priority": "background",
+                    "parent_run_id": str(params.get("parent_run_id") or "")}
             if event.get("type") == "session.steer":
                 self.steering_route_seen.add(run_id)
             if (event.get("type") == "workflow.planned" and run_id in self.steering_route_seen
@@ -2664,11 +3645,28 @@ class JsonLineServer:
             last_public_event.update(event)
             stage = str(event.get("stage") or "")
             event_type = str(event.get("type") or "")
+            metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+            ticket = event.get("task_ticket") if isinstance(event.get("task_ticket"), dict) else {}
+            if event_type in {"controller.routed", "workflow.planned"}:
+                # 仅接收路由/计划事件的真实工作流身份，不从自由摘要或模型角色猜任务用途。
+                plan = event.get("dispatch_plan") if isinstance(event.get("dispatch_plan"), dict) else {}
+                action = plan.get("workflow") or event.get("action")
+                if isinstance(action, str) and action:
+                    last_operation["action"] = action
+                change = ticket.get("setting_change")
+                if isinstance(change, dict) and isinstance(change.get("operation"), str):
+                    last_operation["operation"] = change["operation"]
+                if type(ticket.get("end_chapter_no")) is int and ticket["end_chapter_no"] > 0:
+                    last_operation["end_chapter_no"] = ticket["end_chapter_no"]
+            chapter = event.get("chapter_no") or metadata.get("chapter_no") or ticket.get("chapter_no")
+            if isinstance(chapter, int) and not isinstance(chapter, bool) and chapter > 0:
+                last_operation["chapter_no"] = chapter
+            role = event.get("role") or metadata.get("agent_role")
+            if role in {"coordinator", "writer", "editor", "reviewer", "memory_keeper"}:
+                last_operation["role"] = role
             if (event_type == "workflow.stage" and stage not in {"run", "long_run"}) or event_type.startswith(("writer.", "editor.", "reviewer.", "outline.", "planning.", "provider.", "voice.")):
                 if not event_type.endswith((".delta", ".token")):
                     last_operation["stage"] = stage or event_type
-                    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
-                    chapter = event.get("chapter_no") or metadata.get("chapter_no")
                     match = re.search(r"第\s*(\d+)\s*章", str(event.get("summary") or ""))
                     if chapter or match:
                         last_operation["chapter_no"] = chapter or int(match.group(1))
@@ -2679,6 +3677,13 @@ class JsonLineServer:
                     "params": {"run_id": run_id, **event},
                 }
             )
+            if (stage == "memory.commit" and event.get("status") == "completed"
+                    and params.get("project_root") and method != "memory.attachments"):
+                self.service._schedule_thread_attachments(project)
+            # 每章正式提交后即可整理，不必等整批写作结束；后台使用更低的模型请求优先级。
+            if (stage in {"memory.commit", "planning-v2.publish"} and event.get("status") == "completed"
+                    and params.get("project_root") and method != "knowledge.maintain"):
+                self.service._schedule_knowledge(project)
             event_type = str(event.get("type") or "")
             summary = str(event.get("summary") or "")
             if (
@@ -2687,7 +3692,7 @@ class JsonLineServer:
                 and not event_type.endswith((".delta", ".token"))
             ):
                 try:
-                    await asyncio.to_thread(task_db.record_task_progress, run_id, event_type, summary)
+                    await asyncio.to_thread(task_db.record_task_progress, run_id, event_type, summary, event=event)
                 except Exception:
                     # Progress text is secondary metadata, never a reason to
                     # fail an otherwise healthy writing request.
@@ -2727,16 +3732,21 @@ class JsonLineServer:
                             # forever after the first broken output event.
                             delivery_error = exc
                             if not dispatch_finished and owner_task is not None and not owner_task.cancelling():
-                                owner_task.cancel()
+                                self.cancel_run(run_id, source="event_channel_lost", reason="桌面与本地引擎的事件通道中断")
                 finally:
                     public_events.task_done()
 
         event_worker = asyncio.create_task(forward_events())
-        runtime = RunRuntime(publish=public_events.put_nowait, task_id=run_id, run_id=run_id)
+        runtime = RunRuntime(publish=public_events.put_nowait, task_id=run_id, run_id=run_id,
+            output_policy="provider_default", output_policy_source="current_application_policy",
+            request_priority=2 if params.get("_background") else 0 if params.get("running_run_id") else 1)
         runtime_token = active_runtime.set(runtime)
         task_db = None
         task_started = False
         settings_token = None
+        chapter_accept_key = None
+        chapter_accept_binding = None
+        attachment_key = None
 
         def persist_outcome(
             status: str, *, summary: str = "", error_message: str = "",
@@ -2767,7 +3777,37 @@ class JsonLineServer:
                     project = await asyncio.to_thread(
                         InkFlowProject, Path(str(project_root)).resolve(), recover_on_open=False
                     )
+                    ensure_conversation_available(project)
                     task_db = StudioService(project).db
+                    if method == "workflow.run" and params.get("action") == "review_accept":
+                        # 领取与查重之间不让出事件循环；不同章仍可独立工作。
+                        chapter_accept_binding = _chapter_accept_binding(project, params)
+                        key = (str(project.root).casefold(), params["chapter_no"])
+                        previous = self.service._chapter_accept_runs.get(key)
+                        existing = ({"status": "running", "existing_run_id": previous,
+                            "chapter_no": params["chapter_no"], "reused": True,
+                            "summary": f"第{params['chapter_no']}章已经在后台检查，未重复启动。"} if previous else
+                            _chapter_accept_running_task(project, self.instance_id, params,
+                                chapter_accept_binding, exclude_run_id=run_id))
+                        if existing:
+                            await self.write({"jsonrpc": "2.0", "id": request_id, "result": existing})
+                            return
+                        self.service._chapter_accept_runs[key] = run_id
+                        chapter_accept_key = key
+                    if method == "conversation.send":
+                        # 先核原题再解释自然语言，避免迟到答案错误绑定另一任务的预算快照。
+                        TerminalSession._check_question_identity(project,
+                            params.get("expected_question_id"), params.get("expected_question_task_id"))
+                    if method == "memory.attachments":
+                        attachment_key = (str(project.root).casefold(), str(params["work_id"]))
+                        previous = self.service._attachment_runs.get(attachment_key)
+                        if previous:
+                            await self.write({"jsonrpc": "2.0", "id": request_id, "result": {
+                                "status": "running", "existing_run_id": previous, "reused": True,
+                                "summary": "这份伏笔记录已在后台补全，未重复启动。"}})
+                            attachment_key = None
+                            return
+                        self.service._attachment_runs[attachment_key] = run_id
                     recorded_method = method
                     recorded_params = _task_params(method, params)
                     if method == "workflow.run" and str(params.get("action") or "") == "write":
@@ -2778,9 +3818,34 @@ class JsonLineServer:
                         if chapter_no > 0:
                             recorded_params["_retry_guard"] = chapter_retry_state(project, chapter_no)
                     resume_run_id = None
+                    pending = None
                     suggested_title = None
                     capture_source = "task_start"
-                    if method == "task.retry":
+                    if method == "memory.attachments":
+                        suggested_title = f"第{params.get('chapter_no', '')}章 · 补全伏笔记录"
+                    elif method == "preferences.materials.analyze":
+                        suggested_title = "分析作者习惯素材"
+                    elif method == "knowledge.maintain":
+                        suggested_title = "知识缺口补证" if params.get("gaps_only") is True else "全书知识整理"
+                        if params.get("gaps_only") is True:
+                            runtime.max_calls = 6
+                        if params.get("resume_run_id"):
+                            resume_run_id = str(params["resume_run_id"])
+                            previous = task_db.get_task(resume_run_id)
+                            if previous["method"] != method:
+                                raise ValidationGateError("知识任务续接身份不一致，未按新任务重新分配预算。")
+                            with task_db.connect() as connection:
+                                row = connection.execute("SELECT value_json FROM studio_metadata WHERE key=?",
+                                    ("run_runtime_budget:" + resume_run_id,)).fetchone()
+                            if row is None:
+                                raise ValidationGateError("原知识任务预算记录缺失，未重置额度。")
+                            budget = json.loads(row[0])
+                            runtime.budget_source_run_id = budget["source_run_id"]
+                            runtime.max_calls, runtime.max_tokens = budget["max_calls"], budget["max_tokens"]
+                    elif chapter_accept_binding:
+                        resume_run_id = chapter_accept_binding.get("run_id")
+                        suggested_title = f"第{params['chapter_no']}章 · 检查后转为正史"
+                    elif method == "task.retry":
                         original = task_db.get_task(str(params["task_id"]))
                         if not original["retryable"]:
                             raise InkFlowError("该任务不能一键重试，请查看当前状态后重新说明要求。")
@@ -2802,8 +3867,16 @@ class JsonLineServer:
                         else:
                             capture_source = "legacy_recovery"
                             await emit({"type": "task.settings_legacy", "summary": "此批次没有可关联的原任务快照；将按批次清单中可用的本地设置恢复。"})
+                    elif method == "conversation.send" and params.get("running_run_id"):
+                        parent = task_db.get_task(str(params["running_run_id"]))
+                        if (parent["method"] not in _TASK_SETTINGS_METHODS
+                                or str(parent["params"].get("conversation_id") or "main") != selected_conversation):
+                            raise InkFlowError("后台对话缺少对应的原任务身份，未发送模型请求。")
+                        # This is a side conversation, not a restart of the still-running production task.
                     elif method == "conversation.send":
-                        pending = TerminalSession.pending_resume(project, str(params.get("message") or ""))
+                        pending = TerminalSession.pending_resume(project, str(params.get("message") or ""),
+                            expected_question_id=params.get("expected_question_id"),
+                            expected_question_task_id=params.get("expected_question_task_id"))
                         if pending and pending.get("run_id"):
                             resume_run_id = str(pending["run_id"])
                             original = task_db.get_task(resume_run_id)
@@ -2826,25 +3899,98 @@ class JsonLineServer:
                     task_started = True
                     if recorded_method in _TASK_SETTINGS_METHODS:
                         requested_mode = _requested_task_mode(recorded_method, params)
-                        scope = task_db.prepare_task_settings(
-                            run_id,
-                            novel_id=project.project_id,
-                            settings=lambda: Settings.from_env(project.root),
-                            resume_run_id=resume_run_id,
-                            workspace_root=project.root,
-                            capture_source=capture_source,
-                            registered_now=True,
-                            **({"collaboration_mode": requested_mode} if requested_mode else {}),
-                        )
+                        queued_settings = None
+                        if method == "conversation.send" and not resume_run_id and not params.get("running_run_id"):
+                            candidate = project.db.get_metadata(conversation_key("next_task_settings"))
+                            if isinstance(candidate, dict) and isinstance(candidate.get("id"), str) and isinstance(candidate.get("patch"), dict):
+                                queued_settings = candidate
+                        def task_settings_supplier():
+                            settings = Settings.from_env(project.root)
+                            if queued_settings:
+                                settings = TerminalSession.apply_settings_patch(settings, queued_settings["patch"])
+                            return TerminalSession.writer_grant_settings(settings,
+                                str(params.get("message") or "") if method == "conversation.send" else "")
+                        length_scope = (await asyncio.to_thread(TerminalSession.prepare_saved_length_task,
+                            project, str(params.get("message") or ""), run_id, registered_now=True)
+                            if method == "conversation.send" and not params.get("running_run_id") else None)
+                        if method == "memory.attachments":
+                            # 后台不恢复或重启父写作，只关联原候选已有配置和累计请求账本。
+                            work = project.db.get_metadata("pending_work:" + str(params["work_id"]), {})
+                            source = work.get("source", {})
+                            origin = source.get("parent_run_id")
+                            if (work.get("kind") != "context_source" or source.get("attachment_kind") != "promise_threads"
+                                    or not origin or params.get("parent_run_id") not in {None, "", origin}):
+                                raise ValidationGateError("附件待办缺少原任务来源，未新建模型任务。")
+                            with task_db.connect() as connection:
+                                linked = connection.execute("SELECT task_id FROM task_run_settings WHERE run_id=?", (origin,)).fetchone()
+                            if linked is None or linked["task_id"] != source.get("task_id"):
+                                raise ValidationGateError("附件原任务配置关联不可核验，未使用当前设置代替。")
+                            scope = task_db.prepare_task_settings(origin, novel_id=project.project_id, workspace_root=project.root)
+                            with task_db.connect() as connection:
+                                budget_row = connection.execute("SELECT value_json FROM studio_metadata WHERE key=?", ("run_runtime_budget:" + origin,)).fetchone()
+                            # 桌面旧入口一直采用100次/无Token上限；仅此已核入口可继承旧默认，不猜外部宿主预算。
+                            original_task = task_db.get_task(origin)
+                            if budget_row:
+                                budget = json.loads(budget_row["value_json"])
+                            elif original_task["method"] in {"conversation.send", "workflow.run"}:
+                                budget = {"source_run_id": origin, "max_calls": RunRuntime.__dataclass_fields__["max_calls"].default, "max_tokens": None}
+                            else:
+                                raise ValidationGateError("原附件执行预算不可核验，未按零用量新建额度。")
+                            if (not isinstance(budget.get("source_run_id"), str) or not budget["source_run_id"]
+                                    or type(budget.get("max_calls")) is not int or budget["max_calls"] < 1
+                                    or budget.get("max_tokens") is not None and (type(budget["max_tokens"]) is not int or budget["max_tokens"] < 1)):
+                                raise ValidationGateError("原后台预算记录不完整，未重新分配额度。")
+                            runtime.budget_source_run_id = budget["source_run_id"]
+                            runtime.max_calls, runtime.max_tokens = budget["max_calls"], budget["max_tokens"]
+                            if scope.task_id != source.get("task_id") or scope.snapshot_hash != source.get("snapshot_hash"):
+                                raise ValidationGateError("附件与原任务快照不一致，未重置预算。")
+                            with task_db.connect() as connection:
+                                connection.execute("INSERT INTO task_run_settings(run_id,task_id) VALUES (?,?)", (run_id, scope.task_id))
+                                connection.commit()
+                        elif method == "manual_edits.review":
+                            from .manual_edits import ManualEditsService
+                            manual_run_id = "manual-audit-" + str(params["job_id"])
+                            scope = ManualEditsService(project).prepare_review_scope(str(params["job_id"]),
+                                task_settings_supplier, registered_now=manual_run_id == run_id)
+                            if manual_run_id != run_id:
+                                with task_db.connect() as connection:
+                                    connection.execute("INSERT INTO task_run_settings(run_id,task_id) VALUES (?,?)",
+                                        (run_id, scope.task_id))
+                                    connection.commit()
+                        else:
+                            scope = length_scope or task_db.prepare_task_settings(
+                                run_id,
+                                novel_id=project.project_id,
+                                settings=task_settings_supplier,
+                                resume_run_id=resume_run_id,
+                                resume_batch_id=(chapter_accept_binding.get("batch_review_origin", {}).get("batch_id")
+                                    if chapter_accept_binding else pending.get("batch_review_origin", {}).get("batch_id")
+                                    if method == "conversation.send" and pending else None),
+                                interaction_run_id=str(params["running_run_id"]) if method == "conversation.send" and params.get("running_run_id") else None,
+                                workspace_root=project.root,
+                                capture_source=capture_source,
+                                registered_now=True,
+                                **({"collaboration_mode": requested_mode} if requested_mode else {}),
+                            )
+                        if queued_settings and length_scope is None:
+                            await asyncio.to_thread(project.db.set_metadata,
+                                conversation_key("queued_settings_binding:" + scope.task_id), {"id": queued_settings["id"]})
                         settings_token = active_task_settings.set(scope)
                         runtime.task_id = scope.task_id
+                        # 只存上限和原run身份；已用数量始终以发送账本原子核算，不能复制内存计数。
+                        with task_db.connect() as connection:
+                            connection.execute("INSERT OR IGNORE INTO studio_metadata(key,value_json,updated_at) VALUES(?,?,?)",
+                                ("run_runtime_budget:" + run_id, json_dumps({"source_run_id": runtime.budget_source_run_id or run_id,
+                                    "max_calls": runtime.max_calls, "max_tokens": runtime.max_tokens}), utc_now()))
+                            connection.commit()
                         await emit({
                             "type": "task.settings_bound",
                             "summary": (
                                 "旧任务没有历史配置快照，本次恢复已记录当前配置，后续续跑沿用此版本。"
                                 if scope.source == "legacy_recovery" else
                                 "已沿用原任务的配置版本；设置页面修改只影响新任务。"
-                                if resume_run_id else "已固定本次任务的配置版本。"
+                                if resume_run_id else "已关联原任务配置，理解补充消息；原任务继续运行。"
+                                if params.get("running_run_id") else "已固定本次任务的配置版本。"
                             ),
                             "metadata": scope.public_summary(),
                         })
@@ -2870,6 +4016,7 @@ class JsonLineServer:
                     "type": "run.steering_deferred",
                     "summary": f"有 {len(unapplied)} 条中途补充尚未用于本次输出，原话已保存；请在当前任务继续处理。",
                     "count": len(unapplied),
+                    "metadata": {"message_ids": [item["message_id"] for item in unapplied if item.get("message_id")]},
                 })
             scope = active_task_settings.get()
             if isinstance(result, dict) and scope is not None:
@@ -2891,9 +4038,14 @@ class JsonLineServer:
                 error_code="workflow_result" if failure_guidance is not None else None,
                 retry_allowed=False if failure_guidance is not None else None,
             )
-            if task_db is not None and params.get("project_root"):
+            if (task_db is not None and params.get("project_root")
+                    and (scope is None or project.db.get_metadata("saved_length_task:" + scope.task_id) is None)):
                 try:
                     self.service._schedule_manual_reviews(project)
+                    if method != "memory.attachments":
+                        self.service._schedule_thread_attachments(project)
+                    # 补读期间若有新章节落盘，结束后继续登记新来源，不重跑已完成单元。
+                    self.service._schedule_knowledge(project)
                 except Exception as exc:
                     # Auxiliary scheduling cannot revoke a durable foreground result.
                     warning = "后台手动核对尚未安排，请在核对窗口查看或重试：" + str(exc)[:1000]
@@ -2922,33 +4074,51 @@ class JsonLineServer:
             requested = run_id in self.cancel_requested
             cancel_context = self.cancel_context.get(run_id, {})
             source = cancel_context.get("source", "unknown")
-            stage = str(last_public_event.get("summary") or last_public_event.get("type") or method)
-            if delivery_error is not None and not requested:
+            explicit_cancel = requested and source not in {"app_exit", "window_close", "event_channel_lost"}
+            stage = str(last_public_event.get("summary") or last_public_event.get("type") or method).rstrip("。 .")
+            if delivery_error is not None and (not requested or source == "event_channel_lost"):
                 message = "桌面与本地引擎的事件通道中断"
                 impact = f"最后公开阶段：{stage}。当前步骤已停止；重新打开任务记录后从保存点继续。"
-            elif requested:
+            elif requested and not explicit_cancel:
+                message = "墨流正在退出，本次工作已保留断点"
+                impact = f"退出时：{stage}。下次先核对已保存成果、原配置和已用次数，再续接未完成节点。"
+            elif explicit_cancel:
                 message = "任务由界面的停止操作中断"
-                impact = f"停止前最后公开阶段：{stage}。该阶段尚未完成，因此没有被伪装成通过。"
+                impact = f"停止时：{stage}。可从已保存进度继续。"
             else:
                 message = "任务在运行期间意外中断"
                 impact = f"最后公开阶段：{stage}。墨流会保留断点，下一次继续时从已保存版本恢复。"
             record_warning = persist_outcome(
-                "cancelled" if requested else "interrupted",
+                "cancelled" if explicit_cancel else "interrupted",
                 summary=(
                     f"{message}；来源 {source}；最后阶段 {stage}"
                     if requested else f"{message}；最后阶段 {stage}"
                 ),
                 error_message=(f"事件通道异常：{type(delivery_error).__name__}" if delivery_error is not None else ""),
-                retry_allowed=False,
+                retry_allowed=not explicit_cancel and source in {"app_exit", "window_close"},
             )
+            if explicit_cancel and method == "manual_edits.review" and params.get("project_root"):
+                def mark_manual_cancelled():
+                    with project_write_lock_sync(Path(str(params["project_root"])).resolve()):
+                        target = InkFlowProject(Path(str(params["project_root"])), recover_on_open=False)
+                        jobs = target.db.get_metadata("manual_edit_jobs", {})
+                        job = jobs.get(str(params["job_id"]))
+                        if job and job.get("status") == "interrupted":
+                            jobs[str(params["job_id"])] = {**job, "status": "cancelled",
+                                "summary": "你已停止这项后台核对；候选、原配置与已用次数保留。"}
+                            target.db.set_metadata("manual_edit_jobs", jobs)
+                try:
+                    await asyncio.to_thread(mark_manual_cancelled)
+                except Exception:
+                    pass
             if delivery_error is None:
                 await self.write(
                     {
                         "jsonrpc": "2.0",
                         "id": request_id,
                         "error": {
-                            "code": "cancelled" if requested else "interrupted",
-                            "title": "任务已停止" if requested else "任务意外中断",
+                            "code": "cancelled" if explicit_cancel else "interrupted",
+                            "title": "任务已停止" if explicit_cancel else "工作断点已保留",
                             "message": message,
                             "impact": f"{impact} {record_warning}".strip(),
                             "preserved": "已有正文、草稿版本和正史未被回退",
@@ -2961,7 +4131,7 @@ class JsonLineServer:
                 )
                 public_events.put_nowait(
                     {
-                        "type": "run.cancelled" if requested else "run.interrupted",
+                        "type": "run.cancelled" if explicit_cancel else "run.interrupted",
                         "method": method,
                         "summary": message,
                         "details": impact,
@@ -3006,6 +4176,10 @@ class JsonLineServer:
             await self.write({"jsonrpc": "2.0", "id": request_id, "error": error})
             public_events.put_nowait({"type": "run.failed", "method": method, "summary": error["message"]})
         finally:
+            if attachment_key is not None and self.service._attachment_runs.get(attachment_key) == run_id:
+                self.service._attachment_runs.pop(attachment_key, None)
+            if chapter_accept_key is not None and self.service._chapter_accept_runs.get(chapter_accept_key) == run_id:
+                self.service._chapter_accept_runs.pop(chapter_accept_key, None)
             if self.steering_messages.get(run_id) or self.steering_delivered.get(run_id):
                 await self._defer_unapplied_steering(run_id)
             self.dispatch_finished_runs.discard(run_id)
@@ -3178,8 +4352,10 @@ def _fallback_idea_bundle(preferences: str, requested_count: int) -> NovelIdeaBu
 
 def _short_provider_error(error: ProviderError) -> str:
     text = str(error)
-    if "finish_reason=length" in text or "空 JSON" in text:
-        return "模型推理耗尽了本次预算，未留下完整方案。"
+    if "finish_reason=length" in text:
+        return "服务端提前结束输出，未留下完整方案。"
+    if "空 JSON" in text or "空响应体" in text or "没有返回可用的回复文本" in text:
+        return "模型没有返回可采用的方案，原内容保留。"
     return "模型未能返回可解析方案，已切换为可编辑保底提案。"
 
 
@@ -3197,6 +4373,7 @@ def _acceptance_result_reply(result: dict[str, Any]) -> None:
 
 
 def _visible_result_summary(result: Any) -> str:
+    """记录实际公开结果；与会话保存共用递归取值，避免成功步骤在重开后退回计划占位。"""
     if isinstance(result, dict) and result.get("unapplied_user_updates"):
         return f"本次阶段已结束，但有 {len(result['unapplied_user_updates'])} 条中途补充尚未应用；原话已保存供继续处理。"
     failure = workflow_failure_reason(result)
@@ -3219,6 +4396,9 @@ def _visible_result_summary(result: Any) -> str:
             title = f"第 {revision} 版规划已正式生效" if published else "章节规划已更新"
             action = "可以按当前规划继续写作。" if published else str(result.get("next_action") or "")
             return f"{title}{chapters}。{action}"[:300]
+        actual_reply = workflow_result_summary(result)
+        if actual_reply:
+            return actual_reply[:300]
         for key in ("reply", "help", "gate", "message", "summary", "next_action"):
             if result.get(key):
                 return str(result[key])[:300]
@@ -3290,7 +4470,8 @@ def _list_batch_summaries(project: InkFlowProject) -> list[dict[str, Any]]:
             )
             if repair_status == "waiting_suffix_review":
                 resumable = False
-            if status in {"drafting", "repairing"} and source_run and source_run.get("status") in {"interrupted", "cancelled", "failed"}:
+            if status in {"drafting", "repairing"} and source_run and source_run.get("status") in {
+                    "interrupted", "cancelled", "failed", "waiting_user", "waiting_condition", "completed"}:
                 status = "interrupted"
                 resumable = True
             if source_run and source_run.get("status") == "running":
@@ -3304,6 +4485,17 @@ def _list_batch_summaries(project: InkFlowProject) -> list[dict[str, Any]]:
             targets = [chapter for chapter in current_chapters if first <= chapter["chapter_no"] <= last]
             current_complete = (last >= first and len(targets) == last - first + 1
                 and all(chapter["source_valid"] for chapter in targets))
+            # 续写或单章修订可在原批次之外完成；只投影当前有效正文，原清单继续约束批次接受操作。
+            saved_by_number = {item["chapter_no"]: item for item in projected["chapters"]}
+            current_progress = []
+            for chapter in targets:
+                if not chapter["source_valid"]:
+                    continue
+                saved = saved_by_number.get(chapter["chapter_no"], {})
+                same_source = saved.get("source_valid") and saved.get("version") == chapter["version"]
+                current_progress.append({**(saved if same_source else {}),
+                    "chapter_no": chapter["chapter_no"], "version": chapter["version"],
+                    "status": chapter["status"], "chapter_status": chapter["status"]})
             history_reason = ""
             if current_complete and not (source_run and source_run.get("status") == "running"):
                 if all(chapter["status"] == "accepted" for chapter in targets):
@@ -3315,7 +4507,10 @@ def _list_batch_summaries(project: InkFlowProject) -> list[dict[str, Any]]:
                 "status": status,
                 "historical": bool(history_reason),
                 "history_reason": history_reason,
+                "current_chapters": current_progress,
                 "run_id": value.get("last_run_id"),
+                "conversation_id": str((source_run.get("params") or {}).get("conversation_id") or "main") if source_run else None,
+                "source_run_status": source_run.get("status") if source_run else None,
                 "resume_available": resumable,
                 "start_chapter_no": value.get("start_chapter_no"),
                 "end_chapter_no": value.get("end_chapter_no"),
@@ -3424,10 +4619,13 @@ def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
     """只记录恢复任务所需的小参数，不复制正文、API Key 或模型输出。"""
 
     allowed_by_method = {
-        "conversation.send": {"message", "collaboration_mode", "include_suggestions"},
+        "conversation.send": {"message", "collaboration_mode", "include_suggestions", "message_id", "running_run_id", "source_run_id", "steering_artifact_id", "expected_question_id", "expected_question_task_id"},
         "workflow.run": {
             "include_suggestions", "action",
             "chapter_no",
+            "expected_version", "expected_hash",
+            "source_run_id", "expected_question_id", "expected_question_task_id",
+            "authorization_source",
             "start_chapter_no",
             "end_chapter_no",
             "draft_only",
@@ -3447,6 +4645,8 @@ def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
         "chapter.review_panel": {"chapter_no", "dimensions"},
         "memory.preview": {"chapter_no", "user_accepted"},
         "manual_edits.review": {"job_id"},
+        "memory.attachments": {"work_id", "chapter_no", "parent_run_id", "_resume"},
+        "knowledge.maintain": {"resume_run_id", "gaps_only"},
         "collaboration.reply": {"thread_id", "recipient_role", "question"},
         "voice.clone_script.generate": set(),
         "project.ideate": {"preferences", "fast"},
@@ -3465,14 +4665,14 @@ def _task_params(method: str, params: dict[str, Any]) -> dict[str, Any]:
         "task.retry": {"task_id"},
     }
     allowed = allowed_by_method.get(method, set())
-    allowed = allowed | {"conversation_id"}
+    allowed = allowed | {"conversation_id", "_background", "parent_run_id", "_background_pending_revision"}
     return {key: params[key] for key in allowed if key in params}
 
 
 _TASK_SETTINGS_METHODS = frozenset({
     "conversation.send", "workflow.run", "document.revise_selection",
-    "document.prefill", "chapter.writer_candidates", "chapter.review_panel", "memory.preview", "manual_edits.review",
-    "collaboration.reply", "voice.clone_script.generate", "reference.analyze",
+    "document.prefill", "chapter.writer_candidates", "chapter.review_panel", "memory.preview", "manual_edits.review", "memory.attachments",
+    "collaboration.reply", "voice.clone_script.generate", "reference.analyze", "preferences.materials.analyze", "knowledge.maintain",
     "project.ideate", "prompt.optimize", "provider.test",
 })
 
@@ -3488,7 +4688,44 @@ def _should_track_task(method: str, params: dict[str, Any]) -> bool:
     }
 
 
+def _failure_task_heading(operation: dict[str, Any]) -> str:
+    """用真实工作流/直接操作描述失败范围；章号和角色本身不能证明正文已生成或已审查。"""
+    action = operation.get("action")
+    action = action if isinstance(action, str) else ""
+    labels = {
+        "plan": "规划", "outline": "大纲规划", "redesign_story": "故事规划",
+        "plan_brief": "规划", "plan_next_arc": "篇章规划", "plan_preview": "规划预览",
+        "planning_history_view": "规划查看", "planning_history_restore": "规划恢复",
+        "planning_publish_reviewed": "规划发布",
+        "write_draft": "正文写作", "scene_draft": "场景草稿",
+        "write_review": "正文写作与检查", "write_review_accept": "正文写作与收稿",
+        "review": "正文审查", "review_accept": "正文审查与收稿", "accept": "正文收稿",
+        "revise_draft": "正文修改", "revise_selection": "正文修改",
+        "revise_review": "正文修改与检查", "revise_review_accept": "正文修改与收稿",
+        "repair_accepted": "已接受正文核对", "story_setting_edit": "设定修改",
+    }
+    step = labels.get(action, "")
+    if action == "story_settings_manage":
+        step = "设定核对" if operation.get("operation") == "audit" else "设定维护"
+    # 这些直接入口本身具有明确用途；conversation.send和role/stage不作为替代证据。
+    if not action:
+        step = {"chapter.review_panel": "正文审查", "manual_edits.review": "修改核对",
+                "document.revise_selection": "文档修改"}.get(operation.get("method"), "")
+    if not step:
+        return "这一步未完成。"
+    chapter = operation.get("chapter_no")
+    chapter = chapter if type(chapter) is int and chapter > 0 else None
+    end = operation.get("end_chapter_no")
+    end = end if type(end) is int and chapter is not None and end >= chapter else chapter
+    # 设定任务可能带来源章号，那不是待写章节，不能把来源章号投影成正文失败范围。
+    scope = ""
+    if chapter and action not in {"story_settings_manage", "story_setting_edit"}:
+        scope = f"第 {chapter}{f'～{end}' if end != chapter else ''} 章的"
+    return f"{scope}{step}在这一步暂停。"
+
+
 def _error_payload(exc: Exception, operation: dict[str, Any] | None = None) -> dict[str, Any]:
+    """保留真实错误身份并生成可操作说明；任务名称只取已确认的工作流用途。"""
     message = str(exc) or "墨流遇到未知错误。"
     normalized = message.casefold()
     http_match = re.search(r"\bHTTP\s+(\d{3})\b", message, re.IGNORECASE)
@@ -3509,7 +4746,7 @@ def _error_payload(exc: Exception, operation: dict[str, Any] | None = None) -> d
         )
     elif isinstance(exc, KeyError):
         payload.update(title="任务衔接出现程序错误",
-            message="审查结果已经返回，但墨流读取暂停原因时出错了。这是任务衔接的程序问题，需要修复结果读取后从本章审查继续。" if exc.args == ("stop_reason",) else "墨流读取任务结果时缺少必要的状态字段，无法确定下一步。这是程序衔接问题，需要先修复结果读取，再续接出错步骤。")
+            message="墨流读取本步暂停原因时缺少必要的状态字段。需要修复任务衔接，再从断点继续。" if exc.args == ("stop_reason",) else "墨流在整理本步结果时中断，未能取得完整的处理状态。需要修复任务衔接，再核对当前资料和已有结果后继续。")
     elif isinstance(exc, ValidationError):
         issues = exc.errors(include_input=False)
         names = {"memory_patch": "记忆更新", "evidence_refs": "附加证据", "evidence": "证据原文", "quote": "引用原文", "source_comparisons": "规划对照", "assessments": "审查依据", "chapter_no": "章号", "hook_note": "创作说明", "content": "正文", "max_output_tokens": "单次输出上限", "context_window": "上下文容量"}
@@ -3525,6 +4762,18 @@ def _error_payload(exc: Exception, operation: dict[str, Any] | None = None) -> d
                 for item in issues
             ],
         )
+    elif (isinstance(exc, ValueError) and (operation or {}).get("method") == "voice.job.delete"
+            and message in {"删除前需要确认本任务的音频及转换副本。", "请先停止此语音任务，再删除音频。",
+                "语音任务目录不在允许范围内，未删除。", "音频目录指向外部位置，未删除。",
+                "本任务的音频正在删除，请稍候。", "当前项目没有这个语音转换任务。",
+                "语音任务编号无效。", "没有找到这个语音转换任务。",
+                "这条旧任务指向其他语音目录，为保护已有文件，本页不能直接删除。请先在语音设置核对保存位置。",
+                "音频文件夹指向本任务以外的位置，已保留文件。请先核对语音保存位置。"}):
+        # 仅识别听读删除入口的明确业务门禁；未知 ValueError 仍按程序异常处理，不能误报写章失败。
+        payload.update(code="voice_delete_blocked", title="听读音频暂未删除",
+            message=("音频目录与当前语音保存位置不一致。为避免删错文件，墨流保留了音频；请先核对保存位置。"
+                if message in {"语音任务目录不在允许范围内，未删除。", "音频目录指向外部位置，未删除。"} else message),
+            actions=[{"id": "open_voice", "label": "在听读中心核对音频与保存位置"}], retryable=False)
     elif "@quote:" in message:
         count = len(set(re.findall(r"@quote:\d+", message)))
         payload.update(title="审查引用还没有核对完成",
@@ -3559,6 +4808,19 @@ def _error_payload(exc: Exception, operation: dict[str, Any] | None = None) -> d
             actions=[{"id": "open_settings", "label": "检查模型与接口配置"},
                      {"id": "open_process", "label": "查看接口错误详情"}], retryable=False,
         )
+    elif "报告已完整返回，但" in message or "模型报告已返回，但" in message:
+        payload.update(title="报告已返回，有一项判断需要补正", message=message,
+            actions=[{"id": "open_process", "label": "查看没有给出有效结论的检查项"}])
+    elif "已用完获准的" in message:
+        payload.update(title="本次允许的角色请求次数已用完",
+            message=message + " 当前草稿和已有结果保留；继续补核需要明确追加该角色的请求额度。",
+            actions=[{"id": "open_process", "label": "查看该角色的已用次数和待核问题"}])
+    elif "本步没有发送新的模型请求" in message:
+        payload.update(title="本步尚未发送新请求", message=message,
+            actions=[{"id": "open_process", "label": "查看额度或前置条件"}])
+    elif any(word in message for word in ("空响应体", "没有返回可用的回复文本", "没有提供回复条目", "回复消息缺失或格式错误")):
+        payload.update(title="模型服务没有提供可用回复", message=message,
+            actions=[{"id": "open_process", "label": "核对本次接收状态和已保存结果"}])
     elif any(word in normalized for word in ("api key", "密钥", "模型接口", "服务商")):
         payload.update(
             title="模型配置需要处理",
@@ -3588,9 +4850,9 @@ def _error_payload(exc: Exception, operation: dict[str, Any] | None = None) -> d
     elif "finish_reason=length" in normalized or "空 json 内容" in normalized:
         payload.update(
             title="模型输出被截断或没有正文",
-            message="模型在结果写完之前就达到单次输出上限，返回内容无法完整解析。请检查该模型实际支持的输出上限和本步预算，再从这个步骤继续。" if "finish_reason=length" in normalized else "模型没有返回可解析的结果内容。请查看本步返回记录，核对接口格式及服务状态后再继续。",
+            message="服务商在结果写完前结束输出，返回内容无法完整解析。请查看本步返回记录和模型支持的输出范围，核对后只续接未完成部分。" if "finish_reason=length" in normalized else "模型没有返回可解析的结果内容。请查看本步返回记录，核对接口格式及服务状态后再继续。",
             actions=[{"id": "open_process", "label": "查看本次输出与重试记录"},
-                     {"id": "open_settings", "label": "检查单次输出上限"}],
+                     {"id": "open_settings", "label": "核对模型与接口配置"}],
             retryable=False,
         )
     elif _has_transient_transport_cause(exc) or (
@@ -3601,7 +4863,7 @@ def _error_payload(exc: Exception, operation: dict[str, Any] | None = None) -> d
     ):
         payload.update(
             title="模型调用没有正常返回",
-            message="连接在完整结果返回前中断或超时，墨流无法确认本步结果。请先核对任务状态和网络，再续接未完成步骤，避免重复生成。",
+            message=message if any(word in message for word in ("字节响应数据", "思考阶段数据", "回复正文字符")) else "连接在完整结果返回前中断或超时，墨流无法确认本步结果。请先核对任务状态和网络，再续接未完成步骤，避免重复生成。",
             actions=[
                 {"id": "open_process", "label": "先查看任务状态"},
                 {"id": "retry", "label": "确认后重试"},
@@ -3625,7 +4887,7 @@ def _error_payload(exc: Exception, operation: dict[str, Any] | None = None) -> d
     elif isinstance(exc, NameError):
         payload.update(
             title="任务衔接出了程序错误",
-            message="审核结果已经返回，但墨流整理引用时没有正确取得当前章号。需要修复引用整理步骤，再续接本章审核。" if exc.name == "chapter_no" else "程序执行这一步时读取了尚未建立的内部信息。需要修复本步的信息传递，再从断点继续。",
+            message="墨流执行本步时没有正确取得所需章号。需要修复信息传递，再从断点继续。" if exc.name == "chapter_no" else "程序执行这一步时读取了尚未建立的内部信息。需要修复本步的信息传递，再从断点继续。",
             actions=[{"id": "open_process", "label": "查看出错步骤与恢复条件"}],
             retryable=False,
         )
@@ -3634,11 +4896,13 @@ def _error_payload(exc: Exception, operation: dict[str, Any] | None = None) -> d
     else:
         payload["message"] = "墨流处理任务时遇到了程序异常，当前记录还不足以确定具体原因。请展开本次诊断定位出错步骤，修复后从该步骤继续。"
     operation = operation or {}
-    stage = str(operation.get("stage") or operation.get("method") or "")
-    step = "审查与记忆核对" if any(key in stage for key in ("review", "mode.", "editor", "memory")) else "规划" if any(key in stage for key in ("plan", "outline")) else "写作" if any(key in stage for key in ("writer", "draft")) else ""
     chapter = operation.get("chapter_no")
-    if step:
-        payload["message"] = f"{f'第 {chapter} 章的' if chapter else ''}{step}在这一步暂停。\n{payload['message']}"
+    chapter = chapter if isinstance(chapter, int) and not isinstance(chapter, bool) and chapter > 0 else None
+    if operation.get("run_id"):
+        payload["run_id"] = operation["run_id"]
+    if chapter:
+        payload["chapter_no"] = chapter
+    payload["message"] = f"{_failure_task_heading(operation)}\n{payload['message']}"
     if os.getenv("INKFLOW_DEBUG") == "1" and not isinstance(exc, ValidationError):
         payload["details"] = traceback.format_exc(limit=5)
     return payload

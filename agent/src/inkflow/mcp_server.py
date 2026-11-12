@@ -37,6 +37,50 @@ RECOVERY_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idemp
 EXTERNAL_READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True)
 
 
+@mcp.tool(annotations=READ_ONLY)
+def novel_skills_list(project_root: str | None = None) -> dict[str, Any]:
+    """列出内置、个人及可选本书技能、触发范围和兼容问题；不调用模型。"""
+    from .skills import SkillLibrary
+    return SkillLibrary(project_root).list()
+
+
+@mcp.tool(annotations=READ_ONLY)
+def novel_skill_read(skill_id: str, project_root: str | None = None) -> dict[str, Any]:
+    """按库/技能名读取全部文本与资源清单，外部脚本仅供查看。"""
+    from .skills import SkillLibrary, public_skill
+    return public_skill(SkillLibrary(project_root).get(skill_id), include_texts=True)
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def novel_skill_create(name: str, description: str, scope: str = "personal", project_root: str | None = None) -> dict[str, Any]:
+    """创建未启用的简单技能模板，不覆盖同名包、不执行模型或脚本。"""
+    from .skills import SkillLibrary
+    return SkillLibrary(project_root).create(name=name, description=description, scope=scope)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def novel_skill_import_preview(source: str, project_root: str | None = None) -> dict[str, Any]:
+    """只读预览本地标准目录、SKILL.md或ZIP，返回保存所需的内容哈希。"""
+    from .skills import SkillLibrary
+    return SkillLibrary(project_root).preview(source)
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def novel_skill_import(source: str, expected_hash: str, scope: str = "personal", project_root: str | None = None) -> dict[str, Any]:
+    """作者明确选择后导入刚预览的同版技能，默认未启用且不执行外部程序。"""
+    from .skills import SkillLibrary
+    return SkillLibrary(project_root).import_skill(source=source, scope=scope, expected_hash=expected_hash)
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def novel_skill_configure(skill_id: str, expected_hash: str, enabled: bool, automatic: bool = False,
+                         project_root: str | None = None, control_scope: str | None = None) -> dict[str, Any]:
+    """启用或关闭已检查的当前版本，被动触发还须具备具体角色、步骤和排除条件。"""
+    from .skills import SkillLibrary
+    return SkillLibrary(project_root).configure(skill_id, enabled=enabled, automatic=automatic,
+        expected_hash=expected_hash, control_scope=control_scope)
+
+
 def _workspace() -> Path:
     return Path(os.getenv("INKFLOW_WORKSPACE", os.getcwd())).resolve()
 
@@ -244,7 +288,7 @@ async def novel_continue_until(
     target_characters: int | None = None,
     instruction: str = "",
     target_chapter_no: int | None = None,
-    max_revision_rounds: int = 1,
+    max_revision_rounds: int = 10,
     project_root: str | None = None,
 ) -> dict[str, Any]:
     """循环执行写作、审查、必要修订、重审和记忆提交，直到正史达到字符目标、结束章节或门禁停止。"""
@@ -264,7 +308,7 @@ async def novel_batch_draft(
     start_chapter_no: int,
     end_chapter_no: int,
     instruction: str = "",
-    max_revision_rounds: int = 2,
+    max_revision_rounds: int = 10,
     project_root: str | None = None,
 ) -> dict[str, Any]:
     """生成临时批次草稿；逐章即时审查，但不调用 记忆服务 或提交正史。"""
@@ -645,7 +689,7 @@ def prompt_start_novel(idea: str, chapter_words: int = 3000) -> str:
 def prompt_batch_draft(start_chapter: int, end_chapter: int, instruction: str = "") -> str:
     return (
         f"请调用 novel_batch_draft 生成第 {start_chapter}～{end_chapter} 章。"
-        "逐章 Writer→Reviewer→必要时最多两轮 Writer 修订与重审；批次完成前不提交正史。"
+        "逐章写作、审核与必要的定点补核和修复，同一步累计最多10次；批次完成前不提交正史。"
         f"用户补充：{instruction or '无'}"
     )
 

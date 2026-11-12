@@ -62,13 +62,64 @@ def notes_hash(notes: dict[str, Any]) -> str:
     return content_hash(json_dumps(notes)) if notes else ""
 
 
+def clarification_input_notes(project: Any, notes: dict[str, Any]) -> dict[str, Any] | None:
+    """仅还原当前说明确由同版已答短答更正前的输入；不把任意说明变化当可恢复。"""
+    identity = notes.get("clarification_source", {}).get("artifact_id")
+    answer = project.db.get_agent_artifact(identity) if identity else None
+    data = answer.get("data", {}) if answer else {}
+    if (not answer or answer.get("artifact_type") != "writer_note_clarification" or answer.get("role") != "writer"
+            or answer.get("status") == "superseded" or data.get("status") != "answered"
+            or answer.get("chapter_no") != notes.get("chapter_no")
+            or answer.get("chapter_version") != notes.get("chapter_version")
+            or data.get("source_hash") != notes.get("content_hash")):
+        return None
+    hooks = [item for key in notes.get("artifact_ids", []) if (item := project.db.get_agent_artifact(key))
+        and item.get("artifact_type") == "writer_hook_note" and item.get("status") == "current"
+        and item.get("chapter_no") == notes.get("chapter_no") and item.get("chapter_version") == notes.get("chapter_version")]
+    chapter = project.db.get_chapter(notes["chapter_no"])
+    if len(hooks) != 1 or not chapter or chapter.get("content_hash") != notes.get("content_hash"):
+        return None
+    body = project.resolve_user_path(chapter["path"]).read_text(encoding="utf-8")
+    if content_hash(body) != notes["content_hash"]:
+        return None
+    before = {key: value for key, value in notes.items() if key != "clarification_source"}
+    before["hook_note"], _ = align_annotation_quotes(hooks[0]["data"], body)
+    corrected = data.get("reply", {}).get("corrected_hook_note")
+    if (notes_hash(before) != data.get("writer_notes_hash") or not isinstance(corrected, dict)
+            or {**before["hook_note"], **corrected} != notes.get("hook_note") or annotation_gaps(corrected, body)):
+        return None
+    return before
+
+
+WRITER_NOTE_QUESTION_CONTRACT_VERSION = 2
+
+
 def annotation_gaps(note: dict[str, Any], content: str) -> list[str]:
     gaps = []
     for index, item in enumerate(note.get("annotations", [])):
         quote = str(item.get("quote") or "").strip()
         if (item.get("kind") in {"new_fact", "interpretation"} and not quote) or (quote and quote not in content):
             gaps.append(f"说明第{index + 1}项原句未定位，请纠正或撤回该项说明，不改正文：{str(item.get('statement') or '')[:160]}")
+    for item in note.get("promise_work", []):
+        quote = str(item.get("quote") or "").strip()
+        if (item.get("action") != "delay" and not quote) or (quote and quote not in content):
+            gaps.append(f"伏笔交接 {item.get('thread_id', '')} 的实际落点原句未定位，请更正说明，不改正文")
     return gaps
+
+
+def remaining_note_quote_repair(previous: dict[str, Any], notes: dict[str, Any], content: str) -> tuple[str, int] | None:
+    """完整短答有实际进展且仅剩一条引文时，允许一次只返回该字段的补救，不循环扩额。"""
+    if (previous.get("status") != "incomplete" or previous.get("single_quote_repair")
+            or previous.get("question_contract_version") != WRITER_NOTE_QUESTION_CONTRACT_VERSION):
+        return None
+    corrected = previous.get("reply", {}).get("corrected_hook_note")
+    if (not isinstance(corrected, dict) or len(annotation_gaps(corrected, content)) != 1
+            or len(annotation_gaps(notes.get("hook_note", {}), content)) <= 1):
+        return None
+    paths = [(kind, index) for kind in ("annotations", "promise_work")
+        for index, item in enumerate(corrected.get(kind, []))
+        if str(item.get("quote") or "").strip() and str(item["quote"]).strip() not in content]
+    return paths[0] if len(paths) == 1 else None
 
 
 def clarify_annotation_quotes(note: dict[str, Any], questions: list[str], reply: dict[str, Any], content: str) -> dict[str, Any]:

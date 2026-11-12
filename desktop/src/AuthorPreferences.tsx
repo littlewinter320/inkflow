@@ -1,94 +1,93 @@
-import { useEffect, useState } from "react";
-import { readableSourceText } from "./readableNames";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 type Preference = {
   preference_id: string; text: string; strength: string; scope: string; status: string;
   source_quote?: string; source_ref?: string; topic?: string; revision?: number; level?: string; usage_source?: string;
 };
-type StyleDefault = {
-  name: string; basis: string; priority: string; guides: Array<{ name: string; guidance: string }>;
-  examples?: Array<{ name: string; before: string; after: string; method: string }>;
-};
-type PreferenceSelection = {
-  chapter_no?: number; task?: string; mode?: string; collaboration_mode?: string;
-  selected?: Preference[]; omitted?: Array<{ preference_id: string; text?: string; reason: string }>;
-  budget_reason?: string; warnings?: string[];
-  actor?: string; context_packet_id?: string; recorded_at?: string;
-  voice_budget_tokens?: number; voice_selected_tokens?: number;
-  writing_guides?: Array<{ name: string; source_id: string }>;
-};
-type PreferenceDecision = {
-  run_id: string; created_at: string;
-  decisions: Array<{ status: "resolved" | "needs_choice" | "stale"; reason: string;
-    selected_id?: string; preference_ids: string[]; source_quotes: string[] }>;
-};
 type PreferenceUsage = {
-  disabled: string[]; selection: PreferenceSelection;
-  decisions?: PreferenceDecision[]; learning_enabled?: boolean;
+  disabled: string[]; learning_enabled?: boolean;
 };
 type Event = { event_id: string; reason: string; created_at: string; before?: Preference; after: Preference };
-type MemoryAudit = { facts: Array<{ fact_id: string; subject: string; predicate: string; status: string;
-  evidence_refs: Array<{ source_chapter: number; source_version: number; quote: string; relation: string; status: string }>;
-  dependent_artifacts: string[] }>; events: Array<{ event_id: string; fact_id: string; action: string; reason: string; created_at: string }>;
-  notice: string };
+type MaterialTask = { run_id: string; status: string; summary?: string; error_message?: string;
+  analysis?: { reason: string; applicability: string; preference: string; question: string; level: string; scope: string;
+    coverage?: string[];
+    strengths: Array<{ quote: string; location: string; explanation: string }> } };
 
+// 管理跨书习惯、本书偏好和反馈学习开关。
 export function AuthorPreferences({ projectRoot }: { projectRoot: string }) {
   const [level, setLevel] = useState("author");
   const [items, setItems] = useState<Preference[]>([]);
-  const [styleDefault, setStyleDefault] = useState<StyleDefault | null>(null);
   const [editing, setEditing] = useState<Preference | null>(null);
   const [text, setText] = useState("");
   const [scope, setScope] = useState("project");
-  const [topic, setTopic] = useState("");
   const [quote, setQuote] = useState("");
-  const [sourceRef, setSourceRef] = useState("");
   const [reason, setReason] = useState("");
   const [strength, setStrength] = useState("weak");
   const [events, setEvents] = useState<Event[]>([]);
   const [disabled, setDisabled] = useState<string[]>([]);
-  const [usage, setUsage] = useState<PreferenceSelection>({});
-  const [decisions, setDecisions] = useState<PreferenceDecision[]>([]);
   const [learningEnabled, setLearningEnabled] = useState<boolean | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [memory, setMemory] = useState<MemoryAudit | null>(null);
+  const [materialFiles, setMaterialFiles] = useState<string[]>([]);
+  const [materialTasks, setMaterialTasks] = useState<MaterialTask[]>([]);
+  const [materialNotice, setMaterialNotice] = useState("");
+  const [materialError, setMaterialError] = useState("");
+  const [submittingMaterial, setSubmittingMaterial] = useState(false);
+  const [materialAnswers, setMaterialAnswers] = useState<Record<string, string>>({});
+  const materialRead = useRef(0);
   const scopeKind = scope.split(":", 1)[0];
   const scopeLabels: Record<string, string> = { project: "整个作品", genre: "指定题材", scene: "指定场景", character: "指定人物", chapter: "指定章节", arc: "指定篇章" };
   const scopeText = (value?: string) => value ? (scopeLabels[value.split(":", 1)[0]] || value)
     + (value.includes(":") ? "：" + value.slice(value.indexOf(":") + 1) : "") : "旧记录未保存范围";
-  const levelText = (value?: string) => value === "author" ? "作者默认" : value === "project" ? "本书偏好" : "旧记录未保存层级";
-  const mode = usage.collaboration_mode || usage.mode;
-  const modeLabels: Record<string, string> = { everyday: "日常", review_boost: "审查加强", memory_boost: "记忆加强", full_specialist: "全专项", review: "章节审核", draft: "写章", revise: "修订" };
-  const actorLabels: Record<string, string> = { writer: "写作", editor: "综合审读", reviewer: "专项审查", memory_keeper: "记忆整理", coordinator: "任务协调" };
-  const preferenceName = (id: string) => {
-    const item = [...items, ...(usage.selected || [])].find(value => value.preference_id === id);
-    return item?.topic || (item?.text ? item.text.slice(0, 60) + (item.text.length > 60 ? "…" : "") : "相关习惯（原话见下方）");
-  };
   const api = <T,>(action: string, values: Record<string, unknown> = {}) =>
     window.inkflow.request<T>("preferences.manage", { project_root: projectRoot, level, action, ...values });
   const refresh = async () => {
-    const value = await api<{ preferences: Preference[]; style_default?: StyleDefault }>("list");
+    const value = await api<{ preferences: Preference[] }>("list");
     setItems(value.preferences);
-    setStyleDefault(value.style_default || null);
     if (projectRoot) {
       const result = await api<PreferenceUsage>("usage");
-      setDisabled(result.disabled); setUsage(result.selection); setDecisions(result.decisions || []);
+      setDisabled(result.disabled);
       setLearningEnabled(typeof result.learning_enabled === "boolean" ? result.learning_enabled : null);
     }
   };
+  // 后台结果按小说读取，关闭设置后任务仍由引擎负责。
+  const refreshMaterials = useCallback(async () => {
+    if (!projectRoot) return;
+    const sequence = ++materialRead.current;
+    try {
+      const result = await window.inkflow.request<{ tasks: MaterialTask[] }>(
+        "preferences.materials.list", { project_root: projectRoot });
+      if (sequence === materialRead.current) setMaterialTasks(result.tasks);
+    } catch (cause) {
+      if (sequence === materialRead.current) setMaterialError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }, [projectRoot]);
+  useEffect(() => {
+    setMaterialFiles([]); setMaterialTasks([]); setMaterialError(""); setMaterialNotice(""); setMaterialAnswers({});
+    void refreshMaterials();
+    if (!projectRoot) return;
+    const unsubscribe = window.inkflow.onEvent(value => {
+      const event = value as { run_id?: string; type?: string; project_root?: string };
+      if (event.project_root?.toLowerCase() === projectRoot.toLowerCase() &&
+        event.run_id?.startsWith("preference-material-") && event.type?.startsWith("run.")) {
+        void refreshMaterials();
+      }
+    });
+    return () => { unsubscribe(); ++materialRead.current; };
+  }, [projectRoot, refreshMaterials]);
   useEffect(() => {
     let current = true;
-    setItems([]); setEvents([]); setEditing(null); setText(""); setUsage({}); setError(""); setMemory(null);
-    setDisabled([]); setDecisions([]); setLearningEnabled(null);
+    setItems([]); setEvents([]); setEditing(null); setText(""); setError("");
+    setDisabled([]); setLearningEnabled(null);
     if (level === "project" && !projectRoot) return;
-    void window.inkflow.request<{ preferences: Preference[]; style_default?: StyleDefault }>("preferences.manage", {
+    void window.inkflow.request<{ preferences: Preference[] }>("preferences.manage", {
       project_root: projectRoot, level, action: "list",
-    }).then(value => { if (current) { setItems(value.preferences); setStyleDefault(value.style_default || null); } })
+    }).then(value => { if (current) setItems(value.preferences); })
       .catch(cause => { if (current) setError(String(cause)); });
     if (projectRoot) void window.inkflow.request<PreferenceUsage>(
       "preferences.manage", { project_root: projectRoot, level, action: "usage" },
     ).then(value => { if (current) {
-      setDisabled(value.disabled); setUsage(value.selection); setDecisions(value.decisions || []);
+      setDisabled(value.disabled);
       setLearningEnabled(typeof value.learning_enabled === "boolean" ? value.learning_enabled : null);
     } })
       .catch(cause => { if (current) setError(String(cause)); });
@@ -101,30 +100,51 @@ export function AuthorPreferences({ projectRoot }: { projectRoot: string }) {
   };
   const edit = (item: Preference | null) => {
     setEditing(item); setText(item?.text || ""); setScope(item?.scope || "project");
-    setTopic(item?.topic || ""); setQuote(item?.source_quote || ""); setSourceRef(item?.source_ref || "");
+    setQuote(item?.source_quote || "");
     setStrength(item?.strength || "weak"); setReason("");
   };
   const changeStatus = (item: Preference, status: string) => run(async () => {
     await api("save", { ...item, status, expected_revision: item.revision || 0,
       reason: status === "active" ? "用户确认采用" : "用户停止使用，保留历史" }); await refresh();
   });
+  // 使用原生文件选择器，分析时传路径，桌面界面不读取文件正文。
+  const chooseMaterials = async () => {
+    setMaterialError("");
+    try {
+      const files = await window.inkflow.choosePreferenceMaterials();
+      if (files.length > 4) throw new Error("一次最多选择 4 个文件。");
+      if (files.length) setMaterialFiles(files);
+    } catch (cause) {
+      setMaterialError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+  const submitMaterials = async (questionTask?: MaterialTask) => {
+    if (submittingMaterial || !projectRoot) return;
+    setSubmittingMaterial(true); setMaterialError(""); setMaterialNotice("");
+    try {
+      await window.inkflow.request("preferences.materials.start", {
+        project_root: projectRoot,
+        material: { files: materialFiles, excerpt: quote, level: questionTask?.analysis?.level || level,
+          scope: questionTask?.analysis?.scope || scope, instruction: text },
+        ...(questionTask && { answer_to: questionTask.run_id, answer: materialAnswers[questionTask.run_id] }),
+      });
+      setMaterialNotice("已交给后台分析。你可以关闭设置，在后台任务中查看结果。");
+      await refreshMaterials();
+    } catch (cause) {
+      setMaterialError(cause instanceof Error ? cause.message : "素材暂时无法读取或提交，请检查文件编码后重试。");
+    } finally { setSubmittingMaterial(false); }
+  };
+  // 采用和结束都绑定原回执，刷新习惯时复用正常保存后的读入流程。
+  const decideMaterial = (task: MaterialTask, decision: "adopt" | "dismiss") => run(async () => {
+    const result = await window.inkflow.request<{ summary: string }>("preferences.materials.decide", {
+      project_root: projectRoot, run_id: task.run_id, decision,
+    });
+    setMaterialNotice(result.summary);
+    await refreshMaterials();
+    if (decision === "adopt") await refresh();
+  });
   return <section className="stack-section author-preferences">
     <p className="form-hint">作者默认习惯可跨书使用。本书要求和当前指令优先；人物经历与剧情不会进入作者习惯。这里的保存立即生效。</p>
-    {styleDefault && <details className="memory-card">
-      <summary>基础写作技能 · {styleDefault.name} · 默认启用</summary>
-      <p className="form-hint">{styleDefault.basis} 写作、局部修订与表达审核共用这些引导。</p>
-      <p className="form-hint">{styleDefault.priority} 可以在下方保存自己的要求来调整。</p>
-      {styleDefault.guides.map(guide => <p key={guide.name}><strong>{guide.name}：</strong>{guide.guidance}</p>)}
-      <details><summary>查看表达示例</summary>
-        {styleDefault.examples?.map(example => <article key={example.name}>
-          <strong>{example.name}</strong>
-          <p className="form-hint">常见问题：{example.before}</p>
-          <blockquote style={{ whiteSpace: "pre-line" }}>{example.after}</blockquote>
-          <p>{example.method}</p>
-        </article>)}
-        <p className="form-hint">示例只演示表达，不会作为本书人物或剧情使用。基础技能随软件提供，无需每次导入样稿。</p>
-      </details>
-    </details>}
     <label>管理范围<select disabled={busy} value={level} onChange={event => { setLevel(event.target.value); edit(null); }}>
       <option value="author">作者默认习惯 · 所有小说</option>
       <option value="project" disabled={!projectRoot}>本书偏好</option>
@@ -143,9 +163,7 @@ export function AuthorPreferences({ projectRoot }: { projectRoot: string }) {
         {level === "project" && <><option value="character">指定人物</option><option value="chapter">指定章节</option><option value="arc">指定篇章</option></>}
       </select></label>
       {scopeKind !== "project" && <label>{scopeLabels[scopeKind]}名称<input value={scope.slice(scope.indexOf(":") + 1)} onChange={event => setScope(scopeKind + ":" + event.target.value)} placeholder={scopeKind === "chapter" ? "章节数字，例如 12" : "例如：悬疑、争吵、人物姓名"} /></label>}
-      <label>同类习惯名称<input value={topic} onChange={event => setTopic(event.target.value)} placeholder="例如：叙事节奏" /></label>
       <label>原话或满意片段<textarea value={quote} onChange={event => setQuote(event.target.value)} maxLength={8000} /></label>
-      <label>来源位置<input value={sourceRef} onChange={event => setSourceRef(event.target.value)} placeholder="消息或章节位置，可留空" /></label>
       <label>修改原因<input value={reason} onChange={event => setReason(event.target.value)} maxLength={2000} /></label>
       {level === "project" && <label>要求强度<select value={strength} onChange={event => setStrength(event.target.value)}>
         <option value="weak">普通偏好</option><option value="hard">本书明确硬要求</option>
@@ -156,17 +174,66 @@ export function AuthorPreferences({ projectRoot }: { projectRoot: string }) {
     <div className="settings-inline-actions">
       <button type="button" disabled={busy || !text.trim()} onClick={() => void run(async () => {
         await api("save", { preference_id: editing?.preference_id, expected_revision: editing?.revision || 0,
-          text, scope, topic, source_quote: quote || text, source_ref: sourceRef,
+          text, scope, source_quote: quote || text,
           strength: level === "author" ? "weak" : strength, reason: reason || "用户在设置中保存", status: "active" });
         edit(null); await refresh();
       })}>{editing ? "保存修改" : "添加习惯"}</button>
       {editing && <button type="button" onClick={() => edit(null)}>取消编辑</button>}
     </div>
+    {!editing && <div className="memory-card">
+      <strong>分析写作素材</strong>
+      <p className="form-hint">可选 TXT、Markdown、Word（DOCX）、PDF、EPUB、HTML，或粘贴片段。最多 4 个文件，每个最多 1 GB。全文按模型容量分批阅读，显示实际进度与范围；模型调用仍遵守本次预算。</p>
+      {projectRoot ? <>
+        <button type="button" disabled={submittingMaterial} onClick={() => void chooseMaterials()}>选择素材文件</button>
+        {materialFiles.length > 0 && <><ul>{materialFiles.map(file => <li key={file}>{file.split(/[\\/]/).at(-1)}</li>)}</ul>
+          <button type="button" disabled={submittingMaterial} onClick={() => setMaterialFiles([])}>清除已选文件</button></>}
+        <button type="button" disabled={submittingMaterial || (!materialFiles.length && !quote.trim())}
+          onClick={() => void submitMaterials()}>{submittingMaterial ? "正在提交…" : "交给后台分析"}</button>
+      </> : <p className="form-hint">打开一本小说后即可提交素材分析。</p>}
+    </div>}
+    {materialNotice && <p role="status" className="form-hint">{materialNotice}</p>}
+    {materialError && <p role="alert" className="form-error">{materialError}</p>}
+    {materialTasks.map(task => {
+      const analysis = task.analysis;
+      const needsAnswer = Boolean(analysis && ["waiting_user", "interrupted"].includes(task.status));
+      const failed = ["failed", "waiting_condition", "interrupted"].includes(task.status) && !needsAnswer;
+      const running = ["running", "queued"].includes(task.status);
+      const heading = needsAnswer ? analysis?.preference ? "分析成功 · 等待确认" : "素材尚未识别为可用习惯"
+        : running ? "正在后台分析素材" : failed ? "素材分析未完成" : task.status === "cancelled" ? "分析已停止" : "素材分析已处理";
+      return <article className="memory-card" key={task.run_id}>
+        <strong>{heading}</strong>
+        <p role={failed ? "alert" : undefined}>{needsAnswer ? analysis?.reason : task.error_message || task.summary || heading}</p>
+        {analysis?.coverage?.length ? <details><summary>实际分析范围</summary><ul>
+          {analysis.coverage.map((source, index) => <li key={index}>{source}</li>)}
+        </ul></details> : null}
+        {needsAnswer && analysis && <>
+          {analysis.applicability && <p>适用性：{analysis.applicability}</p>}
+          {analysis.strengths.length > 0 && <><strong>写法加分项</strong><ul>{analysis.strengths.map((item, index) => <li key={index}>
+            <p>{item.explanation}</p><blockquote>{item.quote}</blockquote><small>{item.location}</small>
+          </li>)}</ul></>}
+          {analysis.preference && <p>建议习惯（{analysis.level === "author" ? "跨书默认" : "仅本书"} · {scopeText(analysis.scope)}）：{analysis.preference}</p>}
+          <p><strong>{analysis.question}</strong></p>
+          {!analysis.preference && <label>回答这道问题
+            <textarea value={materialAnswers[task.run_id] || ""} maxLength={2000}
+              onChange={event => setMaterialAnswers({ ...materialAnswers, [task.run_id]: event.target.value })} />
+          </label>}
+          <div className="settings-inline-actions">
+            {analysis.preference
+              ? <button type="button" disabled={busy} onClick={() => void decideMaterial(task, "adopt")}>采用这条习惯</button>
+              : <button type="button" disabled={submittingMaterial || Boolean(editing) || !materialAnswers[task.run_id]?.trim()
+                  || (!materialFiles.length && !quote.trim())} onClick={() => void submitMaterials(task)}>提交回答和素材</button>}
+            <button type="button" disabled={busy} onClick={() => void decideMaterial(task, "dismiss")}>结束这次分析</button>
+          </div>
+          {!analysis.preference && !materialFiles.length && !quote.trim() &&
+            <p className="form-hint">请在上方选择原文件或补充文件，也可以粘贴原文片段。</p>}
+        </>}
+      </article>;
+    })}
     {error && <p role="alert" className="form-error">{error}</p>}
     {items.map(item => <article className="memory-card" key={item.preference_id}>
       <strong>{({ active: "正在使用", paused: "已暂停", candidate: "待确认反馈参考，非硬要求", deleted: "已移出使用" } as Record<string, string>)[item.status] || item.status} · {scopeText(item.scope)}</strong>
-      <p className="form-hint">主题：{item.topic || "未指定"} · 修订：{item.revision === undefined ? "旧记录未保存" : `第${item.revision}次`}</p>
-      <p>{item.text}</p><details><summary>查看来源原话</summary><blockquote>{item.source_quote || "旧记录未保存原话"}</blockquote></details>
+      <p>{item.text}</p><details><summary>查看来源原话</summary><blockquote>{item.source_quote || "旧记录未保存原话"}</blockquote>
+        {item.source_ref && <small>{item.source_ref}</small>}</details>
       <div className="settings-inline-actions">
         <button type="button" disabled={busy} onClick={() => edit(item)}>编辑</button>
         <button type="button" disabled={busy} onClick={() => void changeStatus(item, item.status === "active" ? "paused" : "active")}>{item.status === "active" ? "暂停" : "采用"}</button>
@@ -181,59 +248,5 @@ export function AuthorPreferences({ projectRoot }: { projectRoot: string }) {
       <small>{event.created_at} · {event.reason}</small><p>修改前：{event.before?.text || "无"}（{event.before?.status || "无"}）</p>
       <p>修改后：{event.after.text}（{event.after.status}）</p>
     </article>)}</details>}
-    {projectRoot && <details><summary>最近一次上下文的偏好选择记录</summary>
-      <p>{usage.chapter_no === undefined ? "旧记录未保存章节" : `第 ${usage.chapter_no} 章`} · {mode ? modeLabels[mode] || mode : "旧记录未保存模式"}{usage.actor ? ` · ${actorLabels[usage.actor] || usage.actor}` : ""}</p>
-      {usage.recorded_at && <small>{usage.recorded_at}</small>}
-      {usage.task && <details><summary>查看本次完整要求</summary><p>{readableSourceText(usage.task)}</p></details>}
-      <p className="form-hint">这里显示记录中实际进入上下文的条目；最终模型输入可在关联运行记录中核对。</p>
-      <strong>实际选用</strong>
-      {usage.writing_guides?.length ? <p>本次提供的写作技能：{usage.writing_guides.map(item => item.name).join("、")}。是否正确用在正文中，仍需对照具体段落。</p>
-        : <p className="form-hint">这份旧记录未单独登记内置技能，不能根据当前设置反推当时使用了哪些技能。</p>}
-      {usage.selected?.length ? usage.selected.map(item => <article className="memory-card" key={item.preference_id}>
-        <p>{item.text}</p><small>{levelText(item.level)} · {scopeText(item.scope)}</small>
-        {item.status === "candidate" && <p className="form-hint">待确认反馈参考，非硬要求。</p>}
-        {item.usage_source && <p className="form-hint">选用位置：{item.usage_source}</p>}
-      </article>) : <p>这份记录没有额外作者习惯或本书偏好。内置写作技能与当前任务要求分别处理，不计入这里的习惯条目。</p>}
-      <strong>未选用及原因</strong>
-      {usage.omitted?.length ? usage.omitted.map(item => <article className="memory-card" key={item.preference_id}>
-        <p>{item.text || preferenceName(item.preference_id)}</p><p>原因：{readableSourceText(item.reason || "旧记录未保存原因")}</p>
-      </article>) : <p>没有记录未选用条目。</p>}
-      {usage.voice_budget_tokens !== undefined && <p className="form-hint">
-        声音参考预算：{usage.voice_budget_tokens.toLocaleString()} token；
-        {usage.voice_selected_tokens === undefined ? "旧记录未保存实际用量" : `实际声音段约 ${usage.voice_selected_tokens.toLocaleString()} token（含使用边界说明）`}。
-        这个用量只统计声音参考段，硬要求和其他上下文另计。
-      </p>}
-      <p className="form-hint">预算说明：{usage.budget_reason || (usage.voice_budget_tokens === undefined
-        ? "旧记录未保存具体预算；不能据此推断某项一定因预算被省略。"
-        : "普通习惯与待确认反馈参考按声音预算选取；具体未选用原因见各条记录，整份上下文仍受当前角色预算限制。")}</p>
-      {usage.warnings?.map((warning, index) => <p className="form-hint" key={index}>{warning}</p>)}
-      <p className="form-hint">这些参考已按记录提供给对应角色；是否写进正文，需要看实际段落和审查结果。尚未确认的反馈只作参考。</p>
-    </details>}
-    {projectRoot && <details><summary>最近冲突取舍与待答原因</summary>
-      {decisions.length ? decisions.map((record, recordIndex) => <article className="memory-card" key={`${record.run_id}-${recordIndex}`}>
-        <small>{record.created_at}</small>
-        {record.decisions.map((decision, index) => <div key={index}>
-          <strong>{({ resolved: "已确定本次取舍", needs_choice: "等待你选择", stale: "来源变化，取舍待重核" })[decision.status]}</strong>
-          <p>{readableSourceText(decision.reason)}</p>
-          {decision.selected_id && <p>本次选用：{preferenceName(decision.selected_id)}</p>}
-          <p>关联习惯：{decision.preference_ids.map(preferenceName).join("、") || "当前任务要求"}</p>
-          {decision.source_quotes.map((source, sourceIndex) => <blockquote key={sourceIndex}>{source}</blockquote>)}
-        </div>)}
-      </article>) : <p>暂无冲突取舍记录。</p>}
-      <p className="form-hint">取舍绑定原任务与来源版本；等待选择时请回答关联对话中的提问卡。这里显示记录，不改写已保存习惯。</p>
-    </details>}
-    {projectRoot && <details><summary>本书事实、证据与变更追踪</summary>
-      <button type="button" disabled={busy} onClick={() => void run(async () => {
-        setMemory(await window.inkflow.request<MemoryAudit>("memory.audit", { project_root: projectRoot }));
-      })}>读取本书记忆记录</button>
-      {memory && <><p className="form-hint">{memory.notice} 小说事实由审查与接受流程更新；这里供核对来源。</p>
-        {memory.facts.map(fact => <article className="memory-card" key={fact.fact_id}>
-          <strong>{fact.subject} · {fact.predicate} · {fact.status === "active" ? "当前记录" : "历史记录"}</strong>
-          {fact.evidence_refs.map((ref, index) => <p key={index}>第 {ref.source_chapter} 章 · v{ref.source_version || "旧版未绑定"} · {({ support: "支持", counter: "反证", belief: "人物信念", reference: "参考" } as Record<string, string>)[ref.relation]} · {ref.status === "valid" ? "来源有效" : ref.status === "retired" ? "已停用，保留历史" : "来源变化，待核对"}<br />{ref.quote}</p>)}
-          <small>已记录的直接依赖：{fact.dependent_artifacts.length} 份写作上下文</small>
-          <details><summary>该事实的增删改历史</summary>{memory.events.filter(event => event.fact_id === fact.fact_id).map(event => <p key={event.event_id}>{event.created_at} · {({ add: "新增", replace: "状态更新", supplement: "补充证据", retract: "撤销当前效力", replace_evidence: "替换附加证据", retire_evidence: "停用附加证据", evidence_add: "登记证据", evidence_replace: "重新绑定证据" } as Record<string, string>)[event.action] || "变更记录"} · {event.reason}</p>)}</details>
-        </article>)}
-      </>}
-    </details>}
   </section>;
 }
