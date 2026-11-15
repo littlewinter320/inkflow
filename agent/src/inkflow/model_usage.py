@@ -155,12 +155,13 @@ def normalized_usage(usage: dict[str, Any], *, anthropic: bool = False) -> dict[
         hit = _count(usage.get("prompt_cache_hit_tokens"))
         if hit is None:
             hit = _count(details.get("cached_tokens"))
+        write = _count(details.get("cache_write_tokens", 0))
         miss = _count(usage.get("prompt_cache_miss_tokens"))
         if prompt is not None and hit is None and miss is not None and miss <= prompt:
             hit = prompt - miss
-        if prompt is not None and hit is not None and (hit > prompt or (miss is not None and hit + miss != prompt)):
+        if prompt is not None and hit is not None and (hit > prompt or (miss is not None and hit + miss != prompt)
+                or write is not None and hit + write > prompt):
             hit = None
-        write = 0
     miss = prompt - hit - write if None not in (prompt, hit, write) else None
     return {"input_tokens": prompt, "output_tokens": output, "cache_hit_tokens": hit,
             "cache_write_tokens": write, "uncached_input_tokens": miss}
@@ -197,12 +198,15 @@ def aggregate_usage(usage: dict[str, Any]) -> dict[str, Any]:
     prompt = complete_sum("input_tokens")
     output = complete_sum("output_tokens")
     hit = complete_sum("cache_hit_tokens")
-    miss = complete_sum("uncached_input_tokens")
+    write = complete_sum("cache_write_tokens")
+    # 未命中与未缓存计费量是两个口径：本次新写入的前缀也属于未命中。
+    miss = prompt - hit if prompt is not None and hit is not None else None
     details = usage.get("prompt_tokens_details")
     result = {**usage, "prompt_tokens": prompt, "completion_tokens": output,
               "total_tokens": prompt + output if prompt is not None and output is not None else None,
               "prompt_cache_hit_tokens": hit, "prompt_cache_miss_tokens": miss,
-              "prompt_tokens_details": {**(details if isinstance(details, dict) else {}), "cached_tokens": hit}}
+              "prompt_tokens_details": {**(details if isinstance(details, dict) else {}), "cached_tokens": hit,
+                  **({"cache_write_tokens": write} if write or write is None else {})}}
     for alias, value in (("input_tokens", prompt), ("output_tokens", output)):
         if alias in result:
             result[alias] = value
@@ -210,11 +214,12 @@ def aggregate_usage(usage: dict[str, Any]) -> dict[str, Any]:
 
 
 def _cost_micros(counts: dict[str, int | None], price: dict[str, Any]) -> int | None:
+    """只有计费构成和价格均已知时才算费用。"""
     prompt, output = counts["input_tokens"], counts["output_tokens"]
     if prompt is None or output is None or price["kind"] == "unknown":
         return None
-    # Generic two-rate settings cannot price Anthropic cache writes reliably.
-    if counts.get("cache_write_tokens"):
+    # 现有价格配置只涵盖普通输入和缓存读取；不同缓存写入档不能套同一价格。
+    if counts.get("cache_write_tokens") != 0:
         return None
     hit = counts["cache_hit_tokens"]
     if hit is None and str(price.get("input")) != str(price.get("cache_read")):
@@ -312,6 +317,7 @@ class UsageLedger:
                 role if role in {"coordinator", "writer", "editor", "reviewer", "memory_keeper"} else None,
                 model_override=model)[1]
             safe.update(context_policy_version=settings.retrieval_policy_version,
+                prompt_cache_layout_version=settings.prompt_cache_layout_version,
                 quality_preset=settings.quality_preset, quality_custom_context=settings.quality_custom_context,
                 context_capacity_scale=1.0)
             for name in ("hard_rule_reserved_tokens", "protected_system_tokens", "protected_hard_tokens", "hard_rule_unfilled_reserve_tokens", "effective_input_ceiling_tokens"):
@@ -523,10 +529,10 @@ class UsageLedger:
         }
 
     def cache_observations(self, novel_id: str, settings: Settings) -> dict[str, Any]:
-        """Group actual requests by frozen route/model; retain unscoped history."""
+        """按配置路由总结请求，明细再按服务商实际返回的型号和请求结构分组。"""
         with self._connect() as db:
             rows = [dict(row) for row in db.execute("""SELECT provider,endpoint,model,role,prompt_family,
-                input_tokens,output_tokens,cache_hit_tokens,request_sent,diagnostic_json,started_at,outcome
+                input_tokens,output_tokens,cache_hit_tokens,cache_write_tokens,request_sent,diagnostic_json,started_at,outcome
                 FROM model_attempts WHERE novel_id=? ORDER BY started_at,rowid""", (novel_id,))]
 
         def totals(items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -544,6 +550,7 @@ class UsageLedger:
             output = sum(item["output_tokens"] for item in outputs)
             denominator = sum(item["input_tokens"] for item in reported)
             hit = sum(item["cache_hit_tokens"] for item in reported)
+            written = [item["cache_write_tokens"] for item in reported if _count(item["cache_write_tokens"]) is not None]
             return {"calls": len(attempted), "not_sent_calls": len(items) - len(attempted),
                 "unknown_sent_calls": sum(item["request_sent"] is None for item in attempted),
                 "prompt_tokens": prompt, "completion_tokens": output, "total_tokens": prompt + output,
@@ -555,6 +562,7 @@ class UsageLedger:
                 "cache_reported_input_tokens": denominator,
                 "cache_unknown_prompt_tokens": prompt - denominator,
                 "prompt_cache_hit_tokens": hit, "prompt_cache_miss_tokens": denominator - hit,
+                "cache_write_tokens": sum(written) if written and len(written) == len(reported) else None,
                 "prompt_cache_hit_rate": round(hit / denominator, 4) if denominator else None,
                 "prompt_cache_miss_rate": round((denominator - hit) / denominator, 4) if denominator else None,
                 "average_prompt_tokens": round(prompt / len(inputs)) if inputs else None,
@@ -582,7 +590,8 @@ class UsageLedger:
             for row in items:
                 d = row["diagnostic"]
                 key = (str(row["prompt_family"] or ""), *[str(d.get(name) or "") for name in
-                    ("system_contract_hash", "quality_hash", "thinking", "cache_policy", "message_layout")])
+                    ("system_contract_hash", "quality_hash", "thinking", "cache_policy", "message_layout", "response_model",
+                     "prompt_cache_layout_version")])
                 contracts.setdefault(key, []).append(row)
             history.append({"provider": provider, "endpoint": endpoint, "legacy_endpoint_host": legacy_host or None,
                 "model": model, "role": role, "scope_known": endpoint is not None,
@@ -591,8 +600,8 @@ class UsageLedger:
                     "thinking": key[3], "cache_policy": key[4], "message_layout": key[5],
                     "reference_prefix_tokens_estimated": value[-1]["diagnostic"].get("reference_prefix_tokens"),
                     "stage": value[-1]["diagnostic"].get("stage"),
-                    "response_models": sorted({item["diagnostic"]["response_model"] for item in value
-                        if isinstance(item["diagnostic"].get("response_model"), str)}), **totals(value), "recent": recent(value)}
+                    "layout_version": value[-1]["diagnostic"].get("prompt_cache_layout_version"),
+                    "response_models": [key[6]] if key[6] else [], **totals(value), "recent": recent(value)}
                     for key, value in contracts.items()]})
         selected_endpoint = cache_endpoint(settings.base_url)
         current = {}

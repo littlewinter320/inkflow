@@ -1545,7 +1545,7 @@ class ContextPacket(StrictModel):
     sections: list[ContextSection]
     estimated_tokens: int
     warnings: list[str] = Field(default_factory=list)
-    cache_policy: Literal["standard", "deepseek", "mimo", "openai"] = "standard"
+    cache_policy: Literal["standard", "deepseek", "mimo", "openai", "gemini", "openrouter", "anthropic"] = "standard"
     cache_layout_version: int = 1
     # 已授权的当次审查要求已在请求正文中。单独保留用于引用核验，不改变原资料包的发送格式。
     review_instruction: str = Field(default="", exclude=True)
@@ -1623,9 +1623,10 @@ class ContextPacket(StrictModel):
         catalog = {key: item for key, item in normalized.items() if key != "collections"}
         catalog["collections"] = [{key: item for key, item in collection.items() if key != "records"}
                                   for collection in normalized["collections"]]
-        if self.cache_policy == "deepseek" and self.cache_layout_version >= 13:
+        if self.cache_layout_version >= 29 or self.cache_policy == "deepseek" and self.cache_layout_version >= 13:
             # 定义的顺序不跟随本轮选中记录；记录仍按完整身份关联，不增删任何集合。
             catalog["collections"].sort(key=lambda item: item["collection_id"])
+        diagnostics = {name: catalog.pop(name) for name in ("coverage",) if self.cache_layout_version >= 29 and name in catalog}
         # collection_id把两处一一关联；版本、权限、性质、来源及未知扩展字段均原样留在其所属层。
         selected = {"collections": [{"collection_id": collection["collection_id"], "records": collection["records"]}
                                     for collection in normalized["collections"]]}
@@ -1638,7 +1639,7 @@ class ContextPacket(StrictModel):
                 for collection in selected["collections"]]}
             rule_ids = [record["record_id"] for collection in constraints["collections"] for record in collection["records"]]
             if rule_ids:
-                if self.cache_policy == "deepseek" and self.cache_layout_version >= 13:
+                if self.cache_layout_version >= 29 or self.cache_policy == "deepseek" and self.cache_layout_version >= 13:
                     constraints["collections"].sort(key=lambda item: item["collection_id"])
                     for collection in constraints["collections"]:
                         collection["records"].sort(key=lambda item: item["record_id"])
@@ -1655,6 +1656,8 @@ class ContextPacket(StrictModel):
             original.model_copy(update={**common, "key": f"{key}-records", "title": "本次设定记录与来源（非正史）",
                 "content": json.dumps(selected, ensure_ascii=False, separators=(",", ":")),
                 "source_ids": selected_ids if key == "CSET" else original.source_ids, "cache_scope": "canon"}),
+            *([ContextSection(key=f"{key}-coverage", title="设定选择与未装入范围", content=json.dumps(diagnostics, ensure_ascii=False),
+                hard=section.hard, cache_scope="request")] if diagnostics else []),
             *[item for item in projected if item.key != key],
         ]
 
@@ -1662,7 +1665,8 @@ class ContextPacket(StrictModel):
         """按供应商和冻结布局投影发送顺序，保持原始来源与门禁材料不变。"""
         # 新DeepSeek包沿用已核实的来源排列；旧包缺省版本1，保持原输入。
         openai_layout = self.cache_policy == "openai" and self.cache_layout_version >= 28
-        stable_layout = openai_layout or self.cache_policy == "mimo" or self.cache_policy == "deepseek" and self.cache_layout_version >= 9
+        current_layout = self.cache_layout_version >= 29 and self.cache_policy != "standard"
+        stable_layout = current_layout or openai_layout or self.cache_policy == "mimo" or self.cache_policy == "deepseek" and self.cache_layout_version >= 9
         sections = []
         for section in self.sections:
             if (self.cache_policy == "deepseek" and self.cache_layout_version >= 13
@@ -1679,16 +1683,16 @@ class ContextPacket(StrictModel):
                         "content": json.dumps({"pending_work": state.pop("pending_work")}, ensure_ascii=False)}))
                     section = section.model_copy(update={"content": json.dumps(state, ensure_ascii=False)})
             if (stable_layout and section.key == "SET" and section.cache_prefix_source_ids is not None
-                    or (openai_layout or self.cache_policy == "deepseek" and self.cache_layout_version >= 12) and section.key == "CSET"):
-                # 旧SET仍需Coordinator的完整绑定提示；CSET仅新DeepSeek布局启用，原packet不改。
+                    or (current_layout or openai_layout or self.cache_policy == "deepseek" and self.cache_layout_version >= 12) and section.key == "CSET"):
+                # 旧SET仍需Coordinator的完整绑定提示；只对已启用分层布局的接口投影CSET。
                 split = self._settings_catalog_sections(section)
-                if split is not None and (openai_layout or self.cache_policy == "deepseek" and self.cache_layout_version >= 16):
+                if split is not None and (current_layout or openai_layout or self.cache_policy == "deepseek" and self.cache_layout_version >= 16):
                     # 普通记录随选材与人物状态变化；放在稳定正史之后，硬约定及定义仍在固定前段。
                     split = [item.model_copy(update={"cache_scope": "chapter"})
                              if item.key == "CSET-records" else item for item in split]
                 sections.extend(split if split is not None else [section])
                 continue
-            if openai_layout and section.key in {"O2", "C0"} and section.cache_scope == "book":
+            if (current_layout or openai_layout) and section.key in {"O2", "C0"} and section.cache_scope == "book":
                 # 滚动章纲与组合卡经常换版，放到大纲、细纲和固定设定之后；正文和原编号照常发送。
                 section = section.model_copy(update={"cache_scope": "chapter"})
             if stable_layout and section.key == "B" and section.cache_prefix_source_ids is not None:
@@ -1711,8 +1715,8 @@ class ContextPacket(StrictModel):
                                 "source_ids": [item["事实编号"] for item in selected],
                                 # 相关性选入的补充事实也已属正史；新DeepSeek只把它们排到旧稳定层之后，
                                 # 不新增事实、不改变本轮选择，内容或来源变化仍自然使该处缓存失效。
-                                "cache_scope": "canon" if stable or self.cache_policy == "deepseek"
-                                    and self.cache_layout_version >= 10 else "chapter"}))
+                                "cache_scope": "canon" if stable or (not current_layout and self.cache_policy == "deepseek"
+                                    and self.cache_layout_version >= 10) else "chapter"}))
                     continue
             if stable_layout and section.key == "J":
                 try:
@@ -1773,7 +1777,7 @@ class ContextPacket(StrictModel):
                         sections.append(ContextSection(key=f"{section.key}-coverage", title="设定选择与未装入范围",
                             content=json.dumps({"coverage": coverage}, ensure_ascii=False, separators=(",", ":")),
                             hard=section.hard, cache_scope="request"))
-            if stable_layout and section.key in {"D", "G"} and section.cache_scope == "canon":
+            if stable_layout and section.key in ({"D", "G", "F", "F0"} if current_layout else {"D", "G"}) and section.cache_scope == "canon":
                 section = section.model_copy(update={"cache_scope": "chapter"})
             sections.append(section)
         if stable_layout:
@@ -1804,7 +1808,7 @@ class ContextPacket(StrictModel):
             book_order = {"J": 0, "B": 1, "O0": 2, "O1": 3, "O2": 4, "C0": 5}
             if self.cache_policy == "deepseek" and self.cache_layout_version >= 12:
                 book_order.update({"CSET-definitions": 6, "CSET-rules": 7})
-            if openai_layout:
+            if current_layout or openai_layout:
                 book_order.update({"CSET-definitions": 5, "CSET-rules": 6})
             canon_order = ({"B": 0, "F": 1, "CSET": 2, "SET": 2} if stable_layout else
                            {"B": 0, "CSET": 1, "D": 2, "G": 3} if self.cache_policy == "deepseek" else
@@ -1818,8 +1822,8 @@ class ContextPacket(StrictModel):
             order = (book_order.get(section.key, 10 + index) if section.cache_scope == "book"
                      else canon_order.get(section.key, 10 + index) if section.cache_scope == "canon"
                      else -1 if section.cache_scope == "chapter" and section.key == "E0" else index)
-            if (self.cache_policy == "deepseek" and self.cache_layout_version >= 25
-                    and section.cache_scope == "chapter" and section.key in {"F", "F1", "MEMORY", "WORK"}):
+            if ((current_layout or self.cache_policy == "deepseek" and self.cache_layout_version >= 25)
+                    and section.cache_scope == "chapter" and section.key in ({"F", "F0", "F1", "MEMORY", "WORK"} if current_layout else {"F", "F1", "MEMORY", "WORK"})):
                 # 同章补核时检索、诊断与待办容易变化，排到其余章节资料后；正文和来源逐字保留。
                 # 已回源完整正史若属于canon层仍沿原顺序，不把稳定全文移到动态章节卡后。
                 order = len(sections) + index

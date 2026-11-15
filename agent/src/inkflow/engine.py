@@ -5,6 +5,7 @@ from .session_context import response_input_key
 import asyncio
 from copy import deepcopy
 from contextlib import ExitStack, asynccontextmanager, contextmanager
+from dataclasses import replace
 from difflib import SequenceMatcher
 import json
 import re
@@ -22,7 +23,7 @@ from .config import Settings
 from .context import ContextBuilder, active_batch_context, planning_bundle_for_chapter, mandatory_rules_context as _mandatory_rules_context
 from .outline_context import outline_neighbor_boundaries, outline_sections, replace_outline_range, replace_story_detail_volume
 from .planning_pipeline import PlanningNeedsAttention, load_active_planning, redesign_existing_story, synchronize_v2_projection
-from .errors import ConfigurationError, ProjectError, ProviderError, ValidationGateError
+from .errors import ConfigurationError, InkFlowError, ProjectError, ProviderError, ValidationGateError
 from .project import InkFlowProject, render_book_brief
 from .project_lock import batch_workflow_lock, chapter_operation_locked, project_mutation_locked, project_mutation_locked_sync, project_write_lock, project_write_lock_sync
 from .role_protocol import normalize_role, check_owners_for_mode, new_task_mode, assessment_criteria_for_role
@@ -147,6 +148,15 @@ def _review_settings_fingerprint(settings: Settings) -> str:
                                    and (key != "automatic_output_tokens" or value)
                                    and (key != "retrieval_policy_version" or value != 1)
                                    and (key != "prompt_cache_layout_version" or value != 1)}, indent=None))
+
+
+def _completed_review_settings_match(fingerprint: str | None, settings: Settings) -> bool:
+    """同一配置下已交付的审核可继续核证；本次升级只放行刚替换的两个内置默认值。"""
+    if fingerprint == _review_settings_fingerprint(settings):
+        return True
+    # 比对整份原指纹。书稿、角色、用量与审核门禁仍逐项核证，未完成任务仍须原快照。
+    return (settings.retrieval_policy_version, settings.prompt_cache_layout_version) == (4, 29) and (
+        fingerprint == _review_settings_fingerprint(replace(settings, retrieval_policy_version=3, prompt_cache_layout_version=28)))
 
 
 def _saved_mode_response(project, scope, *, role, checks, system_prompt, user_prompt, output_model, settings, packet=None):
@@ -5825,8 +5835,8 @@ class InkFlowEngine:
         scope = active_task_settings.get()
         mode = scope.effective_collaboration_mode if scope else "everyday"
         bundle = record.get("mode_bundle") or {}
-        settings_match = (scope and bundle.get("snapshot_hash") == scope.snapshot_hash) or (
-            bundle.get("settings_fingerprint") == _review_settings_fingerprint(scope.settings if scope else self.settings))
+        settings_match = (scope and bundle.get("snapshot_hash") == scope.snapshot_hash) or _completed_review_settings_match(
+            bundle.get("settings_fingerprint"), scope.settings if scope else self.settings)
         if bundle.get("mode") != mode or not bundle.get("snapshot_hash") or not settings_match:
             return None
         owners = check_owners_for_mode(mode)
@@ -7801,11 +7811,13 @@ class InkFlowEngine:
             note_questions = ["请逐项处理以下全部说明/伏笔引文缺口，完整返回更正后的hook_note；answers简述结果，不用重复原句：\n"
                 + "\n".join(note_questions)]
         note_snapshot = {"writer_notes_hash": notes_hash(notes), "chapter_no": boundary} if notes else {}
+        knowledge_reading = _review_knowledge_reading(packet) if self.settings.retrieval_policy_version >= 4 else []
         if not gaps:
             snapshots = _recovered_source_snapshots(project, packet)
             if not note_questions:
                 return output, packet, {"attempted": False, "loaded_sources": snapshots, **note_snapshot,
-                    **({"local_quote_repairs": local_quotes} if local_quotes else {})} if snapshots or notes or local_quotes else {}
+                    **({"knowledge_reading": knowledge_reading} if knowledge_reading else {}),
+                    **({"local_quote_repairs": local_quotes} if local_quotes else {})} if snapshots or notes or local_quotes or knowledge_reading else {}
         trace.record("review.source_recovery", "started", "资料缺口先自动检索和补读，不交 Writer 改稿",
                      metadata={"role": agent_role, "gaps": gaps})
         # 点名的设定编号也须进入既有分类RAG，否则只有缺失ID而没有自然语言问题时不会补读。
@@ -7817,6 +7829,12 @@ class InkFlowEngine:
         patch = getattr(output, "memory_patch", None)
         if patch:
             queries.extend(patch.unresolved_conflicts)
+            if self.settings.retrieval_policy_version >= 4:
+                # 原记忆候选已经指出哪句待核时，也用它找同一对象的原句和旧状态。
+                queries.extend(ref.quote for fact in patch.facts for ref in fact.evidence_refs
+                               if ref.source_chapter < boundary)
+                queries.extend(ref.quote for operation in patch.operations for ref in operation.evidence
+                               if ref.source_chapter < boundary)
         # A missing attribution or current-plan comparison is repaired from the
         # already loaded packet, not by searching unrelated historical prose.
         needs_search = not editor_grant and bool(queries or getattr(output, "missing_source_ids", []))
@@ -7828,11 +7846,14 @@ class InkFlowEngine:
             queries.extend(value for value in hook_leads if value.strip())
         queries = list(dict.fromkeys(value.strip()[:160] for value in queries if value.strip()))[:4]
         hits, recovery = (await asyncio.to_thread(
-            HybridRetriever(project).recover_review_sources, queries, chapter_no=boundary, role=agent_role,
+            HybridRetriever(project, knowledge_rag=self.settings.retrieval_policy_version >= 4).recover_review_sources,
+            queries, chapter_no=boundary, role=agent_role,
         )) if gaps and needs_search else ([], {"queries": [], "searched_chapters": []})
         recovery.update({"attempted": True, "model_request_attempted": False, "validation_policy": REVIEW_EVIDENCE_POLICY,
                          "role": agent_role, "gaps": gaps,
                          "loaded_sources": [], **note_snapshot})
+        if knowledge_reading:
+            recovery["knowledge_reading"] = knowledge_reading
         if editor_grant:
             recovery["editor_extra_grant"] = {key: editor_grant[key] for key in (
                 "review_id", "candidate_artifact_id", "root_artifact_id", "report_hash", "writer_notes_hash",
@@ -7880,6 +7901,12 @@ class InkFlowEngine:
             recovery["source_loading"] = json.loads(catalog_section.content).get("补读状态与预算", {})
         recovery["load_warnings"] = packet.warnings
         recovery["loaded_sources"] = _recovered_source_snapshots(project, packet)
+        if "knowledge_matches" in recovery:
+            loaded = packet_sources(packet)
+            for match in recovery["knowledge_matches"]:
+                match["loaded"] = bool(loaded.get(f"chapter:{match['chapter_no']:05d}") and any(
+                    row["chapter_no"] == match["chapter_no"] and row["content_hash"] == match["content_hash"]
+                    for row in recovery["loaded_sources"]))
         trace_path = trace.run_dir / f"source-recovery-{agent_role}.json"
         atomic_write_text(trace_path, json_dumps(recovery))
         if _recovered_sources_changed(project, recovery):
@@ -9313,7 +9340,7 @@ class InkFlowEngine:
                 fingerprint = bundle.get("settings_fingerprint")
                 if (scope is None or bundle.get("mode") != scope.effective_collaboration_mode
                         or not bundle.get("snapshot_hash")
-                        or (fingerprint != _review_settings_fingerprint(scope.settings) if fingerprint is not None
+                        or (not _completed_review_settings_match(fingerprint, scope.settings) if fingerprint is not None
                             else bundle["snapshot_hash"] != scope.snapshot_hash)
                         or bundle.get("story_fingerprint") != self._writer_source_fingerprint(project, chapter_no)
                         or _recovered_sources_changed(project, review_record["report"].evidence_recovery)
@@ -10008,7 +10035,7 @@ class InkFlowEngine:
             coverage = {item.get("check_id"): item for item in bundle.get("coverage", []) if isinstance(item, dict)}
             if (bundle.get("mode") != mode or not bundle.get("snapshot_hash")
                     or (scope and bundle.get("snapshot_hash") != scope.snapshot_hash
-                        and bundle.get("settings_fingerprint") != _review_settings_fingerprint(scope.settings))
+                        and not _completed_review_settings_match(bundle.get("settings_fingerprint"), scope.settings))
                     or any(coverage.get(check_id, {}).get("owner") != role
                            or coverage.get(check_id, {}).get("status") != "passed"
                            for check_id, role in owners.items())):
@@ -13398,7 +13425,7 @@ def _claim_source_contexts(targets: list[dict[str, Any]], findings: list[ReviewF
                 else "全书完结任务的主线要求，只核对实际结果" if source_id.startswith(ENDING_SOURCE_PREFIX)
                 else "批次临时正文，未进入正史" if source_id.startswith("batch:")
                 else "参考与设计记忆，reference_only；须回到其引用的已接受正文才能支持正史判断"
-                if source_id.startswith(("setting-record-", "reference:"))
+                if source_id.startswith(("setting-record-", "reference:", "import:", "shared:", "knowledge:"))
                 else "来源原文；须核对其客观/信念/传闻层级"})
             if len(contexts) == 2:
                 break
@@ -13513,6 +13540,36 @@ def _review_evidence_gaps(output: Any, content: str, packet: ContextPacket, *, p
     if output.verdict == "unknown" and not gaps:
         gaps.append(f"责任角色尚未形成结论：{output.summary}")
     return list(dict.fromkeys(gaps))[:16]
+
+
+def _review_knowledge_reading(packet: ContextPacket) -> list[dict[str, Any]]:
+    """摘取准备给责任角色的知识条目及回源位置；不把取材写成模型引用。"""
+    records = []
+    for section in packet.sections:
+        if section.key != "F" or section.title != "分层混合检索结果":
+            continue
+        try:
+            payload = json.loads(section.content)
+        except ValueError:
+            continue
+        entries = payload.get("自适应结果") if isinstance(payload, dict) else None
+        if not isinstance(entries, list):
+            continue
+        # 只记仍保留在最终资料包中的来源；压缩和恢复都可能留下空索引。
+        for hit in entries:
+            if not isinstance(hit, dict) or hit.get("source_id") not in section.source_ids:
+                continue
+            binding = hit.get("knowledge_source") if hit.get("source_type") == "knowledge_page" else None
+            if isinstance(binding, dict):
+                records.append({"kind": "entry", "name": hit.get("title", ""), "state": hit.get("epistemic_kind", ""), **binding})
+            elif isinstance(origin := hit.get("resolved_source"), dict) and isinstance(hit.get("body"), str):
+                if hit.get("knowledge_locator"):
+                    records.append({"kind": "prose", "title": hit["knowledge_locator"],
+                        "body_hash": content_hash(hit["body"]), **origin})
+                elif str(hit["source_id"]).startswith(("import:", "shared:")):
+                    records.append({"kind": "reference", "title": hit.get("title", ""),
+                        "body_hash": content_hash(hit["body"]), **origin})
+    return records
 
 
 def _recovered_source_snapshots(project: InkFlowProject, packet: ContextPacket) -> list[dict[str, Any]]:
@@ -14196,14 +14253,62 @@ def _partition_review_note_candidates(
 
 
 def _recovered_sources_changed(project: InkFlowProject, recovery: dict[str, Any]) -> bool:
+    """回核实际装入的补读记录。导入片段按整个原资料版本和原位置校验。"""
     if recovery.get("reference_sources"):
-        current = {item["source_id"]: item for item in HybridRetriever(project)._candidates(
-            role=recovery["reference_role"], chapter_no=int(recovery["reference_boundary"]), chapter_version=None)}
-        for source in recovery["reference_sources"]:
+        from .knowledge import KnowledgeService
+        knowledge = KnowledgeService(project)
+        references = recovery["reference_sources"]
+        current = {item["source_id"]: item for item in HybridRetriever(project, knowledge_rag=False)._candidates(
+            role=recovery["reference_role"], chapter_no=int(recovery["reference_boundary"]), chapter_version=None)} if any(
+                not source["source_id"].startswith(("import:", "shared:")) for source in references) else {}
+        for source in references:
+            if source["source_id"].startswith(("import:", "shared:")):
+                try:
+                    raw = knowledge.stored_source(source["source_id"])
+                except (ValueError, OSError, InkFlowError):
+                    return True
+                if not raw or raw["hash"] != source["source_hash"]:
+                    return True
+                span = source.get("resolved_source")
+                if span:
+                    start, end = span.get("start"), span.get("end")
+                    if (span.get("source_id") != source["source_id"] or span.get("source_hash") != raw["hash"]
+                            or type(start) is not int or type(end) is not int or not 0 <= start < end <= len(raw["body"])):
+                        return True
+                    body = raw["body"][start:end]
+                else:
+                    body = raw["body"]
+                if source["body_hash"] != content_hash(body):
+                    return True
+                continue
             actual = current.get(source["source_id"])
             if actual is None or source["body_hash"] != content_hash(str(actual["body"])) or any(source.get(key) != actual.get(key)
                     for key in ("source_type", "version", "source_hash")):
                 return True
+    # 知识召回的原文片段也参与最终核验。归纳条目本身没有正文的权限，只校验实际引用的原始出处。
+    for item in recovery.get("knowledge_reading", []):
+        if item.get("kind") not in {"prose", "reference"}:
+            continue
+        try:
+            if item["kind"] == "prose":
+                number = item["chapter_no"]
+                row = project.db.get_chapter(number)
+                if not row or row["status"] != "accepted" or row["version"] != item["version"] or row["content_hash"] != item["source_hash"]:
+                    return True
+                body = project.db.canonical_chapter_content(number)
+                if body is None:
+                    path = (project.root / row["path"]).resolve()
+                    body = path.read_text(encoding="utf-8") if path.is_relative_to(project.root) and path.is_file() else ""
+            else:
+                from .knowledge import KnowledgeService
+                raw = KnowledgeService(project).stored_source(item["source_id"])
+                body = raw["body"] if raw else None
+            start, end = item["start"], item["end"]
+            if (not body or content_hash(body) != item["source_hash"] or not 0 <= start < end <= len(body)
+                    or content_hash(body[start:end]) != item["body_hash"]):
+                return True
+        except (OSError, TypeError, ValueError, KeyError, InkFlowError):
+            return True
     if recovery.get("writer_notes_hash"):
         current_notes = version_notes(project, int(recovery["chapter_no"]))
         if recovery["writer_notes_hash"] != notes_hash(current_notes):
@@ -14319,7 +14424,8 @@ def _review_evidence_packet(project: InkFlowProject, packet: ContextPacket,
         if hit.get("source_type") not in {"story_reference", "expression_reference", "user_preference"}:
             continue
         body = json_dumps({key: hit.get(key) for key in (
-            "source_id", "source_type", "memory_layer", "category", "identity", "authority", "version", "source_hash", "body")})
+            "source_id", "source_type", "memory_layer", "category", "identity", "authority", "version", "source_hash", "body")}
+            | ({"title": hit["title"], "resolved_source": hit["resolved_source"]} if hit.get("resolved_source") else {}))
         cost = estimate_tokens(body)
         if loaded_count >= 6 or previous_added + added_tokens + cost > added_token_limit or base_tokens + added_tokens + cost + 1500 > hard_token_limit:
             source_status[source_id] = f"参考已找到但未装入：本轮六来源/{SOURCE_RECOVERY_TOKEN_LIMIT:,}token或角色上下文预算不足"

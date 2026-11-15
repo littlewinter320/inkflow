@@ -1387,6 +1387,7 @@ class StudioService:
         self.db = StudioDatabase(project.internal / "studio.db")
 
     def dashboard(self) -> dict[str, Any]:
+        """计算项目进度只需有效字数；段落、对白和阅读时长留给单篇文档。"""
         brief = self.project.db.get_brief()
         plan = self.project.db.get_current_plan_bundle()
         with self.project.db.connect() as connection:
@@ -1398,13 +1399,13 @@ class StudioService:
             canonical = chapter.get("content_text")
             characters = 0
             if canonical is not None and content_hash(canonical) == chapter["content_hash"]:
-                characters = text_statistics(canonical)["characters"]
+                characters = effective_character_count(canonical)
             else:
                 path = self.project.root / chapter["path"]
                 if path.is_file():
                     projected = path.read_text(encoding="utf-8")
                     if content_hash(projected) == chapter["content_hash"]:
-                        characters = text_statistics(projected)["characters"]
+                        characters = effective_character_count(projected)
             written_characters += characters
             if characters:
                 counted_chapters.append(chapter)

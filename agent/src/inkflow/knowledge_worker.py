@@ -22,7 +22,9 @@ KNOWLEDGE_CONTRACT = """你是本次小说任务的记忆责任角色，维护�
 完整阅读 source 本段全部内容。先理解，再与 related_pages 中的已有知识逐项比较。
 为人物、势力、地点、物品、世界规则、事件、伏笔和规划提取充分且可独立阅读的知识。
 主体用稳定正式称呼。找到同一对象时复用给出的 existing_entity_id；身份不确定就保留未知，不能把同名强行合并。
-description 记录具体状态、经过、动机、限制及变化依据，不能只留几个关键词。每条 quote 必须是本段连续原文。
+description 按原文记录谁在什么情境做了什么、结果、发生条件与例外、状态变化前后，以及谁知道这件事。
+时间、地点、物品去向、身份变化、限定数字和重要因果有依据就保留；原文没说明的字段留空。
+一条原句只绑定它能支持的知识。遇到需要几处相隔的原句，请分别整理，再用有出处的关系连起来。每条 quote 都取本段连续原文。
 关系填写 target、target_kind 和有方向的 predicate，例如加入、离开、持有、位于、亲属、敌对、造成、铺垫、兑现。
 同场出现只证明参与同一事件，不证明亲属、敌对或合作。不编造时间，未知用空字符串。
 已发生事实、人物信念、传闻、未来规划、设想和参考分别标记。规划不可当作已发生事实。
@@ -269,10 +271,13 @@ async def answer_knowledge(project, provider, question: str, *, original_message
     source_ids.update(source["id"] for source in snapshot["sources"] if source["state"] == "canon"
         and any(name in source["body"] for name in names))
     if not source_ids:
-        hits = await asyncio.to_thread(HybridRetriever(project).retrieve, question, role=owner,
+        hits = await asyncio.to_thread(HybridRetriever(project, knowledge_rag=scope.settings.retrieval_policy_version >= 4).retrieve, question, role=owner,
             chapter_no=project.db.latest_accepted_chapter_no() + 1)
-        pages = {hit["source_id"].removeprefix("knowledge:") for hit in hits if hit["source_id"].startswith("knowledge:")}
-        source_ids.update(section["source_id"] for node in snapshot["nodes"] if node["id"] in pages for section in node["sections"])
+        source_ids.update(hit["knowledge_source"]["source_id"] for hit in hits if hit.get("knowledge_source"))
+        source_ids.update(hit["source_id"] for hit in hits if hit["source_id"].startswith(("import:", "shared:")))
+        if scope.settings.retrieval_policy_version < 4:
+            pages = {hit["source_id"].removeprefix("knowledge:") for hit in hits if hit["source_id"].startswith("knowledge:")}
+            source_ids.update(section["source_id"] for node in snapshot["nodes"] if node["id"] in pages for section in node["sections"])
         source_ids.update(f"chapter:{hit['chapter_no']}" for hit in hits if hit.get("chapter_no"))
     sources = [source for source in snapshot["sources"] if source["id"] in source_ids]
     if not sources:
@@ -595,22 +600,29 @@ async def dispatch_knowledge(app, method, params, emit):
     if method == "knowledge.index":
         await asyncio.to_thread(service.sync)
         return public_index(await asyncio.to_thread(service.snapshot))
-    if method in {"knowledge.page", "knowledge.source", "knowledge.graph"}:
+    if method == "knowledge.source":
+        # 回看原文只需来源目录，不用重新编排全书对象、事实和关系。
+        sources, _ = await asyncio.to_thread(service.sources)
+        value = next((item for item in sources if item["id"] == params.get("source_id")), None)
+        if value and value.get("stored"):
+            value = await asyncio.to_thread(service.stored_source, value["id"])
+            if value:
+                parts = str(value["id"]).rsplit(":", 1)
+                next_id = parts[0] + ":" + f"{int(parts[1]) + 1:08d}"
+                same_document = {item["id"] for item in sources if item.get("namespace") == value.get("namespace")}
+                value["next"] = next_id if next_id in same_document else ""
+                if value.get("previous") not in same_document:
+                    value["previous"] = ""
+        if (not value or params.get("source_hash") not in (None, value["hash"])
+                or params.get("source_version") not in (None, value.get("version", value.get("revision")))):
+            raise ValueError("这份知识的来源已变化，请刷新目录后核对原文。")
+        return value
+    if method in {"knowledge.page", "knowledge.graph"}:
         snapshot = await asyncio.to_thread(service.snapshot)
         if method == "knowledge.graph":
             return await asyncio.to_thread(knowledge_graph, snapshot, focus=str(params.get("focus") or ""),
                 kind=str(params.get("kind") or ""), limit=params.get("limit", 50))
-        if method == "knowledge.source":
-            value = next((item for item in snapshot["sources"] if item["id"] == params.get("source_id")), None)
-            if value and value.get("stored"):
-                value = await asyncio.to_thread(service.stored_source, value["id"])
-                parts = str(value["id"]).rsplit(":", 1)
-                next_id = parts[0] + ":" + f"{int(parts[1]) + 1:08d}"
-                value["next"] = next_id if any(item["id"] == next_id and item.get("namespace") == value.get("namespace") for item in snapshot["sources"]) else ""
-                if not any(item["id"] == value.get("previous") and item.get("namespace") == value.get("namespace") for item in snapshot["sources"]):
-                    value["previous"] = ""
-        else:
-            value = next((item for item in snapshot["nodes"] if item["id"] == params.get("entity_id")), None)
+        value = next((item for item in snapshot["nodes"] if item["id"] == params.get("entity_id")), None)
         if value is None:
             raise ValueError("这份知识的来源已变化，请刷新目录。")
         return value
@@ -619,10 +631,12 @@ async def dispatch_knowledge(app, method, params, emit):
         if not 1 <= len(query) <= 1000:
             raise ValueError("请填写 1 至 1000 字的搜索内容。")
         result = await asyncio.to_thread(service.search, query)
-        return {"entity_ids": [node["id"] for node in result["nodes"]], "sources": [
-            {"id": source["id"], "title": source["title"], "state": source["state"],
-             "excerpt": source["body"][max(0, source["body"].casefold().find(query.casefold()) - 80):
-                 max(0, source["body"].casefold().find(query.casefold()) - 80) + 350]} for source in result["sources"]]}
+        items = []
+        for source in result["sources"]:
+            start = source.get("match_offset", max(0, source["body"].casefold().find(query.casefold()) - 80))
+            items.append({"id": source["id"], "title": source["title"], "state": source["state"],
+                "excerpt": source["body"][start:start + 350]})
+        return {"entity_ids": [node["id"] for node in result["nodes"]], "sources": items}
     if method == "knowledge.annotate":
         return await asyncio.to_thread(service.annotate, str(params.get("entity_id") or ""),
             note=str(params.get("note") or ""), aliases=params.get("aliases") or [], expected_revision=int(params.get("expected_revision") or 0))

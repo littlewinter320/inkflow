@@ -18,6 +18,7 @@ HARD_RULES = {
     "severe_repetition": {"originality", "format"},
 }
 _SAME_CHAPTER_CONFLICT_NOTE = "本章双处逐字引文待核"
+_KNOWLEDGE_REFERENCE_PREFIXES = ("knowledge:", "import:", "shared:", "reference:")
 
 
 def review_quote_choices(sources: dict[str, str]) -> dict[str, dict[str, str]]:
@@ -501,7 +502,16 @@ def packet_sources(packet: ContextPacket, *, review_requirements: bool = False) 
                        and item.get("source_id") and isinstance(item.get("body"), str)}
             for ref in section.source_ids:
                 if ref in indexed:
-                    sources[ref] = sources.get(ref, "") + "\n" + str(indexed[ref]["body"])
+                    item = indexed[ref]
+                    sources[ref] = sources.get(ref, "") + "\n" + str(item["body"])
+                    # 摘要命中回到已核版的原文片段时，真实章号也可引用，保留原检索编号供旧引用使用。
+                    origin = item.get("resolved_source")
+                    if (item.get("knowledge_locator") and item.get("body_kind") == "accepted_prose"
+                            and isinstance(origin, dict) and type(origin.get("chapter_no")) is int
+                            and 0 < origin["chapter_no"] < packet.chapter_no
+                            and (chapter_ref := f"chapter:{origin['chapter_no']:05d}") == origin.get("source_id")
+                            and chapter_ref != ref):
+                        sources[chapter_ref] = sources.get(chapter_ref, "") + "\n" + str(item["body"])
             continue
         if section.key.startswith("reference-recovery-"):
             payload = json.loads(section.content)
@@ -728,9 +738,15 @@ def verify_review(report: ReviewReport, content: str, packet: ContextPacket) -> 
         reasons: list[str] = []
         rebound_note = ""
         goal_missing = finding.rule_id == "core_function_missing"
+        hard = finding.severity in {"major", "blocking"}
+        editorial = finding.category in {"style", "pacing"}
+
         def allowed_source(ref: str) -> bool:
-            """把作者要求与终局计划限定在结果缺失核对，防止作为正史引用。"""
+            """硬判断先核真实对照；知识归纳与导入资料可以支持普通对照。"""
+            if packet.cache_layout_version >= 29 and hard and not editorial and ref.startswith(_KNOWLEDGE_REFERENCE_PREFIXES):
+                return False
             return goal_missing or (ref != AUTHOR_REQUIREMENT_SOURCE and not ref.startswith(ENDING_SOURCE_PREFIX))
+
         canon_refs = [] if finding.rule_id == "internal_chapter_conflict" else list(finding.canon_refs)
         if finding.reference_evidence.strip():
             matching_refs = [
@@ -745,8 +761,6 @@ def verify_review(report: ReviewReport, content: str, packet: ContextPacket) -> 
             reasons.append("引用无法逐字定位到当前正文")
         if any(ref not in sources or not allowed_source(ref) for ref in canon_refs):
             reasons.append("引用来源不在本次上下文内")
-        hard = finding.severity in {"major", "blocking"}
-        editorial = finding.category in {"style", "pacing"}
         # 跨章表达意见也须有真实对照，不能只定位本章一句就把错误的前章指控交给Writer。
         if editorial and canon_refs and (not finding.reference_evidence.strip() or not any(
                 evidence_matches(finding.reference_evidence, sources.get(ref, "")) for ref in canon_refs)):
@@ -771,6 +785,11 @@ def verify_review(report: ReviewReport, content: str, packet: ContextPacket) -> 
                                         or ref.startswith(("plan:", "setting-record-", "promise-plan:"))
                                         or (finding.rule_id == "canon_conflict" and ref.startswith("task-goal:")) for ref in matched_refs):
                     reasons.append("这里只引用了设计参考；须回到已接受正文或作者明确要求，不能仅因偏离规划判硬错")
+            if (packet.cache_layout_version >= 29 and finding.rule_id == "severe_repetition"
+                    and finding.reference_evidence.strip()
+                    and not any(re.match(r"^(?:chapter:|batch:[^:]+:chapter:)\d+", ref)
+                                and evidence_matches(finding.reference_evidence, sources.get(ref, "")) for ref in canon_refs)):
+                reasons.append("跨章重复的对照原文未定位到正文")
         # A valid first draft quote plus a second exact in-chapter quote is a
         # live state-conflict question even when an unrelated canon citation
         # fails. It still lacks a verified hard finding, so keep it unknown.

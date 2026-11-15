@@ -372,6 +372,7 @@ class ContextBuilder:
             project,
             embedding_model=embedding_model,
             reranker_model=reranker_model,
+            knowledge_rag=retrieval_policy_version >= 4,
         )
         self.hook_strategy = hook_strategy
         self.review_experience_detail = review_experience_detail
@@ -611,6 +612,11 @@ class ContextBuilder:
                 "policy": "未装入不代表不存在；涉及更早经历或状态变动须按人物、物件和事件定点回源。必要原记录及全局硬规则不摘要。"}
         state_facts = [item for item in mandatory_facts if item["predicate"].startswith(("state.", "knows.", "believes.")) or item.get("epistemic_kind") != "objective"]
         general_facts = [item for item in mandatory_facts if item not in state_facts]
+        if self.prompt_cache_layout_version >= 29 and self.cache_policy != "standard":
+            # 新版只把硬世界规则放到稳定前缀：普通历史即使入选，也随当前章和同版状态进入动态资料。
+            common_fact_ids = [str(item["fact_id"]) for item in general_facts
+                if str(item["subject"]).strip() in {"世界", "世界观", "全书"}
+                or str(item["predicate"]).startswith(("rule.", "world.", "constraint."))]
         already_loaded = {
             *[str(item["fact_id"]) for item in mandatory_facts],
             *[str(item["thread_id"]) for item in threads],
@@ -786,7 +792,9 @@ class ContextBuilder:
                 source_ids=[str(item["fact_id"]) for item in general_facts],
                 hard=True,
                 cache_scope="canon",
-                cache_prefix_source_ids=common_fact_ids if (self.cache_policy in {"mimo", "openai"} or self.cache_policy == "deepseek" and self.prompt_cache_layout_version >= 9) else None,
+                cache_prefix_source_ids=common_fact_ids if (self.cache_policy in {"mimo", "openai"}
+                    or self.cache_policy == "deepseek" and self.prompt_cache_layout_version >= 9
+                    or self.prompt_cache_layout_version >= 29 and self.cache_policy != "standard") else None,
             ),
             ContextSection(
                 key="C0", title="本书要求与本章临时范围" if temporary_goal else "书/卷/篇章规划",
@@ -894,7 +902,10 @@ class ContextBuilder:
                     {
                         "检索链": "精确查询 → 本地 BM25 → 可选 BGE-M3 → 融合 → 可选 reranker → 一跳关系扩展 → 权限/章节/版本过滤",
                         "自适应结果": supplemental_hits,
-                        "参考身份": "story_reference/expression_reference 属于参考与设计记忆；引文和核对状态随条目提供，不能冒充已发生正史。",
+                        "参考身份": ("知识档案用来定位相关历史与原文。审核引用实际装入的 chapter: 来源；记忆变更以本章原句和有效前章为据。"
+                            "保留人物所知、传闻、规划和参考的身份及章节时点。"
+                            if self.retrieval_policy_version >= 4 else
+                            "story_reference/expression_reference 属于参考与设计记忆；引文和核对状态随条目提供，不能冒充已发生正史。"),
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -1888,6 +1899,9 @@ class ContextBuilder:
             final_included_source_ids=sorted(included), budget_omitted_count=budget_omitted,
             post_retrieval_omissions=omissions[:80], post_retrieval_omission_count=len(omissions),
             source_reads_meaning="本地回源核验不代表模型已读；装入数仅为编译备料，请求层仍可能缩减软资料，实际输入以请求记录为准；正确引用还需审查。")
+        if "knowledge_retrieval" in diagnostics:
+            diagnostics["knowledge_retrieval"]["prepared_entries"] = sum(
+                item["source_type"] == "knowledge_page" for item in final_items)
         diagnostics["coverage_policy"] = {**coverage, "final_included_count": len(included),
             "actual_fraction": len(included) / relevant if relevant else 0,
             "target_shortfall_count": max(0, target - len(included)), "budget_omitted_count": budget_omitted}
@@ -1983,7 +1997,10 @@ class ContextBuilder:
         """新布局只排列本轮已选条目，复用同项目同角色的编译顺序，不声称供应商已经命中。"""
         # v15将同一算法用于专项与记忆；旧快照仍保留原角色集合，避免改变已付费输入证明。
         eligible = self.actor in {"writer", "editor"} or self.prompt_cache_layout_version >= 15 and self.actor in {"reviewer", "memory_keeper"}
-        if self.prompt_cache_layout_version < 2 or not (self.cache_policy == "mimo" or self.cache_policy == "deepseek" and self.prompt_cache_layout_version >= 9) or not eligible:
+        if (self.prompt_cache_layout_version < 2 or not eligible or not (
+            self.cache_policy == "mimo" or self.cache_policy == "deepseek" and self.prompt_cache_layout_version >= 9
+            or self.prompt_cache_layout_version >= 29 and self.cache_policy in {"openai", "gemini", "openrouter", "anthropic"}
+        )):
             return
         previous: dict[str, Any] = {}
         try:
@@ -2026,8 +2043,9 @@ class ContextBuilder:
         audit: dict[str, Any] = {"version": 2, "basis": "上一份同项目同角色的编译备料，不等于已发送或供应商缓存回执", "sections": {}}
         projected = {item.key: item for item in packet.model_sections()}
         for section in packet.sections:
-            projected_key = ("CSET-records" if section.key == "CSET" and packet.cache_policy == "deepseek"
-                and packet.cache_layout_version >= 13 and "CSET-records" in projected else section.key)
+            projected_key = ("CSET-records" if section.key == "CSET" and "CSET-records" in projected
+                and (packet.cache_layout_version >= 29 or packet.cache_policy == "deepseek" and packet.cache_layout_version >= 13)
+                else section.key)
             if section.key not in {"F", "CSET"} or projected_key not in projected:
                 continue
             from .schemas import _expand_context_tables
@@ -2064,7 +2082,7 @@ class ContextBuilder:
                     audit["sections"][section.key] = {"unchanged_source_count": len(stable), "source_order": order,
                         "previous_common_characters": before, "arranged_common_characters": after}
 
-            if section.key == "F" and current_records:
+            if section.key == "F" and current_records and self.prompt_cache_layout_version < 29:
                 def complete_accepted(hit: dict[str, Any]) -> bool:
                     """只把本轮已回源的完整已接受正文前置；摘要、片段及参考身份继续在动态段。"""
                     body, number, version = hit.get("body"), hit.get("chapter_no"), hit.get("version")

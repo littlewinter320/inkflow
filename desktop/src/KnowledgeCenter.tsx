@@ -3,7 +3,10 @@ import { KnowledgeGraph, knowledgeColors as colors, type KnowledgeGraphData } fr
 import { readableSourceText } from "./readableNames";
 import "./knowledge.css";
 
-type Section = { id: string; title: string; body: string; source_id: string; chapter: number | null; state: string; quote: string; importance: string; current?: boolean; event_time?: string; conflict?: string; candidate_id?: string; decision?: string; decision_revision?: number };
+type Section = { id: string; title: string; body: string; source_id: string; source_title?: string; source_version?: number | null; source_hash?: string;
+  quote_start?: number; quote_end?: number; chapter: number | null; state: string; quote: string; importance: string;
+  current?: boolean; event_time?: string; time_status?: string; valid_from_chapter?: number; valid_to_chapter?: number | null;
+  participants?: string[]; location?: string; thread_status?: string; conflict?: string; candidate_id?: string; decision?: string; decision_revision?: number };
 type Node = { id: string; name: string; kind: string; aliases: string[]; sources: string[]; section_count: number; conflicts: number };
 type Page = Node & { sections: Section[]; note: string; revision: number };
 type Gap = Pick<Section, "source_id" | "title" | "state" | "candidate_id" | "decision" | "decision_revision"> & {
@@ -17,6 +20,22 @@ type Progress = KnowledgeProgress;
 type Snapshot = { nodes: Node[]; edges: Edge[]; sources: Source[]; problems: string[]; gaps?: Gap[]; kinds: Record<string, string>; states: Record<string, string>; progress: Progress };
 type Search = { entity_ids: string[]; sources: Source[] };
 const statuses: Record<string, string> = { queued: "等待整理", running: "正在整理", completed: "本轮整理完成", waiting_user: "需要你决定", waiting_condition: "部分完成", failed: "整理遇到问题", cancelled: "已停止", interrupted: "已保留断点" };
+const timeLabels: Record<string, string> = { explicit: "原文明确", inferred: "根据情节推断", unknown: "时间待核" };
+const threadLabels: Record<string, string> = { open: "已埋下", advanced: "已有推进", paid: "已兑现", delayed: "已延后", abandoned: "已放弃" };
+
+/** 常用出处直接可见，逐字证据和时点在条目中按需展开。 */
+function KnowledgeSectionEvidence({ section, onOpen }: { section: Section; onOpen: () => void }) {
+  const details = [section.event_time, section.time_status && timeLabels[section.time_status],
+    section.valid_from_chapter && (section.valid_to_chapter ? `第 ${section.valid_from_chapter}–${section.valid_to_chapter} 章有效` : `自第 ${section.valid_from_chapter} 章起有效`),
+    section.participants?.length && `参与者 ${section.participants.join("、")}`, section.location && `地点 ${section.location}`,
+    section.thread_status && threadLabels[section.thread_status]].filter(Boolean);
+  return <div className="knowledge-evidence"><button type="button" className="knowledge-source-link" onClick={onOpen}>
+    {section.source_title || "查看原文依据"}{section.source_version ? ` · 版本 ${section.source_version}` : ""} ↗
+  </button>{(section.quote || details.length > 0) && <details><summary>引文与细节</summary>
+    {details.map((item, index) => <p key={index}>{item}</p>)}{section.quote && <blockquote>{section.quote}</blockquote>}
+    {section.quote_start !== undefined && section.quote_end !== undefined && <small>原文字符位置 {section.quote_start + 1}–{section.quote_end}</small>}
+  </details>}</div>;
+}
 /** 全书知识共用目录、完整页面、来源与图谱，异步返回严格绑定当前项目。 */
 export function KnowledgeCenter({ projectRoot, refreshKey = "", graphLimit, onGraphLimitChange, onEditSetting }: { projectRoot: string;
   refreshKey?: string; graphLimit: number | null; onGraphLimitChange: (limit: number | null) => void;
@@ -79,7 +98,17 @@ export function KnowledgeCenter({ projectRoot, refreshKey = "", graphLimit, onGr
     reading.current.scrollIntoView({ block: "nearest" });
   }
   /** 原文由服务重新核来源后返回，界面不自行拼接文件路径。 */
-  async function openSource(id: string) { const identity = projectRoot, requestId = ++sourceRequest.current; try { const value = await window.inkflow.request<Source>("knowledge.source", { project_root: identity, source_id: id }); if (root.current === identity && requestId === sourceRequest.current) { setSource(value); revealReading(); } } catch (cause) { if (root.current === identity && requestId === sourceRequest.current) setError(readableSourceText(String(cause))); } }
+  async function openSource(id: string, binding?: Pick<Section, "source_hash" | "source_version">) {
+    const identity = projectRoot, requestId = ++sourceRequest.current;
+    try {
+      const value = await window.inkflow.request<Source>("knowledge.source", {
+        project_root: identity, source_id: id, source_hash: binding?.source_hash, source_version: binding?.source_version,
+      });
+      if (root.current === identity && requestId === sourceRequest.current) { setSource(value); revealReading(); }
+    } catch (cause) {
+      if (root.current === identity && requestId === sourceRequest.current) setError(readableSourceText(String(cause)));
+    }
+  }
   const active = ["queued", "running"].includes(progress?.control.status || "");
   const resumable = ["failed", "cancelled", "interrupted", "waiting_condition"].includes(progress?.control.status || "");
   const awaitingSources = progress?.control.status === "waiting_condition" && progress.control.read_complete && !progress.pending && !progress.failed;
@@ -160,10 +189,10 @@ export function KnowledgeCenter({ projectRoot, refreshKey = "", graphLimit, onGr
       <div className="knowledge-reading" ref={reading}>{source ? <article className="knowledge-source"><header><div><small>{state(source.state)}</small><h3>{source.title}</h3></div><button type="button" onClick={() => setSource(null)}>返回知识页</button></header>{source.record_id && onEditSetting && <button type="button" onClick={() => onEditSetting(source.record_id!, source.collection_id || "")}>编辑原设定</button>}{source.path && <button type="button" onClick={() => void window.inkflow.workspaceCommand("document", source.path, source.path)}>在工作台打开原资料</button>}<div className="knowledge-actions">{source.previous && <button type="button" onClick={() => void openSource(source.previous!)}>上一段</button>}{source.next && <button type="button" onClick={() => void openSource(source.next!)}>下一段</button>}</div><pre>{source.body}</pre></article> : <>
         {page?.id === selected ? <article className="knowledge-page"><header><div><small>{current?.kinds[page.kind]}</small><h3>{page.name}</h3>{page.aliases.length > 0 && <p>也称 {page.aliases.join("、")}</p>}</div><button type="button" onClick={() => setEdit({ id: page.id, revision: page.revision, note: page.note, aliases: page.aliases.join("\n") })}>维护档案</button></header>
           {edit?.id === page.id && <form className="knowledge-edit" onSubmit={event => { event.preventDefault(); void act("knowledge.annotate", { entity_id: edit.id, expected_revision: edit.revision, note: edit.note, aliases: edit.aliases.split(/\n|、/).map(value => value.trim()).filter(Boolean) }); }}><label>别名，每行一个<textarea value={edit.aliases} onChange={event => setEdit({ ...edit, aliases: event.target.value })} /></label><label>作者补充<textarea rows={5} value={edit.note} onChange={event => setEdit({ ...edit, note: event.target.value })} /></label><p className="form-hint">补充保留为作者备注。修改正文或已确认设定，请打开对应原资料，沿原流程保存和核对。</p><div className="knowledge-actions"><button type="submit" disabled={busy}>保存档案</button><button type="button" onClick={() => setEdit(null)}>取消编辑</button></div></form>}
-          {page.note && <section className="knowledge-author-note"><h4>作者补充</h4><p>{page.note}</p></section>}{page.sections.map(section => <section key={section.id} className={`knowledge-section state-${section.state}`}><header><h4>{section.title}</h4><span>{state(section.state)}{section.current === false ? " · 历史状态" : ""}{section.importance === "core" ? " · 核心" : ""}</span></header>{section.event_time && <small>{section.event_time}</small>}<p>{section.body}</p>
+          {page.note && <section className="knowledge-author-note"><h4>作者补充</h4><p>{page.note}</p></section>}{page.sections.map(section => <section key={section.id} className={`knowledge-section state-${section.state}`}><header><h4>{section.title}</h4><span>{state(section.state)}{section.current === false ? " · 历史状态" : ""}{section.importance === "core" ? " · 核心" : ""}</span></header><p>{section.body}</p>
             {["conflict", "unverified"].includes(section.state) && <p className="form-hint">{section.conflict}</p>}
             {decisionControls(section, section.body)}
-            <button type="button" className="knowledge-source-link" onClick={() => void openSource(section.source_id)}>{current?.sources.find(item => item.id === section.source_id)?.title || "查看原文依据"} ↗</button></section>)}
+            <KnowledgeSectionEvidence section={section} onOpen={() => void openSource(section.source_id, section)} /></section>)}
           <section className="knowledge-backlinks"><h4>关联对象</h4>{current?.edges.filter(edge => edge.source === page.id || edge.target === page.id).map(edge => { const target = edge.source === page.id ? edge.target : edge.source; return <button type="button" key={edge.id} onClick={() => choose(target)}>{edge.source === page.id ? "→" : "←"} {edge.relation} · {current.nodes.find(node => node.id === target)?.name}</button>; })}</section></article>
           : <div className="knowledge-welcome"><h3>从一个人物、一件物品或一条伏笔开始</h3><p>在左侧选择对象，阅读完整档案、经历和关联资料。搜索也会查找原文中的内容。</p><div>{Object.entries(current?.kinds || {}).map(([key, label]) => { const count = current?.nodes.filter(node => node.kind === key).length || 0; return count > 0 ? <button type="button" key={key} onClick={() => setKind(key)}><strong>{count}</strong>{label}</button> : null; })}</div></div>}</>}
       </div></div></section>

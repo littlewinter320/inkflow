@@ -1441,12 +1441,14 @@ class InkFlowProject:
         except (OSError, sqlite3.Error, ProjectError) as exc:
             warnings.append(f"投影待处理事项暂未保存：{exc}；请保留原事务日志。")
 
-    def _finish_projection_pending_work(self, chapter: dict[str, Any]) -> None:
+    def _finish_projection_pending_work(self, chapter: dict[str, Any], *, items: list[dict[str, Any]] | None = None) -> None:
+        """收尾时仍核对当前正文、日志和状态文件；启动扫描可以复用一次待办查询。"""
         source = {key: chapter[key] for key in ("chapter_no", "version", "content_hash", "path")}
-        # Closing a projection must not recompute unrelated review/task UI state.
-        with self.db.connect() as connection:
-            rows = connection.execute("SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%'").fetchall()
-        pending = [item for row in rows if (item := json.loads(row["value_json"]))["kind"] == "accepted_projection"
+        if items is None:
+            with self.db.connect() as connection:
+                items = [json.loads(row["value_json"]) for row in connection.execute(
+                    "SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%' AND json_extract(value_json,'$.kind')='accepted_projection'")]
+        pending = [item for item in items if item["kind"] == "accepted_projection"
                    and item["source"] == source and item["status"] not in {"completed", "superseded", "rejected"}
                    and item.get("chapter_no") in {None, int(chapter["chapter_no"])}]
         if not pending:
@@ -1475,7 +1477,10 @@ class InkFlowProject:
         """Report projection drift; only a verified pending journal may auto-repair it."""
 
         warnings: list[str] = []
-        for chapter in self.db.accepted_chapters():
+        with self.db.connect() as connection:
+            pending = [json.loads(row["value_json"]) for row in connection.execute(
+                "SELECT value_json FROM metadata WHERE key LIKE 'pending_work:%' AND json_extract(value_json,'$.kind')='accepted_projection'")]
+        for chapter in self.db.accepted_chapters(include_content=True):
             chapter_no = int(chapter["chapter_no"])
             try:
                 final_path = self.resolve_user_path(str(chapter["path"]))
@@ -1484,7 +1489,7 @@ class InkFlowProject:
                 warnings.append(warning)
                 self._record_projection_pending_work(chapter, warning, warnings)
                 continue
-            canonical_content = self.db.canonical_chapter_content(chapter_no)
+            canonical_content = chapter.get("content_text")
             if canonical_content is None:
                 warning = f"第 {chapter_no} 章数据库中没有可恢复正文；请保留当前 Markdown 并走备份迁移。"
                 warnings.append(warning)
@@ -1498,7 +1503,8 @@ class InkFlowProject:
                 continue
             try:
                 if self._projection_hash(final_path) == expected_hash:
-                    self._finish_projection_pending_work(chapter)
+                    if pending:
+                        self._finish_projection_pending_work(chapter, items=pending)
                     continue
             except (OSError, UnicodeError, ValueError, KeyError, TypeError, sqlite3.Error, ProjectError) as exc:
                 warning = f"第 {chapter_no} 章投影恢复核验未完成：{exc}；未改动该文件。"

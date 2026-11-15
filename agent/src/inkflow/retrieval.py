@@ -4,6 +4,7 @@ from __future__ import annotations
 from math import isfinite
 
 from collections import Counter, deque
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 import json
 import math
@@ -61,7 +62,9 @@ class HybridRetriever:
         *,
         embedding_model: str = "",
         reranker_model: str = "",
+        knowledge_rag: bool = True,
     ) -> None:
+        """同一检索器服务各角色；已保存任务可以沿原策略恢复。"""
         self.project = project
         self.embedding_model = embedding_model.strip()
         self.reranker_model = reranker_model.strip()
@@ -70,6 +73,7 @@ class HybridRetriever:
         self._embedding_cache_hits = 0
         self._embedding_cache_misses = 0
         self._knowledge_snapshot: dict[str, Any] = {}
+        self.knowledge_rag = knowledge_rag
 
     def retrieve(
         self,
@@ -86,8 +90,8 @@ class HybridRetriever:
         """按权限与相关性召回；新任务按可用窗口选材，旧快照保留原数量策略。"""
         if context_token_budget is not None and (type(context_token_budget) is not int or context_token_budget < 1):
             raise ValueError("检索资料预算必须是正整数。")
-        self._knowledge_query = query
-        candidates = self._candidates(role=role, chapter_no=chapter_no, chapter_version=chapter_version)
+        candidates = self._candidates(role=role, chapter_no=chapter_no, chapter_version=chapter_version,
+                                      queries=[query])
         corpus_candidate_count = len(candidates)
         from .preferences import applicable_preferences
         preferences = applicable_preferences(self._preference_items(), query,
@@ -129,7 +133,9 @@ class HybridRetriever:
                     "reason": str(exc), "fallback": "exact_and_bm25"})
         # 关系与全文属于主召回；向量只补充相似表达，不能挤掉同权威的主召回证据。
         graph_ids = self._knowledge_related_ids(query)
-        graph = [(item["source_id"], 1.0) for item in candidates if item["source_id"] in graph_ids]
+        graph = ([(identity, 1.0) for identity in graph_ids if identity in fingerprints] if self.knowledge_rag
+                 else [(item["source_id"], 1.0) for item in candidates if item["source_id"] in graph_ids])
+        graph_id_set = set(graph_ids)
         primary_ids = {identity for identity, _ in exact + lexical + graph}
         rankings = (("关系", graph), ("精确", exact), ("BM25", lexical), ("语义辅助", semantic))
         scores: dict[str, float] = {}
@@ -172,13 +178,32 @@ class HybridRetriever:
             if source_id in scores:
                 scores[source_id] += adjustment
         by_id = {item["source_id"]: item for item in candidates}
+        folded_query = query.casefold()
+        named_references = {identity for identity, _ in exact if self.knowledge_rag
+                            and identity.startswith(("import:", "shared:")) and identity.casefold() in folded_query}
+        # 知识索引与普通派生记忆按相关性竞争取材容量，实际用途仍由原始来源的权威决定。
         ranked_ids = sorted(
             scores,
-            key=lambda source_id: (by_id[source_id]["authority_rank"], source_id not in primary_ids, -scores[source_id], source_id),
+            # 明确点名的导入资料优先取回，来源用途仍标为外部参考。
+            key=lambda source_id: (source_id not in named_references, min(by_id[source_id]["authority_rank"], 2)
+                if self.knowledge_rag and by_id[source_id]["source_type"] == "knowledge_page"
+                    and by_id[source_id]["chapter_no"] and source_id in graph_id_set
+                else by_id[source_id]["authority_rank"], source_id not in primary_ids, -scores[source_id], source_id),
         )
         verified_sources: dict[int, dict[str, Any]] = {}
         candidate_source_reads = []
         invalid_source_ids = set()
+        knowledge_anchors = {}
+        if self.knowledge_rag:
+            # 与本轮知识关系共用正文快照；正式审核和提交仍在引擎门禁复核来源版本。
+            verified_sources.update({item["chapter"]: {"version": item["version"], "content_hash": item["hash"],
+                "content": item["body"]} for item in self._knowledge_snapshot["sources"] if item["state"] == "canon"})
+            for identity in graph_ids:
+                item = by_id.get(identity, {})
+                binding = item.get("knowledge_source", {})
+                if (binding.get("chapter_no") and type(binding.get("start")) is int
+                        and type(binding.get("end")) is int and item.get("epistemic_kind") not in {"author_note", "hypothesis"}):
+                    knowledge_anchors.setdefault(binding["chapter_no"], binding)
 
         def verified_source(hit: dict[str, Any]) -> dict[str, Any]:
             """新策略先本地核验匹配来源，按章复用已读正文，不靠候选数猜有效比例。"""
@@ -247,6 +272,21 @@ class HybridRetriever:
             if identity in relevant_ids]} for group in ambiguities] if coverage else ambiguities
         selected = preserve_alternatives(selected, comparison_groups, limit=limit)
         relation_ids = set(selected) - initial_ids
+        reserved_knowledge = None
+        if self.knowledge_rag and limit > 1 and role in {"editor", "reviewer", "memory_keeper"}:
+            # 小窗口也为一条版本有效的知识线索保留位置；硬规则、完整必读来源由 ContextBuilder 独立保留。
+            relevant_knowledge = next((identity for identity in ranked_ids if identity in graph_id_set
+                and by_id[identity]["source_type"] == "knowledge_page" and by_id[identity]["chapter_no"]
+                and by_id[identity]["epistemic_kind"] in {"canon", "derived", "belief", "rumor"}), None)
+            if relevant_knowledge and relevant_knowledge not in selected:
+                # 优先换出同章派生摘要或低位历史候选，保住原有歧义对照。
+                comparable = {identity for group in comparison_groups for identity in group["source_ids"]}
+                replacement = next((index for index in range(len(selected) - 1, 0, -1)
+                    if selected[index] not in comparable and not (by_id[selected[index]]["source_type"] == "canon_source"
+                        and by_id[selected[index]]["chapter_no"] == by_id[relevant_knowledge]["chapter_no"])), None)
+                if replacement is not None:
+                    selected[replacement] = relevant_knowledge
+                    reserved_knowledge = relevant_knowledge
         hits = []
         for source_id in selected:
             item = dict(by_id[source_id])
@@ -254,6 +294,8 @@ class HybridRetriever:
             item["score"] = round(scores.get(source_id, 0.0), 6)
             item["retrieval_reasons"] = (["关系扩展：在最终数量预算内替换低相关项"]
                 if source_id in relation_ids else reasons.get(source_id, ["关系扩展"]))
+            if source_id == reserved_knowledge:
+                item["retrieval_reasons"] = [*item["retrieval_reasons"], "审核或记忆任务保留一条同版知识线索"]
             if source_id in feedback and feedback[source_id]:
                 item["retrieval_reasons"].append("同查询、同角色、同来源版本的有界反馈排序")
             if any(source_id in group["source_ids"] for group in ambiguities):
@@ -280,30 +322,53 @@ class HybridRetriever:
             if len(validated) >= limit:
                 break
             if hit["source_type"] not in {"chapter_summary", "canon_fact", "canon_thread", "canon_source"}:
+                if self.knowledge_rag and hit["source_type"] == "knowledge_page":
+                    # 整条知识保留原文出处；目录或一跳关系本身不能成为硬冲突依据。
+                    source_reads.append({"source_id": hit["source_id"], "state": "located",
+                        "via": "knowledge_page", "knowledge_source": hit["knowledge_source"]})
                 validated.append(hit)
                 continue
             try:
-                source = verified_source(hit) if coverage else self._accepted_source(int(hit["chapter_no"]), before_chapter=chapter_no)
+                source = (verified_source(hit) if coverage or self.knowledge_rag
+                          else self._accepted_source(int(hit["chapter_no"]), before_chapter=chapter_no))
                 if ((hit.get("version") is not None and source["version"] != hit["version"])
                         or (hit.get("source_hash") and source["content_hash"] != hit["source_hash"])):
                     raise ValueError("命中后正文来源版本或哈希已变化。")
                 if hit["source_type"] == "canon_fact" and (not str(hit.get("evidence") or "").strip()
                         or hit["evidence"] not in source["content"]):
                     raise ValueError("事实主证据未在当前已接受原文定位。")
+                anchor = knowledge_anchors.get(hit["chapter_no"])
+                if anchor and (anchor["version"] != source["version"] or anchor["source_hash"] != source["content_hash"]):
+                    anchor = None  # 并发换版后，旧引文位置不能套到新正文。
+                if context_token_budget is not None and hit["source_type"] == "canon_source" and anchor:
+                    # 别名命中原文可能没有该别名，优先锚定同章知识条目的逐字引文附近。
+                    excerpt, start, end = _paragraph_excerpt(source["content"], max(0, anchor["start"] - 200),
+                        max_chars=2400, through=anchor["end"])
+                    hit.update(body=excerpt, body_kind="accepted_prose", content_hash=content_hash(excerpt),
+                        resolved_source={"source_id": hit["source_id"], "chapter_no": hit["chapter_no"],
+                            "version": source["version"], "source_hash": source["content_hash"], "start": start, "end": end},
+                        knowledge_locator=anchor["title"])
                 if hit["source_type"] != "chapter_summary":
                     validated.append(hit)
                     source_reads.append({"source_id": hit["source_id"], "chapter_no": hit["chapter_no"],
                         "version": source["version"], "source_hash": source["content_hash"],
-                        "state": "source_validated", "via": hit["source_type"]})
+                        "state": "source_validated", "via": hit["source_type"],
+                        **({key: hit["resolved_source"][key] for key in ("start", "end")} if hit.get("resolved_source") else {})})
                     continue
                 text = source["content"]
                 excerpt_size = (max(800, min(2400, context_token_budget // max(1, limit)))
                                 if context_token_budget is not None else 5000)
-                spans = [{"source_id": str(offset), "title": hit["title"], "body": text[offset:offset + excerpt_size]}
-                         for offset in range(0, len(text), min(1000, excerpt_size // 2))]
-                ranked_spans = self._bm25_ranking(query, spans)
-                offset = int(ranked_spans[0][0]) if ranked_spans else 0
-                excerpt, offset, end = _paragraph_excerpt(text, offset, max_chars=excerpt_size)
+                if anchor:
+                    # 摘要和原文分支共用知识引文位置，别名本身不必出现在原句里。
+                    excerpt, offset, end = _paragraph_excerpt(text, max(0, anchor["start"] - 200),
+                        max_chars=excerpt_size, through=anchor["end"])
+                    hit["knowledge_locator"] = anchor["title"]
+                else:
+                    spans = [{"source_id": str(offset), "title": hit["title"], "body": text[offset:offset + excerpt_size]}
+                             for offset in range(0, len(text), min(1000, excerpt_size // 2))]
+                    ranked_spans = self._bm25_ranking(query, spans)
+                    offset = int(ranked_spans[0][0]) if ranked_spans else 0
+                    excerpt, offset, end = _paragraph_excerpt(text, offset, max_chars=excerpt_size)
                 hit = {**hit, "summary_body": hit["body"], "body": excerpt,
                     "summary_content_hash": hit.get("content_hash"), "content_hash": content_hash(excerpt),
                     "identity": "accepted_source_excerpt", "body_kind": "accepted_prose",
@@ -335,6 +400,10 @@ class HybridRetriever:
                                    "budget": limit},
             "query": query,
             "candidate_count": len(candidates),
+            **({"knowledge_retrieval": {"matched_entries": sum(
+                by_id[identity]["source_type"] == "knowledge_page" for identity in ranked_ids),
+                "retrieved_entries": sum(item["source_type"] == "knowledge_page" for item in result),
+                "reserved_entry": reserved_knowledge}} if self.knowledge_rag else {}),
             **({"coverage_policy": {**coverage,
                 "retrieved_fraction": len(result) / coverage["relevant_candidate_count"] if coverage["relevant_candidate_count"] else 0},
                 "corpus_candidate_count": corpus_candidate_count,
@@ -610,32 +679,41 @@ class HybridRetriever:
         # paragraph index only if large-book recovery becomes a measured bottleneck.
         """
         queries = list(dict.fromkeys(value.strip()[:160] for value in queries if value.strip()))[:4]
+        if self.knowledge_rag and not queries:
+            return [], {"queries": [], "searched_chapters": [], "matched_chapters": [], "reference_hits": []}
+        indexed = self._candidates(role=role, chapter_no=chapter_no, chapter_version=None,
+            queries=queries if self.knowledge_rag else (), recovery=True)
+        accepted = {source["chapter"]: source for source in self._knowledge_snapshot.get("sources", []) if source["state"] == "canon"}
         chapters: dict[int, dict[str, Any]] = {}
         candidates: list[dict[str, Any]] = []
         skipped: list[int] = []
-        for row in self.project.db.accepted_chapters():
+        for row in self.project.db.accepted_chapters(before_chapter=chapter_no):
             number = int(row["chapter_no"])
-            if number >= chapter_no:
-                continue
-            try:
-                source = self._accepted_source(number, before_chapter=chapter_no)
-                text = source["content"]
-            except (OSError, UnicodeError, ValueError):
-                skipped.append(number)
-                continue
-            if not text or content_hash(text) != row["content_hash"]:
-                skipped.append(number)
-                continue
+            if self.knowledge_rag:
+                source = accepted.get(number)
+                if not source or source["version"] != row["version"] or source["hash"] != row["content_hash"]:
+                    skipped.append(number)
+                    continue
+                text = source["body"]
+            else:
+                try:
+                    text = self._accepted_source(number, before_chapter=chapter_no)["content"]
+                except (OSError, ValueError):
+                    skipped.append(number)
+                    continue
+                if content_hash(text) != row["content_hash"]:
+                    skipped.append(number)
+                    continue
             chapters[number] = {**row, "content": text}
             # Overlap keeps nearby pronouns and transitions searchable. The
             # selected chapter is subsequently read in full within the packet budget.
             for offset in range(0, len(text), 1000):
                 candidates.append({"source_id": f"chapter:{number:05d}:offset:{offset}",
-                    "source_type": "canon_source", "chapter_no": number, "version": source["version"],
-                    "source_hash": source["content_hash"], "authority_rank": 2,
+                    "source_type": "canon_source", "chapter_no": number, "version": row["version"],
+                    "source_hash": row["content_hash"], "authority_rank": 2,
                     "authority": "已接受正文定位候选", "entities": _entities(str(row["title"]) + text[offset:offset + 5000]),
                     "title": str(row["title"]), "body": text[offset:offset + 5000]})
-        for item in self._candidates(role=role, chapter_no=chapter_no, chapter_version=None):
+        for item in indexed:
             if (item["source_type"] in {"canon_fact", "canon_thread", "chapter_summary"} and item["chapter_no"] in chapters
                     or item["source_type"] in {"story_reference", "expression_reference", "user_preference"}):
                 candidates.append(item)
@@ -649,6 +727,7 @@ class HybridRetriever:
         matched: dict[int, list[str]] = {}
         reference_scores: dict[str, float] = {}
         branch_diagnostics = []
+        knowledge_matches: dict[int, list[str]] = {}
         from .preferences import applicable_preferences
         for query in queries:
             preferences = applicable_preferences(self._preference_items(), query,
@@ -657,6 +736,18 @@ class HybridRetriever:
             eligible = [item for item in candidates if item["source_type"] != "user_preference"
                         or item["source_id"] in allowed_preferences]
             exact, lexical, branch = self._local_branches(query, eligible)
+            # 定向补证沿用常规知识召回，把命中的目录和关系转换为已经核版的章节原文。
+            graph_ids = list(self._knowledge_related_ids(query)) if self.knowledge_rag else []
+            graph_chapters = [number for identity in graph_ids if identity.startswith("chapter:")
+                              and (number := int(identity.split(":")[1])) in chapters]
+            for rank, number in enumerate(graph_chapters):
+                scores[number] = scores.get(number, 0.0) + 1 / (rank + 1)
+                matched.setdefault(number, []).append(query)
+                knowledge_matches.setdefault(number, []).append(query)
+            if self.knowledge_rag:
+                branch = [{"category": "knowledge", "state": "matched" if graph_ids else "empty",
+                    "candidate_count": len(graph_ids), "matched_source_ids": graph_ids[:24],
+                    "reason": "知识对象、别名与直接关系定位可用前章。"} if item["category"] == "knowledge" else item for item in branch]
             branch_diagnostics.append({"query": query, "branches": branch})
             ranking = list(dict.fromkeys(source_id for source_id, _ in exact + lexical))
             seen: set[int] = set()
@@ -669,11 +760,16 @@ class HybridRetriever:
                     continue
                 seen.add(number)
                 scores[number] = scores.get(number, 0.0) + 1 / (rank + 1)
-                matched.setdefault(number, []).append(query)
+                if query not in matched.setdefault(number, []):
+                    matched[number].append(query)
         selected = sorted(scores, key=lambda number: (-scores[number], -number))[:6]
         hits = [{**chapters[number], "queries": matched[number]} for number in selected]
         return hits, {"queries": queries, "searched_chapters": sorted(chapters),
             "unreadable_chapters": skipped, "matched_chapters": selected,
+            **({"knowledge_matches": [{"chapter_no": number, "version": chapters[number]["version"],
+                "content_hash": chapters[number]["content_hash"], "selected": number in selected}
+                for number in dict.fromkeys([*selected, *knowledge_matches]) if number in knowledge_matches][:32],
+                "knowledge_match_count": len(knowledge_matches)} if self.knowledge_rag else {}),
             "branches": branch_diagnostics, "overlaps": overlaps, "source_conflicts": conflicts,
             "source_gaps": self.source_gaps,
             "reference_hits": [by_id[key] for key in sorted(reference_scores, key=lambda key: (-reference_scores[key], key))[:6]],
@@ -690,7 +786,9 @@ class HybridRetriever:
             "time_span": chapter_no - min(chapters) if chapters else 0,
         }
 
-    def _candidates(self, *, role: str, chapter_no: int, chapter_version: int | None) -> list[dict[str, Any]]:
+    def _candidates(self, *, role: str, chapter_no: int, chapter_version: int | None,
+                    queries: Sequence[str] = (), recovery: bool = False) -> list[dict[str, Any]]:
+        """汇总满足角色和章节边界的候选，供常规检索与审核补证共用。"""
         items: list[dict[str, Any]] = []
         self.source_gaps = []
         for fact in self.project.db.facts_as_of(chapter_no - 1):
@@ -826,22 +924,53 @@ class HybridRetriever:
                 "title": title, "body": body, "chapter_no": None, "version": None,
                 "source_hash": reference["source_hash"], "source_path": reference["source_path"],
                 "authority_rank": 8, "authority": "reference_only", "entities": _entities(title + body)})
-        from .knowledge import KnowledgeService, STATES
-        self._knowledge_snapshot = KnowledgeService(self.project).snapshot(actor=role, before_chapter=chapter_no)
-        for source in KnowledgeService(self.project).reference_hits(getattr(self, "_knowledge_query", "") or "\0"):
+        from .knowledge import HIDDEN_RETRIEVAL_STATES, KnowledgeService, STATES
+        knowledge = KnowledgeService(self.project)
+        self._knowledge_snapshot = knowledge.snapshot(actor=role, before_chapter=chapter_no, retrieval=self.knowledge_rag)
+        for source in (knowledge.reference_hits(queries[0] or "\0") if queries and not self.knowledge_rag else []):
             items.append({"source_id": source["id"], "source_type": "expression_reference", "title": source["title"],
                 "body": source["body"], "chapter_no": None, "version": None, "source_hash": source["hash"],
                 "authority_rank": 8, "authority": "外部参考原文，不属于小说正史", "entities": _entities(source["title"])})
+        if self.knowledge_rag and queries:
+            for source in knowledge.reference_hits(list(queries)):
+                body, start, end = _paragraph_excerpt(source["body"], source["match_offset"], max_chars=2400)
+                items.append({"source_id": source["id"], "source_type": "expression_reference", "title": source["title"],
+                    "body": body, "chapter_no": None, "version": None, "source_hash": source["hash"],
+                    "resolved_source": {"source_id": source["id"], "source_hash": source["hash"], "start": start, "end": end},
+                    "authority_rank": 8, "authority": "外部参考原文", "entities": _entities(source["title"])})
         existing_ids = {item["source_id"] for item in items}
         # 全文成为可检索候选；摘要仍可先读，但不能因摘要省略而找不到原文。
-        for source in self._knowledge_snapshot["sources"]:
+        for source in (() if recovery else self._knowledge_snapshot["sources"]):
             if source["state"] == "canon":
                 identity = f"chapter:{source['chapter']:05d}"
                 if identity not in existing_ids:
                     items.append({"source_id": identity, "source_type": "canon_source", "title": source["title"],
                         "body": source["body"], "chapter_no": source["chapter"], "version": source["version"], "source_hash": source["hash"],
                         "authority_rank": 2, "authority": "已接受正文全文", "entities": _entities(source["title"] + source["body"])})
-        for node in self._knowledge_snapshot["nodes"]:
+        for node in (() if recovery else self._knowledge_snapshot["nodes"]):
+            if self.knowledge_rag:
+                # 整页可能混有不同时间和性质；以单条原始证据为单位参与检索和预算。
+                for section in node["sections"]:
+                    if section["state"] in HIDDEN_RETRIEVAL_STATES:
+                        continue
+                    if section["title"] in {"完整内容", "原始资料"}:
+                        continue
+                    origin = {"source_id": section["source_id"], "title": section["source_title"],
+                        "chapter_no": section["chapter"], "version": section["source_version"],
+                        "source_hash": section["source_hash"], "start": section.get("quote_start"), "end": section.get("quote_end")}
+                    details = {"资料性质": STATES.get(section["state"], section["state"]), "条目": section["title"],
+                        "内容": section["body"], "原文引句": section["quote"],
+                        **{label: section[key] for key, label in (("current", "当前仍有效"), ("event_time", "故事时间"),
+                            ("time_status", "时间依据"), ("valid_from_chapter", "生效章"), ("valid_to_chapter", "失效边界"),
+                            ("participants", "参与者"), ("location", "地点"), ("thread_status", "伏笔进度")) if section.get(key) is not None}}
+                    # 条目身份含原文版本指纹；相同句子随来源换版时旧反馈不会漂移。
+                    items.append({"source_id": f"knowledge:{node['id']}:{section['id']}", "source_type": "knowledge_page",
+                        "title": node["name"], "body": json.dumps(details, ensure_ascii=False), "chapter_no": section["chapter"],
+                        "version": origin["version"], "source_hash": origin["source_hash"], "knowledge_source": origin,
+                        "epistemic_kind": section["state"], "status": "historical" if section.get("current") is False else "",
+                        "authority_rank": 5, "authority": "有来源的知识索引，原文用于核证",
+                        "entities": [node["name"], *node["aliases"]]})
+                continue
             sections = [section for section in node["sections"] if section["state"] != "conflict"]
             if not sections:
                 continue
@@ -927,9 +1056,49 @@ class HybridRetriever:
                 "reason": error or ("本地分类匹配完成。" if first or second else "无适用匹配，停止此分支。")})
         return sorted(exact, key=lambda item: (-item[1], item[0])), sorted(lexical, key=lambda item: (-item[1], item[0])), diagnostics
 
-    def _knowledge_related_ids(self, query: str) -> set[str]:
+    def _knowledge_related_ids(self, query: str) -> list[str] | set[str]:
         """沿明确对象的一跳有据关系补资料，不将连接数当事实权重。"""
         nodes = self._knowledge_snapshot.get("nodes", [])
+        if self.knowledge_rag:
+            from .knowledge import HIDDEN_RETRIEVAL_STATES
+            folded = query.casefold()
+            by_id = {node["id"]: node for node in nodes}
+            matched = []
+            for node in nodes:
+                if node["namespace"] != "book":
+                    continue
+                labels = [node["name"], *node["aliases"]]
+                weight = max((len(name) for name in labels if len(name) >= 2 and name.casefold() in folded), default=0)
+                if f"knowledge:{node['id']}" in folded or folded in {label.casefold() for label in labels}:
+                    weight += 100
+                if weight:
+                    matched.append((weight, node["id"]))
+            direct = [identity for _, identity in sorted(matched, key=lambda item: (-item[0], item[1]))]
+            direct_ids = set(direct)
+            related = set()
+            edge_chapters = []
+            for edge in self._knowledge_snapshot.get("edges", []):
+                if edge["state"] in HIDDEN_RETRIEVAL_STATES | {"author_note", "hypothesis"}:
+                    continue
+                if edge["source"] in direct_ids or edge["target"] in direct_ids:
+                    related.update((edge["source"], edge["target"]))
+                    if edge["source_id"].startswith("chapter:"):
+                        edge_chapters.append(f"chapter:{edge['chapter']:05d}")
+            ranked = []
+            for identity in [*direct, *sorted(related - direct_ids)]:
+                node = by_id[identity]
+                # 补证明确点了条目编号时，先找那条的历史版本，再按当前状态和章序拓展。
+                sections = sorted(node["sections"], key=lambda section: (
+                    f"knowledge:{identity}:{section['id']}" not in folded, section.get("current") is False,
+                    section["importance"] != "core", -(section["chapter"] or 0)))
+                for section in sections:
+                    if section["state"] in HIDDEN_RETRIEVAL_STATES:
+                        continue
+                    item_id = f"knowledge:{identity}:{section['id']}"
+                    if section["source_id"].startswith("chapter:") and section["state"] not in {"author_note", "hypothesis"}:
+                        ranked.append(f"chapter:{section['chapter']:05d}")
+                    ranked.append(item_id)
+            return list(dict.fromkeys([*ranked, *edge_chapters]))
         matched = {node["id"] for node in nodes if any(name and name in query for name in [node["name"], *node["aliases"]])}
         expanded = set(matched)
         for edge in self._knowledge_snapshot.get("edges", []):
@@ -958,7 +1127,7 @@ class HybridRetriever:
 
     @staticmethod
     def _bm25_ranking(query: str, candidates: list[dict[str, Any]]) -> list[tuple[str, float]]:
-        query_terms = _terms(query)
+        query_terms = Counter(_terms(query))
         documents = [_terms(item["title"] + "\n" + item["body"]) for item in candidates]
         if not query_terms or not any(documents):
             return []
@@ -967,12 +1136,12 @@ class HybridRetriever:
         ranked = []
         for item, document in zip(candidates, documents, strict=True):
             counts, length, score = Counter(document), max(1, len(document)), 0.0
-            for term in query_terms:
+            for term, repetitions in query_terms.items():
                 count = counts.get(term, 0)
                 if not count:
                     continue
                 inverse = math.log(1 + (len(documents) - frequency[term] + 0.5) / (frequency[term] + 0.5))
-                score += inverse * count * 2.2 / (count + 1.2 * (0.25 + 0.75 * length / average))
+                score += repetitions * inverse * count * 2.2 / (count + 1.2 * (0.25 + 0.75 * length / average))
             if score > 0:
                 ranked.append((item["source_id"], score))
         return sorted(ranked, key=lambda value: (-value[1], value[0]))
@@ -1075,7 +1244,7 @@ def _cached_cross_encoder(model_name: str):
     return _MODEL_CACHE[key]
 
 
-def _paragraph_excerpt(text: str, offset: int, *, max_chars: int = 5000) -> tuple[str, int, int]:
+def _paragraph_excerpt(text: str, offset: int, *, max_chars: int = 5000, through: int = 0) -> tuple[str, int, int]:
     """Keep nearby paragraph boundaries while retaining exact source offsets."""
     offset = max(0, min(len(text), offset))
     boundary = text.rfind("\n", max(0, offset - 300), offset)
@@ -1085,6 +1254,8 @@ def _paragraph_excerpt(text: str, offset: int, *, max_chars: int = 5000) -> tupl
         boundary = text.rfind("\n", max(start + 1, end - 300), end)
         if boundary > start:
             end = boundary
+    # 逐字证据跨过软截点时保留到引文末尾，由上层资料预算决定是否装入整条。
+    end = max(end, min(through, len(text)))
     return text[start:end], start, end
 
 

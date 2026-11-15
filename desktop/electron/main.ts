@@ -350,13 +350,13 @@ class EngineBridge {
   private process: ChildProcessWithoutNullStreams | null = null;
   private pending = new Map<string, Pending>();
   private backgroundRuns = new Map<string, Pick<Pending, "child" | "conversationId" | "settled" | "markSettled">>();
-  private compatibilityCheck: Promise<void> | null = null;
+  private initialization: Promise<unknown> | null = null;
   private shuttingDown = false;
   private shutdownPromise: Promise<void> | null = null;
 
   start(): void {
     if (this.shuttingDown) return;
-    if (this.process && !this.process.killed && this.process.exitCode === null) return;
+    if (this.process && !this.process.killed && this.process.exitCode === null && this.process.signalCode === null) return;
     const command = this.command();
     const child = spawn(command.executable, command.args, {
       cwd: command.cwd,
@@ -390,39 +390,44 @@ class EngineBridge {
     });
   }
 
+  /** 诊断入口保留原始版本信息，其他请求须经过同一子进程的版本门禁。 */
   async request(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
-    if (method !== "app.initialize") await this.ensureCompatible();
-    return this.requestRaw(method, params);
+    if (method === "app.initialize" && params.version_only !== true) return this.requestRaw(method, params);
+    const started = this.initialize();
+    const child = this.process;
+    const details = await started as { version?: string; protocol_version?: number };
+    // 握手回包之后进程仍可能退出；检查同一承诺，避免把请求交给尚未核对的新进程。
+    if (!child || this.process !== child || this.initialization !== started || child.killed
+        || child.exitCode !== null || child.signalCode !== null) throw new Error("墨流本地引擎已重新启动，请重新打开资料。");
+    if (method === "app.initialize") return details;
+    const desktopVersion = app.getVersion();
+    if (details.version !== desktopVersion || Number(details.protocol_version || 0) !== 1) {
+      throw new Error(`桌面程序 ${desktopVersion} 与内置引擎 ${details.version || "未知"} 不兼容。为避免损坏配置，已停止本次请求；请重新安装当前版本。`);
+    }
+    return this.requestOnChild(child, method, params);
   }
 
-  private async ensureCompatible(): Promise<void> {
-    if (!this.compatibilityCheck) {
-      this.compatibilityCheck = this.requestRaw("app.initialize").then((value) => {
-        const details = value as { version?: string; protocol_version?: number };
-        const desktopVersion = app.getVersion();
-        const engineVersion = String(details.version || "");
-        const protocolVersion = Number(details.protocol_version || 0);
-        if (engineVersion !== desktopVersion || protocolVersion !== 1) {
-          throw new Error(`桌面程序 ${desktopVersion} 与内置引擎 ${engineVersion || "未知"} 不兼容。为避免损坏配置，已停止本次请求；请重新安装当前版本。`);
-        }
+  /** 首页和项目请求共用一次握手，进程失败会清除本次结果。 */
+  private initialize(): Promise<unknown> {
+    if (!this.initialization) {
+      const started = performance.now();
+      const check = this.requestRaw("app.initialize", { version_only: true }).then((value) => {
+        logLifecycle("engine.initialized", { duration_ms: Math.round(performance.now() - started) });
+        return value;
+      }).catch((cause) => {
+        if (this.initialization === check) this.initialization = null;
+        throw cause;
       });
+      this.initialization = check;
     }
-    const check = this.compatibilityCheck;
-    try {
-      await check;
-    } catch (cause) {
-      // A transient startup/pipe failure must not poison every later request.
-      // The next request rechecks the newly started engine's version.
-      if (this.compatibilityCheck === check) this.compatibilityCheck = null;
-      throw cause;
-    }
+    return this.initialization;
   }
 
   private async requestRaw(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
     if (this.shuttingDown) throw new Error("墨流正在保存退出状态，请稍后再试。");
     this.start();
     const child = this.process;
-    if (!child || child.killed || child.exitCode !== null) {
+    if (!child || child.killed || child.exitCode !== null || child.signalCode !== null) {
       throw new Error("墨流本地引擎暂时不可用，请重试。");
     }
     return this.requestOnChild(child, method, params);
@@ -430,7 +435,7 @@ class EngineBridge {
 
   private requestOnChild(child: ChildProcessWithoutNullStreams, method: string, params: Record<string, unknown>): Promise<unknown> {
     if (child.killed || child.exitCode !== null || child.signalCode !== null) {
-      return Promise.reject(new Error("墨流本地引擎已停止，未能发送本次取消请求。"));
+      return Promise.reject(new Error("墨流本地引擎已停止，未能发送本次请求。"));
     }
     const id = randomUUID();
     const payload = JSON.stringify({ jsonrpc: "2.0", id, method, params });
@@ -472,13 +477,13 @@ class EngineBridge {
     if (!child) return;
     if (child.killed || child.exitCode !== null || child.signalCode !== null) {
       this.process = null;
-      this.compatibilityCheck = null;
+      this.initialization = null;
       return;
     }
     logLifecycle("engine.stop-requested", { enginePid: child?.pid });
     this.shuttingDown = true;
     this.process = null;
-    this.compatibilityCheck = null;
+    this.initialization = null;
     for (const [id, item] of this.pending.entries()) {
       if (item.child !== child) continue;
       item.reject(new Error("墨流桌面已关闭，本次引擎任务被中断；已写入的文件会保留。"));
@@ -633,7 +638,7 @@ class EngineBridge {
 
   pendingWorkCount(conversationId?: string): number {
     // Passive preloading and status requests cannot turn an idle window into a running task.
-    const reads = new Set(["project.preload", "project.open", "project.status", "project.tree", "collaboration.overview", "collaboration.list", "batch.progress",
+    const reads = new Set(["app.initialize", "provider.status", "project.preload", "project.open", "project.status", "project.tree", "collaboration.overview", "collaboration.list", "batch.progress",
       "context.status", "context.details", "usage.overview", "task.status", "task.list", "document.read", "document.read_reference", "document.version.read", "document.search",
       "settings.get", "computer.actions.list", "voice.status", "voice.background", "voice.settings.get", "voice.job.list", "voice.job.status", "voice.profile.list", "voice.roles.get", "project.trash.list", "project.canon_migration.status", "conversation.history", "conversation.list", "memory.index",
       "story_settings.list", "story_settings.maintenance", "story_settings.records", "story_settings.templates", "manual_edits.scan", "manual_edits.status", "memory.audit",
@@ -663,7 +668,7 @@ class EngineBridge {
     }
     if (this.process !== child) return;
     this.process = null;
-    this.compatibilityCheck = null;
+    this.initialization = null;
     if (this.shuttingDown) return;
     this.send("engine:status", { level: "error", message: error.message });
   }

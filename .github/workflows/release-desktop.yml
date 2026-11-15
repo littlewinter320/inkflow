@@ -62,7 +62,7 @@ jobs:
           pyinstaller `
             --noconfirm `
             --clean `
-            --onefile `
+            --onedir `
             --name inkflow-engine `
             --paths ./agent/src `
             --collect-submodules mcp.server `
@@ -91,7 +91,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $buildConfig = (Get-Content -Raw -LiteralPath ./package.json | ConvertFrom-Json).build
           $buildConfig.directories.output = '../artifacts/desktop'
-          ($buildConfig.extraResources | Where-Object { $_.to -eq 'engine/inkflow-engine.exe' }).from = '../dist/engine/inkflow-engine.exe'
+          ($buildConfig.extraResources | Where-Object { $_.to -eq 'engine' }).from = '../dist/engine/inkflow-engine'
           New-Item -ItemType Directory -Force -Path ../artifacts | Out-Null
           $buildConfig | ConvertTo-Json -Depth 50 | Set-Content -Encoding utf8 -LiteralPath ../artifacts/desktop-build.json
           npx electron-builder --config ../artifacts/desktop-build.json --win nsis --publish never

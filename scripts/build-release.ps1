@@ -11,6 +11,7 @@ $releaseRoot = Join-Path 'D:\墨流\release' $desktopVersion
 $python = Join-Path $releaseRoot 'venv\Scripts\python.exe'
 $pyinstaller = Join-Path $releaseRoot 'venv\Scripts\pyinstaller.exe'
 $engineOutput = Join-Path $releaseRoot 'engine'
+$engineBundle = Join-Path $engineOutput 'inkflow-engine'
 $agentRoot = Join-Path $repositoryRoot 'agent'
 $extensionBin = Join-Path $repositoryRoot 'extension\bin'
 $extensionRelease = Join-Path $releaseRoot 'extension'
@@ -57,7 +58,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Prompt catalogue generation failed.' }
 & $pyinstaller `
     --noconfirm `
     --clean `
-    --onefile `
+    --onedir `
     --name inkflow-engine `
     --paths (Join-Path $agentRoot 'src') `
     --collect-submodules mcp.server `
@@ -85,15 +86,17 @@ if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller failed with exit code $LASTEXITCODE."
 }
 
-if (-not (Test-Path -LiteralPath (Join-Path $engineOutput 'inkflow-engine.exe'))) {
-    throw 'The Python sidecar build finished without producing inkflow-engine.exe.'
+# 安装包在安装时展开引擎，桌面每次启动直接使用同目录的库和数据。
+if (-not (Test-Path -LiteralPath (Join-Path $engineBundle 'inkflow-engine.exe') -PathType Leaf) -or
+    -not (Test-Path -LiteralPath (Join-Path $engineBundle '_internal') -PathType Container)) {
+    throw 'The Python sidecar build finished without producing the complete engine directory.'
 }
 
 New-Item -ItemType Directory -Force -Path $desktopRelease | Out-Null
 if ($IncludeExtension) {
     New-Item -ItemType Directory -Force -Path $extensionBin | Out-Null
     New-Item -ItemType Directory -Force -Path $extensionRelease | Out-Null
-    Copy-Item -LiteralPath (Join-Path $engineOutput 'inkflow-engine.exe') -Destination (Join-Path $extensionBin 'inkflow-engine.exe') -Force
+    Copy-Item -LiteralPath (Join-Path $engineBundle 'inkflow-engine.exe'), (Join-Path $engineBundle '_internal') -Destination $extensionBin -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'third_party\NOTICES.txt') -Destination (Join-Path $extensionBin 'NOTICES.txt') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'third_party\edge-tts-LICENSE') -Destination (Join-Path $extensionBin 'edge-tts-LICENSE') -Force
     foreach ($notice in @('graphify-LICENSE', 'graphify-LICENSE-MIT', 'graphify-NOTICE')) {

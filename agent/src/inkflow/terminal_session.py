@@ -7446,7 +7446,8 @@ class TerminalSession:
                     elif step.operation == "plan.preview":
                         receipt = await self._run_step("plan.preview", asyncio.to_thread(self.engine.preview_plan_range, root, lower, upper))
                     elif step.operation == "source.search":
-                        receipt = await self._run_step("source.search", asyncio.to_thread(HybridRetriever(project).retrieve,
+                        receipt = await self._run_step("source.search", asyncio.to_thread(HybridRetriever(project,
+                            knowledge_rag=self.engine.settings.retrieval_policy_version >= 4).retrieve,
                             step.instruction or intent.operation_instruction, role="coordinator", chapter_no=number,
                             chapter_version=chapter["version"] if chapter else None))
                     else:  # chapter.read已由工具白名单验证，不接收外部路径。

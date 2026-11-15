@@ -1,24 +1,28 @@
 import { spawn } from "node:child_process";
-import { createServer } from "node:net";
-import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { cp } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const require = createRequire(import.meta.url);
-let executable = require("electron");
-if (process.platform === "win32") {
+const desktopRoot = fileURLToPath(new URL("..", import.meta.url));
+
+/** 首次只复制一次带品牌的运行时，后续启动直接复用。 */
+async function developmentExecutable() {
+  const electron = require("electron");
+  if (process.platform !== "win32") return electron;
   const version = require("../package.json").version;
-  const icon = path.resolve("resources/icon.ico");
+  const icon = path.join(desktopRoot, "resources/icon.ico");
   const identity = `${require("electron/package.json").version}-${version}-${createHash("sha256").update(readFileSync(icon)).digest("hex").slice(0, 12)}`;
   const cache = "D:/墨流/cache/desktop-runtime";
   const runtime = path.join(cache, identity);
-  executable = path.join(runtime, "墨流 InkFlow.exe");
+  const executable = path.join(runtime, "墨流 InkFlow.exe");
   if (!existsSync(executable)) {
     mkdirSync(cache, { recursive: true });
     const prepared = mkdtempSync(path.join(cache, "prepare-"));
-    cpSync(path.dirname(require("electron")), prepared, { recursive: true });
+    await cp(path.dirname(electron), prepared, { recursive: true });
     const branded = path.join(prepared, "墨流 InkFlow.exe");
     copyFileSync(icon, path.join(prepared, "icon.ico"));
     await new Promise((resolve, reject) => {
@@ -35,42 +39,74 @@ if (process.platform === "win32") {
     renameSync(path.join(prepared, "electron.exe"), branded);
     renameSync(prepared, runtime);
   }
+  return executable;
 }
 
-// Compile before Electron can see a previous main.js after a source update.
-await new Promise((resolve, reject) => {
-  const compile = spawn(process.execPath, ["node_modules/typescript/bin/tsc", "-p", "tsconfig.electron.json"], {
-    cwd: new URL("..", import.meta.url), stdio: "inherit", windowsHide: true,
+/** 校验源码与产物的内容；切分支、手动构建或删除产物后都不会启动旧主进程。 */
+async function prepareMainProcess() {
+  const started = performance.now();
+  const sources = readdirSync(path.join(desktopRoot, "electron"), { recursive: true, withFileTypes: true })
+    .filter(entry => entry.isFile() && entry.name.endsWith(".ts"))
+    .map(entry => path.join(entry.parentPath, entry.name)).sort();
+  const inputs = [path.join(desktopRoot, "tsconfig.electron.json"), path.join(desktopRoot, "package-lock.json"), ...sources];
+  const outputs = sources.filter(source => !source.endsWith(".d.ts")).map(source =>
+    path.join(desktopRoot, "dist-electron", path.relative(path.join(desktopRoot, "electron"), source).replace(/\.ts$/, ".js")));
+  const stamp = path.join(desktopRoot, "build", "dev-electron.hash");
+  const fingerprint = (files) => {
+    const hash = createHash("sha256");
+    for (const file of files) {
+      const content = readFileSync(file);
+      hash.update(`${file}:${content.length}\n`).update(content);
+    }
+    return hash.digest("hex");
+  };
+  if (outputs.length && existsSync(stamp) && outputs.every(file => existsSync(file))
+      && readFileSync(stamp, "utf8") === fingerprint([...inputs, ...outputs])) {
+    console.info(`墨流主进程复用已编译文件（${Math.round(performance.now() - started)} ms）`);
+    return;
+  }
+  const sourceHash = fingerprint(inputs);
+  await new Promise((resolve, reject) => {
+    const compile = spawn(process.execPath, [require.resolve("typescript/bin/tsc"), "-p", "tsconfig.electron.json", "--noEmitOnError"], {
+      cwd: desktopRoot, stdio: "inherit", windowsHide: true,
+    });
+    compile.once("error", reject);
+    compile.once("exit", code => code === 0 ? resolve() : reject(new Error(`桌面启动编译失败（${code}）`)));
   });
-  compile.once("error", reject);
-  compile.once("exit", code => code === 0 ? resolve() : reject(new Error(`桌面启动编译失败（${code}）`)));
-});
+  if (sourceHash !== fingerprint(inputs)) throw new Error("桌面源码在启动编译时发生变化，请重新打开墨流。");
+  mkdirSync(path.dirname(stamp), { recursive: true });
+  writeFileSync(stamp, fingerprint([...inputs, ...outputs]));
+  console.info(`墨流主进程编译完成（${Math.round(performance.now() - started)} ms）`);
+}
 
-// Give each development launch its own Vite port, including when 5173 belongs
-// to another application or an older InkFlow frontend.
-const server = createServer();
-const port = await new Promise((resolve, reject) => {
-  server.once("error", reject);
-  server.listen(0, "127.0.0.1", () => {
-    const address = server.address();
-    server.close(() => resolve(address.port));
+/** 直接等待 Vite 自己的监听结果，避免多层命令启动和端口轮询。 */
+async function startFrontend() {
+  const started = performance.now();
+  const { createServer } = await import("vite");
+  const server = await createServer({ root: desktopRoot, server: { host: "localhost", port: 0 } });
+  try {
+    await server.listen();
+    console.info(`墨流开发页面服务已就绪（${Math.round(performance.now() - started)} ms）`);
+    return server;
+  } catch (cause) {
+    await server.close();
+    throw cause;
+  }
+}
+
+const frontend = startFrontend();
+try {
+  const [server, executable] = await Promise.all([frontend, developmentExecutable(), prepareMainProcess()]);
+  const url = server.resolvedUrls?.local[0];
+  if (!url) throw new Error("墨流开发页面服务尚未取得本机地址。");
+  const child = spawn(executable, ["."], {
+    cwd: desktopRoot, env: { ...process.env, VITE_DEV_SERVER_URL: url }, stdio: "inherit", windowsHide: true,
   });
-});
-
-const desktopRoot = fileURLToPath(new URL("..", import.meta.url));
-const concurrentlyPackage = require.resolve("concurrently/package.json");
-const concurrentlyCli = path.resolve(path.dirname(concurrentlyPackage), require(concurrentlyPackage).bin.concurrently);
-const serviceEnv = { ...process.env };
-delete serviceEnv.Path;
-serviceEnv.PATH = [path.join(desktopRoot, "node_modules/.bin"), path.dirname(process.execPath),
-  path.join(process.env.SystemRoot || "C:/Windows", "System32"), process.env.PATH || process.env.Path || ""].join(path.delimiter);
-const child = spawn(process.execPath, [concurrentlyCli, "-k", `vite --port ${port}`,
-  `wait-on tcp:${port} file:dist-electron/main.js && cross-env VITE_DEV_SERVER_URL=http://localhost:${port} "${executable}" .`], {
-  cwd: new URL("..", import.meta.url),
-  env: { ...serviceEnv,
-    INKFLOW_DEV_PORT: String(port), INKFLOW_DEV_EXECUTABLE: executable },
-  stdio: "inherit",
-  windowsHide: true,
-});
-child.once("error", (error) => { console.error(error); process.exitCode = 1; });
-child.once("exit", (code) => { process.exitCode = code ?? 1; });
+  process.exitCode = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", code => resolve(code ?? 1));
+  });
+} finally {
+  const server = await frontend.catch(() => null);
+  await server?.close();
+}

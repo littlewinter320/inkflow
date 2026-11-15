@@ -100,3 +100,6 @@
   .knowledge-directory-items { max-height: 190px; grid-template-columns: 1fr 1fr; }
   .knowledge-reading { border-left: 0; padding-left: 0; }
 }
+.knowledge-evidence details { margin-top: .45rem; }
+.knowledge-evidence summary { cursor: pointer; }
+.knowledge-evidence blockquote { margin: .5rem 0; padding-inline-start: .75rem; border-inline-start: 2px solid currentColor; white-space: pre-wrap; overflow-wrap: anywhere; }

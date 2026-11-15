@@ -890,19 +890,24 @@ class ProjectDatabase:
             ).fetchall()
         return [int(row["chapter_no"]) for row in rows]
 
-    def accepted_chapters(self) -> list[dict[str, Any]]:
+    def accepted_chapters(self, *, include_content: bool = False, before_chapter: int | None = None) -> list[dict[str, Any]]:
+        """在同一读快照中批量获取已接受章及其版本；正文只在确有需要时读取。"""
         with self.connect() as connection:
+            columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(chapters)")} if include_content else set()
+            body = ", chapter.content_text" if "content_text" in columns else ""
+            boundary = " AND chapter.chapter_no<?" if before_chapter is not None else ""
             rows = connection.execute(
-                """SELECT chapter.chapter_no,chapter.title,chapter.status,chapter.version,chapter.path,
+                f"""SELECT chapter.chapter_no,chapter.title,chapter.status,chapter.version,chapter.path,
                           chapter.content_hash,
                           CASE WHEN chapter.version>1 AND (patch.committed_at IS NULL OR patch.committed_at<>chapter.updated_at)
                                THEN NULL ELSE chapter.summary END AS summary,
                           CASE WHEN chapter.version>1 AND (patch.committed_at IS NULL OR patch.committed_at<>chapter.updated_at)
                                THEN 1 ELSE 0 END AS summary_stale,
-                          chapter.updated_at,chapter.accepted_at
+                          chapter.updated_at,chapter.accepted_at{body}
                    FROM chapters AS chapter
                    LEFT JOIN memory_patches AS patch ON patch.chapter_no=chapter.chapter_no
-                   WHERE chapter.status='accepted' ORDER BY chapter.chapter_no"""
+                   WHERE chapter.status='accepted'{boundary} ORDER BY chapter.chapter_no""",
+                (before_chapter,) if before_chapter is not None else (),
             ).fetchall()
         return [dict(row) for row in rows]
 

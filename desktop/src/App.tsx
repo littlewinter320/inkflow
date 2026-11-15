@@ -8,8 +8,6 @@ import { CacheMeter } from "./CacheMeter";
 import { settingsDiff, mergeSettings } from "./settingsPatch";
 import { VersionRepair } from "./VersionRepair";
 import { AuthorPreferences } from "./AuthorPreferences";
-import { BookSettingsBrowser, ManualEditMonitor, StorySettings } from "./StorySettings";
-import { KnowledgeDialog } from "./KnowledgeCenter";
 import { SettingDecisions } from "./SettingDecisions";
 import type { ManualEditJob } from "./StorySettings";
 import type { editor as MonacoEditor } from "monaco-editor";
@@ -17,7 +15,6 @@ import { FormEvent, lazy, memo, Suspense, useCallback, useEffect, useId, useMemo
 import type { CSSProperties, MutableRefObject, ReactNode } from "react";
 import { Mascot, MobaoCompanion, MobaoAvatar } from "./Mascot";
 import { BackgroundTasks } from "./BackgroundTasks";
-import { CreateProject } from "./CreateProject";
 import type { MascotMood } from "./Mascot";
 import { ProjectCenter } from "./ProjectCenter";
 import { chapterNavigationVolumes, type ChapterVolume } from "./chapterNavigation";
@@ -37,10 +34,15 @@ import { SkillsManager } from "./SkillsManager";
 import { SkillMentions } from "./SkillMentions";
 import { SkillProcessDetails, SkillStatusSummary } from "./SkillProcess";
 
-// Reuse the same module import so Home can warm the editor without mounting it.
-const loadEditors = () => import("./MonacoEditors");
-const Editor = lazy(() => loadEditors().then((module) => ({ default: module.Editor })));
-const DiffEditor = lazy(() => loadEditors().then((module) => ({ default: module.DiffEditor })));
+// 按需进入对应视图，首页无需抢先编译编辑器、设定或知识图谱模块。
+const Editor = lazy(() => import("./MonacoEditors").then((module) => ({ default: module.Editor })));
+const DiffEditor = lazy(() => import("./MonacoEditors").then((module) => ({ default: module.DiffEditor })));
+const CreateProject = lazy(() => import("./CreateProject").then((module) => ({ default: module.CreateProject })));
+const KnowledgeDialog = lazy(() => import("./KnowledgeCenter").then((module) => ({ default: module.KnowledgeDialog })));
+const BookSettingsBrowser = lazy(() => import("./StorySettings").then((module) => ({ default: module.BookSettingsBrowser })));
+const ManualEditMonitor = lazy(() => import("./StorySettings").then((module) => ({ default: module.ManualEditMonitor })));
+const StorySettings = lazy(() => import("./StorySettings").then((module) => ({ default: module.StorySettings })));
+const loadingView = <p role="status" className="empty-mini">正在载入…</p>;
 
 type TreeItem = {
   id: string;
@@ -387,7 +389,7 @@ type ContextStatus = {
   compressible_sections: Array<{ key: string; title: string; reason?: string; source_ids?: string[] }>;
   warnings: string[];
   budget_allocation?: Array<{ key: string; title: string; estimated_tokens: number; hard: boolean; source_count: number }>;
-  retrieval_diagnostics?: { corpus_candidate_count?: number; candidate_count?: number; relevant_candidate_count?: number; initial_top_k?: number; retrieved_count?: number; not_retrieved_count?: number; already_in_context_count?: number; additional_selected_count?: number; final_additional_count?: number; final_included_count?: number; budget_omitted_count?: number; post_retrieval_omissions?: unknown[]; post_retrieval_omission_count?: number; coverage_policy?: { policy_version?: number; target_count?: number; target_fraction?: number; relevant_candidate_count?: number; source_validation_failed_count?: number; actual_fraction?: number; target_shortfall_count?: number }; deduplicated_source_ids?: string[]; selected?: unknown[]; discarded?: unknown[]; discarded_display_limit?: number; adaptive_factors?: Record<string, number> };
+  retrieval_diagnostics?: { corpus_candidate_count?: number; candidate_count?: number; relevant_candidate_count?: number; initial_top_k?: number; retrieved_count?: number; not_retrieved_count?: number; already_in_context_count?: number; additional_selected_count?: number; final_additional_count?: number; final_included_count?: number; budget_omitted_count?: number; post_retrieval_omissions?: unknown[]; post_retrieval_omission_count?: number; coverage_policy?: { policy_version?: number; target_count?: number; target_fraction?: number; relevant_candidate_count?: number; source_validation_failed_count?: number; actual_fraction?: number; target_shortfall_count?: number }; deduplicated_source_ids?: string[]; selected?: unknown[]; discarded?: unknown[]; discarded_display_limit?: number; adaptive_factors?: Record<string, number>; knowledge_retrieval?: { matched_entries: number; retrieved_entries: number; prepared_entries?: number } };
   cache_prefix?: { role: string; changed_sections: string[]; first_changed_section: string | null; reason: string; estimated_prefix_tokens: number };
   updated_at?: string;
   source_revision?: string;
@@ -419,9 +421,9 @@ type BatchSummary = {
   current_chapters?: BatchChapterSummary[];
 };
 type LearningEvent = { event_id: string; event_type: string; chapter_no?: number; created_at: string; payload: Record<string, unknown> };
-type UsageSummary = { history_deferred?: boolean; calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; prompt_cache_hit_rate?: number | null; prompt_cache_miss_rate?: number | null; average_prompt_tokens?: number | null; average_completion_tokens?: number | null; cache_reported_calls?: number; cache_unknown_calls?: number; cache_pending_calls?: number; cache_unknown_finished_calls?: number; cache_unknown_prompt_tokens?: number };
+type UsageSummary = { history_deferred?: boolean; calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number; prompt_cache_hit_rate?: number | null; prompt_cache_miss_rate?: number | null; cache_write_tokens?: number | null; average_prompt_tokens?: number | null; average_completion_tokens?: number | null; cache_reported_calls?: number; cache_unknown_calls?: number; cache_pending_calls?: number; cache_unknown_finished_calls?: number; cache_unknown_prompt_tokens?: number };
 type CacheRecentWindow = UsageSummary & { window: number; last_at: string | null };
-type CacheObservationGroup = UsageSummary & { provider: string; endpoint: string | null; legacy_endpoint_host?: string | null; model: string; role: string; scope_known: boolean; input_unknown_calls?: number; output_unknown_calls?: number; recent?: CacheRecentWindow; by_contract: Array<UsageSummary & { stage?: string | null; prompt_family: string; system_contract_hash: string; quality_hash: string; thinking?: string; cache_policy?: string; message_layout?: string; response_models?: string[]; recent?: CacheRecentWindow }> };
+type CacheObservationGroup = UsageSummary & { provider: string; endpoint: string | null; legacy_endpoint_host?: string | null; model: string; role: string; scope_known: boolean; input_unknown_calls?: number; output_unknown_calls?: number; recent?: CacheRecentWindow; by_contract: Array<UsageSummary & { stage?: string | null; prompt_family: string; system_contract_hash: string; quality_hash: string; thinking?: string; cache_policy?: string; message_layout?: string; layout_version?: number | null; response_models?: string[]; recent?: CacheRecentWindow }> };
 type CurrentModelCache = { available: boolean; provider?: string; endpoint?: string | null; cache_policy?: string; by_agent_role: Partial<Record<AgentRole, CacheObservationGroup>>; history_groups: CacheObservationGroup[]; unscoped_calls?: number; warning?: string };
 type PerformanceDiagnostic = { calls: number; sent_calls: number; not_sent_calls: number; unknown_sent_calls: number; request_count: number; failed_calls: number; unknown_usage_calls: number; unknown_cost_calls: number; raw_input_tokens: number | null; cached_input_tokens: number | null; uncached_input_tokens: number | null; output_tokens: number | null; attempt_elapsed_ms: number | null; unknown_duration_calls: number; same_scope_groups?: Array<{ stage: string; calls: number; scope_known: boolean; raw_input_tokens: number | null; cached_input_tokens: number | null; uncached_input_tokens: number | null; output_tokens: number | null }>; writer_sequence?: Array<{ before_attempt_id: string; after_attempt_id: string; conclusion: string }>; time_note?: string; quality_note?: string };
 type QualifiedProduction = { accepted_products: number; unknown_cost_calls: number; known_estimated_cost: number; estimated_cost_per_product: number | null; limitation: string };
@@ -598,6 +600,8 @@ const emptyStatistics: Statistics = {
 // Coordinate the desktop workspace, retaining project/version identity across asynchronous restores.
 function App() {
   const [appInfo, setAppInfo] = useState<Record<string, unknown> | null>(null);
+  const [startupHandshakeDone, setStartupHandshakeDone] = useState(false);
+  const startupSettingsLoaded = useRef({ provider: false, voice: false });
   const [provider, setProvider] = useState<Record<string, unknown> | null>(null);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo>({ status: "not_configured", message: "正在读取更新设置…" });
   const [projectRoot, setProjectRoot] = useState("");
@@ -615,7 +619,6 @@ function App() {
   const [savedText, setSavedText] = useState("");
   const [activeTab, setActiveTabState] = useState<Tab>("editor");
   const [conversations, setConversations] = useState<NovelConversation[]>([]);
-  const [conversationListError, setConversationListError] = useState("");
   const [conversationSwitching, setConversationSwitching] = useState(false);
   const [librarySection, setLibrarySection] = useState<LibrarySection>("draft");
   const [events, setEvents] = useState<EngineEvent[]>([]);
@@ -655,7 +658,6 @@ function App() {
   const [recoveryDraft, setRecoveryDraft] = useState<DocumentUploadCandidate | null>(null);
   const projectRefreshRef = useRef<{ root: string; promise: Promise<void> } | null>(null);
   const projectRecoveryPendingRef = useRef<string | null>(null);
-  const projectPreloadRef = useRef(new Set<string>());
   const suggestionRefreshRef = useRef<{ root: string; promise: Promise<void> } | null>(null);
   const cancelRequestedRef = useRef(false);
   const [mascotMood, setMascotMood] = useState<MascotMood>("idle");
@@ -965,16 +967,6 @@ function App() {
     return () => { active = false; window.clearInterval(timer); window.removeEventListener("focus", poll); };
   }, [projectRoot, request, provider?.powershell_enabled, pendingComputerActions.length]);
 
-  useEffect(() => {
-    if (!projectRoot || projectLoading || sharedWorkspaceRef.current) return;
-    let current = true;
-    setConversations([]); setConversationListError("");
-    void request<{ items: NovelConversation[] }>("conversation.list")
-      .then(result => { if (current) setConversations(result.items); })
-      .catch(cause => { if (current) setConversationListError(errorMessage(cause)); });
-    return () => { current = false; };
-  }, [projectRoot, projectLoading, request]);
-
   /** 保存原聊天草稿后切换完整会话身份；在途任务留在原聊天运行，不转交给新聊天。 */
   const switchChat = async (identity?: string) => {
     if (conversationSwitching || projectLoading || voiceStarting || voiceRecording || voiceTranscribing || sharedWorkspaceRef.current || identity === questionConversationId) return;
@@ -1085,26 +1077,6 @@ function App() {
     }
   };
 
-  // Preload only local read-only pages and editor code; never recover or select a book on Home.
-  const preloadProject = useCallback((root: string) => {
-    if (projectRootRef.current || projectPreloadRef.current.has(root)) return;
-    if (projectPreloadRef.current.size >= 4) return;
-    projectPreloadRef.current.add(root);
-    void Promise.allSettled([
-      window.inkflow.request("project.preload", { project_root: root }),
-      window.inkflow.workspaceView(root),
-      loadEditors(),
-    ]).then(results => {
-      if (results.some(result => result.status === "rejected")) projectPreloadRef.current.delete(root);
-    });
-  }, []);
-
-  useEffect(() => {
-    if (projectRoot || !recentProjects[0]) return;
-    const timer = window.setTimeout(() => preloadProject(recentProjects[0].root), 1000);
-    return () => window.clearTimeout(timer);
-  }, [projectRoot, recentProjects, preloadProject]);
-
   // Ordinary refreshes read current data; only deferred startup recovery retries the write lock.
   const refresh = useCallback(
     async (root = projectRoot) => {
@@ -1123,7 +1095,7 @@ function App() {
         setDashboard(opened.dashboard);
         setTree(opened.tree);
         if (opened.canon_migration !== undefined) setCanonMigration(opened.canon_migration);
-        const overview = await window.inkflow.request<CollaborationOverview>("collaboration.overview", params);
+        const overview = await window.inkflow.request<CollaborationOverview>("collaboration.overview", { ...params, include_diagnostics: false });
         if (root !== projectRootRef.current) return;
         setCollaboration(overview);
       })();
@@ -1253,9 +1225,14 @@ function App() {
     setMascotMood("thinking");
     try {
       if (!await saveDocument(true) || navigationId !== editorNavigationRef.current) return;
+      // 读取上次界面只涉及本机状态，可与聊天身份检查并行。恢复写入仍等身份确认后才开始。
+      const viewPromise = window.inkflow.workspaceView(root).then(value => ({ status: "fulfilled" as const, value }), reason => ({ status: "rejected" as const, reason }));
+      const [catalog, launch] = await Promise.all([
+        window.inkflow.request<{ items: NovelConversation[] }>("conversation.list", { project_root: root }),
+        questionConversationId !== "main" ? window.inkflow.launchContext() : null,
+      ]);
+      if (navigationId !== editorNavigationRef.current) return;
       // 原聊天也可删除；重开先核对本书目录，不能复活main或沿用另一小说的聊天身份。
-      const catalog = await window.inkflow.request<{ items: NovelConversation[] }>("conversation.list", { project_root: root });
-      const launch = questionConversationId !== "main" ? await window.inkflow.launchContext() : null;
       if (!catalog.items.some(item => item.id === questionConversationId) || launch && launch.projectRoot !== root) {
           if (workspaceViewRef.current && !window.inkflow.saveWorkspaceView(workspaceViewRef.current).saved) throw new Error("当前聊天状态未保存，暂未切换小说。");
           await window.inkflow.switchConversation(root, catalog.items.find(item => item.id === "main")?.id || catalog.items[0]?.id);
@@ -1267,7 +1244,6 @@ function App() {
       }
       // Opening may recover pending project writes. Finish it before reading
       // auxiliary panels, so three requests do not race the same recovery lock.
-      const viewPromise = window.inkflow.workspaceView(root).then(value => ({ status: "fulfilled" as const, value }), reason => ({ status: "rejected" as const, reason }));
       const opened = await window.inkflow.request<OpenedProject>("project.open", { project_root: root });
       if (navigationId !== editorNavigationRef.current) return;
       if (!await saveDocument(true) || navigationId !== editorNavigationRef.current) return;
@@ -1276,6 +1252,7 @@ function App() {
       projectRootRef.current = root;
       setDashboard(opened.dashboard);
       setTree(opened.tree);
+      setConversations(catalog.items);
       setContextStatus(null);
       setCollaboration(null);
       setChapterWorkspace(null);
@@ -1289,18 +1266,6 @@ function App() {
       setReferenceDocument(null);
       setActiveTabState("project"); setShowWorkbench(false);
       setProjectLoadStage("目录已载入，正在恢复对话与上次界面…");
-      // 批次记录独立先读，完整用量与旧审计较慢时也能尽早恢复进度条；迟到回包不能盖掉完整概览。
-      void window.inkflow.request<{ batches: BatchSummary[] }>("batch.progress", { project_root: root }).then(progress => {
-        if (requestId === projectOpenRequestRef.current && root === projectRootRef.current) {
-          setCollaboration(current => current ?? { messages: [], tasks: [], learning_events: [], batches: progress.batches });
-        }
-      }).catch(() => { /* 完整概览仍会补读；其中失败会通过现有提示说明。 */ });
-      // Collaboration statistics are supplementary and must not hold up the workspace.
-      void window.inkflow.request<CollaborationOverview>("collaboration.overview", { project_root: root }).then(overview => {
-        if (requestId === projectOpenRequestRef.current && root === projectRootRef.current) setCollaboration(overview);
-      }).catch(cause => {
-        if (requestId === projectOpenRequestRef.current && root === projectRootRef.current) setNotice(`协作概览暂未载入，稍后会自动更新。${errorMessage(cause)}`);
-      });
       const [historyResult] = await Promise.allSettled([
         viewPromise.then(view => window.inkflow.request<ConversationHistoryResponse>("conversation.history", {
           project_root: root, limit: 100, message_ids: [...new Set([
@@ -1368,13 +1333,14 @@ function App() {
         }
       }
       const projectTitle = String(opened.dashboard.brief.title || "未命名小说");
-      let recentProjectWarning = "";
-      try {
-        setRecentProjects(await window.inkflow.rememberRecentProject(root, projectTitle));
-      } catch (cause) {
-        setRecentProjects((items) => rememberRecentProject(items, root, projectTitle));
-        recentProjectWarning = `最近项目记录未保存：${cause instanceof Error ? cause.message : String(cause)}`;
-      }
+      // 最近项目列表是本机便利记录。项目已经核对后即可交给界面，列表保存独立返回。
+      void window.inkflow.rememberRecentProject(root, projectTitle).then(items => {
+        if (requestId === projectOpenRequestRef.current) setRecentProjects(items);
+      }).catch(cause => {
+        if (requestId !== projectOpenRequestRef.current) return;
+        setRecentProjects(items => rememberRecentProject(items, root, projectTitle));
+        setNotice(`最近项目记录未保存：${errorMessage(cause)}`);
+      });
       const historyEntries = historyResult.status === "fulfilled" ? historyResult.value.entries : [];
       const running = historyResult.status === "fulfilled" ? historyResult.value.active_task : null;
       const retained = historyResult.status === "fulfilled" ? historyResult.value.retained_task : null;
@@ -1426,7 +1392,6 @@ function App() {
       const panelWarnings = [
         ...(opened.dashboard.recovery_warnings || []),
         ...(historyResult.status === "rejected" ? [`先前消息：${errorMessage(historyResult.reason)}`] : []),
-        ...(recentProjectWarning ? [recentProjectWarning] : []),
         ...(viewResult.status === "rejected" ? [`上次界面状态：${errorMessage(viewResult.reason)}`] : []),
       ];
       if (panelWarnings.length) setNotice(`小说已打开，以下项目需要核对；墨流没有自动覆盖不一致的文件。\n${panelWarnings.join("\n")}`);
@@ -1503,8 +1468,7 @@ function App() {
       if (message.includes("内置引擎") && message.includes("不兼容")) setShowUpdate(true);
       setMascotMood("rest");
     };
-    // 启动只读本地配置与版本身份；provider.status 不测试连接、不列远端模型、更不准备写章上下文。
-    // The main window stays on Home unless an explicit target or detached-panel context was supplied.
+    // 首页先绘制。项目打开可随时独立发出，状态读取会复用同一次引擎握手。
     void window.inkflow.launchContext()
       .then((launch) => {
         sharedWorkspaceRef.current = launch.shared === true;
@@ -1515,13 +1479,35 @@ function App() {
         else if (projectRootFromArgs) void openProject(projectRootFromArgs, { optimistic: true });
       })
       .catch(showStartupError);
-    void window.inkflow.request<Record<string, unknown>>("app.initialize").then(setAppInfo).catch(showStartupError);
-    void window.inkflow.request<Record<string, unknown>>("provider.status", {}).then(setProvider).catch(cause => {
-      setError(`模型配置需要处理：无法读取已保存的接口设置。${errorMessage(cause)}\n已有设置和书稿保留；请打开设置重新读取。`);
-    });
-    void window.inkflow.request<VoiceSettings>("voice.settings.get").then(setVoiceSettings).catch(() => undefined);
+    void window.inkflow.request<Record<string, unknown>>("app.initialize", { version_only: true }).then(info => {
+      setAppInfo(info);
+    }).catch(showStartupError).finally(() => setStartupHandshakeDone(true));
     void window.inkflow.updateStatus().then((update) => setUpdateInfo(update as UpdateInfo)).catch(() => undefined);
   }, [openProject]);
+
+  useEffect(() => {
+    if (!startupHandshakeDone || projectLoading) return;
+    let active = true;
+    // 先恢复用户选定项目，再补读语音配置；只读请求不会检查远端模型连接。
+    const idle = window.requestIdleCallback(() => {
+      if (!startupSettingsLoaded.current.provider) {
+        void window.inkflow.request<Record<string, unknown>>("provider.status", {}).then(value => {
+          if (active) { startupSettingsLoaded.current.provider = true; setProvider(value); }
+        }).catch(cause => {
+          if (!active) return;
+          const message = errorMessage(cause);
+          if (message.includes("内置引擎") && message.includes("不兼容")) setShowUpdate(true);
+          setError(`模型配置需要处理：无法读取已保存的接口设置。${message}\n已有设置和书稿保留；请打开设置重新读取。`);
+        });
+      }
+      if (!startupSettingsLoaded.current.voice) {
+        void window.inkflow.request<VoiceSettings>("voice.settings.get").then(value => {
+          if (active) { startupSettingsLoaded.current.voice = true; setVoiceSettings(value); }
+        }).catch(() => undefined);
+      }
+    }, { timeout: 2000 });
+    return () => { active = false; window.cancelIdleCallback(idle); };
+  }, [startupHandshakeDone, projectLoading]);
 
   useEffect(() => {
     if (!recoveredRunId || !projectRoot) return;
@@ -1703,25 +1689,33 @@ function App() {
     if (projectLoading) return;
     let active = true;
     let pollingProgress = false;
-    const pollProgress = async () => {
-      if (!active || pollingProgress || activeRunIdRef.current || projectRefreshRef.current?.root === projectRoot || !canPollWorkspace(window.document.visibilityState, window.document.hasFocus())) return;
+    // 开书结果已有状态和目录。首次只补协作摘要，即使有正在恢复的批次也要读到它。
+    const pollProgress = async (overviewOnly = false) => {
+      if (!active || pollingProgress || (!overviewOnly && activeRunIdRef.current)
+        || projectRefreshRef.current?.root === projectRoot
+        || (!overviewOnly && !canPollWorkspace(window.document.visibilityState, window.document.hasFocus()))) return;
       pollingProgress = true;
       try {
-        if (projectRecoveryPendingRef.current === projectRoot) { await refresh(projectRoot); return; }
+        if (!overviewOnly && projectRecoveryPendingRef.current === projectRoot) { await refresh(projectRoot); return; }
+        const params = { project_root: projectRoot };
         const [overview, projectStatus, projectTree] = await Promise.all([
-          window.inkflow.request<CollaborationOverview>("collaboration.overview", { project_root: projectRoot }),
-          window.inkflow.request<Dashboard>("project.status", { project_root: projectRoot }),
-          window.inkflow.request<ProjectTree>("project.tree", { project_root: projectRoot }),
+          window.inkflow.request<CollaborationOverview>("collaboration.overview", { ...params, include_diagnostics: false }),
+          overviewOnly ? undefined : window.inkflow.request<Dashboard>("project.status", params),
+          overviewOnly ? undefined : window.inkflow.request<ProjectTree>("project.tree", params),
         ]);
-        if (active && !activeRunIdRef.current && !projectRefreshRef.current) { setCollaboration(overview); setDashboard(projectStatus); setTree(projectTree); }
+        if (!active || projectRootRef.current !== projectRoot || projectRefreshRef.current?.root === projectRoot
+            || (!overviewOnly && activeRunIdRef.current)) return;
+        setCollaboration(overview);
+        if (projectStatus && projectTree) { setDashboard(projectStatus); setTree(projectTree); }
       } catch { /* 状态查看失败不重发小说任务。 */ }
       finally { pollingProgress = false; }
     };
-    void pollProgress();
-    const progressTimer = window.setInterval(() => void pollProgress(), 15000);
-    window.addEventListener("focus", pollProgress);
-    return () => { active = false; window.clearInterval(progressTimer); window.removeEventListener("focus", pollProgress); };
-  }, [projectRoot, projectLoading, activeRunId, refresh]);
+    const initial = window.requestIdleCallback(() => void pollProgress(true), { timeout: 2000 });
+    const pollVisibleProgress = () => void pollProgress();
+    const progressTimer = window.setInterval(pollVisibleProgress, 15000);
+    window.addEventListener("focus", pollVisibleProgress);
+    return () => { active = false; window.cancelIdleCallback(initial); window.clearInterval(progressTimer); window.removeEventListener("focus", pollVisibleProgress); };
+  }, [projectRoot, projectLoading, refresh]);
 
   const batchProgressActive = Boolean(activeRunId && ((collaboration?.batches || []).some(batch => batch.run_id === activeRunId)
     // 逐章收稿长跑没有batch_id；仍需刷新旧范围进度，不能一直显示续接前的草稿状态。
@@ -2338,7 +2332,7 @@ function App() {
             const work = (result as Record<string, unknown>).pending_work;
             if (Array.isArray(work)) setCollaboration(current => current ? { ...current, pending_work: work as PendingWorkItem[] } : current);
             else {
-              const overview = await request<CollaborationOverview>("collaboration.overview", { project_root: runRoot });
+              const overview = await request<CollaborationOverview>("collaboration.overview", { project_root: runRoot, include_diagnostics: false });
               if (runRoot === projectRootRef.current) setCollaboration(overview);
             }
           }
@@ -2933,7 +2927,7 @@ function App() {
     onSettings={() => openSettings("voice")} />;
 
   // 首页与书内共用同一弹窗实例，建项后打开项目不能重置正在收尾的创建状态。
-  const createProjectDialog = <MotionPresence open={showCreate}>{() => showCreate ? <CreateProject formatError={errorMessage} onClose={() => setShowCreate(false)} onCreated={openProject} /> : null}</MotionPresence>;
+  const createProjectDialog = <MotionPresence open={showCreate}>{() => showCreate ? <Suspense fallback={loadingView}><CreateProject formatError={errorMessage} onClose={() => setShowCreate(false)} onCreated={openProject} /></Suspense> : null}</MotionPresence>;
 
   if (!projectRoot) {
     return (
@@ -2961,7 +2955,7 @@ function App() {
               <div><strong>最近打开</strong><small>只保存在这台电脑</small></div>
               {recentProjects.map((project) => (
                 <div className="recent-project-row" key={project.root}>
-                  <button className="recent-project-open" disabled={projectLoading} onPointerEnter={() => preloadProject(project.root)} onFocus={() => preloadProject(project.root)} onClick={() => void openProject(project.root)}>
+                  <button className="recent-project-open" disabled={projectLoading} onClick={() => void openProject(project.root)}>
                     <span>{project.title}</span><small>{project.root}</small>
                   </button>
                   <div className="recent-project-actions">
@@ -2983,7 +2977,7 @@ function App() {
               : undefined
         } />}
 
-        {<MotionPresence open={Boolean(showManualMonitor)}>{() => (showManualMonitor && <Modal title="手动修改核对" subtitle="后台检测、依据和你的决定" onClose={() => setShowManualMonitor(false)} className="manual-monitor-modal"><ManualEditMonitor jobs={manualJobs} error={manualMonitorError} onRefresh={() => void refreshManualEdits()} onDecision={decideManualEdit} /></Modal>)}</MotionPresence>}
+        {<MotionPresence open={Boolean(showManualMonitor)}>{() => (showManualMonitor && <Modal title="手动修改核对" subtitle="后台检测、依据和你的决定" onClose={() => setShowManualMonitor(false)} className="manual-monitor-modal"><Suspense fallback={loadingView}><ManualEditMonitor jobs={manualJobs} error={manualMonitorError} onRefresh={() => void refreshManualEdits()} onDecision={decideManualEdit} /></Suspense></Modal>)}</MotionPresence>}
       {<MotionPresence open={Boolean(showSettings)}>{() => (showSettings && <SettingsDialog initialSection={typeof settingsInitialSection === "string" ? settingsInitialSection : settingsInitialSection.section} initialRecordId={typeof settingsInitialSection === "string" ? "" : settingsInitialSection.recordId} initialCollectionId={typeof settingsInitialSection === "string" ? "" : settingsInitialSection.collectionId} projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} preferences={uiPreferences} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />)}</MotionPresence>}
         {<MotionPresence open={Boolean(showUpdate)}>{() => (showUpdate && <UpdateDialog info={updateInfo} onClose={() => setShowUpdate(false)} />)}</MotionPresence>}
       </div>{createProjectDialog}</>
@@ -3018,7 +3012,7 @@ function App() {
         <WorkspaceDropPreview workspace={workspace} />
         <WorkspaceChrome workspace={workspace} />
         <WorkspacePanel id="navigation" workspace={workspace} className="left-rail" onDetach={detachWorkspacePanel} actions={<button className="panel-icon" title="新建小说" aria-label="新建小说" onClick={() => setShowCreate(true)}>＋</button>}>
-          <NovelConversations key={projectRoot} items={conversations} currentId={questionConversationId} currentTitle={readableConversationText(messages.find(message => message.role === "user")?.text.slice(0, 36) || "新聊天")} loading={projectLoading || !conversations.length && !conversationListError} disabled={projectLoading || conversationSwitching || voiceStarting || voiceRecording || voiceTranscribing || sharedWorkspaceRef.current} error={conversationListError} onNew={() => void switchChat()} onSwitch={identity => void switchChat(identity)} onUpdate={async (identity, changes) => {
+          <NovelConversations key={projectRoot} items={conversations} currentId={questionConversationId} currentTitle={readableConversationText(messages.find(message => message.role === "user")?.text.slice(0, 36) || "新聊天")} loading={projectLoading} disabled={projectLoading || conversationSwitching || voiceStarting || voiceRecording || voiceTranscribing || sharedWorkspaceRef.current} error="" onNew={() => void switchChat()} onSwitch={identity => void switchChat(identity)} onUpdate={async (identity, changes) => {
             const root = projectRootRef.current;
             const item = await request<NovelConversation>("conversation.update", { project_root: root, target_conversation_id: identity, changes });
             if (projectRootRef.current === root) setConversations(current => current.map(entry => entry.id === item.id ? item : entry));
@@ -3201,7 +3195,7 @@ function App() {
               onError={setError}
             />
           )}
-          {activeTab === "editor" && document?.relative_path === "BOOK.md" && !bookRawEditing && <BookSettingsBrowser key={projectRoot} projectRoot={projectRoot} brief={dashboard?.brief || {}} graphLimit={uiPreferences.graphNodeLimit} onGraphLimitChange={changeGraphLimit} onEditSetting={(recordId, collectionId) => openSettings("story_settings", recordId, collectionId)} refreshKey={String(dashboard?.chapter_progress?.accepted ?? 0) + ":" + (messages.filter(message => message.role === "assistant").at(-1)?.id || "")} focusRecordId={bookSettingFocus?.root === projectRoot ? bookSettingFocus.recordId : ""} focusCollectionId={bookSettingFocus?.root === projectRoot ? bookSettingFocus.collectionId : ""} focusToken={bookSettingFocus?.root === projectRoot ? bookSettingFocus.token : ""} onManage={() => openSettings("story_settings")} onEdit={() => setBookRawEditing(true)} onAudit={() => { setChatInput("检查本书设定与当前规划，有依据的缺项请补齐，具体冲突请解释；不要改已经接受的正文。"); chatInputRef.current?.focus(); }} />}
+          {activeTab === "editor" && document?.relative_path === "BOOK.md" && !bookRawEditing && <Suspense fallback={loadingView}><BookSettingsBrowser key={projectRoot} projectRoot={projectRoot} brief={dashboard?.brief || {}} graphLimit={uiPreferences.graphNodeLimit} onGraphLimitChange={changeGraphLimit} onEditSetting={(recordId, collectionId) => openSettings("story_settings", recordId, collectionId)} refreshKey={String(dashboard?.chapter_progress?.accepted ?? 0) + ":" + (messages.filter(message => message.role === "assistant").at(-1)?.id || "")} focusRecordId={bookSettingFocus?.root === projectRoot ? bookSettingFocus.recordId : ""} focusCollectionId={bookSettingFocus?.root === projectRoot ? bookSettingFocus.collectionId : ""} focusToken={bookSettingFocus?.root === projectRoot ? bookSettingFocus.token : ""} onManage={() => openSettings("story_settings")} onEdit={() => setBookRawEditing(true)} onAudit={() => { setChatInput("检查本书设定与当前规划，有依据的缺项请补齐，具体冲突请解释；不要改已经接受的正文。"); chatInputRef.current?.focus(); }} /></Suspense>}
           {activeTab === "editor" && (document?.relative_path !== "BOOK.md" || bookRawEditing) && (
             <EditorPanel
               projectRoot={projectRoot}
@@ -3270,7 +3264,7 @@ function App() {
           void saveDocument(false, candidate).then(saved => { if (saved) setRecoveryDraft(null); });
         }}>{document?.read_only ? "保存为未接受的修改提案" : "保存核对后的修改"}</button></div>
       </Modal>)}</MotionPresence>}
-      {<MotionPresence open={Boolean(showManualMonitor)}>{() => (showManualMonitor && <Modal title="手动修改核对" subtitle="后台检测、依据和你的决定" onClose={() => setShowManualMonitor(false)} className="manual-monitor-modal"><ManualEditMonitor jobs={manualJobs} error={manualMonitorError} onRefresh={() => void refreshManualEdits()} onDecision={decideManualEdit} /></Modal>)}</MotionPresence>}
+      {<MotionPresence open={Boolean(showManualMonitor)}>{() => (showManualMonitor && <Modal title="手动修改核对" subtitle="后台检测、依据和你的决定" onClose={() => setShowManualMonitor(false)} className="manual-monitor-modal"><Suspense fallback={loadingView}><ManualEditMonitor jobs={manualJobs} error={manualMonitorError} onRefresh={() => void refreshManualEdits()} onDecision={decideManualEdit} /></Suspense></Modal>)}</MotionPresence>}
       {<MotionPresence open={Boolean(showSettings)}>{() => (showSettings && <SettingsDialog initialSection={typeof settingsInitialSection === "string" ? settingsInitialSection : settingsInitialSection.section} initialRecordId={typeof settingsInitialSection === "string" ? "" : settingsInitialSection.recordId} initialCollectionId={typeof settingsInitialSection === "string" ? "" : settingsInitialSection.collectionId} projectRoot={projectRoot} provider={provider} voiceSettings={voiceSettings} voiceStatus={voiceStatus} preferences={uiPreferences} onPreferencesChange={setUiPreferences} onClose={() => setShowSettings(false)} onSaved={setProvider} onVoiceSaved={(settings, status) => { setVoiceSettings(settings); setVoiceStatus(status); }} />)}</MotionPresence>}
       {<MotionPresence open={Boolean(showUpdate)}>{() => (showUpdate && <UpdateDialog info={updateInfo} onClose={() => setShowUpdate(false)} />)}</MotionPresence>}
       {<MotionPresence open={Boolean(showSearch)}>{() => (showSearch && <SearchDialog request={request} result={searchResult} setResult={setSearchResult} onClose={() => setShowSearch(false)} onOpen={async (relativePath) => {
@@ -3278,9 +3272,9 @@ function App() {
         if (item) await openDocument(item);
         setShowSearch(false);
       }} />)}</MotionPresence>}
-      {showKnowledge && projectRoot && <KnowledgeDialog key={projectRoot} projectRoot={projectRoot}
+      {showKnowledge && projectRoot && <Suspense fallback={loadingView}><KnowledgeDialog key={projectRoot} projectRoot={projectRoot}
         graphLimit={uiPreferences.graphNodeLimit} onGraphLimitChange={changeGraphLimit} onClose={() => setShowKnowledge(false)}
-        onEditSetting={(recordId, collectionId) => { setShowKnowledge(false); openSettings("story_settings", recordId, collectionId); }} />}
+        onEditSetting={(recordId, collectionId) => { setShowKnowledge(false); openSettings("story_settings", recordId, collectionId); }} /></Suspense>}
       {pendingQuestions.length > 0 && !projectLoading && <QuestionDialog questions={pendingQuestions}
         projectRoot={projectRoot} conversationId={questionConversationId} identity={pendingQuestionIdentity} drafts={questionAnswerDraftCache}
         onDraftChange={(key, draft) => {
@@ -3307,7 +3301,7 @@ function App() {
           setPendingRejection(null);
           setCollaboration(current => current ? { ...current, pending_work: result.pending_work, rejected_work: result.rejected_work } : current);
           setNotice(result.reply || (target.decision === "reopen" ? "已恢复安排，保留原任务处理次数。尚未执行，必要核对与依赖条件仍按当前状态处理。" : "拒绝决定已保存。已有成果保留，必要核对与依赖条件仍按当前状态处理。"));
-          const overview = await request<CollaborationOverview>("collaboration.overview", { project_root: target.root });
+          const overview = await request<CollaborationOverview>("collaboration.overview", { project_root: target.root, include_diagnostics: false });
           if (projectRootRef.current === target.root) setCollaboration(overview);
         }).catch(cause => { if (projectRootRef.current === target.root) { setPendingDecisionError(errorMessage(cause)); setError(errorMessage(cause)); } }).finally(() => setPendingDecisionWorking(false));
       }} />)}</MotionPresence>}
@@ -4081,17 +4075,31 @@ function CacheRecentObservation({ recent }: { recent?: CacheRecentWindow }) {
     ? recent.prompt_cache_hit_tokens + recent.prompt_cache_miss_tokens : null;
   return <p>最近 {recent.calls} 次（最多 {recent.window} 次） · 输入加权命中 {rate == null ? "服务商未报告" : `${(rate * 100).toFixed(1)}%`} · {cacheCoverageLabel(recent)}
     {reportedInput == null ? "" : `；已报告输入 ${reportedInput.toLocaleString()}、命中 ${recent.prompt_cache_hit_tokens!.toLocaleString()}、未命中 ${recent.prompt_cache_miss_tokens!.toLocaleString()} tokens`}
+    {recent.cache_write_tokens ? ` · 其中写缓存 ${recent.cache_write_tokens.toLocaleString()} tokens` : ""}
     {recent.last_at ? ` · 最近请求 ${formatTime(recent.last_at)}` : ""}</p>;
 }
 
 /** 按接口与请求结构折叠历史明细，保留原始统计口径。 */
 function CacheScopeHistory({ groups, title = "历史接口与模型" }: { groups: CacheObservationGroup[]; title?: string }) {
   if (!groups.length) return null;
-  return <details><summary>{title}</summary><p>部分请求没有返回缓存用量；比例仅按服务商已报告的输入计算，缺失数据不算成 0%。</p><div className="cache-role-list">{groups.map(group => <details key={JSON.stringify([group.provider, group.endpoint, group.legacy_endpoint_host, group.model, group.role])}><summary>{roleLabel(group.role as AgentRole)} · {group.model} · 累计 {group.prompt_cache_hit_rate == null ? "缓存用量未返回" : `${(group.prompt_cache_hit_rate * 100).toFixed(1)}%`} · {group.calls} 次</summary><p>{group.provider} · {group.endpoint || `${group.legacy_endpoint_host || "旧接口"}（历史记录缺少精确路由）`}{group.cache_unknown_calls ? `；${group.cache_unknown_calls} 次未返回缓存用量，未计入比例。` : ""}</p><CacheRecentObservation recent={group.recent} />{group.by_contract.map(contract => <section key={JSON.stringify([contract.prompt_family, contract.system_contract_hash, contract.quality_hash, contract.thinking, contract.cache_policy, contract.message_layout])}><p>{contract.stage || "请求结构未记录"} · {contract.thinking === "enabled" ? "思考" : contract.thinking === "disabled" ? "非思考" : "思考状态未记录"} · 累计 {contract.calls} 次 · {contract.prompt_cache_hit_rate == null ? "缓存用量未返回" : `${(contract.prompt_cache_hit_rate * 100).toFixed(1)}%`}{contract.response_models?.length ? ` · 服务返回模型：${contract.response_models.join("、")}` : ""}</p><CacheRecentObservation recent={contract.recent} /></section>)}</details>)}</div></details>;
+  return <details><summary>{title}</summary><p>缓存比例仅按服务商已报告的输入计算。</p>
+    <div className="cache-role-list">{groups.map(group => <details key={JSON.stringify([group.provider, group.endpoint, group.legacy_endpoint_host, group.model, group.role])}>
+      <summary>{roleLabel(group.role as AgentRole)} · {group.model} · 累计 {group.prompt_cache_hit_rate == null ? "缓存用量未返回" : `${(group.prompt_cache_hit_rate * 100).toFixed(1)}%`} · {group.calls} 次</summary>
+      <p>{group.provider} · {group.endpoint || `${group.legacy_endpoint_host || "旧接口"}（历史记录缺少精确路由）`}{group.cache_unknown_calls ? ` · ${group.cache_unknown_calls} 次缓存用量缺报` : ""}</p>
+      <CacheRecentObservation recent={group.recent} />
+      {group.by_contract.map(contract => <section key={JSON.stringify([contract.prompt_family, contract.system_contract_hash, contract.quality_hash,
+        contract.thinking, contract.cache_policy, contract.message_layout, contract.layout_version, contract.response_models])}>
+        <p>{contract.response_models?.length ? `服务返回 ${contract.response_models.join("、")}` : "实际返回型号未记录"} · {contract.stage || "请求结构未记录"} · {contract.thinking === "enabled" ? "思考" : contract.thinking === "disabled" ? "非思考" : "思考状态未记录"} · {contract.layout_version ? `输入布局 v${contract.layout_version}` : "输入布局未记录"} · {contract.calls} 次 · {contract.prompt_cache_hit_rate == null ? "缓存用量未返回" : `${(contract.prompt_cache_hit_rate * 100).toFixed(1)}%`}</p>
+        <CacheRecentObservation recent={contract.recent} />
+      </section>)}
+    </details>)}</div>
+  </details>;
 }
 
+/** 接口策略名称只描述墨流的发送方式。 */
 function cachePolicyLabel(value?: string): string {
-  return value === "deepseek" ? "连续前缀复用" : value === "mimo" ? "稳定参考分组" : "通用接口";
+  return ({ deepseek: "连续前缀复用", mimo: "稳定参考分组", openai: "稳定前缀与路由键",
+    gemini: "稳定前缀", openrouter: "稳定前缀与会话路由", anthropic: "稳定前缀与用量记录" } as Record<string, string>)[value || ""] || "通用接口";
 }
 
 function cacheTokenLabel(tokens: number, unknown: number | undefined, calls: number): string {
@@ -4120,7 +4128,7 @@ function cacheCoverageDetails(stats?: UsageSummary & { input_unknown_calls?: num
   const known = typeof stats.prompt_cache_hit_tokens === "number" && typeof stats.prompt_cache_miss_tokens === "number"
     ? `服务商已报告：命中 ${stats.prompt_cache_hit_tokens.toLocaleString()}、未命中 ${stats.prompt_cache_miss_tokens.toLocaleString()} token。`
     : "已报告缓存输入量待核。";
-  return `${known}${stats.cache_unknown_prompt_tokens == null ? "" : `尚缺缓存明细的输入 ${stats.cache_unknown_prompt_tokens.toLocaleString()} token。`}${stats.input_unknown_calls ? `另有 ${stats.input_unknown_calls} 次未返回输入用量。` : ""}缺报仅指缓存明细，模型回复状态另行显示；比例仅按服务商已报告缓存的输入计算。`;
+  return `${known}${stats.cache_write_tokens ? `未命中含本次写入缓存的 ${stats.cache_write_tokens.toLocaleString()} token。` : ""}${stats.cache_unknown_prompt_tokens == null ? "" : `尚缺缓存明细的输入 ${stats.cache_unknown_prompt_tokens.toLocaleString()} token。`}${stats.input_unknown_calls ? `另有 ${stats.input_unknown_calls} 次未返回输入用量。` : ""}比例仅按服务商已报告缓存的输入计算。`;
 }
 
 /** 缓存统计必须与生效接口对应；迟到的旧接口回包只放在历史中。 */
@@ -4148,6 +4156,7 @@ function CacheSummary({ usage, provider, historicalUsage }: { usage?: Collaborat
         <footer title={`${cacheCoverageLabel(recent)}。${cacheCoverageDetails(recent)}`}>
           <span>{recent?.calls ? `最近 ${recent.calls} 次` : "暂无调用"}{recent?.cache_pending_calls ? ` · ${recent.cache_pending_calls} 次进行中` : ""}{unreported ? ` · ${unreported} 次缓存未报` : ""}</span>
           <span>{recent?.calls ? typeof recent.prompt_cache_miss_tokens === "number" && typeof recent.prompt_cache_hit_rate === "number" ? <>已报未命中 <span className="cache-token-count">{recent.prompt_cache_miss_tokens.toLocaleString()} Token</span></> : "未命中量待报告" : "—"}</span>
+          {Boolean(recent?.cache_write_tokens) && <span>其中新写入 {recent?.cache_write_tokens?.toLocaleString()} Token</span>}
           {recent?.last_at && <span className="cache-last-request">最近请求 {formatTime(recent.last_at)}</span>}
         </footer>
       </section>;
@@ -4402,6 +4411,8 @@ function ProcessPanelCompact({ projectRoot, collaboration, context, provider, re
   // 本书账本独立恢复，不用完整协作概览是否已返回来判断是否有调用。
   const [usageSnapshot, setUsageSnapshot] = useState<{ root: string; value: CollaborationOverview["usage"] } | null>(null);
   const [usageError, setUsageError] = useState("");
+  const [usageHistory, setUsageHistory] = useState<{ root: string; value: CollaborationOverview["usage"] } | null>(null);
+  const [usageHistoryError, setUsageHistoryError] = useState("");
   useEffect(() => {
     let active = true, loading = false;
     setUsageError("");
@@ -4418,9 +4429,26 @@ function ProcessPanelCompact({ projectRoot, collaboration, context, provider, re
       } finally { loading = false; }
     }
     void refreshUsage();
-    const timer = window.setInterval(() => void refreshUsage(), 5000);
-    return () => { active = false; window.clearInterval(timer); };
+    // 后台窗口保留上次统计，重新获得焦点时才补读。
+    const pollVisibleUsage = () => {
+      if (canPollWorkspace(window.document.visibilityState, window.document.hasFocus())) void refreshUsage();
+    };
+    const timer = window.setInterval(pollVisibleUsage, 5000);
+    window.addEventListener("focus", pollVisibleUsage);
+    return () => { active = false; window.clearInterval(timer); window.removeEventListener("focus", pollVisibleUsage); };
   }, [projectRoot, provider?.model, provider?.base_url]);
+  useEffect(() => {
+    if (!projectRoot || detail !== "usage") return;
+    let active = true;
+    setUsageHistoryError("");
+    // 旧日志只有作者查看用量详情时才扫描，近期命中和费用仍从独立账本更新。
+    void window.inkflow.request<CollaborationOverview["usage"]>("usage.overview", {
+      project_root: projectRoot, include_history: true,
+    }).then(value => {
+      if (active) setUsageHistory({ root: projectRoot, value });
+    }).catch(() => { if (active) setUsageHistoryError("较早的运行日志暂未读到，可以重新打开用量详情。"); });
+    return () => { active = false; };
+  }, [projectRoot, detail]);
   const usage = usageSnapshot?.root === projectRoot ? usageSnapshot.value : collaboration?.usage;
   const retrieval = context?.retrieval_diagnostics;
   const retrievalStats = retrievalCounts(retrieval);
@@ -4440,7 +4468,7 @@ function ProcessPanelCompact({ projectRoot, collaboration, context, provider, re
   } else if (detail === "retrieval") {
     detailContent = <section className="detail-section">
       <header><h4>这次找到的内容</h4><span>{retrieval ? `${retrievalStats.finalKnown ? "本次补入" : "预选"} ${retrievalStats.added} 条` : "暂无记录"}</span></header>
-      <p className="detail-lead">{retrieval?.coverage_policy?.policy_version === 2 ? "比例以适用、去重、有匹配信号且通过本地来源核验的相关候选计算。已有完整证据避免重复附加，其余按输入预算装入。" : "旧记录保留当时的候选与预选数量；缺少相关候选或压缩后装入数时，不倒算成功比例。"}完整请求超预算时还会缩减软资料，实际输入以请求记录为准。取回和准备资料都不等于缓存命中或模型正确引用。</p>
+      <p className="detail-lead">{(retrieval?.coverage_policy?.policy_version ?? 0) >= 2 ? "比例按适用、去重且通过来源核验的匹配候选计算。已有完整证据避免重复附加，其余按当前模型的输入预算装入。" : "旧记录保留当时记录的候选与预选数量。"}完整请求超预算时还会缩减软资料，实际输入以请求记录为准。</p>
       <div className="detail-metrics">
         <DetailMetric label="全书可查线索" value={retrievalStats.corpus} />
         <DetailMetric label="去掉重复与不适用项" value={retrievalStats.candidates} />
@@ -4450,6 +4478,7 @@ function ProcessPanelCompact({ projectRoot, collaboration, context, provider, re
         <DetailMetric label={retrievalStats.finalKnown ? "本次补入" : "初步选入"} value={retrievalStats.added} tone="good" />
         <DetailMetric label="最终准备" value={retrievalStats.included ?? "旧记录未记"} />
       </div>
+      {retrieval?.knowledge_retrieval && <p className="detail-lead">知识条目 · 匹配 {retrieval.knowledge_retrieval.matched_entries} · 取回 {retrieval.knowledge_retrieval.retrieved_entries}{retrieval.knowledge_retrieval.prepared_entries !== undefined ? ` · 备料保留 ${retrieval.knowledge_retrieval.prepared_entries}` : ""}</p>}
       {retrieval && <p className="detail-lead">{retrievalStats.target !== null ? `本档召回目标 ${retrievalStats.target} 条；` : `旧策略数量上限 ${retrieval.initial_top_k || 0} 条；`}{retrievalStats.retrievedPercent !== null ? `实际取回占相关候选 ${retrievalStats.retrievedPercent.toFixed(1)}%；` : ""}{retrievalStats.actualPercent !== null ? `实际选入占比 ${retrievalStats.actualPercent.toFixed(1)}%；` : ""}{retrievalStats.shortfall !== null ? `距目标尚差 ${retrievalStats.shortfall} 条，` : ""}{retrievalStats.budgetOmitted !== null ? `${retrievalStats.budgetOmitted} 条取回后因完整条目或共享预算限制未装入。` : ""}适用候选中另有 {retrievalStats.notRetrieved} 条未取回。数量目标服从来源核验和输入预算，不为凑比例塞入无关资料。</p>}
       {!!retrievalStats.invalidSources && <p className="detail-lead">另有 {retrievalStats.invalidSources} 条相关线索的正文、版本或证据核验未通过，已从有效分母排除，没有作为已读证据装入。</p>}
       {!!retrieval?.post_retrieval_omission_count && <details className="detail-disclosure"><summary>取回后未装入 · {retrieval.post_retrieval_omission_count} 条</summary><p className="record-summary">{readableRecord(displaySafeValue(retrieval.post_retrieval_omissions))}</p></details>}
@@ -4465,7 +4494,8 @@ function ProcessPanelCompact({ projectRoot, collaboration, context, provider, re
         <header><h4>本书累计</h4><span title={String(provider?.model || "未配置")}>{String(provider?.model || "未配置")}</span></header>
         <div className="detail-metrics"><DetailMetric label="请求次数" value={usage?.calls?.toLocaleString() ?? "—"} /><DetailMetric label="已记录 Token" value={usage ? usage.total_tokens.toLocaleString() : "—"} /></div>
       </section>
-      <CacheSummary usage={usage} provider={provider} historicalUsage={collaboration?.usage} />
+      {usageHistoryError && <p role="status">{usageHistoryError}</p>}
+      <CacheSummary usage={usage} provider={provider} historicalUsage={usageHistory?.root === projectRoot ? usageHistory.value : collaboration?.usage} />
       <details className="usage-accounting"><summary>费用与计费说明</summary><CostSummary usage={usage} /><p>费用按各次请求的价格快照估算；未报告的用量保持未知。</p></details>
     </div>;
   }
@@ -5293,7 +5323,7 @@ function SettingsDialog({ initialSection = "appearance", initialRecordId = "", i
           <SettingGroup title="高级电脑操作" note="默认关闭。允许提出读写文件、联网和启动应用的命令；每条执行前仍须确认。"><label className="setting-check"><input type="checkbox" checked={form.powershell_enabled} onChange={(event) => updateForm({ powershell_enabled: event.target.checked })} />允许墨流提出 PowerShell 操作请求</label></SettingGroup>
           </section>
         </SettingsPane>}
-        {section === "story_settings" && <SettingsPane title="本书设定" note="把已发生的变化整理好，有分歧的地方由你决定。"><StorySettings key={`${projectRoot}:${initialRecordId}:${initialCollectionId}`} projectRoot={projectRoot} focusRecordId={initialRecordId} focusCollectionId={initialCollectionId} /></SettingsPane>}
+        {section === "story_settings" && <SettingsPane title="本书设定" note="把已发生的变化整理好，有分歧的地方由你决定。"><Suspense fallback={loadingView}><StorySettings key={`${projectRoot}:${initialRecordId}:${initialCollectionId}`} projectRoot={projectRoot} focusRecordId={initialRecordId} focusCollectionId={initialCollectionId} /></Suspense></SettingsPane>}
         {section === "author" && <SettingsPane title="作者习惯与记忆" note="管理长期习惯，保留每本书自己的声音。"><AuthorPreferences projectRoot={projectRoot} /></SettingsPane>}
       </div>
       <footer className="settings-actions">{result && <span className="form-success">✓ {result}</span>}{error && <span className="form-error">{error}</span>}<button type="button" onClick={onClose}>关闭</button>{section !== "skills" && <button className="primary" type="submit" disabled={working || !provider}>{working ? "正在保存…" : "保存设置"}</button>}</footer>

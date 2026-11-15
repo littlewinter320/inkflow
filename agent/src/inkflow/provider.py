@@ -1519,7 +1519,8 @@ class DeepSeekProvider:
             "response_format": {"type": "json_object"},
             "stream": observable_stream,
         }
-        if observable_stream and self.settings.provider_kind == "openai":
+        if observable_stream and (self.settings.provider_kind == "openai"
+                                  or self.settings.prompt_cache_policy == "openrouter"):
             # 官方流式用量在独立尾块返回；缺失时仍保留未知值，不能按零费用处理。
             payload["stream_options"] = {"include_usage": True}
         # Keep DeepSeek's established message layout; message boundaries do not
@@ -1565,11 +1566,22 @@ class DeepSeekProvider:
             dynamic_prompt = _review_delivery_prompt(dynamic_prompt, output_model,
                 layout_version=self.settings.prompt_cache_layout_version)
             payload["messages"][-1]["content"] = dynamic_prompt
-        if self.settings.provider_kind == "openai" and not self.settings.is_mimo and not self.settings.is_deepseek:
+        if (self.settings.provider_kind == "openai" and not self.settings.is_mimo and not self.settings.is_deepseek
+                and (self.settings.prompt_cache_layout_version < 29 or self.settings.prompt_cache_policy == "openai")):
             payload["prompt_cache_key"] = (
                 f"inkflow:{agent_role or 'unknown'}:{model_override or self.settings.model}:"
                 f"{output_model.__name__}:v1"
             )
+        scope = active_task_settings.get()
+        if self.settings.prompt_cache_layout_version >= 29 and scope and scope.novel_id:
+            # 接口只收到不可读的稳定分组键；章号、任务编号及每次检索排名不会导致路由漂移。
+            route = content_hash(json_dumps([scope.novel_id, agent_role, payload["model"]], indent=None))[:32]
+            if self.settings.prompt_cache_policy == "openai":
+                payload["prompt_cache_key"] = f"inkflow:{route}"
+            elif self.settings.prompt_cache_policy == "openrouter":
+                from .conversation_scope import active_conversation
+                key = content_hash(f"{route}:{active_conversation.get()}")[:32]
+                payload["session_id"] = f"inkflow:{key}"
         generation = _generation_settings(self.settings, agent_role)
         if agent_role and (problems := self.settings.generation_problems(agent_role, model_override)):
             raise ConfigurationError("；".join(problems) + "；请调整当前角色设置，尚未发送请求。")
@@ -1738,8 +1750,10 @@ class DeepSeekProvider:
                             "materials_hash": content_hash(serialized_input),
                             "input_prefix_16k_hashes": input_prefix_fingerprints(serialized_input),
                             "input_characters": len(serialized_input),
+                            # 路由键按书或聊天不同，不能因此把同一请求结构拆成无法比较的小样本。
                             "quality_hash": content_hash(json.dumps({key: value for key, value in payload.items()
-                                if key not in {"messages", "model"}}, sort_keys=True, ensure_ascii=False))},
+                                if key not in {"messages", "model"} and (self.settings.prompt_cache_layout_version < 29
+                                    or key not in {"prompt_cache_key", "session_id"})}, sort_keys=True, ensure_ascii=False))},
                 input_estimate=input_estimate, max_output_tokens=reservation_output,
                 input_bound=len(serialized_input.encode("utf-8")) + 1024,
                 task_id=runtime.task_id if runtime else "")
@@ -2220,6 +2234,7 @@ class AnthropicProvider:
                 model=str(payload["model"]), role=agent_role or "unspecified",
                 prompt_family=f"anthropic:{payload['model']}:{agent_role or 'unknown'}:{request_model.__name__}",
                 diagnostic={**wait_policy, **input_budget, **({"logical_input_hash": content_hash(json.dumps(logical, ensure_ascii=False))} if session_context is not None else {}), "stage": request_model.__name__, "system_contract_hash": content_hash(payload["system"]),
+                            "cache_policy": self.settings.prompt_cache_policy,
                             "output_policy": "provider_required_model_limit", "request_output_limit": required_output,
                             "output_policy_source": runtime.output_policy_source if runtime else "current_application_policy",
                             "user_prefix_4096_hash": content_hash(str(payload["messages"][0]["content"])[:4096]),
@@ -2274,6 +2289,8 @@ class AnthropicProvider:
                 usage = {**raw_usage, "prompt_tokens": counts["input_tokens"],
                          "completion_tokens": counts["output_tokens"],
                          "prompt_cache_hit_tokens": counts["cache_hit_tokens"],
+                         "prompt_tokens_details": {"cached_tokens": counts["cache_hit_tokens"],
+                                                   "cache_write_tokens": counts["cache_write_tokens"]},
                          "prompt_cache_miss_tokens": (counts["input_tokens"] - counts["cache_hit_tokens"]
                              if counts["input_tokens"] is not None and counts["cache_hit_tokens"] is not None else None)}
                 attempt_record["usage"] = usage

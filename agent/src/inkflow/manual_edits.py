@@ -534,8 +534,9 @@ class ManualEditsService:
                     queries.extend(str(value)[:160] for value in list(candidate_data.get("values", {}).values())[:3])
                 else:
                     queries.append(content[:160])
-                recovered, retrieval_trace = HybridRetriever(self.project).recover_review_sources(
-                    queries[:4], chapter_no=boundary)
+                recovered, retrieval_trace = HybridRetriever(self.project,
+                    knowledge_rag=engine.settings.retrieval_policy_version >= 4).recover_review_sources(
+                    queries[:4], chapter_no=boundary, role=role if engine.settings.retrieval_policy_version >= 4 else "reviewer")
                 included = []
                 remaining = min(SOURCE_RECOVERY_TOKEN_LIMIT, max(0, engine.settings.context_budget_for(
                     role)[1] -

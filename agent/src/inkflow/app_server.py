@@ -11,6 +11,7 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -439,7 +440,6 @@ class InkFlowAppService:
 
     def __init__(self, instance_id: str | None = None) -> None:
         self.instance_id = instance_id or f"server-{os.getpid()}-{uuid.uuid4().hex}"
-        self.voice = VoiceRuntime()
         self._manual_workers: dict[str, asyncio.Task] = {}
         self._attachment_workers: dict[str, asyncio.Task] = {}
         self._knowledge_workers: dict[str, asyncio.Task] = {}
@@ -448,6 +448,11 @@ class InkFlowAppService:
         self._chapter_accept_runs: dict[tuple[str, int], str] = {}
         self._conversation_deleting: set[tuple[str, str]] = set()
         self._conversation_is_running: Callable[[Path, str], bool] = lambda root, identity: False
+
+    @cached_property
+    def voice(self) -> VoiceRuntime:
+        """需要语音服务时才打开本机语音目录，版本握手和打开小说可先完成。"""
+        return VoiceRuntime()
 
     def _schedule_knowledge(self, project):
         """已启用的全书维护按来源变动排队，不重复启动、重试失败或占用正文写锁。"""
@@ -751,7 +756,7 @@ class InkFlowAppService:
                       "preferences.materials.analyze"}:
             return await self._preference_materials(method, params, emit)
         if method == "app.initialize":
-            return {
+            info = {
                 "product": "墨流（InkFlow）",
                 "version": __version__,
                 "protocol_version": 1,
@@ -769,14 +774,18 @@ class InkFlowAppService:
                     "voice_runtime": True,
                     "voice_is_formal_agent": False,
                 },
-                "provider": api_key_status(Settings.from_env().provider_kind),
                 # Voice inventory can traverse large local model trees. The
                 # welcome screen does not use it, so do not gate engine
                 # compatibility and every startup RPC on that scan.
                 "voice": {"status": "deferred"},
             }
+            # 桌面版本门禁可只读协议身份；旧客户端继续收到原有凭据状态字段。
+            if params.get("version_only") is not True:
+                info["provider"] = await asyncio.to_thread(lambda: api_key_status(Settings.from_env().provider_kind))
+            return info
         if method == "provider.status":
-            settings = Settings.from_env(params.get("workspace_root"))
+            # MiMo 的接口选择也会读取本机凭据；等待期间仍允许打开书稿和处理界面请求。
+            settings = await asyncio.to_thread(Settings.from_env, params.get("workspace_root"))
             if any(key in params for key in ("provider_kind", "base_url", "model", "role_models", "context_input_limit_tokens",
                                            "agent_context_budgets", "context_budget_mode", "context_hard_tokens", "context_soft_tokens")):
                 from dataclasses import replace
@@ -786,10 +795,10 @@ class InkFlowAppService:
                     **{key: params[key] for key in names if key in params}, "max_output_tokens": 1})
                 settings = replace(settings, **{key: getattr(preview, key) for key in names})
                 if settings.provider_kind == "mimo":
-                    settings = replace(settings, base_url=mimo_endpoint_for_key(
-                        settings.base_url, settings.get_api_key() or ""))
+                    key = await asyncio.to_thread(settings.get_api_key)
+                    settings = replace(settings, base_url=mimo_endpoint_for_key(settings.base_url, key or ""))
             return {
-                **api_key_status(settings.provider_kind),
+                **await asyncio.to_thread(api_key_status, settings.provider_kind),
                 "provider_kind": settings.provider_kind,
                 "base_url": settings.base_url,
                 "model": settings.model,
@@ -1406,10 +1415,10 @@ class InkFlowAppService:
             # 统计独立读取已提交账本，不等全量协作/待办扫描，也不触发打开项目的恢复写入。
             root = self._validated_project_root(params)
             return await asyncio.to_thread(lambda: _usage_overview(
-                InkFlowProject(root, recover_on_open=False), Settings.from_env(root), include_history=False))
+                InkFlowProject(root, recover_on_open=False), Settings.from_env(root),
+                include_history=params.get("include_history") is True))
         if method == "collaboration.overview":
-            # The desktop refresh awaits this alongside project.open. It only
-            # reads committed records and should not wait for a long Writer call.
+            # 桌面待办轮询只需协作状态；已有调用方默认仍可取得完整用量与审计。
             root = self._validated_project_root(params)
 
             def read_overview() -> dict[str, Any]:
@@ -1427,8 +1436,10 @@ class InkFlowAppService:
                     **pending,
                     "learning_events": project.db.list_learning_events(int(params.get("learning_limit", 12))),
                     "artifacts": project.db.list_agent_artifacts(limit=30),
-                    "trace_runs": recent_trace_runs(root, int(params.get("trace_limit", 12))),
-                    "usage": _usage_overview(project, Settings.from_env(root)),
+                    **({} if params.get("include_diagnostics") is False else {
+                        "trace_runs": recent_trace_runs(root, int(params.get("trace_limit", 12))),
+                        "usage": _usage_overview(project, Settings.from_env(root)),
+                    }),
                 }
 
             return await asyncio.to_thread(read_overview)
@@ -3129,7 +3140,9 @@ def _usage_overview(project: InkFlowProject, settings: Settings, *, include_hist
             for attempt in usage_attempts(usage):
                 counts = normalized_usage(attempt)
                 prompt, completion = counts["input_tokens"], counts["output_tokens"]
-                cache_hit, cache_miss = counts["cache_hit_tokens"], counts["uncached_input_tokens"]
+                # 历史百分比沿当前账本的读缓存口径；此次写入也计为未命中。
+                cache_hit = counts["cache_hit_tokens"]
+                cache_miss = prompt - cache_hit if prompt is not None and cache_hit is not None else None
                 for target in (overall, bucket, stage_bucket):
                     target["calls"] += 1
                     if prompt is None:

@@ -255,7 +255,9 @@ def _planning_thread_evidence(project: InkFlowProject, accepted: list[dict[str, 
              "检索相关或原文存在不等于支持结论。未选中、未命中、节选外内容都不能据此判不存在。"
              "新未来设想无需旧章预先出现；只有关键过去前提仍缺必要来源才判资料不足。\n")
     excerpt_limit = max(0, token_limit - estimate_tokens(intro + json.dumps(thread_records, ensure_ascii=False) + "\n\n\n" * 6))
-    retriever = HybridRetriever(project)
+    from .task_settings import active_task_settings
+    scope = active_task_settings.get()
+    retriever = HybridRetriever(project, knowledge_rag=scope is None or scope.settings.retrieval_policy_version >= 4)
     hits, diagnostics = retriever.recover_review_sources(queries, chapter_no=anchor + 1) if queries and excerpt_limit else ([], {})
     rows = {int(item["chapter_no"]): item for item in accepted}
     # Resolve known planting/advance identities before using fuzzy-search leads.

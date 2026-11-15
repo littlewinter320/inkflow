@@ -191,7 +191,7 @@ def creation_preset_mappings(settings: Settings | None = None) -> dict[str, dict
             "id": preset, "name": name, "note": note,
             "quality_preset": preset, "quality_custom_context": False,
             "reasoning_effort": effort, "thinking_policy_version": CURRENT_THINKING_POLICY_VERSION,
-            "retrieval_policy_version": 3, "inquiry_frequency": inquiry,
+            "retrieval_policy_version": 4, "inquiry_frequency": inquiry,
             "agent_thinking": preset_agent_thinking(preset),
             "context_soft_tokens": soft, "context_hard_tokens": hard,
             "review_verification_mode": verification, "context_budget_mode": "custom",
@@ -211,6 +211,9 @@ def apply_creation_preset(settings: Settings, preset: str) -> Settings:
     if settings.thinking_policy_version < 7:
         # 旧分段批次尚未冻结的阶段继续采用升级前选档所用的策略。
         values.update(thinking_policy_version=6, agent_thinking=preset_agent_thinking(preset, 6))
+    # 子阶段沿父任务的取材版本；选择新的质量档不会改变同一个恢复链的检索语义。
+    if settings.retrieval_policy_version < 4:
+        values["retrieval_policy_version"] = 3  # 升级前该入口也会按目标档位使用策略3。
     return replace(settings, **{key: value for key, value in values.items()
                                 if key not in {"id", "name", "note", "context_budget_basis"}})
 
@@ -362,7 +365,7 @@ class Settings:
     disable_model_reasoning: bool = False
     thinking_policy_version: int = CURRENT_THINKING_POLICY_VERSION
     mimo_retry_policy_version: int = 2
-    retrieval_policy_version: int = 3
+    retrieval_policy_version: int = 4
     # v4在v3请求排列上增加作者界面的公开措辞约束，不改变资料选择和角色权限。
     # v5压缩逐字重复的协调要求，仅将MiMo规划Writer输出格式放到资料末尾，保留原任务合同。
     # v12把已选设定的固定定义、作者硬约定与任务细节分层，只影响新任务的发送投影。
@@ -373,7 +376,7 @@ class Settings:
     # v18首轮原文前置、索引后置；动态结构化资料只发送可逐字重建的标准JSON补丁。
     # v19在90%压力后等待自然边界整理；完整输入检查点与结果校验分开，补缺仅返回错误路径。
     # v20统一输入容量，保护写作承接原文，关键动态资料完整发送，并按失效资料占用整理历史。
-    prompt_cache_layout_version: int = 28
+    prompt_cache_layout_version: int = 29
     agent_thinking: dict[str, dict[str, str]] = field(default_factory=dict)
     context_soft_tokens: int = 256_000
     context_hard_tokens: int = 614_400
@@ -693,12 +696,12 @@ class Settings:
         retry_policy_version = value.get("mimo_retry_policy_version", 2)
         if type(retry_policy_version) is not int or retry_policy_version not in {1, 2}:
             raise ConfigurationError("MiMo重试策略版本只能是1或2。")
-        retrieval_policy_version = value.get("retrieval_policy_version", 3)
-        if type(retrieval_policy_version) is not int or retrieval_policy_version not in {1, 2, 3}:
-            raise ConfigurationError("检索策略版本只能是1至3。")
-        prompt_cache_layout_version = value.get("prompt_cache_layout_version", 28)
-        if type(prompt_cache_layout_version) is not int or prompt_cache_layout_version not in range(1, 29):
-            raise ConfigurationError("请求缓存布局版本只能是1至28。")
+        retrieval_policy_version = value.get("retrieval_policy_version", 4)
+        if type(retrieval_policy_version) is not int or retrieval_policy_version not in {1, 2, 3, 4}:
+            raise ConfigurationError("检索策略版本只能是1至4。")
+        prompt_cache_layout_version = value.get("prompt_cache_layout_version", 29)
+        if type(prompt_cache_layout_version) is not int or prompt_cache_layout_version not in range(1, 30):
+            raise ConfigurationError("请求缓存布局版本只能是1至29。")
         trace_level = str(value.get("trace_level", defaults.trace_level)).lower()
         if trace_level not in {"compact", "standard", "full"}:
             raise ConfigurationError("过程记录级别只能是 compact、standard 或 full。")
@@ -939,13 +942,13 @@ class Settings:
         if type(policy_version) is int and 1 <= policy_version < CURRENT_THINKING_POLICY_VERSION:
             value["thinking_policy_version"] = CURRENT_THINKING_POLICY_VERSION
         # 只升级新任务；已付费任务仍从原快照恢复原取材策略，不能冒用新输入复用旧报告。
-        if type(value.get("retrieval_policy_version", 3)) is int and value.get("retrieval_policy_version") in {1, 2}:
-            value = {**value, "retrieval_policy_version": 3}
+        if type(value.get("retrieval_policy_version", 4)) is int and value.get("retrieval_policy_version") in {1, 2, 3}:
+            value = {**value, "retrieval_policy_version": 4}
         # 旧全局设置曾随保存携带内部布局版本；只升级新任务的内存默认，不改原文件或快照。
         # 未知值、布尔值等仍交from_mapping报错，不能借升级掩盖配置损坏。
-        layout_version = value.get("prompt_cache_layout_version", 28)
-        if type(layout_version) is int and layout_version in range(1, 28):
-            value = {**value, "prompt_cache_layout_version": 28}
+        layout_version = value.get("prompt_cache_layout_version", 29)
+        if type(layout_version) is int and layout_version in range(1, 29):
+            value = {**value, "prompt_cache_layout_version": 29}
         # 新任务回到作者的角色范围与档位；旧快照仍按记录中的配置恢复。
         value.pop("openai_recommended_reasoning", None)
         value.pop("disable_model_reasoning", None)
@@ -1011,12 +1014,17 @@ class Settings:
 
     @property
     def prompt_cache_policy(self) -> str:
-        """官方 OpenAI 新任务独立采用稳定资料前缀，兼容接口沿用原布局。"""
+        """官方路由使用相应布局；第三方兼容接口保持标准请求。"""
         if self.is_mimo or self.is_deepseek:
             return "mimo" if self.is_mimo else "deepseek"
+        host = urlparse(self.base_url).hostname
         if (self.prompt_cache_layout_version >= 28 and self.provider_kind == "openai"
-                and urlparse(self.base_url).hostname == "api.openai.com"):
+                and host == "api.openai.com"):
             return "openai"
+        if self.prompt_cache_layout_version >= 29 and (
+                (self.provider_kind, host) in {("gemini", "generativelanguage.googleapis.com"), ("openrouter", "openrouter.ai"),
+                    ("anthropic", "api.anthropic.com")}):
+            return self.provider_kind
         return "standard"
 
     @property

@@ -22,6 +22,8 @@ export function reviewSourceLabel(value: unknown): string {
   if (batch) return `第${Number(batch[1])}章同批草稿`;
   if (source.startsWith("task-goal:")) return "本章临时目标";
   if (source.startsWith("plan:chapter:")) return "本章规划";
+  if (source.startsWith("knowledge:")) return "知识档案";
+  if (source.startsWith("import:") || source.startsWith("shared:")) return "导入参考";
   if (/setting-record-/.test(source)) return "设定条目";
   return /^(?:BOOK|OUTLINE|STORY_DETAIL|RECENT_PLAN|PLAN|STATE)\.md$/.test(source) ? documentLabel(source) : "对照资料";
 }
@@ -90,6 +92,9 @@ function ReviewReadableDetails({ report, incomplete }: { report: RecordData; inc
   const focus = (report.focus_observation || {}) as RecordData, hook = (report.hook_assessment || {}) as RecordData;
   const audit = (report.context_use_audit || {}) as RecordData;
   const basis = Array.isArray(report.confidence_basis) ? report.confidence_basis.map(String) : [];
+  const recovery = report.evidence_recovery as { roles?: Record<string, RecordData> } | undefined;
+  const knowledge = Object.entries(recovery?.roles || {}).filter(([, data]) =>
+    records(data?.knowledge_reading).length > 0 || records(data?.knowledge_matches).length > 0);
   // 这里只展示真实保存过的算式，不从尚未核实的等级重新算出一个假总分。
   const arithmetic = basis.filter(line => /^加权符合度：|^.+：等级\d对应[\d.]+% × \d+ = [\d.]+分/.test(line)).map(line => line.split("；", 1)[0]);
   const sources = (value: unknown) => Array.isArray(value) && value.length ? value.map(reviewSourceLabel).join("、") : "没有单独记录";
@@ -109,6 +114,14 @@ function ReviewReadableDetails({ report, incomplete }: { report: RecordData; inc
       {!records(report.source_comparisons).length && <p>尚未保存完整逐字对照，不能据此声称已经核实前文。</p>}</section>
     <section><h4>资料与设定使用核对</h4><p>{reviewExplanation(audit.summary) || "没有单独的资料使用说明。"}</p><p>实际采用：{sources(audit.used_source_ids)}</p><p>应读但未完成对照：{sources(audit.missing_required_source_ids)}</p><p>提出冲突的资料：{sources(audit.conflicting_source_ids)}</p>
       {records(audit.setting_checks).map((item, index) => <details className="review-report-item" key={index}><summary>设定条目{index + 1} · {({ compatible: "原评定使用相容", not_applicable: "原判本章未涉及", conflict: "原报告提出冲突", needs_evidence: "还需依据" } as Record<string, string>)[String(item.disposition)] || "待核"}</summary><p>{reviewExplanation(item.reason)}</p><ReviewQuote value={item.setting_quote} title="设定原句" /><ReviewQuote value={item.chapter_quote} title="本章对应原句" /></details>)}</section>
+    {knowledge.length > 0 && <section><h4>知识库取材</h4>{knowledge.map(([role, data]) => <details className="review-report-item" key={role}>
+      <summary>{roles[role] || "责任检查"}</summary>
+      {records(data.knowledge_reading).map((item, index) => <p key={`ready-${index}`}>
+        {item.kind === "prose" ? "备料含正文片段" : item.kind === "reference" ? "备料含外部参考片段" : "备料含知识条目"} · {String(item.name || item.title || "相关资料")}
+        {typeof item.chapter_no === "number" ? ` · 第 ${item.chapter_no} 章` : ""}{typeof item.version === "number" ? ` · 版本 ${item.version}` : ""}
+      </p>)}
+      {records(data.knowledge_matches).map((item, index) => <p key={`located-${index}`}>第 {String(item.chapter_no)} 章 · {item.loaded ? "已补入完整正文" : "已定位，完整正文未计入补读"}</p>)}
+    </details>)}</section>}
     <section><h4>动态参考观察</h4>{records(report.reference_observations).map((item, index) => <details className="review-report-item" key={index}><summary>{reviewExplanation(item.aspect) || `观察${index + 1}`}</summary><p>{reviewExplanation(item.observation)}</p><ReviewQuote value={item.chapter_evidence} title="本章原文" /><ReviewQuote value={item.source_evidence} title={reviewSourceLabel(item.source_id)} /><p>其他解释：{reviewExplanation(item.alternative)}</p><p>参考用途：{reviewExplanation(item.reference_use)}</p></details>)}
       {!records(report.reference_observations).length && <p>本次没有额外参考观察。</p>}</section>
     <section><h4>微改建议（尚未执行）</h4>{records(report.copyedits).map((item, index) => <article className="review-report-item" key={index}><ReviewQuote value={item.target_excerpt} title="原句" /><ReviewQuote value={item.replacement} title="建议替换内容" /><p>原因：{reviewExplanation(item.reason)}</p></article>)}

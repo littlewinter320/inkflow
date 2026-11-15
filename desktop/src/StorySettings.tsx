@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import "./story-settings.css";
 import { documentLabel, readableSourceText, readableConversationText } from "./readableNames";
 import { readableRecordText, readableValue } from "./readableRecords";
-import { KnowledgeCenter as BookMemory } from "./KnowledgeCenter";
+// 只有进入记忆页才载入知识目录与图谱，设定页先呈现可编辑内容。
+const BookMemory = lazy(() => import("./KnowledgeCenter").then(module => ({ default: module.KnowledgeCenter })));
 
 type Field = { key: string; label: string; description?: string; default?: string };
 type Template = { template_id: string; name: string; category: string; description: string; fields: Field[] };
@@ -123,7 +124,7 @@ export function BookSettingsBrowser({ projectRoot, brief, refreshKey, graphLimit
             {!focusRecordId && collection.collection_id === focusCollectionId && <StorySettings key={`${projectRoot}:${collection.collection_id}:candidates`} projectRoot={projectRoot}
               focusCollectionId={collection.collection_id} inlineContext={{ collection }} onChanged={refreshRecords} />}
           </section>)}
-        {visited.includes("memory") && <div hidden={!memoryView}><BookMemory projectRoot={projectRoot} refreshKey={refreshKey} graphLimit={graphLimit} onGraphLimitChange={onGraphLimitChange} onEditSetting={onEditSetting} /></div>}
+        {visited.includes("memory") && <div hidden={!memoryView}><Suspense fallback={<p role="status" className="empty-mini">正在载入知识库…</p>}><BookMemory projectRoot={projectRoot} refreshKey={refreshKey} graphLimit={graphLimit} onGraphLimitChange={onGraphLimitChange} onEditSetting={onEditSetting} /></Suspense></div>}
       </div>
     </div>
   </section>;

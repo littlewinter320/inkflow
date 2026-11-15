@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from uuid import uuid4
 from pathlib import Path
 from typing import Any, Literal
@@ -43,6 +44,7 @@ STATES = {"canon": "正文事实", "derived": "有据归纳", "plan": "未来规
 STATES["unverified"] = "待核线索"
 STATES["author_note"] = "作者补充"
 STATES["dismissed"] = "已搁置"
+HIDDEN_RETRIEVAL_STATES = {"conflict", "unverified", "dismissed"}
 
 
 class KnowledgeClaim(StrictModel):
@@ -139,14 +141,16 @@ class KnowledgeService:
                 result.append({"id": identity, "title": title, "body": body, "state": state,
                     "hash": content_hash(body), "chapter": None, "path": "", **fields})
 
-        for chapter in self.db.accepted_chapters():
+        for chapter in self.db.accepted_chapters(include_content=True, before_chapter=before_chapter):
             number = chapter["chapter_no"]
-            if before_chapter and number >= before_chapter:
+            try:
+                body = chapter.get("content_text")
+                if body is None:
+                    path = (self.project.root / chapter["path"]).resolve()
+                    body = path.read_text(encoding="utf-8") if path.is_relative_to(self.project.root) and path.is_file() else ""
+            except (OSError, ValueError):
+                problems.append(f"第 {number} 章已接受正文无法读取，暂不整理。")
                 continue
-            body = self.db.canonical_chapter_content(number)
-            if body is None:
-                path = (self.project.root / chapter["path"]).resolve()
-                body = path.read_text(encoding="utf-8") if path.is_relative_to(self.project.root) and path.is_file() else ""
             if not body or content_hash(body) != chapter["content_hash"]:
                 problems.append(f"第 {number} 章原文与保存版本不一致，暂不整理。")
                 continue
@@ -345,7 +349,7 @@ class KnowledgeService:
                 "AND status='reading' AND run_id=?", (reason[:1200], utc_now(), segment_id, run_id))
             connection.commit()
 
-    def snapshot(self, *, actor: str = "user", before_chapter: int | None = None) -> dict:
+    def snapshot(self, *, actor: str = "user", before_chapter: int | None = None, retrieval: bool = False) -> dict:
         """把同版事实、设定、规划、全文归纳编为同一组可读页面和有向关系。"""
         sources, problems = self.sources(actor=actor, before_chapter=before_chapter)
         source_problems = list(problems)
@@ -356,6 +360,7 @@ class KnowledgeService:
         with self.db.connect() as connection:
             annotations = {row["entity_id"]: {**json.loads(row["data_json"]), "revision": row["revision"]}
                            for row in connection.execute("SELECT * FROM knowledge_annotations")}
+            # 只取已完成的归纳；下方按当前可见来源重新核对版本。
             extracted = [dict(row) for row in connection.execute("SELECT * FROM knowledge_segments WHERE status IN ('completed','supplemented')")]
             decisions = {row["key"].removeprefix("knowledge.decision:"): json.loads(row["value_json"])
                          for row in connection.execute("SELECT key,value_json FROM metadata WHERE key LIKE 'knowledge.decision:%'")}
@@ -364,7 +369,11 @@ class KnowledgeService:
             facts = [dict(row) for row in connection.execute("SELECT * FROM facts WHERE branch_id='main' AND status IN ('active','superseded') ORDER BY source_chapter,created_at")]
         alias_ids = {(item.get("namespace", "book"), alias): identity for identity, item in annotations.items() for alias in item.get("aliases", [])}
 
+        entity_ids = {}
+        section_ids = {}
+
         def entity(name, kind="entity", namespace="book", preferred=""):
+            """保持角色或物件的稳定身份。"""
             kind = kind if kind in KINDS else "entity"
             identity = preferred or alias_ids.get((namespace, name)) or _identity(kind, name, namespace)
             if identity not in nodes:
@@ -372,24 +381,38 @@ class KnowledgeService:
                 nodes[identity] = {"id": identity, "name": name, "kind": kind, "namespace": namespace,
                     "aliases": annotation.get("aliases", []), "note": annotation.get("note", ""),
                     "revision": annotation.get("revision", 0), "sections": [], "sources": []}
+                section_ids[identity] = set()
+                for label in {name, *nodes[identity]["aliases"]}:
+                    entity_ids.setdefault((namespace, label), []).append(identity)
             elif nodes[identity]["kind"] == "entity" and kind != "entity":
                 nodes[identity]["kind"] = kind
             return identity
 
         def append(identity, title, body, source, state, *, quote="", importance="normal", **fields):
-            item_id = content_hash(json_dumps([identity, title, body, source["id"], state]))[:24]
+            """来源身份与引文位置随知识项投影，旧提案也可从已核对的阅读段还原。"""
+            start, end = fields.pop("quote_range", (0, len(source["body"])))
+            offset = source["body"].find(quote, start, end) if quote and source["body"] else -1
+            key = [identity, title, body, source["id"], state]
+            if retrieval or actor == "user":
+                key.extend((source["hash"], quote, offset, fields.get("segment_id")))
+            item_id = content_hash(json_dumps(key))[:24]
             section = {"id": item_id, "title": title, "body": body, "source_id": source["id"],
-                "chapter": source["chapter"], "state": state, "quote": quote, "importance": importance, **fields}
-            if not any(old["id"] == item_id for old in nodes[identity]["sections"]):
+                "chapter": source["chapter"], "source_title": source["title"], "source_version": source.get("version", source.get("revision")),
+                "source_hash": source["hash"], "state": state, "quote": quote, "importance": importance,
+                    **({"quote_start": offset, "quote_end": offset + len(quote)} if offset >= 0 else {}), **fields}
+            if item_id not in section_ids[identity]:
                 nodes[identity]["sections"].append(section)
+                section_ids[identity].add(item_id)
             if source["id"] not in nodes[identity]["sources"]:
                 nodes[identity]["sources"].append(source["id"])
             return item_id
 
         def connect(origin, target, relation, source, state, *, quote="", **fields):
+            """把单向关系连接到原始出处，供目录和检索共同使用。"""
             identity = content_hash(json_dumps([origin, target, relation, source["id"], quote]))[:24]
             edges[identity] = {"id": identity, "source": origin, "target": target, "relation": relation,
-                "source_id": source["id"], "chapter": source["chapter"], "state": state, "quote": quote, **fields}
+                "source_id": source["id"], "chapter": source["chapter"], "state": state, "quote": quote,
+                "source_version": source.get("version", source.get("revision")), "source_hash": source["hash"], **fields}
 
         # 先建立有明确类型的设定身份；无类型旧事实只在同名对象唯一时复用。
         for source in sources:
@@ -405,9 +428,9 @@ class KnowledgeService:
                        source.get("namespace", "book"))
 
         def resolve(name, kind="entity", namespace="book", preferred=""):
-            matches = [item["id"] for item in nodes.values() if item["namespace"] == namespace
-                       and (item["name"] == name or name in item["aliases"])
-                       and (kind == "entity" or item["kind"] in {kind, "entity"})]
+            """只在当前来源域内解析名称，把同名比较限制为实际匹配的对象。"""
+            matches = [identity for identity in entity_ids.get((namespace, name), [])
+                       if kind == "entity" or nodes[identity]["kind"] in {kind, "entity"}]
             if preferred and preferred not in matches:
                 # 同域同类型的唯一名称可接回当前页，只有无法唯一定位的旧引用仍提示待核。
                 if len(matches) != 1 and preferred != _identity(kind, name, namespace):
@@ -417,24 +440,36 @@ class KnowledgeService:
 
         current_ids = {item["fact_id"] for item in (self.db.facts_as_of(before_chapter - 1) if before_chapter else self.db.current_facts(include_evidence=False))}
         for fact in facts:
+            if retrieval and before_chapter and fact["valid_from_chapter"] >= before_chapter:
+                continue
             source = source_map.get(f"chapter:{fact['source_chapter']}")
             if (not source or fact["source_version"] not in {None, source.get("version")}
                     or fact["source_hash"] not in {None, source["hash"]} or fact["evidence"] not in source["body"]):
                 continue
             identity = resolve(fact["subject"])
             state = "canon" if fact["epistemic_kind"] == "objective" else fact["epistemic_kind"]
+            valid_to = fact["valid_to_chapter"]
+            if retrieval and before_chapter and valid_to is not None and valid_to >= before_chapter:
+                valid_to = None  # 当时尚未发生的失效不进入回看资料。
             append(identity, fact["predicate"], _text(json.loads(fact["value_json"])), source, state,
-                   quote=fact["evidence"], current=fact["fact_id"] in current_ids, event_time=fact["event_time"] or "")
+                   quote=fact["evidence"], current=fact["fact_id"] in current_ids, event_time=fact["event_time"] or "",
+                   valid_from_chapter=fact["valid_from_chapter"], valid_to_chapter=valid_to)
 
         from .narrative_memory import event_history
-        history = event_history(self.db.narrative_history_rows(before_chapter or self.db.latest_accepted_chapter_no() + 1))
+        if self.db.canonical_content_migration_required():
+            problems.append("事件索引需要先完成正史正文数据库升级。")
+            history = {"events": [], "coverage": {"complete": False}}
+        else:
+            history = event_history(self.db.narrative_history_rows(before_chapter or self.db.latest_accepted_chapter_no() + 1))
         for event in history["events"]:
             source = source_map.get(f"chapter:{event['chapter_no']}")
             if not source:
                 continue
             identity = entity(event["summary"][:100], "event", preferred="event-" + content_hash(event["source_id"])[:24])
             state = "canon" if event["narrative_mode"] in {"current", "flashback"} else "hypothesis" if event["narrative_mode"] in {"dream", "hypothetical"} else event["narrative_mode"]
-            append(identity, "事件经过", event["summary"], source, state, quote=event["evidence"], event_time=event.get("event_time") or "")
+            append(identity, "事件经过", event["summary"], source, state, quote=event["evidence"], event_time=event.get("event_time") or "",
+                   participants=event["participants"], location=event["location"], time_status=event.get("time_status"),
+                   quote_range=(event["start"], event["end"]) if event["start"] is not None else (0, len(source["body"])))
             for name in event["participants"]:
                 target = resolve(name, "character")
                 connect(target, identity, "参与事件", source, state, quote=event["evidence"])
@@ -451,13 +486,37 @@ class KnowledgeService:
 
         gaps = []
         gap_evidence = {}
+        loaded_imports = {}
         for row in extracted:
             source = source_map.get(row["source_id"])
             if not source or source["hash"] != row["source_hash"]:
                 continue
-            output = KnowledgeExtraction.model_validate_json(row["result_json"])
+            try:
+                output = KnowledgeExtraction.model_validate_json(row["result_json"])
+            except ValueError:
+                problems.append(f"「{source['title']}」有知识阅读记录无法解析，保留原记录待核对。")
+                continue
             namespace = source.get("namespace", "book")
+            # 导入清单只含元信息，打开档案时按块核验引文，旧阅读段亦可还原准确位置。
+            if source.get("stored") and output.claims and actor == "user":
+                if source["id"] not in loaded_imports:
+                    try:
+                        raw = self.stored_source(source["id"])
+                    except (ValueError, OSError, InkFlowError):
+                        raw = None
+                    loaded_imports[source["id"]] = raw if raw and raw["hash"] == source["hash"] else None
+                    if len(loaded_imports) > 4:
+                        loaded_imports.pop(next(iter(loaded_imports)))
+                if not loaded_imports[source["id"]]:
+                    problems.append(f"「{source['title']}」的原资料已变化，暂未采用该段知识归纳。")
+                    continue
+                source = {**source, "body": loaded_imports[source["id"]]["body"]}
             for claim_number, claim in enumerate(output.claims):
+                # 同文件存在重复原句时，必须落在当时真实阅读的同一段，不能随便绑定第一次出现。
+                span = (row["start_offset"], row["end_offset"])
+                if source["body"] and (retrieval or actor == "user") and (not claim.quote.strip() or source["body"].find(claim.quote, *span) < 0):
+                    problems.append(f"「{source['title']}」有知识条目无法定位到原阅读段，待重新核对。")
+                    continue
                 # 外部方法可共享；外部故事的具体人物永远保留来源域。
                 identity = resolve(claim.subject, claim.kind, namespace, claim.existing_entity_id)
                 candidate_id = content_hash(row["segment_id"] + ":" + str(claim_number))[:24]
@@ -485,7 +544,9 @@ class KnowledgeService:
                 append(identity, title, decision["body"] if choice == "edit" else claim.description,
                     source, state, quote=claim.quote,
                     importance=claim.importance, event_time=claim.event_time, conflict=claim.conflict,
-                    candidate_id=candidate_id, decision=choice, decision_revision=decision.get("revision", 0))
+                    candidate_id=candidate_id, decision=choice, decision_revision=decision.get("revision", 0),
+                    quote_range=span, segment_id=row["segment_id"], read_start=span[0], read_end=span[1],
+                    run_id=row["run_id"], recorded_at=row["updated_at"])
                 # 文字改写是作者补充，原模型关系不随新表述自动生效。
                 if claim.target and choice not in {"edit", "dismiss"}:
                     connect(identity, resolve(claim.target, claim.target_kind, namespace), claim.predicate, source, state,
@@ -572,21 +633,63 @@ class KnowledgeService:
         nodes = [node for node in snapshot["nodes"] if node["id"] in matches]
         source_ids = {source for node in nodes for source in node["sources"]}
         sources = [source for source in snapshot["sources"] if source["id"] in source_ids or any(term in source["body"].casefold() for term in terms)]
-        # 大资料仅在 SQLite 中搜索正文，命中后最多取回一页结果，避免重载整份文件。
-        with self.db.connect() as connection:
-            rows = connection.execute("SELECT data_json FROM knowledge_sources WHERE active=1 AND source_id LIKE 'import:%' "
-                "AND instr(lower(json_extract(data_json,'$.body')),lower(?))>0 LIMIT ?", (query, limit)).fetchall()
-            sources.extend(json.loads(row[0]) for row in rows)
-        from .preferences import author_connection
-        with author_connection() as connection:
-            if connection.execute("SELECT 1 FROM sqlite_master WHERE name='knowledge_shared_sources'").fetchone():
-                sources.extend(json.loads(row[0]) for row in connection.execute("SELECT data_json FROM knowledge_shared_sources "
-                    "WHERE json_extract(data_json,'$.ready')=1 AND instr(lower(json_extract(data_json,'$.body')),lower(?))>0 LIMIT ?", (query, limit)))
-        sources = list({source["id"]: source for source in sources}.values())
+        # 导入原文先列实际片段，避免目录里的空占位或整页上限盖住全文命中。
+        imports = self.reference_hits([query], limit=limit)
+        sources = list({source["id"]: source for source in [*sources, *imports]}.values())
+        sources.sort(key=lambda source: "match_offset" not in source)
         return {"nodes": nodes[:limit], "sources": sources[:limit], "edges": edges, "problems": snapshot["problems"]}
 
-    def reference_hits(self, query: str, *, limit: int = 6) -> list[dict]:
-        """未完成模型整理的已导入原文也可检索，全文搜索不依赖向量或抽取成功。"""
+    def reference_hits(self, query: str | list[str], *, limit: int = 6) -> list[dict]:
+        """导入资料直接匹配短词组或来源编号。旧任务仍可按原查询整句重建。"""
+        if isinstance(query, list):
+            phrases = Counter(term for value in query for term in re.findall(
+                r"[a-z0-9_.:-]{2,}|[\u3400-\u9fff]{2,}", value.casefold()[:20000]))
+            # 四字词组优先，同时给整句中的短人名和地名留少量匹配机会。
+            long_parts, short_parts = Counter(), Counter()
+            for term, count in phrases.items():
+                if re.fullmatch(r"[\u3400-\u9fff]+", term) and len(term) > 4:
+                    for width, bucket in ((4, long_parts), (2, short_parts)):
+                        for index in range(len(term) - width + 1):
+                            bucket[term[index:index + width]] += count
+            terms = [term for term, _ in sorted(phrases.items(), key=lambda item: (-item[1], -len(item[0]))) if len(term) <= 80][:12]
+            for parts, count in ((long_parts, 12), (short_parts, 8)):
+                terms.extend(term for term, _ in parts.most_common(count) if term not in terms)
+            if not terms:
+                return []
+            weights = [(term, min(len(term), 16)) for term in terms]
+
+            def score(identity, title, body):
+                """每段只解一次原资料；逐词匹配留在本地且不把正文存进排序结果。"""
+                folded = str(body or "").casefold()
+                title = str(title or "").casefold()
+                return sum(weight for term, weight in weights if term == identity or term in title or term in folded)
+
+            def read(connection, table, scope):
+                """在 SQLite 内解析并排序，只返回命中的有限资料块。"""
+                # shortcut: 逐块做有界词组匹配，实测大型导入库变慢时再增加派生全文索引。
+                connection.create_function("inkflow_reference_score", 3, score, deterministic=True)
+                return connection.execute(f"""WITH ranked AS (SELECT source_id,inkflow_reference_score(source_id,
+                    json_extract(data_json,'$.title'),json_extract(data_json,'$.body')) AS score
+                    FROM {table} WHERE {scope} ORDER BY score DESC,source_id LIMIT ?)
+                    SELECT ranked.score,s.data_json FROM ranked JOIN {table} s USING(source_id) WHERE ranked.score>0""",
+                    (limit,)).fetchall()
+
+            with self.db.connect() as connection:
+                rows = read(connection, "knowledge_sources", "active=1 AND source_id LIKE 'import:%'")
+            from .preferences import author_connection
+            with author_connection() as connection:
+                if connection.execute("SELECT 1 FROM sqlite_master WHERE name='knowledge_shared_sources'").fetchone():
+                    rows += read(connection, "knowledge_shared_sources", "json_extract(data_json,'$.ready')=1")
+            results = []
+            for _, raw in sorted(rows, key=lambda row: -row[0])[:limit]:
+                item = json.loads(raw)
+                if content_hash(item["body"]) != item["hash"]:
+                    continue
+                # 在原始文本重新匹配，避免大小写折叠扩张后产生错位的引文位置。
+                offset = next((match.start() for term in sorted(terms, key=len, reverse=True)
+                               if (match := re.search(re.escape(term), item["body"], re.IGNORECASE))), 0)
+                results.append({**item, "match_offset": max(0, offset - 180)})
+            return results
         with self.db.connect() as connection:
             rows = connection.execute("SELECT data_json FROM knowledge_sources WHERE active=1 AND source_id LIKE 'import:%' "
                 "AND instr(lower(json_extract(data_json,'$.body')),lower(?))>0 LIMIT ?", (query, limit)).fetchall()

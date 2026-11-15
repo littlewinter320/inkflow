@@ -98,14 +98,17 @@ export function BackgroundTasks({ request, projectRoot, revision, writing, writi
     finally { inFlight.current = false; }
   }, [projectRoot, request]);
   useEffect(() => {
-    void refresh();
+    // 首页可先交互；打开面板时立即读，收起时等首次空闲再读后台状态。
+    const initial = open ? undefined : window.requestIdleCallback(() => void refresh(), { timeout: 2500 });
+    if (open) void refresh();
     const timer = window.setInterval(() => void refresh(), open ? 3000 : 6000);
     const visible = () => { if (!document.hidden) void refresh(); };
     document.addEventListener("visibilitychange", visible);
-    return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", visible); };
+    return () => { if (initial !== undefined) window.cancelIdleCallback(initial); window.clearInterval(timer); document.removeEventListener("visibilitychange", visible); };
   }, [refresh, open]);
   useEffect(() => { setSnapshot({ components: [], jobs: [], data_root: "" }); setChapterTasks([]); setKnowledge(null); setLoaded(false); }, [projectRoot]);
   useEffect(() => {
+    if (!revision) return;
     const timer = window.setTimeout(() => void refresh(), 600);
     return () => window.clearTimeout(timer);
   }, [revision, refresh]);
